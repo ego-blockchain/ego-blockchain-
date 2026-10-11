@@ -122,6 +122,69 @@ const STORAGE_PLANS: [(&str, u64, f64, f64); 3] = [
     ("Max", 1024, 4.99, 49.90),
 ];
 const PLAN_PRICE_TOLERANCE: f64 = 0.5;
+const STORAGE_FEE_SINK: &str = "egot1feesink0000000000000000000000000000000";
+
+fn plan_price_usd(name: &str, billing: &str) -> Option<(u64, f64, i64)> {
+    let (_, gb, monthly, annual) = STORAGE_PLANS.iter().find(|(n, ..)| *n == name)?;
+    match billing {
+        "monthly" => Some((*gb, *monthly, 30 * 86_400)),
+        "annual" => Some((*gb, *annual, 365 * 86_400)),
+        _ => None,
+    }
+}
+
+pub(crate) fn plan_paid_in_egusd(memo: &str) -> Option<(u64, i64)> {
+    let rest = memo.strip_prefix("credits_pay:")?;
+    let mut parts = rest.split(':');
+    let credits: u64 = parts.next()?.parse().ok()?;
+    if parts.next()? != "plan" {
+        return None;
+    }
+    let (gb, price_usd, period_secs) = plan_price_usd(parts.next()?, parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    (credits >= crate::chain_db::usd_to_credits(price_usd)).then_some((gb, period_secs))
+}
+
+fn queue_payment(tx: LedgerTx) {
+    crate::mempool::get_mempool().push(tx.clone());
+    crate::commands::tx_pending::add(&tx);
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::broadcast_pending_tx(tx).await;
+    });
+}
+
+#[tauri::command]
+pub async fn subscribe_storage_plan(
+    plan: String,
+    billing: String,
+    state: State<'_, AppState>,
+) -> Result<String, EgoDesktopError> {
+    let (_, price_usd, _) = plan_price_usd(plan.trim(), billing.trim())
+        .ok_or_else(|| EgoDesktopError::InvalidInput("Choose Basic, Pro or Max, billed monthly or annual.".into()))?;
+    let credits = crate::chain_db::usd_to_credits(price_usd);
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
+    let mut ledger = Ledger::load();
+    if ledger.address.is_empty() {
+        return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
+    }
+    let have = crate::chain_db::credits_balance(&ledger.address);
+    if have < credits {
+        return Err(EgoDesktopError::InvalidInput(format!(
+            "This plan costs {:.2} EGUSD and you have {:.2} EGUSD. Convert some EGOC to EGUSD in the Wallet first.",
+            credits as f64 / 100.0,
+            have as f64 / 100.0
+        )));
+    }
+    let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", ledger.staked_amount > 0);
+    let memo = format!("credits_pay:{}:plan:{}:{}", credits, plan.trim(), billing.trim());
+    let tx = crate::commands::credits::build_signed_tx(&state, &mut ledger, STORAGE_FEE_SINK, 0, memo, "credits_pay", fee)?;
+    let hash = tx.hash.clone();
+    queue_payment(tx);
+    ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;
+    Ok(hash)
+}
 
 pub(crate) fn paid_plan(memo: &str, amount_uegoc: u64, egoc_usd: f64) -> Option<(u64, i64)> {
     let rest = memo.strip_prefix("Ego Storage ")?;
@@ -194,11 +257,18 @@ pub async fn store_file(
             let chain = load_chain();
             let egoc_usd = crate::p2p::get_egoc_price_usd();
             let plan = chain.transactions.iter()
-                .filter(|tx| tx.from == ledger_quota.address
-                    && tx.tx_type == "transfer"
-                    && tx.to == "egot1storagefees000000000000000000000000000000"
-                    && tx.status == "Confirmed")
-                .filter_map(|tx| paid_plan(tx.memo.as_deref().unwrap_or(""), tx.amount, egoc_usd).map(|plan| (tx, plan)))
+                .filter(|tx| tx.from == ledger_quota.address && tx.status == "Confirmed")
+                .filter_map(|tx| {
+                    let memo = tx.memo.as_deref().unwrap_or("");
+                    let plan = if tx.tx_type == "credits_pay" && tx.to == STORAGE_FEE_SINK {
+                        plan_paid_in_egusd(memo)
+                    } else if tx.tx_type == "transfer" && tx.to == "egot1storagefees000000000000000000000000000000" {
+                        paid_plan(memo, tx.amount, egoc_usd)
+                    } else {
+                        None
+                    };
+                    plan.map(|plan| (tx, plan))
+                })
                 .max_by_key(|(tx, _)| tx.timestamp);
 
             match plan {
@@ -391,29 +461,31 @@ pub async fn store_file(
         };
         let tx_hash = format!("0x{}", ego_core::hash_data(sign_input.as_bytes()).to_hex());
 
-        // store_data tx: fee deducted → escrow + on-chain proof of file commitment
-        crate::mempool::get_mempool().push(LedgerTx {
-            hash:               tx_hash.clone(),
-            from:               ledger.address.clone(),
-            to:                 "egot1storagefees000000000000000000000000000000".into(),
-            amount:             if pay_egusd { 0 } else { cost_uegoc },
-            memo:               Some(if pay_egusd {
-                                    format!("credits_pay:{}:storage:{}", cost_credits, cid)
-                                } else {
-                                    format!("{} | {} blocks | {} months",
-                                        file_name, blocks_total, request.duration_months)
-                                }),
-            timestamp:          now,
-            signature:          signature_hex,
-            status:             "Pending".into(),
-            block_height:       None,
-            nonce,
-            tx_type:            if pay_egusd { "credits_pay".into() } else { "store_data".into() },
-            cid:                cid.clone(),
-            commitment_hash:    commitment_hash.clone(),
-            ..LedgerTx::default()
-        });
-        ledger.nonce = nonce;
+        if pay_egusd {
+            let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
+            let memo = format!("credits_pay:{}:storage:{}", cost_credits, cid);
+            let tx = crate::commands::credits::build_signed_tx(&_state, &mut ledger, STORAGE_FEE_SINK, 0, memo, "credits_pay", fee)?;
+            queue_payment(tx);
+        } else {
+            crate::mempool::get_mempool().push(LedgerTx {
+                hash:               tx_hash.clone(),
+                from:               ledger.address.clone(),
+                to:                 "egot1storagefees000000000000000000000000000000".into(),
+                amount:             cost_uegoc,
+                memo:               Some(format!("{} | {} blocks | {} months",
+                                        file_name, blocks_total, request.duration_months)),
+                timestamp:          now,
+                signature:          signature_hex,
+                status:             "Pending".into(),
+                block_height:       None,
+                nonce,
+                tx_type:            "store_data".into(),
+                cid:                cid.clone(),
+                commitment_hash:    commitment_hash.clone(),
+                ..LedgerTx::default()
+            });
+            ledger.nonce = nonce;
+        }
 
         eprintln!("[Storage] store_data tx {} | cid={} | commitment={} | fee={} uEGOC",
             &tx_hash[..18], &cid[..16], &commitment_hash[..16], cost_uegoc);
@@ -1499,5 +1571,25 @@ mod plan_payment_tests {
         let paid = uegoc(1.99);
         assert!(paid_plan("Ego Storage Pro – monthly ($1.99)", paid, PRICE * 0.6).is_some());
         assert!(paid_plan("Ego Storage Pro – monthly ($1.99)", paid, PRICE * 0.4).is_none());
+    }
+}
+
+#[cfg(test)]
+mod plan_egusd_tests {
+    use super::plan_paid_in_egusd;
+
+    #[test]
+    fn a_plan_paid_in_full_in_egusd_counts_whatever_egoc_does() {
+        assert_eq!(plan_paid_in_egusd("credits_pay:199:plan:Pro:monthly"), Some((200, 30 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:4990:plan:Max:annual"), Some((1024, 365 * 86_400)));
+    }
+
+    #[test]
+    fn an_underpaid_or_made_up_plan_does_not() {
+        assert_eq!(plan_paid_in_egusd("credits_pay:198:plan:Pro:monthly"), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Huge:monthly"), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Pro:weekly"), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:99999:storage:egocid1abc"), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Pro:monthly:extra"), None);
     }
 }

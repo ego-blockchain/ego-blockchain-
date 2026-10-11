@@ -26,8 +26,7 @@ fn sign_and_queue_contract_tx(
     fee: u64,
 ) -> Result<LedgerTx, EgoDesktopError> {
     let from = ledger.address.clone();
-    let confirmed = crate::ledger::last_confirmed_nonce(&from);
-    let nonce = ledger.nonce.max(confirmed) + 1;
+    let nonce = crate::ledger::next_nonce_for(&from, ledger.nonce);
     let kp = state.get_keypair().ok_or_else(|| {
         EgoDesktopError::WalletError("Wallet not initialized - call init_wallet first".into())
     })?;

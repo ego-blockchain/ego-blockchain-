@@ -123,7 +123,6 @@ const PLANS: SubscriptionPlan[] = [
 ];
 
 const FREE_GB = 5;
-const STORAGE_POOL_ADDR = 'egot1storagefees000000000000000000000000000000';
 
 const FEATURES = [
   { icon: '⚡', title: 'Lightning Fast', desc: 'Sub-50ms retrieval from the nearest peer node' },
@@ -318,14 +317,6 @@ const StoragePage: React.FC = () => {
     }
   }
 
-  // Convert a USD amount to uEGOC using the live rate.
-  // Minimum 1 EGOC to avoid dust.
-  function usdToUegoc(usd: number): number {
-    if (usd <= 0) return 0;
-    const egoc = usd / egocPriceUsd;
-    return Math.max(1_000_000, Math.round(egoc * 1_000_000));
-  }
-
   async function openSubModal(manage = false) {
     setNetCapacity(null);
     setCapacityLoading(true);
@@ -398,18 +389,10 @@ const StoragePage: React.FC = () => {
       setSubError(`Not enough network capacity for the ${plan.name} plan (${plan.gb >= 1024 ? `${plan.gb / 1024} TB` : `${plan.gb} GB`}). Only ${netCapacity ? netCapacity.total_available_gb.toFixed(1) + ' GB' : 'unknown'} available across the network.`);
       return;
     }
-    const priceUsd   = subBilling === 'annual' ? plan.priceAnnualUsd : plan.priceMonthlyUsd;
-    const priceUegoc = usdToUegoc(priceUsd);
     setSubscribing(true);
     setSubError('');
     try {
-      await invoke('send_transaction', {
-        request: {
-          to_address: STORAGE_POOL_ADDR,
-          amount: priceUegoc,
-          memo: `Ego Storage ${plan.name} – ${subBilling} ($${priceUsd.toFixed(2)})`,
-        },
-      });
+      await invoke('subscribe_storage_plan', { plan: plan.name, billing: subBilling });
       const now      = Math.floor(Date.now() / 1000);
       const duration = subBilling === 'annual' ? 365 * 86400 : 30 * 86400;
       const sub: ActiveSubscription = {

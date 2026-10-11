@@ -190,8 +190,7 @@ pub async fn send_transaction(
         )));
     }
 
-    let confirmed_nonce = crate::ledger::last_confirmed_nonce(&from);
-    let nonce      = ledger.nonce.max(confirmed_nonce) + 1;
+    let nonce      = crate::ledger::next_nonce_for(&from, ledger.nonce);
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; // testnet
@@ -379,8 +378,7 @@ pub async fn prepare_transaction(
     }
     let is_staker  = ledger.staked_amount > 0;
     let fee        = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
-    let confirmed_nonce_legacy = crate::ledger::last_confirmed_nonce(&from);
-    let nonce      = ledger.nonce.max(confirmed_nonce_legacy) + 1;
+    let nonce      = crate::ledger::next_nonce_for(&from, ledger.nonce);
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; 
@@ -919,7 +917,6 @@ pub async fn request_tx_code(
                 )));
             }
 
-            let confirmed_nonce = crate::ledger::last_confirmed_nonce(&from);
             let ts = chrono::Utc::now().timestamp();
             let pending_max_nonce: u64 = {
                 let map = PENDING_TXS.lock().unwrap_or_else(|e| e.into_inner());
@@ -930,7 +927,7 @@ pub async fn request_tx_code(
                     .unwrap_or(0)
             };
             let memo_str = memo_opt.as_deref().unwrap_or("");
-            let nonce = ledger.nonce.max(confirmed_nonce).max(pending_max_nonce) + 1;
+            let nonce = crate::ledger::next_nonce_for(&from, ledger.nonce.max(pending_max_nonce));
             if pending_max_nonce > 0 && nonce <= pending_max_nonce {
                 return Err(EgoDesktopError::InvalidInput(
                     "Too many pending transactions. Please wait for some to confirm first.".into(),

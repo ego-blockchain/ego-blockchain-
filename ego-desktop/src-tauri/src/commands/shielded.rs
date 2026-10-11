@@ -701,8 +701,7 @@ pub async fn shield_deposit(
         )));
     }
 
-    let confirmed_nonce = crate::ledger::last_confirmed_nonce(&from);
-    let mut nonce = ledger.nonce.max(confirmed_nonce);
+    let mut nonce = crate::ledger::next_nonce_for(&from, ledger.nonce) - 1;
     let now = chrono::Utc::now().timestamp();
     let ed_pk = hex::encode(kp.ed25519_public_key().as_bytes());
     let dil_pk = hex::encode(&kp.dilithium_public_key().key_data);

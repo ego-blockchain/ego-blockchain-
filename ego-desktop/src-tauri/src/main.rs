@@ -983,6 +983,7 @@ fn main() {
             commands::wallet::get_tx_fee,
             commands::wallet::clear_pending_transactions,
             commands::storage::store_file,
+            commands::storage::subscribe_storage_plan,
             commands::storage::get_file_metadata,
             commands::storage::get_stored_files,
             commands::storage::get_egosafe_files,

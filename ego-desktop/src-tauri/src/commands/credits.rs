@@ -20,7 +20,7 @@ pub struct CreditsTxResponse {
     pub message: String,
 }
 
-fn build_signed_tx(
+pub(crate) fn build_signed_tx(
     state: &State<'_, AppState>,
     ledger: &mut Ledger,
     to: &str,
@@ -30,8 +30,7 @@ fn build_signed_tx(
     fee: u64,
 ) -> Result<LedgerTx, EgoDesktopError> {
     let from = ledger.address.clone();
-    let confirmed_nonce = crate::ledger::last_confirmed_nonce(&from);
-    let nonce = ledger.nonce.max(confirmed_nonce) + 1;
+    let nonce = crate::ledger::next_nonce_for(&from, ledger.nonce);
     let ts = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes_v2(&from, to, amount, nonce, ts, CHAIN_ID, &memo);
 
@@ -67,7 +66,7 @@ fn build_signed_tx(
     Ok(tx)
 }
 
-async fn queue_tx(tx: LedgerTx, ledger: Ledger) {
+pub(crate) async fn queue_tx(tx: LedgerTx, ledger: Ledger) {
     crate::mempool::get_mempool().push(tx.clone());
     crate::commands::tx_pending::add(&tx);
     let _ = ledger.save();

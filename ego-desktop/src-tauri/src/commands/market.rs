@@ -378,7 +378,7 @@ async fn submit_op(
             fmt_egoc(available)
         )));
     }
-    let nonce = ledger.nonce.max(crate::ledger::last_confirmed_nonce(&from)) + 1;
+    let nonce = crate::ledger::next_nonce_for(&from, ledger.nonce);
     let tx = build_op_tx(&kp, &from, tx_type, call_args, amount, nonce, fee, chrono::Utc::now().timestamp())
         .map_err(EgoDesktopError::InvalidInput)?;
     crate::ledger::verify_incoming_tx(&tx).map_err(EgoDesktopError::InvalidInput)?;
