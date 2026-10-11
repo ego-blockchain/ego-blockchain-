@@ -692,6 +692,11 @@ const StoragePage: React.FC = () => {
         </div>
 
         <div className="p-5">
+          <div className="mb-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+            <span className="font-semibold text-amber-300">🧪 Ego Storage is still in testing.</span>{' '}
+            Plans are paid with testnet EGUSD, and your plan works for real while it runs: upload, open, share and
+            delete your files any time. Keep your own copy of anything important until the main network launches.
+          </div>
           {step === 'idle' && (() => {
             const usedBytes  = files.filter(f => f.status === 'Active' || f.status === 'PendingSync').reduce((s, f) => s + f.original_size, 0);
             const now        = Math.floor(Date.now() / 1000);
