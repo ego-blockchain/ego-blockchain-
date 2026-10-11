@@ -165,6 +165,17 @@ pub fn storage_reward_uegoc(gb: f64) -> u64 {
     reward_usd_to_uegoc(STORAGE_REWARD_USD_PER_GB_DAY * gb)
 }
 
+/// What one GB of peer data held for a day pays right now, as the Earnings page pays it:
+/// (µEGOC, the dollar target behind it). Moves with the EGOC price, the early-network
+/// multiplier and how much of the node pool is left.
+pub fn storage_rate_per_gb_day() -> (u64, f64) {
+    let scale = pool_scale(crate::chain_db::balance_of(crate::chain_db::NODE_POOL_ADDR));
+    (
+        (storage_reward_uegoc(1.0) as f64 * scale) as u64,
+        STORAGE_REWARD_USD_PER_GB_DAY * current_early_multiplier() * scale,
+    )
+}
+
 static VALIDATOR_BLOCKS_VOTED: std::sync::atomic::AtomicU64
     = std::sync::atomic::AtomicU64::new(0);
 static VALIDATOR_BLOCKS_TOTAL: std::sync::atomic::AtomicU64
@@ -246,7 +257,11 @@ pub fn node_pool_remaining_uegoc(_chain: &crate::ledger::SharedChain) -> u64 {
 }
 
 pub fn node_reward_scale(chain: &crate::ledger::SharedChain) -> f64 {
-    let remaining = node_pool_remaining_uegoc(chain);
+    pool_scale(node_pool_remaining_uegoc(chain))
+}
+
+/// Rewards taper once less than a fifth of the node pool is left, and stop when it's empty.
+fn pool_scale(remaining: u64) -> f64 {
     if remaining == 0 { return 0.0; }
     let pct = remaining as f64 / NODE_POOL_UEGOC as f64;
     if pct >= 0.20 { 1.0 } else { pct / 0.20 }

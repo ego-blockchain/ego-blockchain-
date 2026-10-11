@@ -104,6 +104,9 @@ pub struct StorageMetrics {
     pub disk_free_bytes: u64,
     /// Unix timestamp when storage was last configured. Locked for 60 days from this point.
     pub storage_configured_at: Option<i64>,
+    /// What one GB of peer data held for a day pays right now, in µEGOC and the dollar target behind it.
+    pub reward_uegoc_per_gb_day: u64,
+    pub reward_usd_per_gb_day: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -648,6 +651,7 @@ pub async fn get_storage_metrics(
     }
 
     let disk_free_bytes = fs2::available_space(storage_dir()).unwrap_or(0);
+    let (reward_uegoc_per_gb_day, reward_usd_per_gb_day) = crate::tokenomics::storage_rate_per_gb_day();
 
     Ok(StorageMetrics {
         storage_allocated_bytes: allocated,
@@ -660,6 +664,8 @@ pub async fn get_storage_metrics(
         peer_bytes_hosted,
         disk_free_bytes,
         storage_configured_at:   ledger.storage_configured_at,
+        reward_uegoc_per_gb_day,
+        reward_usd_per_gb_day,
     })
 }
 

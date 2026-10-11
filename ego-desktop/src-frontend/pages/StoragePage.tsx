@@ -27,6 +27,9 @@ interface StorageDeal {
 interface StorageMetrics {
   storage_allocated_bytes: number;
   space_used_bytes: number;
+  /** What one GB of peer data held for a day pays right now (µEGOC, and the dollar target behind it). */
+  reward_uegoc_per_gb_day?: number;
+  reward_usd_per_gb_day?: number;
   space_available_bytes: number;
   availability_status: string;
   last_post_latency_ms?: number;
@@ -147,11 +150,14 @@ function fmtExpiry(ts: number) {
   return `${days}d left`;
 }
 
-function storageEarningsPerDay(peerBytesHosted: number) {
-  return (peerBytesHosted / 1e9) * 0.5;
+/** EGOC per GB per day right now. It moves with the EGOC price and the network's size. */
+function egocPerGbDay(m: StorageMetrics | null) {
+  return (m?.reward_uegoc_per_gb_day ?? 0) / 1e6;
 }
-function maxEarningsPerDay(allocatedBytes: number) {
-  return (allocatedBytes / 1e9) * 0.5;
+/** A small rate with enough digits to read. */
+function fmtRate(n: number) {
+  if (n === 0) return '0';
+  return n >= 1 ? n.toFixed(2) : n.toPrecision(3);
 }
 
 const PROCESS_STAGES: { key: ProcessStage; label: string; detail: string; ms: number }[] = [
@@ -529,8 +535,10 @@ const StoragePage: React.FC = () => {
   const available      = metrics?.space_available_bytes ?? 0;
   const peerHosted     = metrics?.peer_bytes_hosted ?? 0;
   const peerUsedPct    = allocated > 0 ? Math.min(100, Math.round((peerHosted / allocated) * 100)) : 0;
-  const earningsPerDay = storageEarningsPerDay(peerHosted);
-  const maxPerDay      = maxEarningsPerDay(allocated);
+  const ratePerGb      = egocPerGbDay(metrics);
+  const usdPerGb       = metrics?.reward_usd_per_gb_day ?? 0;
+  const earningsPerDay = (peerHosted / 1e9) * ratePerGb;
+  const maxPerDay      = (allocated / 1e9) * ratePerGb;
 
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
@@ -548,7 +556,9 @@ const StoragePage: React.FC = () => {
                 The more you allocate, the more you earn.
               </p>
               <div className="bg-black/30 rounded-xl p-3 text-xs text-gray-400 mb-4">
-                Max reward rate: <span className="text-green-400 font-semibold">0.5 EGOC / GB / day</span> — earned only when your allocated space is actively used by the network.
+                Reward rate right now: <span className="text-green-400 font-semibold">{metrics ? `${fmtRate(ratePerGb)} EGOC / GB / day` : '…'}</span>
+                {usdPerGb > 0 && <> (a ${fmtRate(usdPerGb)} per GB per day target, paid in EGOC at the current price)</>}
+                {' '}— earned only for space other people's files actually use, on testnet right now.
                 &nbsp;Files stored by others are AES-256-GCM encrypted and you cannot read their contents.
               </div>
               <button
@@ -1147,11 +1157,11 @@ const StoragePage: React.FC = () => {
 
                   <div className="bg-gray-900 rounded-xl p-3 space-y-1.5 text-sm">
                     <div className="flex justify-between"><span className="text-gray-400">Allocation</span><span>{allocGb} GB</span></div>
-                    <div className="flex justify-between"><span className="text-gray-400">Storage reward target</span><span className="text-green-400 font-bold">~${(allocGb * 0.002).toFixed(3)}/day in EGOC</span></div>
+                    <div className="flex justify-between"><span className="text-gray-400">Storage reward target</span><span className="text-green-400 font-bold">up to {fmtRate(allocGb * ratePerGb)} EGOC/day</span></div>
                   </div>
 
                   <div className="text-xs text-yellow-600/80 bg-yellow-500/10 rounded-lg px-3 py-2">
-                    ⚠️ Actual rewards are paid only when your space is used by other peers. Rate adjusts with EGOC price.
+                    ⚠️ Actual rewards are paid only when your space is used by other peers. The rate follows the EGOC price, is higher while the network is young, and tapers when the reward pool runs low.
                   </div>
                   <div className="text-xs text-gray-500">
                     Files are encrypted by the uploader — you cannot read their contents.
