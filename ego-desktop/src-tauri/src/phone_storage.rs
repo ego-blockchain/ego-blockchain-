@@ -153,6 +153,9 @@ async fn put_manifest(params: &Value) -> RpcResult {
     if format!("egomfd1{}", ego_core::hash_data(&bytes).to_hex()) != cid {
         return Err((-32602, "The manifest doesn't match its ID.".into()));
     }
+    if crate::file_delete::is_deleted(&cid) {
+        return Err((-32602, "This file was deleted by its owner.".into()));
+    }
     let phone: PhoneManifest = serde_json::from_slice(&bytes)
         .map_err(|e| (-32602, format!("The manifest couldn't be read: {e}")))?;
     if phone.blocks.is_empty() || phone.total_size == 0 || phone.total_size > MAX_FILE_BYTES
@@ -261,28 +264,26 @@ async fn get_block(params: &Value) -> RpcResult {
     }
 }
 
-/// storage.delete: the owner drops a file. This node forgets it and removes its blocks.
+/// storage.delete: the owner drops a file everywhere. The phone's signed request is
+/// itself the delete notice, so this node removes its copy and passes it to every other.
 async fn delete(params: &Value) -> RpcResult {
     let now = chrono::Utc::now().timestamp();
     let cid = params["cid"].as_str().unwrap_or_default().to_string();
     let owner = signed_owner(params, DELETE_DOMAIN, &cid, now)?;
-    let _guard = crate::ledger::TX_MUTEX.lock().await;
-    let removed = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-        let mut ledger = Ledger::load();
-        let Some(pos) = ledger.stored_files.iter().position(|f| f.cid == cid && f.owner == owner) else {
-            return Ok(false);
-        };
-        let file = ledger.stored_files.remove(pos);
-        if let Ok(manifest) = crate::blocks::load_manifest(&file.cid) {
-            for b in &manifest.blocks {
-                let _ = std::fs::remove_file(crate::blocks::block_path(&b.block_cid));
-            }
-        }
-        let _ = std::fs::remove_file(crate::blocks::manifest_path(&file.cid));
-        ledger.save().map_err(|e| e.to_string())?;
-        Ok(true)
-    }).await.map_err(|e| (-32603, e.to_string()))?.map_err(|e| (-32603, e))?;
-    Ok(json!({ "removed": removed }))
+    let held = {
+        let (c, o) = (cid.clone(), owner.clone());
+        tokio::task::spawn_blocking(move || Ledger::load().stored_files.iter().any(|f| f.cid == c && f.owner == o))
+            .await.map_err(|e| (-32603, e.to_string()))?
+    };
+    let notice = crate::file_delete::DeleteNotice {
+        cid,
+        owner,
+        pubkey: params["pubkey"].as_str().unwrap_or_default().to_string(),
+        sig: params["sig"].as_str().unwrap_or_default().to_string(),
+        ts: params["ts"].as_i64().unwrap_or_default(),
+    };
+    crate::file_delete::delete_everywhere(notice).await;
+    Ok(json!({ "removed": held }))
 }
 
 /// storage.usage: what an owner has stored on this node, and their plan's space.

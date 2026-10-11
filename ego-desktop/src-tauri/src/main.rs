@@ -28,6 +28,7 @@ mod contract_exec;
 mod dao_chat;
 mod gateway;
 mod phone_storage;
+mod file_delete;
 mod commands;
 mod compute_admission;
 mod config;
@@ -1575,6 +1576,8 @@ fn main() {
                     // reports older than 30 min from the network total.
                     if loop_tick % 5 == 0 {
                         bounded!(15, crate::p2p::broadcast_data_manifest());
+                        // Repeat this week's deletes for nodes that were offline.
+                        bounded!(15, crate::file_delete::repeat_mine());
                     }
                     bounded!(15, crate::p2p::sync_chain_from_peers());
                     bounded!(15, crate::p2p::dht_discover_relays());

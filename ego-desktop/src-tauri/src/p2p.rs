@@ -3278,6 +3278,10 @@ pub enum P2PMessage {
         is_relay:     bool,     
         endpoint:     String,
     },
+    /// The owner deleted this file: every node drops its copy and never takes it again.
+    FileDelete {
+        notice: crate::file_delete::DeleteNotice,
+    },
     PinRequest {
         cid:           String,
         from_addr:     String,
@@ -5748,6 +5752,8 @@ pub async fn check_file_replication() {
     // nodes we keep 2 copies, with 3+ we reach the full MIN_REPLICAS. (Previously gated to
     // >50 validators, which left every early-network file on a single master = data loss
     // the moment that user shut down.)
+    // Drop copies of files whose owners deleted them, before any of them is replicated again.
+    crate::file_delete::sweep().await;
     if known_validator_count() < 2 { return; }
     let _guard = crate::ledger::TX_MUTEX.lock().await; // This is fine, it's a tokio mutex
     let mut ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
@@ -5965,7 +5971,9 @@ pub async fn check_file_replication() {
                 let master_alive = file.master_last_seen > 0
                     && (now - file.master_last_seen) < MASTER_TIMEOUT_SECS;
 
-                if !master_alive {
+                // A quiet master may mean the owner deleted the file: look for a
+                // tombstone on the DHT and wait for it before taking over.
+                if !master_alive && crate::file_delete::may_promote(&file.cid, now) {
                     // Master has not sent a heartbeat within the timeout window.
                     // Promote self to master and broadcast to find a new slave.
                     tracing::warn!("Replication: slave promoting to master for {} (master {} silent for {}s)",
@@ -8248,6 +8256,9 @@ async fn handle_event(
                     Ok(P2PMessage::DataManifest { from_addr, available_gb, is_relay, endpoint, .. }) => {
                         record_data_manifest(&from_addr, available_gb, is_relay, &endpoint);
                     }
+                    Ok(P2PMessage::FileDelete { notice }) => {
+                        tokio::spawn(crate::file_delete::handle(notice, false));
+                    }
                     Ok(P2PMessage::ShardAnnounce { from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count }) => {
                         crate::sharding::handle_shard_announce_update(&from_addr, &from_endpoint, &held_shards, uptime_secs, network_node_count, shard_count);
                     }
@@ -8383,9 +8394,14 @@ async fn handle_event(
                 kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(rec))) => {
                     let key_str = String::from_utf8_lossy(rec.record.key.as_ref()).to_string();
 
-                    if key_str.starts_with("ego-manifest:") {
+                    if key_str.starts_with("ego-deleted:") {
+                        if let Ok(notice) = serde_json::from_slice::<crate::file_delete::DeleteNotice>(&rec.record.value) {
+                            tokio::spawn(crate::file_delete::handle(notice, false));
+                        }
+                    } else if key_str.starts_with("ego-manifest:") {
                         let manifest_cid = key_str.trim_start_matches("ego-manifest:").to_string();
-                        if let Ok(manifest) = serde_json::from_slice::<crate::blocks::FileManifest>(&rec.record.value) {
+                        let deleted = crate::file_delete::is_deleted(&manifest_cid);
+                        if let (false, Ok(manifest)) = (deleted, serde_json::from_slice::<crate::blocks::FileManifest>(&rec.record.value)) {
                             let _ = crate::blocks::save_manifest(&manifest);
                             eprintln!("[DHT] Manifest {} received from DHT ({} blocks)", &manifest_cid[..16.min(manifest_cid.len())], manifest.blocks.len());
 
@@ -8580,8 +8596,16 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             }
         }
 
+        P2PMessage::FileDelete { notice } => {
+            crate::file_delete::handle(notice, false).await;
+        }
+
         P2PMessage::PinRequest { cid, from_addr, from_endpoint, storage_fee_uegoc, expiry } => {
             eprintln!("[P2P] PinRequest for {} from {} fee={} expiry={}", cid, from_addr, storage_fee_uegoc, expiry);
+            if crate::file_delete::is_deleted(&cid) {
+                eprintln!("[P2P] PinRequest for {} refused: its owner deleted it", &cid[..16.min(cid.len())]);
+                return;
+            }
             let ledger    = crate::ledger::Ledger::load();
             let used: u64 = ledger.stored_files.iter().map(|f| f.encrypted_size).sum();
             let capacity  = ledger.storage_allocated_bytes;
@@ -10127,6 +10151,10 @@ async fn update_ledger_for_block(manifest_cid: &str, app: Option<&tauri::AppHand
 }
 
 async fn process_received_manifest(manifest_cid: &str, app: Option<&tauri::AppHandle<tauri::Wry>>) {
+    if crate::file_delete::is_deleted(manifest_cid) {
+        let _ = std::fs::remove_file(crate::blocks::manifest_path(manifest_cid));
+        return;
+    }
     let Ok(manifest) = crate::blocks::load_manifest(manifest_cid) else { return; };
     let total    = manifest.blocks.len() as u32;
     let received = crate::blocks::blocks_received_count(&manifest);

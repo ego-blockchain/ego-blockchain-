@@ -792,6 +792,19 @@ pub async fn delete_stored_file(
     cid: String,
     _state: State<'_, AppState>,
 ) -> Result<(), EgoDesktopError> {
+    // Deleting your own file removes it from every node that keeps a copy, not just this one.
+    let own_file = {
+        let ledger = Ledger::load();
+        ledger.stored_files.iter().any(|f| f.cid == cid && (f.owner.is_empty() || f.owner == ledger.address))
+    };
+    if own_file {
+        if let Some(kp) = _state.get_keypair() {
+            let notice = crate::file_delete::DeleteNotice::sign(&kp, &cid, chrono::Utc::now().timestamp());
+            crate::file_delete::delete_everywhere(notice).await;
+            sync_reservation(Ledger::load().storage_allocated_bytes);
+            return Ok(());
+        }
+    }
     let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = Ledger::load();
     let my_addr = ledger.address.clone();
