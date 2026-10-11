@@ -153,7 +153,7 @@ async fn put_manifest(params: &Value) -> RpcResult {
     if format!("egomfd1{}", ego_core::hash_data(&bytes).to_hex()) != cid {
         return Err((-32602, "The manifest doesn't match its ID.".into()));
     }
-    if crate::file_delete::is_deleted(&cid) {
+    if crate::file_delete::is_deleted(&owner, &cid) {
         return Err((-32602, "This file was deleted by its owner.".into()));
     }
     let phone: PhoneManifest = serde_json::from_slice(&bytes)

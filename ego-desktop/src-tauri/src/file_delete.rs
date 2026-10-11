@@ -10,6 +10,10 @@
 //! for a week. Every node that sees it removes the file, keeps a tombstone so
 //! the file is never pinned or fetched again, and a slave checks for a
 //! tombstone before it ever promotes itself.
+//!
+//! A tombstone belongs to an owner and a file together. File IDs aren't
+//! secret, so anyone can sign a valid notice for someone else's file ID with
+//! their own key; it only ever counts against copies that signer owns.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -24,6 +28,19 @@ const REPEAT_SECS: i64 = 7 * 86_400;
 const KEEP_SECS: i64 = 180 * 86_400;
 /// A slave whose master went quiet waits this long for a tombstone from the DHT before promoting.
 pub const TOMBSTONE_WAIT_SECS: i64 = 90;
+/// Past this many, the oldest tombstones issued elsewhere are forgotten first.
+const MAX_TOMBSTONES: usize = 50_000;
+
+/// Where a tombstone is kept: one owner's file, never the file ID alone.
+fn key(owner: &str, cid: &str) -> String {
+    format!("{owner}/{cid}")
+}
+
+/// The DHT record holding an owner's delete for a file. Owned the same way, so a
+/// stranger's record can't overwrite the real owner's.
+pub fn dht_key(owner: &str, cid: &str) -> String {
+    format!("ego-deleted:{owner}:{cid}")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteNotice {
@@ -78,13 +95,17 @@ fn path() -> std::path::PathBuf {
     crate::ledger::base_data_dir().join("deleted_files.json")
 }
 
+/// Reads saved tombstones, rekeying any kept by file ID alone (and dropping those with no notice).
+fn parse(json: &str) -> HashMap<String, Tombstone> {
+    serde_json::from_str::<HashMap<String, Tombstone>>(json).unwrap_or_default()
+        .into_values()
+        .filter_map(|t| Some((t.notice.as_ref().map(|n| key(&n.owner, &n.cid))?, t)))
+        .collect()
+}
+
 fn with_tombstones<T>(f: impl FnOnce(&mut HashMap<String, Tombstone>) -> T) -> T {
     let mut guard = TOMBSTONES.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(|| {
-        std::fs::read_to_string(path()).ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    });
+    let map = guard.get_or_insert_with(|| parse(&std::fs::read_to_string(path()).unwrap_or_default()));
     f(map)
 }
 
@@ -94,20 +115,42 @@ fn save(map: &HashMap<String, Tombstone>) {
     }
 }
 
-pub fn is_deleted(cid: &str) -> bool {
-    with_tombstones(|m| m.contains_key(cid))
+/// Whether `owner` deleted their file `cid`. Someone else's delete for the same ID doesn't count.
+pub fn is_deleted(owner: &str, cid: &str) -> bool {
+    with_tombstones(|m| m.contains_key(&key(owner, cid)))
+}
+
+/// Whether every copy of `cid` this node holds was deleted by its owner. A file held here
+/// for no one isn't.
+pub fn deleted_here(ledger: &Ledger, cid: &str) -> bool {
+    let mut owners = ledger.stored_files.iter()
+        .filter(|f| f.cid == cid)
+        .map(|f| if f.owner.is_empty() { ledger.address.as_str() } else { f.owner.as_str() })
+        .peekable();
+    owners.peek().is_some() && owners.all(|o| is_deleted(o, cid))
+}
+
+/// Adds a notice to `map`. True when it's new.
+fn record(map: &mut HashMap<String, Tombstone>, notice: &DeleteNotice, mine: bool, now: i64) -> bool {
+    map.retain(|_, t| now - t.seen_at < KEEP_SECS);
+    let k = key(&notice.owner, &notice.cid);
+    let fresh = !map.contains_key(&k);
+    let entry = map.entry(k).or_insert_with(|| Tombstone { notice: Some(notice.clone()), seen_at: now, mine });
+    if mine && !entry.mine {
+        entry.mine = true;
+        entry.seen_at = now;
+    }
+    while map.len() > MAX_TOMBSTONES {
+        let Some(oldest) = map.iter().filter(|(_, t)| !t.mine).min_by_key(|(_, t)| t.seen_at).map(|(k, _)| k.clone()) else { break };
+        map.remove(&oldest);
+    }
+    fresh
 }
 
 /// Remembers a notice. True when it's new here.
 fn remember(notice: &DeleteNotice, mine: bool, now: i64) -> bool {
     with_tombstones(|m| {
-        m.retain(|_, t| now - t.seen_at < KEEP_SECS);
-        let fresh = !m.contains_key(&notice.cid);
-        let entry = m.entry(notice.cid.clone()).or_insert_with(|| Tombstone { notice: Some(notice.clone()), seen_at: now, mine });
-        if mine && !entry.mine {
-            entry.mine = true;
-            entry.seen_at = now;
-        }
+        let fresh = record(m, notice, mine, now);
         save(m);
         fresh
     })
@@ -180,7 +223,7 @@ pub async fn broadcast(notice: &DeleteNotice) {
         crate::p2p::publish_gossip("ego-shards-v1", data).await;
     }
     if let (Some(tx), Ok(value)) = (crate::p2p::DHT_CMD_TX.get(), serde_json::to_vec(notice)) {
-        let _ = tx.send(crate::p2p::DhtCommand::PutPeer { key: format!("ego-deleted:{}", notice.cid), value });
+        let _ = tx.send(crate::p2p::DhtCommand::PutPeer { key: dht_key(&notice.owner, &notice.cid), value });
     }
     // Directly to every peer we know: replicas may not be in the gossip mesh yet.
     let peers = tokio::task::spawn_blocking(crate::p2p::load_peer_cache).await.unwrap_or_default();
@@ -216,31 +259,35 @@ pub async fn sweep() {
         return;
     }
     let held: std::collections::HashSet<String> = tokio::task::spawn_blocking(|| {
-        Ledger::load().stored_files.into_iter().map(|f| f.cid).collect()
+        let ledger = Ledger::load();
+        ledger.stored_files.iter()
+            .map(|f| key(if f.owner.is_empty() { &ledger.address } else { &f.owner }, &f.cid))
+            .collect()
     }).await.unwrap_or_default();
-    for notice in notices.into_iter().filter(|n| held.contains(&n.cid)) {
+    for notice in notices.into_iter().filter(|n| held.contains(&key(&n.owner, &n.cid))) {
         handle(notice, false).await;
     }
 }
 
-/// Whether a slave may promote itself for `cid` now that its master is quiet: only after it has
-/// asked the DHT for a tombstone and waited long enough for one to arrive.
-pub fn may_promote(cid: &str, now: i64) -> bool {
-    if is_deleted(cid) {
+/// Whether a slave may promote itself for `owner`'s file `cid` now that its master is quiet:
+/// only after it has asked the DHT for the owner's tombstone and waited long enough for one to arrive.
+pub fn may_promote(owner: &str, cid: &str, now: i64) -> bool {
+    if is_deleted(owner, cid) {
         return false;
     }
+    let k = key(owner, cid);
     let mut guard = ASKED.lock().unwrap_or_else(|e| e.into_inner());
     let asked = guard.get_or_insert_with(HashMap::new);
-    match asked.get(cid) {
+    match asked.get(&k) {
         Some(at) if now - at >= TOMBSTONE_WAIT_SECS => {
-            asked.remove(cid);
+            asked.remove(&k);
             true
         }
         Some(_) => false,
         None => {
-            asked.insert(cid.to_string(), now);
+            asked.insert(k, now);
             if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
-                let _ = tx.send(crate::p2p::DhtCommand::GetPeers { key: format!("ego-deleted:{cid}") });
+                let _ = tx.send(crate::p2p::DhtCommand::GetPeers { key: dht_key(owner, cid) });
             }
             false
         }
@@ -286,10 +333,58 @@ mod tests {
 
     #[test]
     fn slaves_wait_for_a_tombstone_before_promoting() {
-        let cid = "egomfd1promotetest";
-        assert!(!may_promote(cid, 1_000));
-        assert!(!may_promote(cid, 1_000 + TOMBSTONE_WAIT_SECS - 1));
-        assert!(may_promote(cid, 1_000 + TOMBSTONE_WAIT_SECS));
+        let (owner, cid) = ("egot1promoteowner", "egomfd1promotetest");
+        assert!(!may_promote(owner, cid, 1_000));
+        assert!(!may_promote(owner, cid, 1_000 + TOMBSTONE_WAIT_SECS - 1));
+        assert!(may_promote(owner, cid, 1_000 + TOMBSTONE_WAIT_SECS));
+    }
+
+    #[test]
+    fn a_strangers_delete_for_your_file_is_ignored() {
+        let mine = notice(15, "egomfd1yours");
+        let stranger = notice(16, "egomfd1yours");
+        // The stranger really signed it, for your file's ID, as themselves.
+        assert!(stranger.is_authentic());
+        assert_ne!(stranger.owner, mine.owner);
+
+        let mut map = HashMap::new();
+        assert!(record(&mut map, &stranger, false, 100));
+        assert!(!map.contains_key(&key(&mine.owner, &mine.cid)));
+        assert!(map.contains_key(&key(&stranger.owner, &stranger.cid)));
+        assert_ne!(dht_key(&mine.owner, &mine.cid), dht_key(&stranger.owner, &stranger.cid));
+
+        // Your own delete still counts, alongside theirs.
+        assert!(record(&mut map, &mine, false, 101));
+        assert!(map.contains_key(&key(&mine.owner, &mine.cid)));
+        assert!(!record(&mut map, &mine, false, 102));
+    }
+
+    #[test]
+    fn tombstones_saved_by_file_id_alone_move_under_their_owner() {
+        let n = notice(17, "egomfd1old");
+        let old = serde_json::json!({
+            "egomfd1old": { "notice": n, "seen_at": 5, "mine": true },
+            "egomfd1empty": { "notice": null, "seen_at": 5 },
+        });
+        let map = parse(&old.to_string());
+        assert_eq!(map.len(), 1);
+        assert!(map[&key(&n.owner, "egomfd1old")].mine);
+        assert!(parse("not json").is_empty());
+    }
+
+    #[test]
+    fn the_oldest_tombstones_from_elsewhere_go_first() {
+        let mut map = HashMap::new();
+        let mine = notice(18, "egomfd1keep");
+        record(&mut map, &mine, true, 0);
+        for i in 1..MAX_TOMBSTONES as i64 {
+            map.insert(format!("someone/egomfd1n{i}"), Tombstone { notice: None, seen_at: i, mine: false });
+        }
+        assert!(record(&mut map, &notice(19, "egomfd1newest"), false, MAX_TOMBSTONES as i64));
+        assert_eq!(map.len(), MAX_TOMBSTONES);
+        assert!(map.contains_key(&key(&mine.owner, &mine.cid)));
+        assert!(!map.contains_key("someone/egomfd1n1"));
+        assert!(map.contains_key("someone/egomfd1n2"));
     }
 
     #[test]

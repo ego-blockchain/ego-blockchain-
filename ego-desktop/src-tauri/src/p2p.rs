@@ -3292,6 +3292,10 @@ pub enum P2PMessage {
         /// Deal expiry so slave knows how long to hold and when collateral is returned.
         #[serde(default)]
         expiry: i64,
+        /// Whose file it is, which may not be the sender: a gateway hosts phones' files, and a
+        /// promoted slave re-pins someone else's. Only this owner's delete removes the copy.
+        #[serde(default)]
+        owner: String,
     },
 
     PinAck {
@@ -5674,12 +5678,12 @@ pub async fn request_file_pinning(cids: Vec<String>) {
             let mut eps = if all_eps.is_empty() { vec![ep.clone()] } else { all_eps };
             if !eps.contains(&ep) { eps.push(ep); }
             for cid in cids_to_send {
-                let (fee, expiry) = {
+                let (fee, expiry, owner) = {
                     tokio::task::spawn_blocking(crate::ledger::Ledger::load).await
                         .map(|l| l.stored_files.iter()
                         .find(|f| f.cid == cid)
-                        .map(|f| (f.storage_fee_uegoc, f.expiry))
-                        .unwrap_or((0, 0))).unwrap_or((0,0))
+                        .map(|f| (f.storage_fee_uegoc, f.expiry, f.owner.clone()))
+                        .unwrap_or_default()).unwrap_or_default()
                 };
                 let msg = P2PMessage::PinRequest {
                     cid,
@@ -5687,6 +5691,7 @@ pub async fn request_file_pinning(cids: Vec<String>) {
                     from_endpoint:     my_ep2.clone(),
                     storage_fee_uegoc: fee,
                     expiry,
+                    owner:             if owner.is_empty() { from.clone() } else { owner },
                 };
                 if let Err(e) = send_message_any(&eps, &msg).await {
                     if !e.contains("none of the requested protocols") {
@@ -5973,7 +5978,7 @@ pub async fn check_file_replication() {
 
                 // A quiet master may mean the owner deleted the file: look for a
                 // tombstone on the DHT and wait for it before taking over.
-                if !master_alive && crate::file_delete::may_promote(&file.cid, now) {
+                if !master_alive && crate::file_delete::may_promote(&file.owner, &file.cid, now) {
                     // Master has not sent a heartbeat within the timeout window.
                     // Promote self to master and broadcast to find a new slave.
                     tracing::warn!("Replication: slave promoting to master for {} (master {} silent for {}s)",
@@ -8400,8 +8405,8 @@ async fn handle_event(
                         }
                     } else if key_str.starts_with("ego-manifest:") {
                         let manifest_cid = key_str.trim_start_matches("ego-manifest:").to_string();
-                        let deleted = crate::file_delete::is_deleted(&manifest_cid);
-                        if let (false, Ok(manifest)) = (deleted, serde_json::from_slice::<crate::blocks::FileManifest>(&rec.record.value)) {
+                        // process_received_manifest drops it if every copy here was deleted.
+                        if let Ok(manifest) = serde_json::from_slice::<crate::blocks::FileManifest>(&rec.record.value) {
                             let _ = crate::blocks::save_manifest(&manifest);
                             eprintln!("[DHT] Manifest {} received from DHT ({} blocks)", &manifest_cid[..16.min(manifest_cid.len())], manifest.blocks.len());
 
@@ -8600,9 +8605,11 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             crate::file_delete::handle(notice, false).await;
         }
 
-        P2PMessage::PinRequest { cid, from_addr, from_endpoint, storage_fee_uegoc, expiry } => {
+        P2PMessage::PinRequest { cid, from_addr, from_endpoint, storage_fee_uegoc, expiry, owner } => {
             eprintln!("[P2P] PinRequest for {} from {} fee={} expiry={}", cid, from_addr, storage_fee_uegoc, expiry);
-            if crate::file_delete::is_deleted(&cid) {
+            // Older nodes don't say whose file it is: theirs, then.
+            let owner = if owner.is_empty() { from_addr.clone() } else { owner };
+            if crate::file_delete::is_deleted(&owner, &cid) {
                 eprintln!("[P2P] PinRequest for {} refused: its owner deleted it", &cid[..16.min(cid.len())]);
                 return;
             }
@@ -8674,7 +8681,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                             storage_fee_uegoc:      storage_fee_uegoc,
                             expiry:                 if expiry > 0 { expiry } else { now2 + 30 * 86_400 },
                             collateral_locked_uegoc: collateral,
-                            owner:                  from_addr.clone(), // owner = uploader, not us
+                            owner:                  owner.clone(), // owner = uploader, not us
                             ..Default::default()
                         });
                         let _ = ledger2.save();
@@ -10151,7 +10158,10 @@ async fn update_ledger_for_block(manifest_cid: &str, app: Option<&tauri::AppHand
 }
 
 async fn process_received_manifest(manifest_cid: &str, app: Option<&tauri::AppHandle<tauri::Wry>>) {
-    if crate::file_delete::is_deleted(manifest_cid) {
+    let cid = manifest_cid.to_string();
+    let deleted = tokio::task::spawn_blocking(move || crate::file_delete::deleted_here(&crate::ledger::Ledger::load(), &cid))
+        .await.unwrap_or(false);
+    if deleted {
         let _ = std::fs::remove_file(crate::blocks::manifest_path(manifest_cid));
         return;
     }
@@ -10166,6 +10176,10 @@ async fn process_received_manifest(manifest_cid: &str, app: Option<&tauri::AppHa
             if f.status != "Failed" {
                 let now = chrono::Utc::now().timestamp();
                 f.blocks_total    = total;
+                // A replica learns its size here, so the space it takes counts against what this node offers.
+                if f.encrypted_size == 0 {
+                    f.encrypted_size = manifest.blocks.iter().map(|b| b.size).sum();
+                }
                 let prev = f.blocks_received;
                 f.blocks_received = received;
                 f.manifest_cid    = manifest_cid.to_string();
