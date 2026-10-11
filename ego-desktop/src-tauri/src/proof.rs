@@ -490,7 +490,7 @@ pub async fn burn_collateral(addr: &str, cid: &str, collateral: u64) {
     let return_amount = collateral.saturating_sub(burn_amount);
     let now   = chrono::Utc::now().timestamp();
     let mut ledger = crate::ledger::Ledger::load();
-    let burn_nonce   = ledger.nonce + 1;
+    let burn_nonce   = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let return_nonce = ledger.nonce + 2;
 
     let sign_input  = format!("burn_collateral:{}:{}:{}", addr, cid, burn_nonce);
@@ -533,7 +533,7 @@ pub async fn return_collateral(addr: &str, cid: &str, collateral: u64) {
     use crate::ledger::LedgerTx;
     let now   = chrono::Utc::now().timestamp();
     let mut ledger = crate::ledger::Ledger::load();
-    let nonce = ledger.nonce + 1;
+    let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let sign_input = format!("return_collateral:{}:{}:{}", addr, cid, nonce);
     let sig_hex    = crate::ledger::load_seed()
         .ok()
@@ -560,7 +560,7 @@ async fn record_slash_tx(addr: &str, cid: &str, strikes: u32) {
     use crate::ledger::LedgerTx;
     let now   = chrono::Utc::now().timestamp();
     let mut ledger = crate::ledger::Ledger::load();
-    let nonce = ledger.nonce + 1;
+    let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let sign_input = format!("slash_storage:{}:{}:{}", addr, cid, nonce);
     let signature_hex = crate::ledger::load_seed()
         .ok()

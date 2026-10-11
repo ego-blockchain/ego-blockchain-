@@ -729,7 +729,7 @@ pub async fn purchase_hosting_plan(
     }
 
     let now   = chrono::Utc::now().timestamp();
-    let nonce = ledger.nonce + 1;
+    let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let memo  = if pay_egusd {
         format!("credits_pay:{}:hosting:{}:{}", total_credits, tier.trim(), months)
     } else {

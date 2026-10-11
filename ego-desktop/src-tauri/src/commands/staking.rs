@@ -199,7 +199,7 @@ pub async fn stake_coins(
         }
     }
 
-    let nonce      = ledger.nonce + 1;
+    let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let ts         = chrono::Utc::now().timestamp();
     let memo       = format!("stake:{lock_days}");
     let sign_bytes = tx_signing_bytes_v2(
@@ -341,7 +341,7 @@ pub async fn unstake_coins(
         None    => return Err(EgoDesktopError::WalletError("Wallet not initialized".into())),
     };
 
-    let unstake_nonce = ledger.nonce + 1;
+    let unstake_nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let sign_bytes = tx_signing_bytes_v2(
         &from,
         STAKING_ADDR,

@@ -82,7 +82,7 @@ pub async fn create_storage_deal(
         return Err(EgoDesktopError::WalletError("Failed to lock payment in escrow".into()));
     }
     push_system_tx(&my_addr, STORAGE_ESCROW_ADDR, total_cost,
-        &format!("storage_deal_escrow:{}", provider_address), ledger.nonce + 1);
+        &format!("storage_deal_escrow:{}", provider_address), crate::ledger::next_nonce_for(&ledger.address, ledger.nonce));
 
     let cid_str = cid.unwrap_or_default();
     let (comm_d_hex, n_real_leaves, n_padded_leaves) = if !cid_str.is_empty() {
@@ -289,7 +289,7 @@ pub async fn terminate_storage_deal(deal_id: String) -> Result<(), EgoDesktopErr
     if deal.escrow_remaining > 0 {
         crate::chain_db::internal_balance_transfer(STORAGE_ESCROW_ADDR, &my_addr, deal.escrow_remaining);
         push_system_tx(STORAGE_ESCROW_ADDR, &my_addr, deal.escrow_remaining,
-            &format!("storage_terminate_refund:{}", deal_id), ledger.nonce + 1);
+            &format!("storage_terminate_refund:{}", deal_id), crate::ledger::next_nonce_for(&ledger.address, ledger.nonce));
     }
 
     deal.status           = "terminated".to_string();

@@ -636,7 +636,7 @@ pub async fn post_compute_job(
         )));
     }
 
-    let nonce      = ledger.nonce + 1;
+    let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&from, COMPUTE_ESCROW_ADDR, bid_uegoc, nonce, ts);
     let sig_hex    = if let Some(kp) = state.get_keypair() {
@@ -817,7 +817,7 @@ pub async fn accept_compute_job(
         )));
     }
 
-    let nonce      = ledger.nonce + 1;
+    let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&my_addr, COMPUTE_ESCROW_ADDR, collateral, nonce, ts);
     let sig_hex    = if let Some(kp) = state.get_keypair() {
@@ -1338,7 +1338,7 @@ pub async fn book_reservation(
         if crate::chain_db::balance_of(&my_addr) < fee {
             return Err(EgoDesktopError::WalletError("Insufficient EGOC for the network fee".into()));
         }
-        let nonce = ledger.nonce + 1;
+        let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
         let memo  = format!("credits_pay:{}:resv:{}", total_cost, offer_id);
         let sign_bytes = crate::ledger::tx_signing_bytes_v2(
             &my_addr, RESERVATION_ESCROW_ADDR, 0, nonce, now, 1, &memo,
@@ -1379,7 +1379,7 @@ pub async fn book_reservation(
             return Err(EgoDesktopError::WalletError("Failed to lock buyer payment in escrow".into()));
         }
 
-        let nonce      = ledger.nonce + 1;
+        let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
         let sign_bytes = tx_signing_bytes(&my_addr, RESERVATION_ESCROW_ADDR, total_cost, nonce, now);
         let kp = state.get_keypair().ok_or_else(|| {
             crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
@@ -2236,7 +2236,7 @@ pub async fn terminate_reservation(
     if res.escrow_remaining > 0 {
         crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, res.escrow_remaining);
         push_system_tx(RESERVATION_ESCROW_ADDR, &my_addr, res.escrow_remaining,
-            &format!("reservation_terminate_refund:{}", reservation_id), ledger.nonce + 1);
+            &format!("reservation_terminate_refund:{}", reservation_id), crate::ledger::next_nonce_for(&ledger.address, ledger.nonce));
     }
 
     if bonded && res.collateral_uegoc > 0 {

@@ -360,7 +360,7 @@ pub async fn store_file(
         // Anyone with the manifest can recompute this to verify file integrity.
         let commitment_hash = crate::blocks::compute_commitment(&manifest.blocks);
 
-        let nonce  = ledger.nonce + 1;
+        let nonce  = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
         let sign_input = format!("store_data:{}:{}:{}:{}", ledger.address, cid, commitment_hash, nonce);
         let signature_hex = {
             ego_core::KeyPair::from_bytes(&{
@@ -715,7 +715,7 @@ pub async fn delete_stored_file(
 
         if is_hosted_deal {
             let remaining_secs = file.expiry - now;
-            let nonce      = ledger.nonce + 1;
+            let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
             let sign_input = format!("slash_storage:early_delete:{}:{}:{}", my_addr, cid, nonce);
             let signature_hex = crate::ledger::load_seed()
             .ok()

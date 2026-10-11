@@ -82,7 +82,7 @@ pub async fn import_shared_file(
         } else {
             bundle.from_address.clone()
         };
-        let nonce = ledger.nonce + 1;
+        let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
         let sign_input = format!("retrieve_file:{}:{}:{}", recipient_addr, cid, nonce);
         let signature_hex = crate::ledger::load_seed()
             .ok()

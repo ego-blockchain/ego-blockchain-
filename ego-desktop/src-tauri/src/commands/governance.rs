@@ -35,7 +35,7 @@ pub async fn submit_governance_vote(
     if from.is_empty() {
         return Err(EgoDesktopError::WalletError("wallet not initialized".into()));
     }
-    let nonce      = ledger.nonce + 1;
+    let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(
         &from, "egot1governance000000000000000000000000000000", activate_at, nonce, ts,

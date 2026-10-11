@@ -32,7 +32,7 @@ pub async fn open_state_channel(
         );
         let channel_id = channel.channel_id.clone();
 
-        let nonce = ledger.nonce + 1;
+        let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
         let now = chrono::Utc::now().timestamp();
         let memo = format!("open_channel:{}", channel_id);
 
@@ -235,7 +235,7 @@ pub async fn submit_l2_batch(
         let now = chrono::Utc::now().timestamp();
 
         // Anchor the L2 batch to the L1 chain via the Mempool
-        let nonce = ledger.nonce + 1;
+        let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
         let memo = format!("l2_batch:{}:{}:{}", bid, post_root, stark_proof_hex);
         let sign_bytes = crate::ledger::tx_signing_bytes(
             &ledger.address, 

@@ -193,7 +193,7 @@ pub async fn create_cluster_booking(
 
     {
         use crate::ledger::{tx_signing_bytes, LedgerTx};
-        let nonce      = ledger.nonce + 1;
+        let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
         let sign_bytes = tx_signing_bytes(&my_addr, CLUSTER_ESCROW_ADDR, total_cost, nonce, now);
         let kp = state.get_keypair().ok_or_else(|| {
             crate::chain_db::internal_balance_transfer(CLUSTER_ESCROW_ADDR, &my_addr, total_cost);

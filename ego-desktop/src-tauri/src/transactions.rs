@@ -94,7 +94,7 @@ pub async fn send_transaction(
         )));
     }
 
-    let nonce      = ledger.nonce + 1;
+    let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; // testnet

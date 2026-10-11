@@ -1324,6 +1324,30 @@ pub fn last_confirmed_nonce(address: &str) -> u64 {
     *nonce_store().get(address).unwrap_or(&0)
 }
 
+pub const MAX_NONCE_AHEAD: u64 = 10;
+
+pub fn next_nonce_for(address: &str, local: u64) -> u64 {
+    let confirmed = last_confirmed_nonce(address).max(crate::chain_db::max_confirmed_nonce_from_db(address));
+    let pending = crate::mempool::get_mempool()
+        .peek_all()
+        .into_iter()
+        .filter(|t| t.from == address)
+        .map(|t| t.nonce)
+        .max()
+        .unwrap_or(0);
+    choose_next_nonce(confirmed, pending, local)
+}
+
+pub fn choose_next_nonce(confirmed: u64, pending: u64, local: u64) -> u64 {
+    let from_chain = confirmed.max(pending) + 1;
+    let from_local = local + 1;
+    if from_local > from_chain && from_local <= confirmed + MAX_NONCE_AHEAD {
+        from_local
+    } else {
+        from_chain
+    }
+}
+
 /// Unconditionally set the confirmed nonce for an address to `nonce`.
 /// Unlike `record_confirmed_nonce`, this can lower the value — used by reorg rollback.
 pub fn set_confirmed_nonce(address: &str, nonce: u64) {
@@ -1463,6 +1487,25 @@ pub fn contract_commit_memo(tx_type: &str, entrypoint: &str, args_hex: &str, cod
     match tx_type {
         "deploy" => format!("deploy:{}:{}", code_hash, &args_digest[..16]),
         _        => format!("call:{}:{}", entrypoint, &args_digest[..16]),
+    }
+}
+
+#[cfg(test)]
+mod nonce_choice_tests {
+    use super::*;
+
+    #[test]
+    fn a_counter_that_ran_past_the_window_falls_back_to_the_chain() {
+        assert_eq!(choose_next_nonce(22, 0, 32), 23);
+        assert_eq!(choose_next_nonce(22, 25, 32), 26);
+    }
+
+    #[test]
+    fn a_counter_inside_the_window_keeps_in_flight_transactions_apart() {
+        assert_eq!(choose_next_nonce(22, 0, 25), 26);
+        assert_eq!(choose_next_nonce(22, 0, 31), 32);
+        assert_eq!(choose_next_nonce(22, 0, 10), 23);
+        assert_eq!(choose_next_nonce(0, 0, 0), 1);
     }
 }
 

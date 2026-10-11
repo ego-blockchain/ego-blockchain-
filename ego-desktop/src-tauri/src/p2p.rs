@@ -8610,7 +8610,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 // ── Lock collateral on-chain ──────────────────────────────
                 if collateral > 0 {
                     let now2       = chrono::Utc::now().timestamp();
-                    let nonce      = ledger2.nonce + 1;
+                    let nonce      = crate::ledger::next_nonce_for(&ledger2.address, ledger2.nonce);
                     let sign_input = format!("lock_collateral:{}:{}:{}", my_addr, cid, nonce);
                     let sig_hex    = crate::ledger::load_seed().ok().flatten()
                         .and_then(|s| { let mut a = [0u8;32]; a.copy_from_slice(&s[..32]); ego_core::KeyPair::from_bytes(&a).ok() })
@@ -9882,7 +9882,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                 use crate::ledger::LedgerTx;
             let _guard = crate::ledger::TX_MUTEX.lock().await;
             let mut ledger2 = crate::ledger::Ledger::load();
-                let nonce = crate::ledger::Ledger::load().nonce + 1;
+                let nonce = { let l = crate::ledger::Ledger::load(); crate::ledger::next_nonce_for(&l.address, l.nonce) };
                 let sign_input = format!("external_slash:{}:{}:{}", my_addr, accused_addr, now);
                 let sig_hex = crate::ledger::load_seed().ok().flatten()
                     .and_then(|s| { let mut a=[0u8;32]; a.copy_from_slice(&s[..32]); ego_core::KeyPair::from_bytes(&a).ok() })
@@ -11410,7 +11410,7 @@ pub fn maybe_emit_validator_registration() {
             && tx.memo.as_deref() == Some(memo.as_str()));
     if already { return; }
 
-    let nonce = ledger.nonce + 1;
+    let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let ts = chrono::Utc::now().timestamp();
     let sign_bytes = crate::ledger::tx_signing_bytes_v2(&addr, &addr, 0, nonce, ts, 1, &memo);
     let signature = hex::encode(sk.sign(&sign_bytes).to_bytes());
