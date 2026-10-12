@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 pub const TOPIC: &str = "ego-dao-chat-v1";
-pub const MAX_BODY_CHARS: usize = 500;
+/// Long enough for a real post or a block of code, short enough that sync and gossip stay quick.
+pub const MAX_BODY_CHARS: usize = 4_000;
 pub const MAX_NAME_CHARS: usize = 24;
 pub const BAN_VOTES: usize = 5;
 pub const BAN_SECS: i64 = 14 * 86_400;
@@ -19,7 +20,7 @@ pub const MAX_EMOJI_CHARS: usize = 16;
 /// A profile picture is an Ego Storage share link to the image.
 pub const MAX_AVATAR_CHARS: usize = 400;
 
-const MAX_LINES: usize = 12;
+const MAX_LINES: usize = 80;
 const LATE_GOSSIP_SECS: i64 = 600;
 const KEEP_POSTS_SECS: i64 = 30 * 86_400;
 const KEEP_VOTES_SECS: i64 = KEEP_POSTS_SECS + VOTE_WINDOW_SECS;
@@ -421,6 +422,9 @@ pub fn check_avatar(a: &Avatar, now: i64) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A first removal lasts BAN_SECS. Anyone removed again after coming back is removed for good.
+pub const PERMANENT: i64 = i64::MAX;
+
 pub fn bans(votes: &[(i64, String)]) -> Vec<(i64, i64)> {
     let mut sorted = votes.to_vec();
     sorted.sort();
@@ -434,8 +438,12 @@ pub fn bans(votes: &[(i64, String)]) -> Vec<(i64, i64)> {
         open.retain(|_, t| ts - *t < VOTE_WINDOW_SECS);
         open.insert(voter, ts);
         if open.len() >= BAN_VOTES {
-            out.push((ts, ts.saturating_add(BAN_SECS)));
-            floor = ts.saturating_add(BAN_SECS);
+            let end = if out.is_empty() { ts.saturating_add(BAN_SECS) } else { PERMANENT };
+            out.push((ts, end));
+            if end == PERMANENT {
+                break;
+            }
+            floor = end;
             open.clear();
         }
     }
@@ -627,6 +635,8 @@ pub fn prune(now: i64) {
 
     let cutoff = format!("{VOTES_BY_TIME}{:020}", (now - KEEP_VOTES_SECS).max(0));
     let mut stale = Vec::new();
+    // Votes that removed someone are their record: kept, so a second removal is known to be one.
+    let mut removed: HashMap<String, bool> = HashMap::new();
     for (k, _) in crate::chain_db::dao_scan(VOTES_BY_TIME.as_bytes(), VOTES_BY_TIME.as_bytes(), false, usize::MAX) {
         if k.as_slice() >= cutoff.as_bytes() {
             break;
@@ -634,6 +644,10 @@ pub fn prune(now: i64) {
         let key = String::from_utf8_lossy(&k).to_string();
         let mut parts = key[VOTES_BY_TIME.len()..].splitn(3, '/');
         if let (Some(ts), Some(target), Some(voter)) = (parts.next(), parts.next(), parts.next()) {
+            let was_removed = *removed.entry(target.to_string()).or_insert_with(|| !ban_record(target).1.is_empty());
+            if was_removed {
+                continue;
+            }
             stale.push(format!("{VOTES}{target}/{ts}/{voter}").into_bytes());
         }
         stale.push(k);
@@ -1025,6 +1039,13 @@ mod tests {
 
         let end = t + 4 + BAN_SECS;
         v.extend(votes(&[(end + 1, "a"), (end + 2, "b"), (end + 3, "c"), (end + 4, "d"), (end + 5, "e")]));
+        let b = bans(&v);
+        assert_eq!(b.len(), 2);
+        // Removed again after coming back: for good.
+        assert_eq!(b[1], (end + 5, PERMANENT));
+        assert_eq!(banned_until(&b, end + 400 * DAY), Some(PERMANENT));
+        assert!(hidden(end + 400 * DAY, &b));
+        v.extend(votes(&[(end + 30 * DAY, "x"), (end + 30 * DAY, "y")]));
         assert_eq!(bans(&v).len(), 2);
     }
 

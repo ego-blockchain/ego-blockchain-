@@ -143,6 +143,54 @@ pub(crate) fn feed(me: String, before: Option<i64>, now: i64) -> ChatFeed {
     }
 }
 
+/// One person's record in the chat.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemberView {
+    pub address: String,
+    pub name: String,
+    pub avatar: String,
+    /// Messages kept by the network (it keeps the last 30 days), and the oldest of them.
+    pub posts: usize,
+    pub first_post: Option<i64>,
+    pub last_post: Option<i64>,
+    pub reactions_received: usize,
+    /// Removal votes counting toward a removal now.
+    pub removal_votes: usize,
+    pub threshold: usize,
+    pub vote_days: i64,
+    pub ban_days: i64,
+    pub my_vote: bool,
+    /// Past and current removals, oldest first.
+    pub removals: usize,
+    pub removed_until: Option<i64>,
+    pub removed_for_good: bool,
+}
+
+pub(crate) fn member(address: &str, viewer: &str, now: i64) -> MemberView {
+    let posts: Vec<dao_chat::Post> = dao_chat::recent_posts(None, 20_000).into_iter().filter(|p| p.from == address).collect();
+    let reactions_received = posts.iter().map(|p| dao_chat::reactions_to(p).iter().filter(|r| r.from != address).count()).sum();
+    let (votes, bans) = dao_chat::ban_record(address);
+    let open = dao_chat::open_votes(&votes, now);
+    let removed_until = dao_chat::banned_until(&bans, now);
+    MemberView {
+        address: address.to_string(),
+        name: dao_chat::name_of(address).map(|n| n.name).unwrap_or_default(),
+        avatar: dao_chat::avatar_of(address).map(|a| a.link).unwrap_or_default(),
+        posts: posts.len(),
+        first_post: posts.first().map(|p| p.ts),
+        last_post: posts.last().map(|p| p.ts),
+        reactions_received,
+        removal_votes: open.len(),
+        threshold: dao_chat::BAN_VOTES,
+        vote_days: dao_chat::VOTE_WINDOW_SECS / 86_400,
+        ban_days: dao_chat::BAN_SECS / 86_400,
+        my_vote: open.iter().any(|v| v == viewer),
+        removals: bans.len(),
+        removed_until: removed_until.filter(|u| *u != dao_chat::PERMANENT),
+        removed_for_good: removed_until == Some(dao_chat::PERMANENT),
+    }
+}
+
 /// Groups reactions by emoji, most used first.
 pub(crate) fn reaction_counts(reacts: &[dao_chat::React], me: &str) -> Vec<ReactionCount> {
     let mut counts: Vec<ReactionCount> = Vec::new();

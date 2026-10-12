@@ -280,7 +280,7 @@ pub async fn receive_gossip(data: Vec<u8>) {
 fn cost(method: &str) -> f64 {
     match method {
         "tx.submit" | "chat.submit" => 20.0,
-        "chat.feed" | "node.earnings" => 4.0,
+        "chat.feed" | "chat.member" | "node.earnings" => 4.0,
         "wallet.getRewards" => 2.0,
         "wallet.getCredits" => 1.0,
         "shielded.lookup" => 2.0,
@@ -338,6 +338,22 @@ async fn chat_feed(params: &Value) -> Result<Value, (i32, String)> {
     .await
     .map_err(|e| (-32603, e.to_string()))?;
     serde_json::to_value(feed).map_err(|e| (-32603, e.to_string()))
+}
+
+/// chat.member: one person's record in the chat, for the page that opens from their picture.
+async fn chat_member(params: &Value) -> Result<Value, (i32, String)> {
+    let address = params["address"].as_str().unwrap_or_default().to_string();
+    if !crate::dao_chat::is_address(&address) {
+        return Err((-32602, "That isn't an Ego address.".into()));
+    }
+    let viewer = params["viewer"].as_str().unwrap_or_default().to_string();
+    let viewer = if crate::dao_chat::is_address(&viewer) { viewer } else { String::new() };
+    let member = tokio::task::spawn_blocking(move || {
+        crate::commands::dao_chat::member(&address, &viewer, chrono::Utc::now().timestamp())
+    })
+    .await
+    .map_err(|e| (-32603, e.to_string()))?;
+    serde_json::to_value(member).map_err(|e| (-32603, e.to_string()))
 }
 
 async fn chat_submit(params: &Value) -> Result<Value, (i32, String)> {
@@ -561,6 +577,7 @@ async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>
     let result = match method.as_str() {
         "chat.feed" => chat_feed(&params).await,
         "chat.submit" => chat_submit(&params).await,
+        "chat.member" => chat_member(&params).await,
         "storage.capacity" => storage_capacity().await,
         "wallet.getRewards" => wallet_rewards(&params).await,
         "wallet.getCredits" => wallet_credits(&params).await,
