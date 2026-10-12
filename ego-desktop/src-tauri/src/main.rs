@@ -477,6 +477,7 @@ fn headless_main() {
         });
 
         tokio::spawn(crate::gateway::supervise());
+        tokio::spawn(crate::commands::storage::renew_loop());
 
         tokio::spawn(async {
             crate::commands::consensus::run_post_loop().await;
@@ -987,6 +988,8 @@ fn main() {
             commands::wallet::clear_pending_transactions,
             commands::storage::store_file,
             commands::storage::subscribe_storage_plan,
+            commands::storage::get_storage_plan,
+            commands::storage::set_storage_auto_renew,
             commands::storage::get_file_metadata,
             commands::storage::get_stored_files,
             commands::storage::get_egosafe_files,
@@ -1668,6 +1671,7 @@ fn main() {
             });
 
             tauri::async_runtime::spawn(crate::gateway::supervise());
+            tauri::async_runtime::spawn(crate::commands::storage::renew_loop());
 
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_view_change_monitor().await;

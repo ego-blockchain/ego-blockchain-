@@ -21,7 +21,7 @@ pub struct CreditsTxResponse {
 }
 
 pub(crate) fn build_signed_tx(
-    state: &State<'_, AppState>,
+    state: &AppState,
     ledger: &mut Ledger,
     to: &str,
     amount: u64,

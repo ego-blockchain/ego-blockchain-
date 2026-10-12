@@ -192,7 +192,15 @@ pub async fn subscribe_storage_plan(
     billing: String,
     state: State<'_, AppState>,
 ) -> Result<String, EgoDesktopError> {
-    let (_, price_usd, _) = plan_price_usd(plan.trim(), billing.trim())
+    let hash = pay_for_plan(&state, plan.trim(), billing.trim()).await?;
+    let mut ledger = Ledger::load();
+    ledger.storage_renew_off = false;
+    let _ = ledger.save();
+    Ok(hash)
+}
+
+async fn pay_for_plan(state: &AppState, plan: &str, billing: &str) -> Result<String, EgoDesktopError> {
+    let (_, price_usd, _) = plan_price_usd(plan, billing)
         .ok_or_else(|| EgoDesktopError::InvalidInput("Choose Basic, Pro or Max, billed monthly or annual.".into()))?;
     let credits = crate::chain_db::usd_to_credits(price_usd);
     let _guard = crate::ledger::TX_MUTEX.lock().await;
@@ -209,8 +217,8 @@ pub async fn subscribe_storage_plan(
         )));
     }
     let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", ledger.staked_amount > 0);
-    let memo = format!("credits_pay:{}:plan:{}:{}", credits, plan.trim(), billing.trim());
-    let tx = crate::commands::credits::build_signed_tx(&state, &mut ledger, STORAGE_FEE_SINK, 0, memo, "credits_pay", fee)?;
+    let memo = format!("credits_pay:{}:plan:{}:{}", credits, plan, billing);
+    let tx = crate::commands::credits::build_signed_tx(state, &mut ledger, STORAGE_FEE_SINK, 0, memo, "credits_pay", fee)?;
     let hash = tx.hash.clone();
     queue_payment(tx);
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;
@@ -237,30 +245,166 @@ pub(crate) fn paid_plan(memo: &str, amount_uegoc: u64, egoc_usd: f64) -> Option<
 /// The storage space `address` has paid for: its newest valid plan payment on
 /// chain (EGUSD, or EGOC worth enough at today's price), kept for 30 days
 /// after the plan ends. Without one it's the free 5 GB.
-pub fn storage_quota_bytes(address: &str, now: i64) -> u64 {
-    const FREE_BYTES: u64 = 5 * 1_000_000_000;
-    const GRACE_SECS: i64 = 30 * 86_400;
+pub const PLAN_GRACE_SECS: i64 = 30 * 86_400;
+const RENEW_BEFORE_SECS: i64 = 86_400;
+const RENEW_RETRY_SECS: i64 = 6 * 3_600;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActivePlan {
+    pub name: String,
+    pub billing: String,
+    pub gb: u64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PlanPayment {
+    name: &'static str,
+    billing: &'static str,
+    gb: u64,
+    period_secs: i64,
+    paid_at: i64,
+}
+
+fn plan_named(name: &str, billing: &str) -> Option<(&'static str, &'static str)> {
+    let name = STORAGE_PLANS.iter().find(|(n, ..)| *n == name)?.0;
+    let billing = match billing {
+        "monthly" => "monthly",
+        "annual" => "annual",
+        _ => return None,
+    };
+    Some((name, billing))
+}
+
+fn plan_payment(tx: &LedgerTx, egoc_usd: f64) -> Option<PlanPayment> {
+    let memo = tx.memo.as_deref().unwrap_or("");
+    let (gb, period_secs, name, billing) = if tx.tx_type == "credits_pay" && tx.to == STORAGE_FEE_SINK {
+        let (gb, period) = plan_paid_in_egusd(memo)?;
+        let mut parts = memo.split(':').skip(3);
+        let (name, billing) = plan_named(parts.next()?, parts.next()?)?;
+        (gb, period, name, billing)
+    } else if tx.tx_type == "transfer" && tx.to == "egot1storagefees000000000000000000000000000000" {
+        let (gb, period) = paid_plan(memo, tx.amount, egoc_usd)?;
+        let rest = memo.strip_prefix("Ego Storage ")?;
+        let (name, rest) = rest.split_once(' ')?;
+        let billing = rest.trim_start_matches(|c: char| c == '–' || c == '-' || c == ' ').split_whitespace().next()?;
+        let (name, billing) = plan_named(name, billing)?;
+        (gb, period, name, billing)
+    } else {
+        return None;
+    };
+    Some(PlanPayment { name, billing, gb, period_secs, paid_at: tx.timestamp })
+}
+
+fn plan_after(mut payments: Vec<PlanPayment>) -> Option<ActivePlan> {
+    payments.sort_by_key(|p| p.paid_at);
+    let mut plan: Option<ActivePlan> = None;
+    for p in payments {
+        let start = match &plan {
+            Some(current) if current.expires_at + PLAN_GRACE_SECS > p.paid_at => current.expires_at,
+            _ => p.paid_at,
+        };
+        plan = Some(ActivePlan { name: p.name.into(), billing: p.billing.into(), gb: p.gb, expires_at: start + p.period_secs });
+    }
+    plan
+}
+
+pub fn storage_plan_of(address: &str) -> Option<ActivePlan> {
     let chain = load_chain();
     let egoc_usd = crate::p2p::get_egoc_price_usd();
-    let plan = chain.transactions.iter()
+    let payments = chain.transactions.iter()
         .filter(|tx| tx.from == address && tx.status == "Confirmed")
-        .filter_map(|tx| {
-            let memo = tx.memo.as_deref().unwrap_or("");
-            let plan = if tx.tx_type == "credits_pay" && tx.to == STORAGE_FEE_SINK {
-                plan_paid_in_egusd(memo)
-            } else if tx.tx_type == "transfer" && tx.to == "egot1storagefees000000000000000000000000000000" {
-                paid_plan(memo, tx.amount, egoc_usd)
-            } else {
-                None
-            };
-            plan.map(|plan| (tx, plan))
-        })
-        .max_by_key(|(tx, _)| tx.timestamp);
-    let quota = match plan {
-        Some((tx, (gb, period_secs))) if now < tx.timestamp + period_secs + GRACE_SECS => gb * 1_000_000_000,
+        .filter_map(|tx| plan_payment(tx, egoc_usd))
+        .collect();
+    plan_after(payments)
+}
+
+pub fn storage_quota_bytes(address: &str, now: i64) -> u64 {
+    const FREE_BYTES: u64 = 5 * 1_000_000_000;
+    let quota = match storage_plan_of(address) {
+        Some(plan) if now < plan.expires_at + PLAN_GRACE_SECS => plan.gb * 1_000_000_000,
         _ => FREE_BYTES,
     };
     quota.max(FREE_BYTES)
+}
+
+#[derive(Debug, Serialize)]
+pub struct StoragePlanStatus {
+    pub plan: Option<ActivePlan>,
+    pub auto_renew: bool,
+    pub renew_problem: Option<String>,
+}
+
+static RENEW_STATE: std::sync::Mutex<(i64, Option<String>)> = std::sync::Mutex::new((0, None));
+
+#[tauri::command]
+pub async fn get_storage_plan() -> Result<StoragePlanStatus, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let ledger = Ledger::load();
+        StoragePlanStatus {
+            plan: storage_plan_of(&ledger.address),
+            auto_renew: !ledger.storage_renew_off,
+            renew_problem: RENEW_STATE.lock().unwrap_or_else(|e| e.into_inner()).1.clone(),
+        }
+    })
+    .await
+    .map_err(|e| EgoDesktopError::WalletError(e.to_string()))
+}
+
+#[tauri::command]
+pub async fn set_storage_auto_renew(on: bool) -> Result<bool, EgoDesktopError> {
+    let mut ledger = Ledger::load();
+    ledger.storage_renew_off = !on;
+    ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;
+    Ok(on)
+}
+
+fn renewal_due(plan: &ActivePlan, now: i64) -> bool {
+    now >= plan.expires_at - RENEW_BEFORE_SECS && now < plan.expires_at + PLAN_GRACE_SECS
+}
+
+async fn renew_once(state: &AppState) {
+    let now = chrono::Utc::now().timestamp();
+    let (plan, renew_off) = {
+        let ledger = Ledger::load();
+        if ledger.address.is_empty() {
+            return;
+        }
+        (storage_plan_of(&ledger.address), ledger.storage_renew_off)
+    };
+    let Some(plan) = plan else { return };
+    if renew_off || !renewal_due(&plan, now) {
+        return;
+    }
+    {
+        let guard = RENEW_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if now - guard.0 < RENEW_RETRY_SECS {
+            return;
+        }
+    }
+    let result = pay_for_plan(state, &plan.name, &plan.billing).await;
+    let mut guard = RENEW_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.0 = now;
+    match result {
+        Ok(hash) => {
+            guard.1 = None;
+            eprintln!("[Storage] Renewed the {} plan ({}) with {}", plan.name, plan.billing, hash);
+        }
+        Err(e) => {
+            eprintln!("[Storage] Couldn't renew the {} plan: {e}", plan.name);
+            guard.1 = Some(format!("Couldn't renew your {} plan: {e}", plan.name));
+        }
+    }
+}
+
+pub async fn renew_loop() {
+    loop {
+        let state = crate::app::global_app_state();
+        if state.get_keypair().is_some() {
+            renew_once(&state).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+    }
 }
 
 #[tauri::command]
@@ -1662,5 +1806,44 @@ mod free_share_tests {
         assert!(!should_share_freely(0, false, 29 * GB), "a nearly full disk is left alone");
         assert!(!should_share_freely(0, true, 500 * GB), "someone who turned sharing off stays off");
         assert!(!should_share_freely(50 * GB, false, 500 * GB), "a node that chose its own size keeps it");
+    }
+}
+
+#[cfg(test)]
+mod renewal_tests {
+    use super::{plan_after, renewal_due, ActivePlan, PlanPayment};
+
+    const DAY: i64 = 86_400;
+
+    fn pay(name: &'static str, gb: u64, at: i64) -> PlanPayment {
+        PlanPayment { name, billing: "monthly", gb, period_secs: 30 * DAY, paid_at: at }
+    }
+
+    #[test]
+    fn renewing_early_adds_a_full_period_instead_of_losing_days() {
+        let plan = plan_after(vec![pay("Pro", 200, 0), pay("Pro", 200, 29 * DAY)]).unwrap();
+        assert_eq!(plan.expires_at, 60 * DAY);
+    }
+
+    #[test]
+    fn renewing_late_within_grace_continues_and_after_grace_starts_fresh() {
+        assert_eq!(plan_after(vec![pay("Pro", 200, 0), pay("Pro", 200, 40 * DAY)]).unwrap().expires_at, 60 * DAY);
+        assert_eq!(plan_after(vec![pay("Pro", 200, 0), pay("Pro", 200, 100 * DAY)]).unwrap().expires_at, 130 * DAY);
+    }
+
+    #[test]
+    fn the_latest_payment_names_the_plan() {
+        let plan = plan_after(vec![pay("Basic", 50, 0), pay("Max", 1024, 10 * DAY)]).unwrap();
+        assert_eq!((plan.name.as_str(), plan.gb), ("Max", 1024));
+        assert_eq!(plan_after(vec![]), None);
+    }
+
+    #[test]
+    fn renewal_is_due_from_a_day_before_the_end_until_grace_runs_out() {
+        let plan = ActivePlan { name: "Pro".into(), billing: "monthly".into(), gb: 200, expires_at: 30 * DAY };
+        assert!(!renewal_due(&plan, 28 * DAY));
+        assert!(renewal_due(&plan, 29 * DAY));
+        assert!(renewal_due(&plan, 50 * DAY));
+        assert!(!renewal_due(&plan, 61 * DAY));
     }
 }

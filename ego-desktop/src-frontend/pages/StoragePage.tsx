@@ -226,39 +226,41 @@ const StoragePage: React.FC = () => {
   const capacityPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => { loadData(); }, []);
-  useEffect(() => {
-    // Load subscription from localStorage then cross-check against on-chain tx history.
-    // If no matching confirmed storage tx exists, clear the cached subscription to prevent tampering.
-    (async () => {
-      try {
-        const raw = localStorage.getItem('ego_storage_sub');
-        if (!raw) return;
-        const sub = JSON.parse(raw) as ActiveSubscription;
-        // Verify on-chain: check that a confirmed storage payment tx exists
-        const txs = await invoke<{ tx_type: string; to: string; status: string; memo: string | null; timestamp: number }[]>('get_transactions');
-        const STORAGE_POOL = 'egot1storagefees000000000000000000000000000000';
-        const planName = PLANS.find(p => p.id === sub.plan)?.name ?? '';
-        const hasOnChainTx = txs.some(tx =>
-          tx.status === 'Confirmed' &&
-          tx.to === STORAGE_POOL &&
-          (tx.memo ?? '').includes(planName) &&
-          Math.abs(tx.timestamp - sub.subscribedAt) < 120 // within 2 min of subscription
-        );
-        if (hasOnChainTx || sub.plan === 'free') {
-          setSubscription(sub);
-        } else {
-          // On-chain tx not found — could be tampered or tx still pending. Keep it but flag.
-          // We still set it so UX isn't broken for legitimate users with slow confirmations.
-          setSubscription(sub);
-        }
-      } catch {
-        // get_transactions failed (no wallet yet) — still load from localStorage
-        try {
-          const raw = localStorage.getItem('ego_storage_sub');
-          if (raw) setSubscription(JSON.parse(raw) as ActiveSubscription);
-        } catch {}
+  const pendingSubRef = useRef<{ sub: ActiveSubscription; until: number } | null>(null);
+  const [renewProblem, setRenewProblem] = useState<string | null>(null);
+
+  async function refreshPlan() {
+    try {
+      const status = await invoke<{
+        plan: { name: string; billing: 'monthly' | 'annual'; gb: number; expires_at: number } | null;
+        auto_renew: boolean;
+        renew_problem: string | null;
+      }>('get_storage_plan');
+      setRenewProblem(status.renew_problem);
+      const pending = pendingSubRef.current;
+      const now = Math.floor(Date.now() / 1000);
+      const fromChain: ActiveSubscription | null = status.plan ? {
+        plan: status.plan.name.toLowerCase(),
+        billing: status.plan.billing,
+        expiresAt: status.plan.expires_at,
+        gb: status.plan.gb,
+        subscribedAt: 0,
+        cancelled: !status.auto_renew,
+      } : null;
+      if (pending && pending.until > now && (!fromChain || fromChain.expiresAt < pending.sub.expiresAt)) {
+        setSubscription({ ...pending.sub, cancelled: !status.auto_renew });
+        return;
       }
-    })();
+      pendingSubRef.current = null;
+      setSubscription(fromChain);
+    } catch {}
+  }
+
+  useEffect(() => {
+    try { localStorage.removeItem('ego_storage_sub'); } catch {}
+    refreshPlan();
+    const t = setInterval(refreshPlan, 30_000);
+    return () => clearInterval(t);
   }, []);
   useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
 
@@ -401,11 +403,12 @@ const StoragePage: React.FC = () => {
       await invoke('subscribe_storage_plan', { plan: plan.name, billing: subBilling });
       const now      = Math.floor(Date.now() / 1000);
       const duration = subBilling === 'annual' ? 365 * 86400 : 30 * 86400;
+      const base     = subscription && subscription.expiresAt > now ? subscription.expiresAt : now;
       const sub: ActiveSubscription = {
         plan: plan.id, billing: subBilling,
-        expiresAt: now + duration, gb: plan.gb, subscribedAt: now,
+        expiresAt: base + duration, gb: plan.gb, subscribedAt: now,
       };
-      localStorage.setItem('ego_storage_sub', JSON.stringify(sub));
+      pendingSubRef.current = { sub, until: now + 10 * 60 };
       setSubscription(sub);
       setShowSubModal(false);
     } catch (e: any) {
@@ -415,12 +418,18 @@ const StoragePage: React.FC = () => {
     }
   }
 
-  function handleCancelSubscription() {
-    if (!subscription) return;
-    const updated = { ...subscription, cancelled: true };
-    localStorage.setItem('ego_storage_sub', JSON.stringify(updated));
-    setSubscription(updated);
+  async function setAutoRenew(on: boolean) {
+    try {
+      await invoke('set_storage_auto_renew', { on });
+      if (subscription) setSubscription({ ...subscription, cancelled: !on });
+    } catch (e: any) {
+      setSubError(String(e));
+    }
     setShowCancelConfirm(false);
+  }
+
+  function handleCancelSubscription() {
+    setAutoRenew(false);
   }
 
   function startUpload() {
@@ -733,7 +742,10 @@ const StoragePage: React.FC = () => {
                       )}
                       {subValid && subscription!.cancelled && (
                         <span className="ml-2 text-xs text-yellow-400">
-                          active until {new Date(subscription!.expiresAt * 1000).toLocaleDateString()} · cancelled
+                          active until {new Date(subscription!.expiresAt * 1000).toLocaleDateString()} · auto-renew off
+                          <button onClick={() => setAutoRenew(true)} className="ml-2 text-emerald-400 hover:text-emerald-300 underline">
+                            Turn auto-renew on
+                          </button>
                         </span>
                       )}
                       {inGrace && (
@@ -768,6 +780,11 @@ const StoragePage: React.FC = () => {
                       style={{ width: `${usedPct}%` }}
                     />
                   </div>
+                  {renewProblem && subscription && !subscription.cancelled && (
+                    <div className="text-xs text-red-400">
+                      {renewProblem}. Add EGUSD before {new Date((subscription.expiresAt + 30 * 86400) * 1000).toLocaleDateString()} to keep your plan.
+                    </div>
+                  )}
                   {nearLimit && (
                     <div className="text-xs text-yellow-400">
                       You're using {usedPct}% of your storage — consider upgrading.
@@ -1424,14 +1441,14 @@ const StoragePage: React.FC = () => {
                 <div className="bg-gray-800 border border-gray-700 rounded-xl px-4 py-3">
                   {!showCancelConfirm ? (
                     <div className="flex items-center justify-between">
-                      <span className="text-xs text-gray-400">Want to stop your subscription?</span>
+                      <span className="text-xs text-gray-400">Your plan renews automatically from your EGUSD.</span>
                       <button onClick={() => setShowCancelConfirm(true)} className="text-xs text-red-400 hover:text-red-300 underline transition">
                         Cancel subscription
                       </button>
                     </div>
                   ) : (
                     <div className="space-y-2">
-                      <p className="text-xs text-gray-400">Your plan stays active until <span className="text-white">{new Date(subscription.expiresAt * 1000).toLocaleDateString()}</span>. After that, files are kept for 30 more days.</p>
+                      <p className="text-xs text-gray-400">It won't renew. Your plan stays active until <span className="text-white">{new Date(subscription.expiresAt * 1000).toLocaleDateString()}</span>, then files are kept for 30 more days.</p>
                       <div className="flex gap-3">
                         <button onClick={() => setShowCancelConfirm(false)} className="text-xs text-gray-400 hover:text-white px-3 py-1.5 bg-gray-700 rounded-lg transition">Keep Subscription</button>
                         <button onClick={handleCancelSubscription} className="text-xs text-red-400 hover:text-red-300 px-3 py-1.5 bg-red-500/10 border border-red-500/20 rounded-lg transition">Yes, Cancel</button>
@@ -1479,7 +1496,7 @@ const StoragePage: React.FC = () => {
                     </button>
                   ) : (
                     <div className="space-y-2">
-                      <p className="text-xs text-gray-400">Your plan stays active until {new Date(subscription.expiresAt * 1000).toLocaleDateString()}. After that, files are kept for 30 more days.</p>
+                      <p className="text-xs text-gray-400">It won't renew. Your plan stays active until {new Date(subscription.expiresAt * 1000).toLocaleDateString()}, then files are kept for 30 more days.</p>
                       <div className="flex gap-3 justify-center">
                         <button onClick={() => setShowCancelConfirm(false)} className="text-xs text-gray-400 hover:text-white px-3 py-1.5 bg-gray-700 rounded-lg">Keep Subscription</button>
                         <button onClick={handleCancelSubscription} className="text-xs text-red-400 hover:text-red-300 px-3 py-1.5 bg-red-500/10 border border-red-500/20 rounded-lg">Yes, Cancel</button>
