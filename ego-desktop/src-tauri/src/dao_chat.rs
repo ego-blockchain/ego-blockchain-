@@ -14,6 +14,10 @@ pub const SYNC_MAX_VOTES: usize = 5_000;
 pub const SYNC_MAX_REQUEST_BYTES: usize = 4 * 1024;
 pub const SYNC_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub const CHANGE_WINDOW_SECS: i64 = 3_600;
+/// A reaction is one emoji, which can take several characters (skin tones, families, flags).
+pub const MAX_EMOJI_CHARS: usize = 16;
+/// A profile picture is an Ego Storage share link to the image.
+pub const MAX_AVATAR_CHARS: usize = 400;
 
 const MAX_LINES: usize = 12;
 const LATE_GOSSIP_SECS: i64 = 600;
@@ -30,6 +34,8 @@ const VOTE_DOMAIN: &str = "ego/dao-chat/vote/v1";
 const NAME_DOMAIN: &str = "ego/dao-chat/name/v1";
 const EDIT_DOMAIN: &str = "ego/dao-chat/edit/v1";
 const DELETE_DOMAIN: &str = "ego/dao-chat/delete/v1";
+const REACT_DOMAIN: &str = "ego/dao-chat/react/v1";
+const AVATAR_DOMAIN: &str = "ego/dao-chat/avatar/v1";
 
 const POSTS: &str = "dchat/p/";
 const VOTES: &str = "dchat/v/";
@@ -37,6 +43,8 @@ const VOTES_BY_TIME: &str = "dchat/vt/";
 const NAMES: &str = "dchat/n/";
 const EDITS: &str = "dchat/e/";
 const DELETES: &str = "dchat/x/";
+const REACTS: &str = "dchat/r/";
+const AVATARS: &str = "dchat/a/";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Post {
@@ -87,6 +95,29 @@ pub struct Delete {
     pub sig: String,
 }
 
+/// One person's reaction to a post. Each person has at most one per post; the newest wins,
+/// and an empty emoji takes it back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct React {
+    pub from: String,
+    pub post_id: String,
+    pub post_ts: i64,
+    pub emoji: String,
+    pub ts: i64,
+    pub pubkey: String,
+    pub sig: String,
+}
+
+/// A profile picture: an Ego Storage share link to the image, or empty to remove it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Avatar {
+    pub from: String,
+    pub link: String,
+    pub ts: i64,
+    pub pubkey: String,
+    pub sig: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Wire {
@@ -95,6 +126,8 @@ pub enum Wire {
     Name(Name),
     Edit(Edit),
     Delete(Delete),
+    React(React),
+    Avatar(Avatar),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +144,10 @@ pub struct SyncResponse {
     pub edits: Vec<Edit>,
     #[serde(default)]
     pub deletes: Vec<Delete>,
+    #[serde(default)]
+    pub reacts: Vec<React>,
+    #[serde(default)]
+    pub avatars: Vec<Avatar>,
 }
 
 impl Post {
@@ -145,6 +182,33 @@ impl Delete {
     pub fn signing_bytes(&self) -> Vec<u8> {
         format!("{DELETE_DOMAIN}\n{}\n{}\n{}\n{}", self.from, self.post_id, self.post_ts, self.ts).into_bytes()
     }
+}
+
+impl React {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        format!("{REACT_DOMAIN}\n{}\n{}\n{}\n{}\n{}", self.from, self.post_id, self.post_ts, self.ts, self.emoji).into_bytes()
+    }
+}
+
+impl Avatar {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        format!("{AVATAR_DOMAIN}\n{}\n{}\n{}", self.from, self.ts, self.link).into_bytes()
+    }
+}
+
+/// One emoji, or nothing to take a reaction back: no letters, digits, spaces or control characters.
+pub fn is_emoji(s: &str) -> bool {
+    s.is_empty()
+        || (s.chars().count() <= MAX_EMOJI_CHARS
+            && !s.chars().any(|c| c.is_whitespace() || c.is_control() || c.is_ascii_alphanumeric()))
+}
+
+/// An Ego Storage share link, or nothing.
+pub fn is_avatar_link(s: &str) -> bool {
+    s.is_empty()
+        || (s.starts_with("egoshare1:")
+            && s.chars().count() <= MAX_AVATAR_CHARS
+            && !s.chars().any(|c| c.is_whitespace() || c.is_control()))
 }
 
 pub fn can_change(post_ts: i64, now: i64) -> bool {
@@ -240,6 +304,18 @@ pub fn sign_edit(kp: &ego_core::KeyPair, post: &Post, body: &str, ts: i64) -> Ed
     e
 }
 
+pub fn sign_react(kp: &ego_core::KeyPair, post: &Post, emoji: &str, ts: i64) -> React {
+    let mut r = React { from: address_of_key(kp), post_id: post.id(), post_ts: post.ts, emoji: emoji.into(), ts, pubkey: String::new(), sig: String::new() };
+    (r.pubkey, r.sig) = sign(kp, &r.signing_bytes());
+    r
+}
+
+pub fn sign_avatar(kp: &ego_core::KeyPair, link: &str, ts: i64) -> Avatar {
+    let mut a = Avatar { from: address_of_key(kp), link: link.into(), ts, pubkey: String::new(), sig: String::new() };
+    (a.pubkey, a.sig) = sign(kp, &a.signing_bytes());
+    a
+}
+
 pub fn sign_delete(kp: &ego_core::KeyPair, post: &Post, ts: i64) -> Delete {
     let mut d = Delete { from: address_of_key(kp), post_id: post.id(), post_ts: post.ts, ts, pubkey: String::new(), sig: String::new() };
     (d.pubkey, d.sig) = sign(kp, &d.signing_bytes());
@@ -319,6 +395,32 @@ pub fn check_name(n: &Name, now: i64) -> Result<(), &'static str> {
     Ok(())
 }
 
+pub fn check_react(r: &React, now: i64) -> Result<(), &'static str> {
+    if r.ts > now + FUTURE_SKEW_SECS || r.ts < r.post_ts || r.post_ts < now - KEEP_POSTS_SECS {
+        return Err("time");
+    }
+    if !is_post_id(&r.post_id) || !is_emoji(&r.emoji) {
+        return Err("text");
+    }
+    if !signed_by(&r.pubkey, &r.from, &r.signing_bytes(), &r.sig) {
+        return Err("signature");
+    }
+    Ok(())
+}
+
+pub fn check_avatar(a: &Avatar, now: i64) -> Result<(), &'static str> {
+    if a.ts > now + FUTURE_SKEW_SECS {
+        return Err("time");
+    }
+    if !is_avatar_link(&a.link) {
+        return Err("text");
+    }
+    if !signed_by(&a.pubkey, &a.from, &a.signing_bytes(), &a.sig) {
+        return Err("signature");
+    }
+    Ok(())
+}
+
 pub fn bans(votes: &[(i64, String)]) -> Vec<(i64, i64)> {
     let mut sorted = votes.to_vec();
     sorted.sort();
@@ -393,6 +495,28 @@ fn scan_since<T: for<'de> Deserialize<'de>>(prefix: &str, since: i64, limit: usi
         .into_iter()
         .filter_map(|(_, v)| decode(&v))
         .collect()
+}
+
+fn react_key(post_ts: i64, post_id: &str, from: &str) -> Vec<u8> {
+    format!("{REACTS}{:020}/{}/{}", post_ts.max(0), post_id, from).into_bytes()
+}
+
+fn avatar_key(addr: &str) -> Vec<u8> {
+    format!("{AVATARS}{addr}").into_bytes()
+}
+
+/// Everyone's current reaction to a post, taken-back ones left out.
+pub fn reactions_to(post: &Post) -> Vec<React> {
+    let prefix = format!("{REACTS}{:020}/{}/", post.ts.max(0), post.id());
+    crate::chain_db::dao_scan(prefix.as_bytes(), prefix.as_bytes(), false, usize::MAX)
+        .into_iter()
+        .filter_map(|(_, v)| decode::<React>(&v))
+        .filter(|r| !r.emoji.is_empty())
+        .collect()
+}
+
+pub fn avatar_of(addr: &str) -> Option<Avatar> {
+    crate::chain_db::dao_get(&avatar_key(addr)).and_then(|b| decode(&b))
 }
 
 fn vote_key(v: &Vote) -> Vec<u8> {
@@ -516,7 +640,7 @@ pub fn prune(now: i64) {
     }
     crate::chain_db::dao_delete(&stale);
 
-    for prefix in [EDITS, DELETES] {
+    for prefix in [EDITS, DELETES, REACTS] {
         let cutoff = format!("{prefix}{:020}", (now - KEEP_POSTS_SECS).max(0));
         let old: Vec<Vec<u8>> = crate::chain_db::dao_scan(prefix.as_bytes(), prefix.as_bytes(), false, usize::MAX)
             .into_iter()
@@ -635,6 +759,36 @@ pub fn accept(wire: &Wire, now: i64, source: Source) -> Result<bool, &'static st
             }
             Ok(true)
         }
+        Wire::React(r) => {
+            check_react(r, now)?;
+            // Only on posts this node has, which leaves out deleted ones.
+            if post_by_id(r.post_ts, &r.post_id).is_none() {
+                return Ok(false);
+            }
+            let key = react_key(r.post_ts, &r.post_id, &r.from);
+            let newer = crate::chain_db::dao_get(&key)
+                .and_then(|b| decode::<React>(&b))
+                .map(|old| (r.ts, &r.sig) > (old.ts, &old.sig))
+                .unwrap_or(true);
+            if !newer {
+                return Ok(false);
+            }
+            if source == Source::Gossip && !within_burst(&r.from, now, 0) {
+                return Err("rate");
+            }
+            let bytes = serde_json::to_vec(r).map_err(|_| "encode")?;
+            crate::chain_db::dao_put(&key, &bytes).map_err(|_| "store")?;
+            Ok(true)
+        }
+        Wire::Avatar(a) => {
+            check_avatar(a, now)?;
+            if avatar_of(&a.from).map(|old| (old.ts, &old.sig) >= (a.ts, &a.sig)).unwrap_or(false) {
+                return Ok(false);
+            }
+            let bytes = serde_json::to_vec(a).map_err(|_| "encode")?;
+            crate::chain_db::dao_put(&avatar_key(&a.from), &bytes).map_err(|_| "store")?;
+            Ok(true)
+        }
     }
 }
 
@@ -646,10 +800,12 @@ pub fn sync_response(req: &SyncRequest, now: i64) -> SyncResponse {
     let mut authors: Vec<&str> = posts.iter().map(|p| p.from.as_str()).collect();
     authors.sort();
     authors.dedup();
-    let names = authors.into_iter().filter_map(name_of).collect();
+    let names = authors.iter().copied().filter_map(name_of).collect();
+    let avatars = authors.into_iter().filter_map(avatar_of).collect();
     let edits = scan_since(EDITS, since, SYNC_MAX_POSTS);
     let deletes = scan_since(DELETES, since, SYNC_MAX_POSTS);
-    SyncResponse { posts, votes, names, edits, deletes }
+    let reacts = scan_since(REACTS, since, SYNC_MAX_VOTES);
+    SyncResponse { posts, votes, names, edits, deletes, reacts, avatars }
 }
 
 pub fn ingest(resp: SyncResponse, now: i64) -> usize {
@@ -676,6 +832,16 @@ pub fn ingest(resp: SyncResponse, now: i64) -> usize {
     }
     for e in resp.edits.into_iter().take(SYNC_MAX_POSTS) {
         if accept(&Wire::Edit(e), now, Source::Sync) == Ok(true) {
+            fresh += 1;
+        }
+    }
+    for r in resp.reacts.into_iter().take(SYNC_MAX_VOTES) {
+        if accept(&Wire::React(r), now, Source::Sync) == Ok(true) {
+            fresh += 1;
+        }
+    }
+    for a in resp.avatars.into_iter().take(SYNC_MAX_POSTS) {
+        if accept(&Wire::Avatar(a), now, Source::Sync) == Ok(true) {
             fresh += 1;
         }
     }
@@ -751,6 +917,46 @@ mod tests {
         assert_eq!(e.signing_bytes(), format!("ego/dao-chat/edit/v1\n{from}\ncb73b6f6aed5d28c2e7546f860543c1e\n1800000000\n1800000003\nhello again").into_bytes());
         let d = Delete { from: from.into(), post_id: p.id(), post_ts: p.ts, ts: 1_800_000_004, pubkey: String::new(), sig: String::new() };
         assert_eq!(d.signing_bytes(), format!("ego/dao-chat/delete/v1\n{from}\ncb73b6f6aed5d28c2e7546f860543c1e\n1800000000\n1800000004").into_bytes());
+    }
+
+    #[test]
+    fn reactions_and_pictures_are_signed_by_their_owner() {
+        let kp = key();
+        let now = 1_800_000_000;
+        let post = sign_post(&key(), "", "gm", now - 60);
+        let r = sign_react(&kp, &post, "🔥", now);
+        assert_eq!(check_react(&r, now), Ok(()));
+        let mut swapped = r.clone();
+        swapped.emoji = "👎".into();
+        assert_eq!(check_react(&swapped, now), Err("signature"));
+        let mut stolen = r.clone();
+        stolen.from = address_of_key(&key());
+        assert_eq!(check_react(&stolen, now), Err("signature"));
+        // Taking a reaction back is an empty emoji; words aren't emoji.
+        assert_eq!(check_react(&sign_react(&kp, &post, "", now), now), Ok(()));
+        assert_eq!(check_react(&sign_react(&kp, &post, "lol", now), now), Err("text"));
+        assert_eq!(check_react(&sign_react(&kp, &post, "👍🏽", now), now), Ok(()));
+        assert_eq!(check_react(&sign_react(&kp, &post, "🔥", now - 120), now), Err("time"));
+
+        let a = sign_avatar(&kp, "egoshare1:egomfd1abc:00:bmFtZQ==:egot1x", now);
+        assert_eq!(check_avatar(&a, now), Ok(()));
+        assert_eq!(check_avatar(&sign_avatar(&kp, "", now), now), Ok(()));
+        assert_eq!(check_avatar(&sign_avatar(&kp, "https://evil.example/x.png", now), now), Err("text"));
+        let mut redirected = a.clone();
+        redirected.link = "egoshare1:egomfd1other:00:bmFtZQ==:egot1x".into();
+        assert_eq!(check_avatar(&redirected, now), Err("signature"));
+    }
+
+    #[test]
+    fn reaction_and_picture_bytes_match_the_phone_app() {
+        let from = "egot1yzwkx349luk82ksl0xe2tm6rfwj26t7pg5apncg2";
+        let r = React { from: from.into(), post_id: "cb73b6f6aed5d28c2e7546f860543c1e".into(), post_ts: 1_800_000_000, emoji: "🔥".into(), ts: 1_800_000_005, pubkey: String::new(), sig: String::new() };
+        assert_eq!(r.signing_bytes(), format!("ego/dao-chat/react/v1\n{from}\ncb73b6f6aed5d28c2e7546f860543c1e\n1800000000\n1800000005\n🔥").into_bytes());
+        let a = Avatar { from: from.into(), link: "egoshare1:x".into(), ts: 1_800_000_006, pubkey: String::new(), sig: String::new() };
+        assert_eq!(a.signing_bytes(), format!("ego/dao-chat/avatar/v1\n{from}\n1800000006\negoshare1:x").into_bytes());
+        // Older nodes' sync answers, without reactions or pictures, still read.
+        let old: SyncResponse = serde_json::from_str(r#"{"posts":[],"votes":[],"names":[]}"#).unwrap();
+        assert!(old.reacts.is_empty() && old.avatars.is_empty());
     }
 
     #[test]

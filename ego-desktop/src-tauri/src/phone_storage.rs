@@ -264,6 +264,30 @@ async fn get_block(params: &Value) -> RpcResult {
     }
 }
 
+/// storage.getManifest: a stored file's list of blocks, so anyone with its share link can open it
+/// (the key in the link decrypts it; the list alone reveals nothing). Asks the DHT when it isn't here.
+async fn get_manifest(params: &Value) -> RpcResult {
+    let cid = params["cid"].as_str().unwrap_or_default().to_string();
+    if !cid.starts_with("egomfd1") || cid.len() > 80 {
+        return Err((-32602, "That isn't a file ID.".into()));
+    }
+    let c = cid.clone();
+    let found = tokio::task::spawn_blocking(move || crate::blocks::load_manifest(&c).ok())
+        .await.map_err(|e| (-32603, e.to_string()))?;
+    match found {
+        Some(m) if m.manifest_cid == cid || m.manifest_cid.is_empty() => Ok(json!({
+            "total_size": m.total_size,
+            "blocks": m.blocks.iter().map(|b| json!({ "block_cid": b.block_cid, "nonce_hex": b.nonce_hex, "size": b.size })).collect::<Vec<_>>(),
+        })),
+        _ => {
+            if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
+                let _ = tx.send(crate::p2p::DhtCommand::GetPeers { key: format!("ego-manifest:{cid}") });
+            }
+            Ok(json!({ "pending": true }))
+        }
+    }
+}
+
 /// storage.delete: the owner drops a file everywhere. The phone's signed request is
 /// itself the delete notice, so this node removes its copy and passes it to every other.
 async fn delete(params: &Value) -> RpcResult {
@@ -304,13 +328,14 @@ async fn usage(params: &Value) -> RpcResult {
     }).await.map_err(|e| (-32603, e.to_string()))
 }
 
-pub const METHODS: &[&str] = &["storage.putBlock", "storage.putManifest", "storage.getBlock", "storage.delete", "storage.usage"];
+pub const METHODS: &[&str] = &["storage.putBlock", "storage.putManifest", "storage.getBlock", "storage.getManifest", "storage.delete", "storage.usage"];
 
 pub async fn dispatch(method: &str, params: &Value) -> Option<RpcResult> {
     Some(match method {
         "storage.putBlock" => put_block(params).await,
         "storage.putManifest" => put_manifest(params).await,
         "storage.getBlock" => get_block(params).await,
+        "storage.getManifest" => get_manifest(params).await,
         "storage.delete" => delete(params).await,
         "storage.usage" => usage(params).await,
         _ => return None,

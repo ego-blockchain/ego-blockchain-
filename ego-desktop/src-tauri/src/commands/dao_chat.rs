@@ -25,12 +25,24 @@ pub struct PostView {
     pub removal_votes: usize,
     pub my_vote: bool,
     pub removed_until: Option<i64>,
+    /// The author's profile picture, an Ego Storage share link, or empty.
+    pub avatar: String,
+    /// Each emoji people reacted with, most used first.
+    pub reactions: Vec<ReactionCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReactionCount {
+    pub emoji: String,
+    pub count: usize,
+    pub mine: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatFeed {
     pub me: String,
     pub my_name: String,
+    pub my_avatar: String,
     pub my_removed_until: Option<i64>,
     pub threshold: usize,
     pub ban_days: i64,
@@ -80,6 +92,7 @@ pub(crate) fn feed(me: String, before: Option<i64>, now: i64) -> ChatFeed {
     let oldest = posts.first().map(|p| p.ts);
     let mut records: HashMap<String, (Vec<(i64, String)>, Vec<(i64, i64)>)> = HashMap::new();
     let mut names: HashMap<String, Option<String>> = HashMap::new();
+    let mut avatars: HashMap<String, String> = HashMap::new();
     let mut views = Vec::with_capacity(posts.len());
     for p in posts {
         let (votes, bans) = records.entry(p.from.clone()).or_insert_with(|| dao_chat::ban_record(&p.from)).clone();
@@ -94,6 +107,11 @@ pub(crate) fn feed(me: String, before: Option<i64>, now: i64) -> ChatFeed {
             .unwrap_or_else(|| p.name.clone());
         let open = dao_chat::open_votes(&votes, now);
         let edit = dao_chat::edit_of(&p);
+        let avatar = avatars
+            .entry(p.from.clone())
+            .or_insert_with(|| dao_chat::avatar_of(&p.from).map(|a| a.link).unwrap_or_default())
+            .clone();
+        let reactions = reaction_counts(&dao_chat::reactions_to(&p), &me);
         views.push(PostView {
             id: p.id(),
             from: p.from.clone(),
@@ -106,19 +124,39 @@ pub(crate) fn feed(me: String, before: Option<i64>, now: i64) -> ChatFeed {
             removal_votes: open.len(),
             my_vote: open.iter().any(|v| *v == me),
             removed_until: dao_chat::banned_until(&bans, now),
+            avatar,
+            reactions,
         });
     }
     let my_removed_until = if me.is_empty() { None } else { dao_chat::banned_until(&dao_chat::ban_record(&me).1, now) };
     let my_name = dao_chat::name_of(&me).map(|n| n.name).unwrap_or_default();
+    let my_avatar = dao_chat::avatar_of(&me).map(|a| a.link).unwrap_or_default();
     ChatFeed {
         me,
         my_name,
+        my_avatar,
         my_removed_until,
         threshold: dao_chat::BAN_VOTES,
         ban_days: dao_chat::BAN_SECS / 86_400,
         posts: views,
         oldest,
     }
+}
+
+/// Groups reactions by emoji, most used first.
+pub(crate) fn reaction_counts(reacts: &[dao_chat::React], me: &str) -> Vec<ReactionCount> {
+    let mut counts: Vec<ReactionCount> = Vec::new();
+    for r in reacts {
+        match counts.iter_mut().find(|c| c.emoji == r.emoji) {
+            Some(c) => {
+                c.count += 1;
+                c.mine |= r.from == me;
+            }
+            None => counts.push(ReactionCount { emoji: r.emoji.clone(), count: 1, mine: r.from == me }),
+        }
+    }
+    counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.emoji.cmp(&b.emoji)));
+    counts
 }
 
 #[tauri::command]
@@ -245,4 +283,20 @@ pub async fn dao_chat_delete(post_id: String, post_ts: i64, state: State<'_, App
 #[tauri::command]
 pub async fn dao_chat_sync(app: AppHandle) -> Result<usize, EgoDesktopError> {
     Ok(crate::p2p::dao_chat_sync_now(Some(app)).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reactions_are_counted_per_emoji_with_mine_marked() {
+        let r = |from: &str, emoji: &str| dao_chat::React {
+            from: from.into(), post_id: String::new(), post_ts: 0, emoji: emoji.into(), ts: 0, pubkey: String::new(), sig: String::new(),
+        };
+        let counts = reaction_counts(&[r("a", "🔥"), r("b", "❤️"), r("me", "🔥"), r("c", "🔥")], "me");
+        assert_eq!(counts.len(), 2);
+        assert_eq!((counts[0].emoji.as_str(), counts[0].count, counts[0].mine), ("🔥", 3, true));
+        assert_eq!((counts[1].emoji.as_str(), counts[1].count, counts[1].mine), ("❤️", 1, false));
+    }
 }
