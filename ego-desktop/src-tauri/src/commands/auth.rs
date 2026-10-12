@@ -295,15 +295,7 @@ async fn load_active_wallet(
         .map_err(|e| EgoDesktopError::WalletError(format!("{e}")))?;
     state.set_session_start(chrono::Utc::now().timestamp());
 
-    {
-        let mut ledger = Ledger::load();
-        if ledger.storage_allocated_bytes == 0 {
-            ledger.storage_allocated_bytes = 10 * 1_000_000_000;
-            let _ = ledger.save();
-            let _ = fs::create_dir_all(storage_dir());
-            eprintln!("[storage] Auto-provisioned 10 GB storage quota");
-        }
-    }
+    tauri::async_runtime::spawn_blocking(crate::commands::storage::provision_free_share);
 
     // Heavy chain_db work (RocksDB cold open + real balance) runs in
     // background so init_wallet returns in ~50 ms instead of 2-8 s.

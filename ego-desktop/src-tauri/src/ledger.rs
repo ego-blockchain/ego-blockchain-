@@ -838,6 +838,9 @@ pub struct Ledger {
     #[serde(default)]
     pub storage_configured_at: Option<i64>,
 
+    #[serde(default)]
+    pub storage_opted_out: bool,
+
     /// If set, all storage/consensus/coverage rewards are suspended until this timestamp.
     /// Applied when a node lowers its committed storage allocation after the 60-day lock expires.
     #[serde(default)]

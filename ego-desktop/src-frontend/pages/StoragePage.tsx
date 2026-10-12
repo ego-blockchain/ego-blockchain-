@@ -742,12 +742,21 @@ const StoragePage: React.FC = () => {
                         </span>
                       )}
                     </div>
-                    <button
-                      onClick={() => openSubModal(subValid ? true : false)}
-                      className="text-xs text-blue-400 hover:text-blue-300 underline"
-                    >
-                      {subValid ? 'Manage' : 'Upgrade →'}
-                    </button>
+                    {subValid ? (
+                      <button
+                        onClick={() => openSubModal(true)}
+                        className="text-xs text-blue-400 hover:text-blue-300 underline"
+                      >
+                        Manage
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => openSubModal(false)}
+                        className={`shrink-0 bg-gradient-to-r from-emerald-500 to-blue-600 hover:from-emerald-400 hover:to-blue-500 text-white text-sm font-bold px-5 py-2.5 rounded-xl shadow-lg shadow-emerald-500/25 transition-all hover:scale-105 ${nearLimit ? 'animate-pulse' : ''}`}
+                      >
+                        ⬆ Upgrade storage
+                      </button>
+                    )}
                   </div>
                   <div className="flex justify-between text-xs text-gray-400 mb-1">
                     <span>{fmtBytes(usedBytes)} used</span>
@@ -762,6 +771,11 @@ const StoragePage: React.FC = () => {
                   {nearLimit && (
                     <div className="text-xs text-yellow-400">
                       You're using {usedPct}% of your storage — consider upgrading.
+                    </div>
+                  )}
+                  {!subValid && !nearLimit && (
+                    <div className="text-xs text-emerald-400">
+                      Need more room? Plans start at 0.79 EGUSD a month for 50 GB, up to 1 TB.
                     </div>
                   )}
                 </div>

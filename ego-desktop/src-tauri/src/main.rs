@@ -418,6 +418,7 @@ fn headless_main() {
         Ok(addr) => tracing::info!("Headless wallet ready: {}", addr),
         Err(e)   => tracing::error!("Headless wallet init failed: {}", e),
     }
+    crate::commands::storage::provision_free_share();
     crate::p2p::prime_ed25519_seed_cache();
 
     let rt = tokio::runtime::Builder::new_multi_thread()

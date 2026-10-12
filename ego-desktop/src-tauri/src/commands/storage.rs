@@ -16,6 +16,34 @@ use tauri::{Manager, State};
 // Its size = allocated_bytes − bytes_used_by_blocks.
 // The OS always sees the full allocation as occupied.
 
+pub const FREE_SHARE_BYTES: u64 = 10 * 1_000_000_000;
+const KEEP_FOR_OWNER_BYTES: u64 = 20 * 1_000_000_000;
+
+pub fn should_share_freely(allocated: u64, opted_out: bool, disk_free: u64) -> bool {
+    allocated == 0 && !opted_out && disk_free >= FREE_SHARE_BYTES + KEEP_FOR_OWNER_BYTES
+}
+
+pub fn provision_free_share() {
+    let mut ledger = Ledger::load();
+    if ledger.address.is_empty() {
+        return;
+    }
+    let dir = storage_dir();
+    let _ = fs::create_dir_all(&dir);
+    let disk_free = fs2::available_space(&dir).unwrap_or(0);
+    if !should_share_freely(ledger.storage_allocated_bytes, ledger.storage_opted_out, disk_free) {
+        if ledger.storage_allocated_bytes == 0 && !ledger.storage_opted_out {
+            eprintln!("[Storage] Not sharing space yet: only {:.1} GB free on this drive", disk_free as f64 / 1e9);
+        }
+        return;
+    }
+    ledger.storage_allocated_bytes = FREE_SHARE_BYTES;
+    if ledger.save().is_ok() {
+        sync_reservation(FREE_SHARE_BYTES);
+        eprintln!("[Storage] Sharing 10 GB with the network");
+    }
+}
+
 fn reservation_path() -> std::path::PathBuf {
     storage_dir().join("ego_reserved.bin")
 }
@@ -783,6 +811,7 @@ pub async fn configure_storage(
 
     ledger.storage_allocated_bytes = requested_bytes;
     ledger.storage_configured_at   = Some(now);
+    ledger.storage_opted_out       = requested_bytes == 0;
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
 
     // Physically lock the allocated space on disk.
@@ -1549,6 +1578,7 @@ pub async fn reset_storage(_state: State<'_, AppState>) -> Result<(), EgoDesktop
     let mut ledger = Ledger::load();
     ledger.stored_files.clear();
     ledger.storage_allocated_bytes = 0;
+    ledger.storage_opted_out = true;
     ledger.storage_drive = String::new();
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
 
@@ -1612,5 +1642,25 @@ mod plan_egusd_tests {
         assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Pro:weekly"), None);
         assert_eq!(plan_paid_in_egusd("credits_pay:99999:storage:egocid1abc"), None);
         assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Pro:monthly:extra"), None);
+    }
+}
+
+#[cfg(test)]
+mod free_share_tests {
+    use super::{should_share_freely, FREE_SHARE_BYTES};
+
+    const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn a_new_node_with_room_shares_ten_gb() {
+        assert!(should_share_freely(0, false, 100 * GB));
+        assert!(should_share_freely(0, false, FREE_SHARE_BYTES + 20 * GB));
+    }
+
+    #[test]
+    fn it_leaves_a_nearly_full_disk_and_a_no_alone() {
+        assert!(!should_share_freely(0, false, 29 * GB), "a nearly full disk is left alone");
+        assert!(!should_share_freely(0, true, 500 * GB), "someone who turned sharing off stays off");
+        assert!(!should_share_freely(50 * GB, false, 500 * GB), "a node that chose its own size keeps it");
     }
 }
