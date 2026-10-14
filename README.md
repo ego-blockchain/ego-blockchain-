@@ -57,7 +57,7 @@ extension/             Chrome MV3 browser wallet
 mobile/                React Native client
 sdk/                   TypeScript SDK and WalletConnect integration
 services/              oracle, explorer, indexer, bridge relayer, presale proxy
-contracts/             Urego contract library (DeFi, DEX, NFT, governance, …)
+contracts/             P2P escrow contracts, plus Urego library drafts (not yet compilable, see contracts/README.md)
 testnet/               Docker Compose testnet, genesis config, deploy scripts
 ```
 

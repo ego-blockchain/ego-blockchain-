@@ -1060,4 +1060,32 @@ mod tests {
         assert!(!s.contains_key(&code_key(&addr)));
         assert!(!log(&s, &addr)[0].ok);
     }
+
+    #[test]
+    fn arithmetic_that_overflows_fails_the_call_instead_of_wrapping() {
+        let src = r#"contract Meter {
+            pub fn init() {
+                storage.set("n", 0);
+            }
+            pub fn up() {
+                let v: u64 = storage.get_u64("n");
+                storage.set("n", v + 1);
+            }
+            pub fn down() {
+                let v: u64 = storage.get_u64("n");
+                storage.set("n", v - 1);
+            }
+        }"#;
+        let code = urego_compiler::compile(src).unwrap();
+        let deploy = deploy_tx("egot1alice", 1, &code);
+        let addr = deploy.contract_addr.clone();
+        let mut s = Store::new();
+        apply(&mut s, 1, &[deploy]);
+        apply(&mut s, 2, &[call_tx("egot1bob", 1, &addr, "down", "")]);
+        apply(&mut s, 3, &[call_tx("egot1bob", 2, &addr, "up", "")]);
+        let st: ContractState = serde_json::from_slice(&s[&state_key(&addr)]).unwrap();
+        assert_eq!(st.get("", "n").map(|b| read_u64(&b)), Some(1));
+        let entries = log(&s, &addr);
+        assert_eq!(entries.iter().filter(|e| !e.ok).count(), 1);
+    }
 }

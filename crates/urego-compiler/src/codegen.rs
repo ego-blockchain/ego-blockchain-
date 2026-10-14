@@ -216,6 +216,22 @@ impl Codegen {
         wat.push_str(&format!("    (call $storage_set (i32.const 0) (i32.const 0) (local.get $kp) (local.get $kl) (i32.const {SCRATCH_U64}) (i32.const 8))\n"));
         wat.push_str("  )\n\n");
 
+        wat.push_str("  (func $__add (param $a i64) (param $b i64) (result i64) (local $r i64)\n");
+        wat.push_str("    (local.set $r (i64.add (local.get $a) (local.get $b)))\n");
+        wat.push_str("    (if (i64.lt_u (local.get $r) (local.get $a)) (then (unreachable)))\n");
+        wat.push_str("    (local.get $r)\n");
+        wat.push_str("  )\n\n");
+        wat.push_str("  (func $__sub (param $a i64) (param $b i64) (result i64)\n");
+        wat.push_str("    (if (i64.lt_u (local.get $a) (local.get $b)) (then (unreachable)))\n");
+        wat.push_str("    (i64.sub (local.get $a) (local.get $b))\n");
+        wat.push_str("  )\n\n");
+        wat.push_str("  (func $__mul (param $a i64) (param $b i64) (result i64) (local $r i64)\n");
+        wat.push_str("    (local.set $r (i64.mul (local.get $a) (local.get $b)))\n");
+        wat.push_str("    (if (i64.ne (local.get $a) (i64.const 0)) (then\n");
+        wat.push_str("      (if (i64.ne (i64.div_u (local.get $r) (local.get $a)) (local.get $b)) (then (unreachable)))))\n");
+        wat.push_str("    (local.get $r)\n");
+        wat.push_str("  )\n\n");
+
         for func in &contract.functions {
             let func_wat = self.gen_function(func)?;
             wat.push_str(&func_wat);
@@ -387,8 +403,8 @@ impl Codegen {
                 w.push_str(&format!("    (local.get ${name})\n"));
                 w.push_str(&self.gen_expr(value, ctx)?);
                 let instr = match op {
-                    BinOp::Add => "i64.add",
-                    BinOp::Sub => "i64.sub",
+                    BinOp::Add => "call $__add",
+                    BinOp::Sub => "call $__sub",
                     _ => return Err(CompileError::CodegenError(
                         "only += and -= compound assignments are supported".into()
                     )),
@@ -492,9 +508,9 @@ impl Codegen {
                 w.push_str(&self.gen_expr(right, ctx)?);
                 match op {
 
-                    BinOp::Add => w.push_str("    (i64.add)\n"),
-                    BinOp::Sub => w.push_str("    (i64.sub)\n"),
-                    BinOp::Mul => w.push_str("    (i64.mul)\n"),
+                    BinOp::Add => w.push_str("    (call $__add)\n"),
+                    BinOp::Sub => w.push_str("    (call $__sub)\n"),
+                    BinOp::Mul => w.push_str("    (call $__mul)\n"),
                     BinOp::Div => w.push_str("    (i64.div_u)\n"),
                     BinOp::Rem => w.push_str("    (i64.rem_u)\n"),
 

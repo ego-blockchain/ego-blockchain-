@@ -1698,6 +1698,10 @@ pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
         tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp)
     };
     vk.verify(&msg, &sig).map_err(|_| "Ed25519 signature invalid".to_string())?;
+    let dilithium_disabled = crate::chain_db::is_feature_disabled(
+        crate::chain_db::FEATURE_DILITHIUM_DISABLED,
+    );
+    verify_sender_binding(tx, &pk_arr, &msg, dilithium_disabled)?;
     if tx_hash_must_match_standard_signing(tx) {
         let expected_hash = expected_standard_tx_hash(tx);
         if tx.hash != expected_hash {
@@ -1859,26 +1863,6 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         return Err(format!("missing signature or pubkey in TX from {}", tx.from));
     }
 
-    let hrp = if tx.chain_id == 1 { "egot" } else { "ego" };
-    
-    let ed_pk = hex::decode(&tx.public_key_ed25519).unwrap_or_default();
-    if ed_pk.len() != 32 {
-        return Err(format!("Spoofing detected: invalid Ed25519 pubkey length"));
-    }
-    let ed_expected = ego_core::EgoAddress::from_public_key_bytes(&ed_pk, tx.chain_id as u32, ego_core::AddressType::EOA)
-        .to_bech32(hrp).unwrap_or_default();
-
-    if !dilithium_disabled && !tx.dilithium_pubkey.is_empty() {
-        let dil_pk = hex::decode(&tx.dilithium_pubkey).unwrap_or_default();
-        let dil_expected = ego_core::EgoAddress::from_dilithium_pk(&dil_pk, tx.chain_id as u32, ego_core::AddressType::EOA)
-            .to_bech32(hrp).unwrap_or_default();
-        if tx.from != dil_expected && tx.from != ed_expected {
-            return Err(format!("Spoofing detected: TX from {} does not match attached pubkeys", tx.from));
-        }
-    } else if tx.from != ed_expected {
-        return Err(format!("Spoofing detected: TX from {} does not match Ed25519 pubkey", tx.from));
-    }
-
     let pk_bytes = hex::decode(&tx.public_key_ed25519)
         .map_err(|_| "invalid pubkey hex".to_string())?;
     let sig_bytes = hex::decode(&tx.signature)
@@ -1904,6 +1888,7 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     };
     vk.verify(&msg, &sig)
         .map_err(|_| format!("Ed25519 signature verification failed for TX from {}", tx.from))?;
+    verify_sender_binding(tx, &pk_arr, &msg, dilithium_disabled)?;
 
     if tx_hash_must_match_standard_signing(tx) {
         let expected_hash = expected_standard_tx_hash(tx);
@@ -1952,6 +1937,36 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     Ok(())
 }
 
+fn verify_sender_binding(tx: &LedgerTx, ed_pk: &[u8; 32], msg: &[u8], dilithium_disabled: bool) -> Result<(), String> {
+    let hrp = if tx.chain_id == 1 { "egot" } else { "ego" };
+    let ed_expected = ego_core::EgoAddress::from_public_key_bytes(ed_pk, tx.chain_id as u32, ego_core::AddressType::EOA)
+        .to_bech32(hrp).unwrap_or_default();
+    if !ed_expected.is_empty() && tx.from == ed_expected {
+        return Ok(());
+    }
+    if dilithium_disabled || tx.dilithium_pubkey.is_empty() || tx.dilithium_signature.is_empty() {
+        return Err(format!("Spoofing detected: TX from {} is not signed by the key that owns it", tx.from));
+    }
+    let dil_pk = hex::decode(&tx.dilithium_pubkey)
+        .map_err(|_| "invalid dilithium pubkey hex".to_string())?;
+    let dil_expected = ego_core::EgoAddress::from_dilithium_pk(&dil_pk, tx.chain_id as u32, ego_core::AddressType::EOA)
+        .to_bech32(hrp).unwrap_or_default();
+    if dil_expected.is_empty() || tx.from != dil_expected {
+        return Err(format!("Spoofing detected: TX from {} does not match attached pubkeys", tx.from));
+    }
+    let dil_sig = hex::decode(&tx.dilithium_signature)
+        .map_err(|_| "invalid dilithium signature hex".to_string())?;
+    let valid = ego_core::verify_signature(
+        &ego_core::PublicKey::dilithium2(dil_pk),
+        msg,
+        &ego_core::Signature::dilithium2(dil_sig),
+    ).map_err(|e| format!("ML-DSA-44 error for TX from {}: {}", tx.from, e))?;
+    if !valid {
+        return Err(format!("ML-DSA-44 signature invalid for TX from {}", tx.from));
+    }
+    Ok(())
+}
+
 pub fn tx_signing_bytes(from: &str, to: &str, amount: u64, nonce: u64, timestamp: i64) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(b"ego/tx/v1:");
@@ -1975,7 +1990,7 @@ pub fn tx_signing_bytes_v2(
     from: &str, to: &str, amount: u64, nonce: u64, timestamp: i64,
     chain_id: u8, memo: &str,
 ) -> Vec<u8> {
-    let memo = &memo[..memo.len().min(256)]; // cap at 256 chars
+    let memo = &memo.as_bytes()[..memo.len().min(256)];
     let mut v = Vec::new();
     v.extend_from_slice(b"ego/tx/v2:");
     v.push(chain_id);
@@ -1991,7 +2006,7 @@ pub fn tx_signing_bytes_v2(
     v.extend_from_slice(&timestamp.to_le_bytes());
     v.push(b':');
     v.extend_from_slice(&(memo.len() as u32).to_le_bytes());
-    v.extend_from_slice(memo.as_bytes());
+    v.extend_from_slice(memo);
     v
 }
 
@@ -2013,4 +2028,87 @@ pub fn tx_human_summary(
         nonce,
         network, chain_id,
     )
+}
+
+#[cfg(test)]
+mod sender_binding_tests {
+    use super::*;
+
+    fn addr_of_ed(kp: &ego_core::KeyPair) -> String {
+        ego_core::EgoAddress::from_public_key_bytes(kp.ed25519_public_key().as_bytes(), 1, ego_core::AddressType::EOA)
+            .to_bech32("egot").unwrap()
+    }
+
+    fn addr_of_dil(kp: &ego_core::KeyPair) -> String {
+        ego_core::EgoAddress::from_dilithium_pk(&kp.dilithium_public_key().key_data, 1, ego_core::AddressType::EOA)
+            .to_bech32("egot").unwrap()
+    }
+
+    fn signed(from: &str, signer: &ego_core::KeyPair, dil: Option<&ego_core::KeyPair>) -> LedgerTx {
+        let mut tx = LedgerTx {
+            from: from.into(),
+            to: "egot1recipient".into(),
+            amount: 1_000_000,
+            nonce: 1,
+            timestamp: 1_700_000_000,
+            chain_id: 1,
+            tx_version: 2,
+            tx_type: "transfer".into(),
+            fee_uegoc: 1_000,
+            ..LedgerTx::default()
+        };
+        let msg = tx_signing_bytes_v2(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp, 1, "");
+        tx.public_key_ed25519 = hex::encode(signer.ed25519_public_key().as_bytes());
+        tx.signature = hex::encode(signer.sign_ed25519(&msg).as_bytes());
+        if let Some(d) = dil {
+            tx.dilithium_pubkey = hex::encode(&d.dilithium_public_key().key_data);
+            tx.dilithium_signature = hex::encode(&d.sign_dilithium(&msg).signature_data);
+        }
+        tx.hash = expected_standard_tx_hash(&tx);
+        tx
+    }
+
+    #[test]
+    fn the_owner_key_passes() {
+        let owner = ego_core::KeyPair::generate();
+        assert!(verify_confirmed_tx_sig(&signed(&addr_of_ed(&owner), &owner, None)).is_ok());
+    }
+
+    #[test]
+    fn a_stranger_key_cannot_spend_from_someone_else() {
+        let victim = ego_core::KeyPair::generate();
+        let attacker = ego_core::KeyPair::generate();
+        let tx = signed(&addr_of_ed(&victim), &attacker, None);
+        assert!(verify_confirmed_tx_sig(&tx).is_err());
+        assert!(verify_incoming_tx_with_miner(&tx, "").is_err());
+    }
+
+    #[test]
+    fn a_legacy_address_needs_its_own_dilithium_signature() {
+        let victim = ego_core::KeyPair::generate();
+        let attacker = ego_core::KeyPair::generate();
+        let mut tx = signed(&addr_of_dil(&victim), &attacker, None);
+        tx.dilithium_pubkey = hex::encode(&victim.dilithium_public_key().key_data);
+        tx.hash = expected_standard_tx_hash(&tx);
+        assert!(verify_confirmed_tx_sig(&tx).is_err());
+        assert!(verify_incoming_tx_with_miner(&tx, "").is_err());
+
+        let mut forged = signed(&addr_of_dil(&victim), &attacker, Some(&attacker));
+        forged.dilithium_pubkey = hex::encode(&victim.dilithium_public_key().key_data);
+        assert!(verify_confirmed_tx_sig(&forged).is_err());
+    }
+
+    #[test]
+    fn a_legacy_address_with_its_dilithium_signature_passes() {
+        let owner = ego_core::KeyPair::generate();
+        assert!(verify_confirmed_tx_sig(&signed(&addr_of_dil(&owner), &owner, Some(&owner))).is_ok());
+    }
+
+    #[test]
+    fn a_multibyte_memo_at_the_cap_is_cut_on_bytes() {
+        let memo = format!("{}é", "a".repeat(255));
+        let bytes = tx_signing_bytes_v2("a", "b", 1, 1, 1, 1, &memo);
+        let tail = &bytes[bytes.len() - 256..];
+        assert_eq!(tail, &memo.as_bytes()[..256]);
+    }
 }
