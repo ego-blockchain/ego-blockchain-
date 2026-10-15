@@ -1317,8 +1317,17 @@ const WalletPage: React.FC = () => {
         </div>
 
         {!isLiveMode && (
-          <div className="rounded-lg px-3 py-2 mb-5 font-mono text-xs truncate bg-white/10 text-blue-100">
-            {myAddress || 'Loading address…'}
+          <div className="flex items-center gap-2 mb-5">
+            <div className="flex-1 min-w-0 rounded-lg px-3 py-2 font-mono text-xs truncate bg-white/10 text-blue-100">
+              {myAddress || 'Loading address…'}
+            </div>
+            <button
+              onClick={copyAddr}
+              disabled={!myAddress}
+              className="shrink-0 px-3 py-2 rounded-lg text-xs font-bold bg-white/15 hover:bg-white/25 text-white disabled:opacity-40"
+            >
+              {copied ? 'Copied' : 'Copy'}
+            </button>
           </div>
         )}
         {isLiveMode && (
