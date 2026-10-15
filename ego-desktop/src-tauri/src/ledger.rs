@@ -1983,6 +1983,15 @@ pub fn check_tx_version_at(tx: &LedgerTx, height: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The version rule a block at `height` holds this tx to. System txs carry no
+/// user signature, so block validation skips them and so does this.
+pub fn tx_version_fits_block(tx: &LedgerTx, height: u64) -> Result<(), String> {
+    if is_protocol_system_tx(tx) || is_reserved_system_source(&tx.from) {
+        return Ok(());
+    }
+    check_tx_version_at(tx, height)
+}
+
 pub fn tx_signing_bytes_for(tx: &LedgerTx) -> Vec<u8> {
     match tx.tx_version {
         3 => tx_signing_bytes_v3(tx),
@@ -2263,6 +2272,23 @@ mod tx_v3_tests {
         assert!(check_tx_version_at(&v4, TX_V3_FROM_HEIGHT).is_err());
         assert_eq!(tx_version_for_height(TX_V3_FROM_HEIGHT - 1), 2);
         assert_eq!(tx_version_for_height(TX_V3_FROM_HEIGHT), 3);
+    }
+
+    #[test]
+    fn proposals_hold_user_txs_to_the_block_version_but_not_system_txs() {
+        let user_v2 = LedgerTx { from: "egot1sender".into(), tx_version: 2, ..LedgerTx::default() };
+        let user_v3 = LedgerTx { from: "egot1sender".into(), tx_version: 3, ..LedgerTx::default() };
+        assert!(tx_version_fits_block(&user_v2, TX_V2_UNTIL_HEIGHT - 1).is_ok());
+        assert!(tx_version_fits_block(&user_v2, TX_V2_UNTIL_HEIGHT).is_err());
+        assert!(tx_version_fits_block(&user_v3, TX_V3_FROM_HEIGHT - 1).is_err());
+        assert!(tx_version_fits_block(&user_v3, TX_V2_UNTIL_HEIGHT).is_ok());
+        let faucet = LedgerTx {
+            from: crate::chain_db::NODE_POOL_ADDR.into(),
+            tx_type: "faucet".into(),
+            tx_version: 2,
+            ..LedgerTx::default()
+        };
+        assert!(tx_version_fits_block(&faucet, TX_V2_UNTIL_HEIGHT).is_ok());
     }
 
     #[test]

@@ -3513,6 +3513,12 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             // TX was already confirmed by a peer's block, silently drop from mempool
                 return false;
             }
+        // A tx admitted to the mempool just before a version switch can be the wrong
+        // version for this block; proposing it would get the whole block refused.
+        if let Err(e) = crate::ledger::tx_version_fits_block(tx, height) {
+            eprintln!("[TX] {:.12} Rejected — {e}", tx.hash);
+            return false;
+        }
         if tx.nonce > 0 && blocked_senders.contains(&tx.from) {
             held_back.push((*tx).clone());
             return false;

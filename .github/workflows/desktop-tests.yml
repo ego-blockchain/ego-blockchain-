@@ -1,0 +1,58 @@
+name: Desktop tests
+
+# Runs every Ego Desktop unit test. Manual only: start it from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'Only run tests whose name contains this (empty runs all)'
+        required: false
+        default: ''
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/ego-desktop/src-tauri/target
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ego-desktop/src-tauri -> target
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.0-dev libssl-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev clang lld llvm
+
+      - name: Install frontend dependencies
+        working-directory: ego-desktop
+        run: npm install
+
+      - name: Fetch Rust deps + patch wry for webkit2gtk 0.18.2
+        working-directory: ego-desktop/src-tauri
+        run: |
+          cargo fetch
+          WRY=$(find ~/.cargo/registry/src -path "*/wry-*/src/webview/webkitgtk/mod.rs" 2>/dev/null | head -1)
+          if [ -n "$WRY" ]; then
+            sed -i 's/use webkit2gtk::{/use webkit2gtk::{SettingsExt, /' "$WRY"
+          fi
+
+      - name: Build frontend
+        working-directory: ego-desktop
+        run: npm run build
+
+      - name: Test
+        working-directory: ego-desktop/src-tauri
+        run: cargo test --release --bin ego-desktop "${{ inputs.filter }}"
