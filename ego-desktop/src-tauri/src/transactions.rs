@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, tx_signing_bytes, tx_signing_bytes_v2, tx_human_summary, Ledger, LedgerTx};
+use crate::ledger::{load_chain, tx_human_summary, Ledger, LedgerTx};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -98,26 +98,12 @@ pub async fn send_transaction(
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; // testnet
-    let sign_bytes = tx_signing_bytes_v2(
-        &from, &request.to_address, request.amount, nonce, ts, CHAIN_ID, memo_str,
-    );
+    let Some(kp) = state.get_keypair() else {
+        return Err(EgoDesktopError::WalletError(
+            "Wallet not initialized – call init_wallet first".into(),
+        ));
+    };
 
-    // Hybrid signing: Ed25519 (classical) + ML-DSA-44 (post-quantum).
-    // Both signatures must verify — attacker needs to break BOTH schemes.
-    let (signature_hex, public_key_ed25519, dilithium_pubkey_hex, dilithium_sig_hex) =
-        if let Some(kp) = state.get_keypair() {
-            let ed_sig  = hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes());
-            let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
-            let dil_sig = hex::encode(kp.sign_dilithium(&sign_bytes).as_bytes());
-            let dil_pk  = hex::encode(kp.dilithium_public_key().key_data);
-            (ed_sig, ed_pk, dil_pk, dil_sig)
-        } else {
-            return Err(EgoDesktopError::WalletError(
-                "Wallet not initialized – call init_wallet first".into(),
-            ));
-        };
-
-    let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
     let fee_uegoc = tokio::task::spawn_blocking(crate::chain_db::get_current_base_fee)
         .await
         .unwrap_or(crate::mempool::MIN_FEE_UEGOC).max(crate::mempool::MIN_FEE_UEGOC);
@@ -130,26 +116,22 @@ pub async fn send_transaction(
         )));
     }
 
-    let pending_tx = LedgerTx {
-        hash:                tx_hash.clone(),
+    let mut pending_tx = LedgerTx {
         from:                from.clone(),
         to:                  request.to_address.clone(),
         amount:              request.amount,
         memo:                request.memo.clone(),
         timestamp:           ts,
-        signature:           signature_hex,
-        public_key_ed25519,
-        dilithium_pubkey:    dilithium_pubkey_hex,
-        dilithium_signature: dilithium_sig_hex,
         status:              "Pending".into(),
         block_height:        None,
         nonce,
         fee_uegoc,
-        tx_version:          2,
         chain_id:            CHAIN_ID,
         signed_summary:      summary.clone(),
         ..LedgerTx::default()
     };
+    crate::ledger::seal_tx(&mut pending_tx, &kp, true);
+    let tx_hash = pending_tx.hash.clone();
     crate::commands::tx_pending::add(&pending_tx);
     if let Err(e) = crate::mempool::get_mempool().push(pending_tx.clone()) {
         crate::commands::tx_pending::remove(&pending_tx.hash);

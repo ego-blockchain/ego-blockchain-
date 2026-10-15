@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{data_dir, tx_human_summary, tx_signing_bytes_v2, Ledger, LedgerTx};
+use crate::ledger::{data_dir, tx_human_summary, Ledger, LedgerTx};
 use crate::shielded::{self, denominate, Note, ShieldedPool, DENOMINATIONS_UEGOC};
 use crate::shielded_chain::{self, UnshieldBody, SHIELDED_POOL_ADDR, TX_SHIELD, TX_UNSHIELD};
 use aes_gcm::aead::{Aead, KeyInit};
@@ -703,8 +703,6 @@ pub async fn shield_deposit(
 
     let mut nonce = crate::ledger::next_nonce_for(&from, ledger.nonce) - 1;
     let now = chrono::Utc::now().timestamp();
-    let ed_pk = hex::encode(kp.ed25519_public_key().as_bytes());
-    let dil_pk = hex::encode(&kp.dilithium_public_key().key_data);
 
     let seed = wallet_seed()?;
     let existing = {
@@ -743,32 +741,25 @@ pub async fn shield_deposit(
         let commitment = note.commitment();
         taken.insert(commitment);
         let memo = shielded_chain::shield_memo(&commitment);
-        let sign_bytes = tx_signing_bytes_v2(&from, SHIELDED_POOL_ADDR, *value, nonce, now, CHAIN_ID, &memo);
-        let ed_sig = kp.sign_ed25519(&sign_bytes);
-        let dil_sig = kp.sign_dilithium(&sign_bytes);
-        let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
         let summary = tx_human_summary(&from, SHIELDED_POOL_ADDR, *value, &memo, CHAIN_ID, nonce, fee);
-        txs.push(LedgerTx {
-            hash: hash.clone(),
+        let mut tx = LedgerTx {
             from: from.clone(),
             to: SHIELDED_POOL_ADDR.to_string(),
             amount: *value,
             memo: Some(memo),
             timestamp: now,
-            signature: hex::encode(ed_sig.as_bytes()),
             status: "Pending".into(),
             block_height: None,
             nonce,
-            public_key_ed25519: ed_pk.clone(),
-            dilithium_pubkey: dil_pk.clone(),
-            dilithium_signature: hex::encode(&dil_sig.signature_data),
             tx_type: TX_SHIELD.to_string(),
             fee_uegoc: fee,
-            tx_version: 2,
             chain_id: CHAIN_ID,
             signed_summary: summary,
             ..LedgerTx::default()
-        });
+        };
+        crate::ledger::seal_tx(&mut tx, &kp, true);
+        let hash = tx.hash.clone();
+        txs.push(tx);
         stored.push(StoredNote {
             note,
             commitment: hex::encode(commitment),

@@ -407,6 +407,7 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
                 "next": confirmed.max(pending_max) + 1,
                 "fee_uegoc": fee,
                 "chain_id": 1,
+                "tx_version": crate::ledger::signing_tx_version(),
             }))
         }
 

@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{contract_commit_memo, contracts_dir, tx_signing_bytes_v2, Ledger, LedgerTx};
+use crate::ledger::{contract_commit_memo, contracts_dir, Ledger, LedgerTx};
 use ego_vm::{CallResult, VmError};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -65,26 +65,16 @@ pub(crate) fn build_contract_tx(
     fee: u64,
 ) -> LedgerTx {
     let memo = contract_commit_memo(tx_type, entrypoint, args_hex, code_hash);
-    let sign_bytes = tx_signing_bytes_v2(from, contract_addr, 0, nonce, ts, CHAIN_ID, &memo);
-    let ed_sig  = kp.sign_ed25519(&sign_bytes);
-    let dil_sig = kp.sign_dilithium(&sign_bytes);
-
-    LedgerTx {
-        hash: format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex()),
+    let mut tx = LedgerTx {
         from: from.to_string(),
         to: contract_addr.to_string(),
         amount: 0,
         memo: Some(memo),
         timestamp: ts,
-        signature: hex::encode(ed_sig.as_bytes()),
         status: "Pending".into(),
         block_height: None,
         nonce,
-        public_key_ed25519: hex::encode(kp.ed25519_public_key().as_bytes()),
-        dilithium_pubkey: hex::encode(&kp.dilithium_public_key().key_data),
-        dilithium_signature: hex::encode(&dil_sig.signature_data),
         fee_uegoc: fee,
-        tx_version: 2,
         chain_id: CHAIN_ID,
         tx_type: tx_type.to_string(),
         contract_addr: contract_addr.to_string(),
@@ -92,7 +82,9 @@ pub(crate) fn build_contract_tx(
         call_args: args_hex.to_string(),
         wasm_code: wasm_hex.to_string(),
         ..LedgerTx::default()
-    }
+    };
+    crate::ledger::seal_tx(&mut tx, kp, true);
+    tx
 }
 
 fn err(msg: impl Into<String>) -> EgoDesktopError {

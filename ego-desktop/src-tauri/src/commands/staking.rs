@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, tx_signing_bytes_v2, Ledger, LedgerTx};
+use crate::ledger::{load_chain, Ledger, LedgerTx};
 use crate::tokenomics::{staking_pool_remaining_uegoc, effective_apr_bps};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -202,49 +202,26 @@ pub async fn stake_coins(
     let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let ts         = chrono::Utc::now().timestamp();
     let memo       = format!("stake:{lock_days}");
-    let sign_bytes = tx_signing_bytes_v2(
-        &from,
-        STAKING_ADDR,
-        amount_uegoc,
-        nonce,
-        ts,
-        STAKING_CHAIN_ID,
-        &memo,
-    );
-    let (sig_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
-        let ed_sig = kp.sign_ed25519(&sign_bytes);
-        let dil_sig = kp.sign_dilithium(&sign_bytes);
-        (
-            hex::encode(ed_sig.as_bytes()),
-            hex::encode(kp.ed25519_public_key().as_bytes()),
-            hex::encode(&dil_sig.signature_data),
-            hex::encode(kp.dilithium_public_key().key_data),
-        )
-    } else {
+    let Some(kp) = state.get_keypair() else {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     };
-    let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-
-    crate::mempool::get_mempool().push(LedgerTx {
-        hash:               tx_hash.clone(),
+    let mut stake_tx = LedgerTx {
         from:               from.clone(),
         to:                 STAKING_ADDR.to_string(),
         amount:             amount_uegoc,
         memo:               Some(memo),
         timestamp:          ts,
-        signature:          sig_hex,
         status:             "Pending".into(),
         block_height:       None,
         nonce,
-        public_key_ed25519: pubkey_hex,
-        dilithium_pubkey:   dil_pubkey_hex,
-        dilithium_signature: dil_sig_hex,
         tx_type:            "stake".to_string(),
         fee_uegoc,
-        tx_version:         2,
         chain_id:           STAKING_CHAIN_ID,
         ..LedgerTx::default()
-    });
+    };
+    crate::ledger::seal_tx(&mut stake_tx, &kp, true);
+    let tx_hash = stake_tx.hash.clone();
+    crate::mempool::get_mempool().push(stake_tx);
 
     ledger.stake_positions.push(crate::ledger::StakePosition {
         id: tx_hash.clone(),
@@ -342,39 +319,22 @@ pub async fn unstake_coins(
     };
 
     let unstake_nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
-    let sign_bytes = tx_signing_bytes_v2(
-        &from,
-        STAKING_ADDR,
-        staked_amount,
-        unstake_nonce,
-        ts,
-        STAKING_CHAIN_ID,
-        &memo,
-    );
-    let ed_sig = kp.sign_ed25519(&sign_bytes);
-    let dil_sig = kp.sign_dilithium(&sign_bytes);
-    let unstake_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-
-    crate::mempool::get_mempool().push(LedgerTx {
-        hash:                unstake_hash,
+    let mut unstake_tx = LedgerTx {
         from:                from.clone(),
         to:                  STAKING_ADDR.to_string(),
         amount:              staked_amount,
         memo:                Some(memo),
         timestamp:           ts,
-        signature:           hex::encode(ed_sig.as_bytes()),
         status:              "Pending".into(),
         block_height:        None,
         nonce:               unstake_nonce,
-        public_key_ed25519:  hex::encode(kp.ed25519_public_key().as_bytes()),
-        dilithium_pubkey:    hex::encode(kp.dilithium_public_key().key_data),
-        dilithium_signature: hex::encode(&dil_sig.signature_data),
         tx_type:             "unstake".to_string(),
         fee_uegoc,
-        tx_version:          2,
         chain_id:            STAKING_CHAIN_ID,
         ..LedgerTx::default()
-    });
+    };
+    crate::ledger::seal_tx(&mut unstake_tx, &kp, true);
+    crate::mempool::get_mempool().push(unstake_tx);
 
     // Both principal AND accrued APR reward are settled deterministically at
     // block-commit, derived from on-chain data (see chain_db: unstake_credit_amount

@@ -4138,6 +4138,8 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                     return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
                 }
         } else {
+            crate::ledger::check_tx_version_at(tx, block.height)
+                .map_err(|e| format!("tx {} rejected: {}", tx.hash, e))?;
             crate::ledger::verify_confirmed_tx_sig(tx)
                 .map_err(|e| format!("tx {} rejected: {}", tx.hash, e))?;
         }

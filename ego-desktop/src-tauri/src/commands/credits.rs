@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{tx_signing_bytes_v2, Ledger, LedgerTx};
+use crate::ledger::{Ledger, LedgerTx};
 use serde::Serialize;
 use tauri::State;
 
@@ -32,36 +32,26 @@ pub(crate) fn build_signed_tx(
     let from = ledger.address.clone();
     let nonce = crate::ledger::next_nonce_for(&from, ledger.nonce);
     let ts = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes_v2(&from, to, amount, nonce, ts, CHAIN_ID, &memo);
-
     let Some(kp) = state.get_keypair() else {
         return Err(EgoDesktopError::WalletError(
             "Wallet not initialized – call init_wallet first".into(),
         ));
     };
-    let ed_sig = kp.sign_ed25519(&sign_bytes);
-    let dil_sig = kp.sign_dilithium(&sign_bytes);
-
-    let tx = LedgerTx {
-        hash: format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex()),
+    let mut tx = LedgerTx {
         from,
         to: to.to_string(),
         amount,
         memo: Some(memo),
         timestamp: ts,
-        signature: hex::encode(ed_sig.as_bytes()),
         status: "Pending".into(),
         block_height: None,
         nonce,
-        public_key_ed25519: hex::encode(kp.ed25519_public_key().as_bytes()),
-        dilithium_pubkey: hex::encode(&kp.dilithium_public_key().key_data),
-        dilithium_signature: hex::encode(&dil_sig.signature_data),
         fee_uegoc: fee,
-        tx_version: 2,
         chain_id: CHAIN_ID,
         tx_type: tx_type.to_string(),
         ..LedgerTx::default()
     };
+    crate::ledger::seal_tx(&mut tx, &kp, true);
     ledger.nonce = nonce;
     Ok(tx)
 }

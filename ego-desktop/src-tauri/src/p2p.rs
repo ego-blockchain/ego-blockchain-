@@ -11454,12 +11454,7 @@ pub fn maybe_emit_validator_registration() {
 
     let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let ts = chrono::Utc::now().timestamp();
-    let sign_bytes = crate::ledger::tx_signing_bytes_v2(&addr, &addr, 0, nonce, ts, 1, &memo);
-    let signature = hex::encode(sk.sign(&sign_bytes).to_bytes());
-    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-
-    let tx = crate::ledger::LedgerTx {
-        hash,
+    let mut tx = crate::ledger::LedgerTx {
         from: addr.clone(),
         to: addr.clone(),
         amount: 0,
@@ -11469,12 +11464,14 @@ pub fn maybe_emit_validator_registration() {
         status: "Pending".into(),
         nonce,
         public_key_ed25519: ed_pk_hex,
-        signature,
         tx_type: "validator_register".into(),
-        tx_version: 2,
+        tx_version: crate::ledger::signing_tx_version(),
         chain_id: 1,
         ..crate::ledger::LedgerTx::default()
     };
+    let sign_bytes = crate::ledger::tx_signing_bytes_for(&tx);
+    tx.signature = hex::encode(sk.sign(&sign_bytes).to_bytes());
+    tx.hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
 
     match crate::mempool::get_mempool().push(tx) {
         Ok(()) => {

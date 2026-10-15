@@ -655,7 +655,7 @@ export function shieldDeposit(ctx: ShieldedContext, amountUegoc: number): Promis
     const derived = await deriveNotes(values.map((v, k) => ({ ...noteSecrets(ctx.seed, first + k), values: [v] })));
     const created = now();
     const txs = values.map((value, k) =>
-      buildSignedEgoTx(ctx.seed, ctx.address, POOL_ADDRESS, value, info.next + k, fee, shieldMemo(derived[k].commitment), TX_SHIELD),
+      buildSignedEgoTx(ctx.seed, ctx.address, POOL_ADDRESS, value, info.next + k, fee, shieldMemo(derived[k].commitment), TX_SHIELD, info.tx_version ?? 2),
     );
     const fresh: StoredNote[] = values.map((value, k) => ({
       index: first + k,

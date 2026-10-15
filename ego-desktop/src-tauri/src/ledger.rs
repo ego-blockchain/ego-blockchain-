@@ -1643,20 +1643,7 @@ pub fn credited_to_recipient(tx: &LedgerTx) -> u64 {
 }
 
 pub(crate) fn expected_standard_tx_hash(tx: &LedgerTx) -> String {
-    let msg = if tx.tx_version >= 2 {
-        tx_signing_bytes_v2(
-            &tx.from,
-            &tx.to,
-            tx.amount,
-            tx.nonce,
-            tx.timestamp,
-            tx.chain_id,
-            tx.memo.as_deref().unwrap_or(""),
-        )
-    } else {
-        tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp)
-    };
-    format!("0x{}", ego_core::hash_data(&msg).to_hex())
+    format!("0x{}", ego_core::hash_data(&tx_signing_bytes_for(tx)).to_hex())
 }
 
 fn tx_hash_must_match_standard_signing(tx: &LedgerTx) -> bool {
@@ -1691,12 +1678,11 @@ pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
     let vk  = VerifyingKey::from_bytes(&pk_arr)
         .map_err(|e| format!("invalid pubkey: {e}"))?;
     let sig = DalekSig::from_bytes(&sig_arr);
-    let msg = if tx.tx_version >= 2 {
-        tx_signing_bytes_v2(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp,
-            tx.chain_id, tx.memo.as_deref().unwrap_or(""))
-    } else {
-        tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp)
-    };
+    match tx.block_height {
+        Some(h) => check_tx_version_at(tx, h)?,
+        None => check_tx_version_known(tx)?,
+    }
+    let msg = tx_signing_bytes_for(tx);
     vk.verify(&msg, &sig).map_err(|_| "Ed25519 signature invalid".to_string())?;
     let dilithium_disabled = crate::chain_db::is_feature_disabled(
         crate::chain_db::FEATURE_DILITHIUM_DISABLED,
@@ -1878,14 +1864,8 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         .map_err(|e| format!("invalid pubkey: {e}"))?;
     let sig = DalekSig::from_bytes(&sig_arr);
 
-    let msg = if tx.tx_version >= 2 {
-        tx_signing_bytes_v2(
-            &tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp,
-            tx.chain_id, tx.memo.as_deref().unwrap_or(""),
-        )
-    } else {
-        tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp)
-    };
+    check_tx_version_at(tx, crate::chain_db::local_chain_height().saturating_add(1))?;
+    let msg = tx_signing_bytes_for(tx);
     vk.verify(&msg, &sig)
         .map_err(|_| format!("Ed25519 signature verification failed for TX from {}", tx.from))?;
     verify_sender_binding(tx, &pk_arr, &msg, dilithium_disabled)?;
@@ -1965,6 +1945,98 @@ fn verify_sender_binding(tx: &LedgerTx, ed_pk: &[u8; 32], msg: &[u8], dilithium_
         return Err(format!("ML-DSA-44 signature invalid for TX from {}", tx.from));
     }
     Ok(())
+}
+
+pub const TX_V3_FROM_HEIGHT: u64 = 30_000;
+pub const TX_V2_UNTIL_HEIGHT: u64 = 40_000;
+pub const MAX_MEMO_BYTES: usize = 256;
+
+pub fn tx_version_for_height(height: u64) -> u8 {
+    if height >= TX_V3_FROM_HEIGHT { 3 } else { 2 }
+}
+
+pub fn signing_tx_version() -> u8 {
+    tx_version_for_height(crate::chain_db::local_chain_height().saturating_add(1))
+}
+
+fn check_tx_version_known(tx: &LedgerTx) -> Result<(), String> {
+    if tx.tx_version > 3 {
+        return Err(format!("unknown transaction version {}", tx.tx_version));
+    }
+    if tx.tx_version == 3 && tx.memo.as_deref().map(str::len).unwrap_or(0) > MAX_MEMO_BYTES {
+        return Err(format!("memo longer than {MAX_MEMO_BYTES} bytes"));
+    }
+    Ok(())
+}
+
+pub fn check_tx_version_at(tx: &LedgerTx, height: u64) -> Result<(), String> {
+    check_tx_version_known(tx)?;
+    if tx.tx_version == 3 && height < TX_V3_FROM_HEIGHT {
+        return Err(format!("version 3 transactions are valid from block {TX_V3_FROM_HEIGHT}"));
+    }
+    if tx.tx_version < 3 && height >= TX_V2_UNTIL_HEIGHT {
+        return Err(format!(
+            "version {} transactions do not sign their fee and were retired at block {TX_V2_UNTIL_HEIGHT}; update the wallet",
+            tx.tx_version
+        ));
+    }
+    Ok(())
+}
+
+pub fn tx_signing_bytes_for(tx: &LedgerTx) -> Vec<u8> {
+    match tx.tx_version {
+        3 => tx_signing_bytes_v3(tx),
+        v if v >= 2 => tx_signing_bytes_v2(
+            &tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp,
+            tx.chain_id, tx.memo.as_deref().unwrap_or(""),
+        ),
+        _ => tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp),
+    }
+}
+
+pub fn tx_signing_bytes_v3(tx: &LedgerTx) -> Vec<u8> {
+    let memo = tx.memo.as_deref().unwrap_or("").as_bytes();
+    let mut v = Vec::with_capacity(160 + memo.len());
+    v.extend_from_slice(b"ego/tx/v3:");
+    v.push(tx.chain_id);
+    v.push(b':');
+    v.extend_from_slice(tx.from.as_bytes());
+    v.push(b':');
+    v.extend_from_slice(tx.to.as_bytes());
+    v.push(b':');
+    v.extend_from_slice(&tx.amount.to_le_bytes());
+    v.push(b':');
+    v.extend_from_slice(&tx.nonce.to_le_bytes());
+    v.push(b':');
+    v.extend_from_slice(&tx.timestamp.to_le_bytes());
+    v.push(b':');
+    v.extend_from_slice(&tx.fee_uegoc.to_le_bytes());
+    v.push(b':');
+    v.extend_from_slice(&tx.priority_fee_uegoc.to_le_bytes());
+    v.push(b':');
+    v.extend_from_slice(&(tx.tx_type.len() as u32).to_le_bytes());
+    v.extend_from_slice(tx.tx_type.as_bytes());
+    v.push(b':');
+    v.extend_from_slice(&(memo.len() as u32).to_le_bytes());
+    v.extend_from_slice(memo);
+    v
+}
+
+pub fn seal_tx(tx: &mut LedgerTx, kp: &ego_core::KeyPair, with_dilithium: bool) {
+    if tx.tx_version == 0 {
+        tx.tx_version = signing_tx_version();
+    }
+    let msg = tx_signing_bytes_for(tx);
+    tx.public_key_ed25519 = hex::encode(kp.ed25519_public_key().as_bytes());
+    tx.signature = hex::encode(kp.sign_ed25519(&msg).as_bytes());
+    if with_dilithium {
+        tx.dilithium_pubkey = hex::encode(&kp.dilithium_public_key().key_data);
+        tx.dilithium_signature = hex::encode(&kp.sign_dilithium(&msg).signature_data);
+    } else {
+        tx.dilithium_pubkey.clear();
+        tx.dilithium_signature.clear();
+    }
+    tx.hash = format!("0x{}", ego_core::hash_data(&msg).to_hex());
 }
 
 pub fn tx_signing_bytes(from: &str, to: &str, amount: u64, nonce: u64, timestamp: i64) -> Vec<u8> {
@@ -2110,5 +2182,95 @@ mod sender_binding_tests {
         let bytes = tx_signing_bytes_v2("a", "b", 1, 1, 1, 1, &memo);
         let tail = &bytes[bytes.len() - 256..];
         assert_eq!(tail, &memo.as_bytes()[..256]);
+    }
+}
+
+#[cfg(test)]
+mod tx_v3_tests {
+    use super::*;
+
+    const VECTOR: &str = "65676f2f74782f76333a013a65676f743173656e6465723a65676f7431726563697069656e743aa0252600000000003a07000000000000003a00d2496b000000003ae8030000000000003a00000000000000003a080000007472616e736665723a050000006c756e6368";
+
+    fn sealed(kp: &ego_core::KeyPair) -> LedgerTx {
+        let from = ego_core::EgoAddress::from_public_key_bytes(kp.ed25519_public_key().as_bytes(), 1, ego_core::AddressType::EOA)
+            .to_bech32("egot").unwrap();
+        let mut tx = LedgerTx {
+            from,
+            to: "egot1recipient".into(),
+            amount: 2_500_000,
+            nonce: 7,
+            timestamp: 1_800_000_000,
+            chain_id: 1,
+            tx_version: 3,
+            tx_type: "transfer".into(),
+            fee_uegoc: 1_000,
+            memo: Some("lunch".into()),
+            block_height: Some(TX_V3_FROM_HEIGHT),
+            ..LedgerTx::default()
+        };
+        seal_tx(&mut tx, kp, false);
+        tx
+    }
+
+    #[test]
+    fn v3_bytes_match_the_shared_vector() {
+        let tx = LedgerTx {
+            from: "egot1sender".into(),
+            to: "egot1recipient".into(),
+            amount: 2_500_000,
+            nonce: 7,
+            timestamp: 1_800_000_000,
+            chain_id: 1,
+            tx_version: 3,
+            tx_type: "transfer".into(),
+            fee_uegoc: 1_000,
+            memo: Some("lunch".into()),
+            ..LedgerTx::default()
+        };
+        assert_eq!(hex::encode(tx_signing_bytes_for(&tx)), VECTOR);
+    }
+
+    #[test]
+    fn a_sealed_v3_transaction_verifies() {
+        let kp = ego_core::KeyPair::generate();
+        assert!(verify_confirmed_tx_sig(&sealed(&kp)).is_ok());
+    }
+
+    #[test]
+    fn changing_the_fee_or_type_breaks_the_signature() {
+        let kp = ego_core::KeyPair::generate();
+        let mut raised = sealed(&kp);
+        raised.fee_uegoc = 900_000;
+        assert!(verify_confirmed_tx_sig(&raised).is_err());
+        let mut tipped = sealed(&kp);
+        tipped.priority_fee_uegoc = 1;
+        assert!(verify_confirmed_tx_sig(&tipped).is_err());
+        let mut retyped = sealed(&kp);
+        retyped.tx_type = "stake".into();
+        assert!(verify_confirmed_tx_sig(&retyped).is_err());
+    }
+
+    #[test]
+    fn versions_switch_at_their_heights() {
+        let v2 = LedgerTx { tx_version: 2, ..LedgerTx::default() };
+        let v3 = LedgerTx { tx_version: 3, ..LedgerTx::default() };
+        let v4 = LedgerTx { tx_version: 4, ..LedgerTx::default() };
+        assert!(check_tx_version_at(&v2, TX_V3_FROM_HEIGHT).is_ok());
+        assert!(check_tx_version_at(&v2, TX_V2_UNTIL_HEIGHT - 1).is_ok());
+        assert!(check_tx_version_at(&v2, TX_V2_UNTIL_HEIGHT).is_err());
+        assert!(check_tx_version_at(&v3, TX_V3_FROM_HEIGHT - 1).is_err());
+        assert!(check_tx_version_at(&v3, TX_V3_FROM_HEIGHT).is_ok());
+        assert!(check_tx_version_at(&v4, TX_V3_FROM_HEIGHT).is_err());
+        assert_eq!(tx_version_for_height(TX_V3_FROM_HEIGHT - 1), 2);
+        assert_eq!(tx_version_for_height(TX_V3_FROM_HEIGHT), 3);
+    }
+
+    #[test]
+    fn a_v3_memo_is_signed_whole_and_capped() {
+        let long = LedgerTx { tx_version: 3, memo: Some("x".repeat(MAX_MEMO_BYTES + 1)), ..LedgerTx::default() };
+        assert!(check_tx_version_at(&long, TX_V3_FROM_HEIGHT).is_err());
+        let fits = LedgerTx { tx_version: 3, memo: Some("é".repeat(MAX_MEMO_BYTES / 2)), ..LedgerTx::default() };
+        assert!(check_tx_version_at(&fits, TX_V3_FROM_HEIGHT).is_ok());
+        assert!(tx_signing_bytes_for(&fits).ends_with("é".repeat(MAX_MEMO_BYTES / 2).as_bytes()));
     }
 }

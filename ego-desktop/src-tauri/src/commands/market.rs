@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{data_dir, tx_human_summary, tx_signing_bytes_v2, Ledger, LedgerTx};
+use crate::ledger::{data_dir, tx_human_summary, Ledger, LedgerTx};
 use crate::market_chain::{
     self as market, ArbiterBody, DisputeBody, EscrowRef, Family, FeedbackBody, LockBody, OfferBody, OfferRef,
     Outcome, Price, Rating, Role, SettleBody, Side, Trade, TradeOpenBody, TradeRef, TradeState, MARKET_CHAIN_ID,
@@ -326,31 +326,24 @@ pub fn build_op_tx(
     now: i64,
 ) -> Result<LedgerTx, String> {
     let memo = market::op_memo(tx_type, &call_args).ok_or_else(|| format!("{tx_type} is not a market operation"))?;
-    let sign_bytes = tx_signing_bytes_v2(from, MARKET_ESCROW_ADDR, amount, nonce, now, MARKET_CHAIN_ID, &memo);
-    let ed_sig = kp.sign_ed25519(&sign_bytes);
-    let dil_sig = kp.sign_dilithium(&sign_bytes);
-    Ok(LedgerTx {
-        hash: format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex()),
+    let mut tx = LedgerTx {
         from: from.to_string(),
         to: MARKET_ESCROW_ADDR.to_string(),
         amount,
         memo: Some(memo.clone()),
         timestamp: now,
-        signature: hex::encode(ed_sig.as_bytes()),
         status: "Pending".into(),
         block_height: None,
         nonce,
-        public_key_ed25519: hex::encode(kp.ed25519_public_key().as_bytes()),
-        dilithium_pubkey: hex::encode(&kp.dilithium_public_key().key_data),
-        dilithium_signature: hex::encode(&dil_sig.signature_data),
         tx_type: tx_type.to_string(),
         fee_uegoc: fee,
         call_args,
-        tx_version: 2,
         chain_id: MARKET_CHAIN_ID,
         signed_summary: tx_human_summary(from, MARKET_ESCROW_ADDR, amount, &memo, MARKET_CHAIN_ID, nonce, fee),
         ..LedgerTx::default()
-    })
+    };
+    crate::ledger::seal_tx(&mut tx, kp, true);
+    Ok(tx)
 }
 
 async fn submit_op(

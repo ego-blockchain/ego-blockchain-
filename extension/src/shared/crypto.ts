@@ -151,7 +151,7 @@ export function txSigningBytesV2(
   memo: string,
 ): Uint8Array {
   const enc = new TextEncoder();
-  const memoBytes = enc.encode(memo.slice(0, 256));
+  const memoBytes = enc.encode(memo).slice(0, 256);
   const colon = new Uint8Array([0x3a]);
   const memoLen = new Uint8Array(4);
   new DataView(memoLen.buffer).setUint32(0, memoBytes.length, true);
@@ -171,6 +171,79 @@ export function txSigningBytesV2(
   let off = 0;
   for (const a of parts) { out.set(a, off); off += a.length; }
   return out;
+}
+
+// Byte-identical mirror of Ego Desktop's ledger::tx_signing_bytes_v3, which
+// also signs the fee, the priority fee and the transaction type:
+// "ego/tx/v3:" chain_id ':' from ':' to ':' amount_u64le ':' nonce_u64le ':'
+// timestamp_i64le ':' fee_u64le ':' priority_fee_u64le ':' type_len_u32le type ':'
+// memo_len_u32le memo
+export function txSigningBytesV3(
+  from: string,
+  to: string,
+  amountUegoc: bigint,
+  nonce: bigint,
+  timestamp: bigint,
+  chainId: number,
+  feeUegoc: bigint,
+  priorityFeeUegoc: bigint,
+  txType: string,
+  memo: string,
+): Uint8Array {
+  const enc = new TextEncoder();
+  const memoBytes = enc.encode(memo);
+  if (memoBytes.length > MAX_MEMO_BYTES) {
+    throw new Error(`Memo is longer than ${MAX_MEMO_BYTES} bytes`);
+  }
+  const typeBytes = enc.encode(txType);
+  const colon = new Uint8Array([0x3a]);
+  const parts = [
+    enc.encode('ego/tx/v3:'),
+    new Uint8Array([chainId]), colon,
+    enc.encode(from), colon,
+    enc.encode(to), colon,
+    u64le(amountUegoc), colon,
+    u64le(nonce), colon,
+    u64le(BigInt.asUintN(64, timestamp)), colon,
+    u64le(feeUegoc), colon,
+    u64le(priorityFeeUegoc), colon,
+    u32le(typeBytes.length), typeBytes, colon,
+    u32le(memoBytes.length), memoBytes,
+  ];
+  const total = parts.reduce((s, a) => s + a.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const a of parts) { out.set(a, off); off += a.length; }
+  return out;
+}
+
+export const MAX_MEMO_BYTES = 256;
+
+function u32le(n: number): Uint8Array {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n, true);
+  return b;
+}
+
+function txSigningBytes(
+  version: number,
+  from: string,
+  to: string,
+  amountUegoc: number,
+  nonce: number,
+  timestamp: number,
+  chainId: number,
+  feeUegoc: number,
+  txType: string,
+  memo: string,
+): Uint8Array {
+  if (version === 3) {
+    return txSigningBytesV3(
+      from, to, BigInt(amountUegoc), BigInt(nonce), BigInt(timestamp), chainId,
+      BigInt(feeUegoc), BigInt(0), txType, memo,
+    );
+  }
+  return txSigningBytesV2(from, to, BigInt(amountUegoc), BigInt(nonce), BigInt(timestamp), chainId, memo);
 }
 
 export interface SignedEgoTx {
@@ -202,11 +275,12 @@ export function buildSignedEgoTx(
   feeUegoc: number,
   memo: string,
   txType = 'transfer',
+  txVersion = 2,
 ): SignedEgoTx {
   const chainId = 1;
   const timestamp = Math.floor(Date.now() / 1000);
-  const signBytes = txSigningBytesV2(
-    from, to, BigInt(amountUegoc), BigInt(nonce), BigInt(timestamp), chainId, memo,
+  const signBytes = txSigningBytes(
+    txVersion, from, to, amountUegoc, nonce, timestamp, chainId, feeUegoc, txType, memo,
   );
   const keypair = nacl.sign.keyPair.fromSeed(seed);
   const sig = nacl.sign.detached(signBytes, keypair.secretKey);
@@ -225,7 +299,7 @@ export function buildSignedEgoTx(
     public_key_ed25519: toHex(keypair.publicKey),
     fee_uegoc: feeUegoc,
     tx_type: txType,
-    tx_version: 2,
+    tx_version: txVersion,
     chain_id: chainId,
   };
 }
@@ -251,12 +325,13 @@ export function buildSignedContractCallTx(
   argsHex: string,
   nonce: number,
   feeUegoc: number,
+  txVersion = 2,
 ): SignedEgoTx & { contract_addr: string; entrypoint: string; call_args: string } {
   const chainId = 1;
   const timestamp = Math.floor(Date.now() / 1000);
   const memo = contractCommitMemo(entrypoint, argsHex);
-  const signBytes = txSigningBytesV2(
-    from, contractAddr, BigInt(0), BigInt(nonce), BigInt(timestamp), chainId, memo,
+  const signBytes = txSigningBytes(
+    txVersion, from, contractAddr, 0, nonce, timestamp, chainId, feeUegoc, 'call', memo,
   );
   const keypair = nacl.sign.keyPair.fromSeed(seed);
   const sig = nacl.sign.detached(signBytes, keypair.secretKey);
@@ -274,7 +349,7 @@ export function buildSignedContractCallTx(
     public_key_ed25519: toHex(keypair.publicKey),
     fee_uegoc: feeUegoc,
     tx_type: 'call',
-    tx_version: 2,
+    tx_version: txVersion,
     chain_id: chainId,
     contract_addr: contractAddr,
     entrypoint,

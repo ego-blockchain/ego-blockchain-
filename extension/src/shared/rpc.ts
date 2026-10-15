@@ -59,6 +59,7 @@ export interface NonceInfo {
   next: number;
   fee_uegoc: number;
   chain_id: number;
+  tx_version?: number;
 }
 
 export async function getNonceInfo(

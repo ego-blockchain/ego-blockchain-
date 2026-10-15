@@ -735,42 +735,27 @@ pub async fn purchase_hosting_plan(
     } else {
         format!("hosting_plan:{}:{}", tier.trim(), months)
     };
-    let sign_bytes = crate::ledger::tx_signing_bytes_v2(
-        &owner, HOSTING_FEE_SINK, 0, nonce, now, 1, &memo,
-    );
-
-    let (sig_hex, dil_pk, dil_sig) = if let Some(kp) = state.get_keypair() {
-        (
-            hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes()),
-            hex::encode(kp.dilithium_public_key().key_data),
-            hex::encode(kp.sign_dilithium(&sign_bytes).as_bytes()),
-        )
-    } else {
+    let Some(kp) = state.get_keypair() else {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     };
 
-    let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-
-    let pending_tx = crate::ledger::LedgerTx {
-        hash:                tx_hash.clone(),
+    let mut pending_tx = crate::ledger::LedgerTx {
         from:                owner.clone(),
         to:                  HOSTING_FEE_SINK.to_string(),
         amount:              0,
         memo:                Some(memo.clone()),
         timestamp:           now,
-        signature:           sig_hex,
-        dilithium_pubkey:    dil_pk,
-        dilithium_signature: dil_sig,
         status:              "Pending".into(),
         block_height:        None,
         nonce,
-        tx_version:          2,
         chain_id:            1,
         fee_uegoc:           if pay_egusd { 0 } else { total_uegoc },
         tx_type:             if pay_egusd { "credits_pay".into() } else { "hosting_plan".into() },
         signed_summary:      memo.clone(),
         ..crate::ledger::LedgerTx::default()
     };
+    crate::ledger::seal_tx(&mut pending_tx, &kp, true);
+    let tx_hash = pending_tx.hash.clone();
 
     crate::commands::tx_pending::add(&pending_tx);
     crate::mempool::get_mempool().push(pending_tx.clone());

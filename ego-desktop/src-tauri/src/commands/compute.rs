@@ -1340,31 +1340,23 @@ pub async fn book_reservation(
         }
         let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
         let memo  = format!("credits_pay:{}:resv:{}", total_cost, offer_id);
-        let sign_bytes = crate::ledger::tx_signing_bytes_v2(
-            &my_addr, RESERVATION_ESCROW_ADDR, 0, nonce, now, 1, &memo,
-        );
         let kp = state.get_keypair()
             .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
-        let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-        let _ = crate::mempool::get_mempool().push(LedgerTx {
-            hash:                tx_hash,
+        let mut tx = LedgerTx {
             from:                my_addr.clone(),
             to:                  RESERVATION_ESCROW_ADDR.to_string(),
             amount:              0,
             memo:                Some(memo),
             timestamp:           now,
-            signature:           hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes()),
             status:              "Pending".into(),
             nonce,
-            public_key_ed25519:  hex::encode(kp.ed25519_public_key().as_bytes()),
-            dilithium_pubkey:    hex::encode(&kp.dilithium_public_key().key_data),
-            dilithium_signature: hex::encode(&kp.sign_dilithium(&sign_bytes).signature_data),
             fee_uegoc:           fee,
             tx_type:             "credits_pay".to_string(),
-            tx_version:          2,
             chain_id:            1,
             ..LedgerTx::default()
-        });
+        };
+        crate::ledger::seal_tx(&mut tx, &kp, true);
+        let _ = crate::mempool::get_mempool().push(tx);
         ledger.nonce = nonce;
         ledger.save().map_err(EgoDesktopError::FileSystemError)?;
     } else {

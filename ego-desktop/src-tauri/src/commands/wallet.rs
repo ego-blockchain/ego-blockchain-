@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, save_chain, tx_signing_bytes, tx_signing_bytes_v2, tx_human_summary, Ledger, LedgerBlock, LedgerTx};
+use crate::ledger::{load_chain, save_chain, tx_human_summary, Ledger, LedgerBlock, LedgerTx};
 use once_cell::sync::Lazy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -194,44 +194,26 @@ pub async fn send_transaction(
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; // testnet
-    let sign_bytes = tx_signing_bytes_v2(
-        &from, &request.to_address, request.amount, nonce, ts, CHAIN_ID, memo_str,
-    );
-
-    let (signature_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
-        let ed_sig  = kp.sign_ed25519(&sign_bytes);
-        let dil_sig = kp.sign_dilithium(&sign_bytes);
-        let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
-        let dil_pk  = hex::encode(&kp.dilithium_public_key().key_data);
-        (hex::encode(ed_sig.as_bytes()), ed_pk,
-         hex::encode(&dil_sig.signature_data), dil_pk)
-    } else {
+    let Some(kp) = state.get_keypair() else {
         return Err(EgoDesktopError::WalletError(
             "Wallet not initialized – call init_wallet first".into(),
         ));
     };
 
-    let tx_hash     = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
     let summary     = tx_human_summary(
         &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, fee,
     );
 
-    let tx = LedgerTx {
-        hash:                tx_hash.clone(),
+    let mut tx = LedgerTx {
         from:                from.clone(),
         to:                  request.to_address.clone(),
         amount:              request.amount,
         memo:                request.memo.clone(),
         timestamp:           ts,
-        signature:           signature_hex,
         status:              "Pending".into(),
         block_height:        None,
         nonce,
-        public_key_ed25519:  pubkey_hex,
-        dilithium_pubkey:    dil_pubkey_hex,
-        dilithium_signature: dil_sig_hex,
         fee_uegoc:           fee,
-        tx_version:          2,
         chain_id:            CHAIN_ID,
         is_private:          request.is_private.unwrap_or(false) || request.amount >= SHIELD_THRESHOLD_UEGOC,
         signed_summary:      summary.clone(),
@@ -250,6 +232,8 @@ pub async fn send_transaction(
                              },
         ..LedgerTx::default()
     };
+    crate::ledger::seal_tx(&mut tx, &kp, true);
+    let tx_hash = tx.hash.clone();
 
     eprintln!("[TX] {:.12} Pending — {:.16} → {:.16} {} uEGOC nonce={}",
         tx.hash, from, request.to_address, request.amount, nonce);
@@ -382,36 +366,25 @@ pub async fn prepare_transaction(
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; 
-    let sign_bytes = tx_signing_bytes_v2(
-        &from, &request.to_address, request.amount, nonce, ts, CHAIN_ID, memo_str,
-    );
-    let (signature_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
-        let ed_sig  = kp.sign_ed25519(&sign_bytes);
-        let dil_sig = kp.sign_dilithium(&sign_bytes);
-        let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
-        let dil_pk  = hex::encode(&kp.dilithium_public_key().key_data);
-        (hex::encode(ed_sig.as_bytes()), ed_pk,
-         hex::encode(&dil_sig.signature_data), dil_pk)
-    } else {
+    let Some(kp) = state.get_keypair() else {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     };
-    let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
     let summary = tx_human_summary(
         &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, fee,
     );
-    let tx = LedgerTx {
-        hash: tx_hash.clone(), from: from.clone(), to: request.to_address.clone(),
+    let mut tx = LedgerTx {
+        from: from.clone(), to: request.to_address.clone(),
         amount: request.amount, memo: request.memo.clone(), timestamp: ts,
-        signature: signature_hex, status: "Pending".into(),
-        block_height: None, nonce, public_key_ed25519: pubkey_hex,
-        dilithium_pubkey: dil_pubkey_hex, dilithium_signature: dil_sig_hex,
+        status: "Pending".into(),
+        block_height: None, nonce,
         fee_uegoc: fee,
-        tx_version: 2,
         chain_id: CHAIN_ID,
         is_private: request.is_private.unwrap_or(false) || request.amount >= SHIELD_THRESHOLD_UEGOC,
         signed_summary: summary.clone(),
         ..LedgerTx::default()
     };
+    crate::ledger::seal_tx(&mut tx, &kp, true);
+    let tx_hash = tx.hash.clone();
     chain.transactions.push(tx.clone());
     chain.mine_block(&tx_hash, &from);
     let block = chain.blocks.last().cloned().ok_or_else(||
@@ -450,19 +423,7 @@ pub async fn commit_transaction(
     }
 
     let expected_hash = {
-        let sign_bytes = if tx.tx_version >= 2 {
-            tx_signing_bytes_v2(
-                &tx.from,
-                &tx.to,
-                tx.amount,
-                tx.nonce,
-                tx.timestamp,
-                tx.chain_id,
-                tx.memo.as_deref().unwrap_or(""),
-            )
-        } else {
-            tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp)
-        };
+        let sign_bytes = crate::ledger::tx_signing_bytes_for(&tx);
         format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex())
     };
     if tx.hash != expected_hash {
@@ -933,53 +894,31 @@ pub async fn request_tx_code(
                     "Too many pending transactions. Please wait for some to confirm first.".into(),
                 ));
             }
-            let sign_bytes = tx_signing_bytes_v2(
-                &from, &to_address, amount, nonce, ts, CHAIN_ID_2FA, memo_str,
-            );
-
             let hrp = if CHAIN_ID_2FA == 1 { "egot" } else { "ego" };
-            let ed_sig      = kp.sign_ed25519(&sign_bytes);
-            let dil_sig     = kp.sign_dilithium(&sign_bytes);
-            let sig_hex     = hex::encode(ed_sig.as_bytes());
-            let pk_hex      = hex::encode(kp.ed25519_public_key().as_bytes());
-            let dil_sig_raw = hex::encode(&dil_sig.signature_data);
-            let dil_pk_raw  = hex::encode(&kp.dilithium_public_key().key_data);
-
-            let dil_bytes    = hex::decode(&dil_pk_raw).unwrap_or_default();
             let dil_expected = ego_core::EgoAddress::from_dilithium_pk(
-                &dil_bytes, CHAIN_ID_2FA as u32, ego_core::AddressType::EOA,
+                &kp.dilithium_public_key().key_data, CHAIN_ID_2FA as u32, ego_core::AddressType::EOA,
             ).to_bech32(hrp).unwrap_or_default();
-            let (dil_pk_hex, dil_sig_hex) = if dil_expected == from {
-                (dil_pk_raw, dil_sig_raw)
-            } else {
-                (String::new(), String::new())
-            };
 
-            let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
             let summary = tx_human_summary(
                 &from, &to_address, amount, memo_str, CHAIN_ID_2FA, nonce, fee,
             );
-            let tx = LedgerTx {
-                hash:                tx_hash.clone(),
+            let mut tx = LedgerTx {
                 from:                from.clone(),
                 to:                  to_address.clone(),
                 amount,
                 memo:                memo_opt.clone(),
                 timestamp:           ts,
-                signature:           sig_hex,
                 status:              "Pending".into(),
                 block_height:        None,
                 nonce,
-                public_key_ed25519:  pk_hex,
-                dilithium_pubkey:    dil_pk_hex,
-                dilithium_signature: dil_sig_hex,
                 fee_uegoc:           fee,
-                tx_version:          2,
                 chain_id:            CHAIN_ID_2FA,
                 is_private:          request.is_private.unwrap_or(false) || amount >= SHIELD_THRESHOLD_UEGOC,
                 signed_summary:      summary,
                 ..LedgerTx::default()
             };
+            crate::ledger::seal_tx(&mut tx, &kp, dil_expected == from);
+            let tx_hash = tx.hash.clone();
 
             crate::email::check_send_limit(&email).map_err(EgoDesktopError::InvalidInput)?;
 

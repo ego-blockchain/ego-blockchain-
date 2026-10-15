@@ -255,6 +255,8 @@ async function sendTransaction(
       info.next,
       info.fee_uegoc,
       params.memo ?? '',
+      'transfer',
+      info.tx_version ?? 2,
     );
 
     const result = await submitTx(tx, rpcUrl);
@@ -294,6 +296,7 @@ async function callContract(
       (callArgs ?? '').toLowerCase(),
       info.next,
       info.fee_uegoc,
+      info.tx_version ?? 2,
     );
 
     const result = await submitTx(tx, rpcUrl);
