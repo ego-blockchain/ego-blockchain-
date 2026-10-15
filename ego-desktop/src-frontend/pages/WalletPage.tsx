@@ -1321,7 +1321,26 @@ const WalletPage: React.FC = () => {
             {myAddress || 'Loading address…'}
           </div>
         )}
-        {isLiveMode && <div className="mb-5" />}
+        {isLiveMode && (
+          <div className="mb-5 space-y-1.5">
+            <div className="text-xs text-gray-400">Your mainnet address</div>
+            <div className="flex items-center gap-2">
+              <div className="flex-1 min-w-0 rounded-lg px-3 py-2 font-mono text-xs truncate bg-white/5 border border-gray-700 text-gray-200">
+                {mainnetAddress || 'Loading address…'}
+              </div>
+              <button
+                onClick={() => mainnetAddress && copyChainAddress('mainnet', mainnetAddress)}
+                disabled={!mainnetAddress}
+                className="shrink-0 px-3 py-2 rounded-lg text-xs font-bold bg-white/10 hover:bg-white/20 text-gray-200 disabled:opacity-40"
+              >
+                {copiedChain === 'mainnet' ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <div className="text-[11px] text-gray-500">
+              Pre-sale purchases, grants and testnet rewards are credited to this address in the genesis block. It comes from your recovery phrase, so it stays the same on every device you restore it on.
+            </div>
+          </div>
+        )}
 
         <div className={`grid gap-2 ${
           ({ 4: 'grid-cols-4', 5: 'grid-cols-5', 6: 'grid-cols-6' } as Record<number, string>)[

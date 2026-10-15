@@ -2177,11 +2177,24 @@ pub async fn import_wallet_backup(
 /// a zero balance until mainnet launches.
 #[tauri::command]
 pub async fn get_mainnet_address() -> Result<String, EgoDesktopError> {
-    let ledger = Ledger::load();
-    if ledger.mainnet_address.is_empty() {
-        return Err(EgoDesktopError::WalletError("Mainnet address not yet derived".into()));
+    let mut ledger = Ledger::load();
+    if !ledger.mainnet_address.is_empty() {
+        return Ok(ledger.mainnet_address);
     }
-    Ok(ledger.mainnet_address)
+    let seed = crate::ledger::load_seed()
+        .ok()
+        .flatten()
+        .ok_or_else(|| EgoDesktopError::WalletError("Create or unlock a wallet first".into()))?;
+    let seed: [u8; 32] = seed.as_slice().try_into()
+        .map_err(|_| EgoDesktopError::CryptoError("Wallet seed must be 32 bytes".into()))?;
+    let keypair = KeyPair::from_bytes(&seed)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Wallet key: {e}")))?;
+    let address = keypair
+        .derive_bech32_address(0, AddressType::EOA, "ego")
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Mainnet address: {e}")))?;
+    ledger.mainnet_address = address.clone();
+    ledger.save().map_err(EgoDesktopError::WalletError)?;
+    Ok(address)
 }
 
 #[cfg(test)]
