@@ -1858,6 +1858,15 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         if confirmed_balance < required {
             return Err(format!("insufficient balance for staking: needs {}", required));
         }
+        if crate::chain_db::seat_rules_active(crate::chain_db::local_chain_height().saturating_add(1)) {
+            let mark = crate::chain_db::faucet_mark(&tx.from);
+            if required > confirmed_balance.saturating_sub(mark) {
+                return Err(format!(
+                    "faucet coins can't be staked: {} of this balance came from the faucet",
+                    mark / 1_000_000
+                ));
+            }
+        }
     }
 
     if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {

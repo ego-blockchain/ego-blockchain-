@@ -1206,10 +1206,13 @@ pub fn committee_source() -> (Vec<String>, bool) {
     // this, anyone could register a handful of free nodes and outvote the committee.
     // The starting committee keeps its seats without the stake.
     if crate::chain_db::seat_rules_active(deciding) {
+        let needs_uptime = deciding >= crate::chain_db::UPTIME_FROM_HEIGHT;
+        let decided_at = crate::chain_db::get_block_by_height(boundary).map(|b| b.timestamp).unwrap_or(0);
         let joiners: Vec<(String, u64)> = crate::chain_db::registered_validators_with_seat_heights()
             .into_iter()
             .filter(|(a, _)| !genesis.contains(a))
             .filter(|(a, _)| crate::ledger::get_validator_stake(a) >= crate::chain_db::MIN_SEAT_STAKE_UEGOC)
+            .filter(|(a, _)| !needs_uptime || crate::chain_db::has_seat_uptime(a, decided_at))
             .collect();
         let admitted = crate::chain_db::admitted_joiners(&joiners, boundary, crate::chain_db::COMMITTEE_EPOCH);
         on_chain.retain(|a| genesis.contains(a) || admitted.contains(a));

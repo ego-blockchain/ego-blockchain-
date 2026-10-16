@@ -607,6 +607,99 @@ fn uptime_last_key(addr: &str) -> Vec<u8> {
     format!("uptime_last:{addr}").into_bytes()
 }
 
+fn uptime_streak_key(addr: &str) -> Vec<u8> {
+    format!("uptime_streak:{addr}").into_bytes()
+}
+
+/// Consecutive uptime payouts no more than this far apart count as one unbroken streak.
+pub const UPTIME_STREAK_GAP_SECS: i64 = 12 * 3600;
+/// A joiner needs this many unbroken uptime payouts (two days) before it may take a seat.
+pub const SEAT_MIN_UPTIME_STREAK: u32 = 8;
+
+/// (payouts in the current unbroken streak, time of the latest one)
+fn uptime_streak_in(db: &DB, addr: &str) -> (u32, i64) {
+    db.cf_handle(CF_META)
+        .and_then(|cf| db.get_cf(cf, uptime_streak_key(addr)).ok().flatten())
+        .filter(|b| b.len() >= 12)
+        .map(|b| (u32::from_le_bytes(b[..4].try_into().unwrap()), i64::from_le_bytes(b[4..12].try_into().unwrap())))
+        .unwrap_or((0, 0))
+}
+
+pub fn uptime_streak(addr: &str) -> (u32, i64) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    uptime_streak_in(&db, addr)
+}
+
+pub fn next_uptime_streak(prev: (u32, i64), paid_at: i64) -> (u32, i64) {
+    let (count, last) = prev;
+    if count > 0 && paid_at.saturating_sub(last) <= UPTIME_STREAK_GAP_SECS {
+        (count.saturating_add(1), paid_at)
+    } else {
+        (1, paid_at)
+    }
+}
+
+/// Whether a joiner has been reliably online: an unbroken uptime streak long enough, and
+/// still going at the time the committee is decided.
+pub fn has_seat_uptime(addr: &str, decided_at: i64) -> bool {
+    let (count, last) = uptime_streak(addr);
+    count >= SEAT_MIN_UPTIME_STREAK && decided_at.saturating_sub(last) <= UPTIME_STREAK_GAP_SECS
+}
+
+// ── Faucet marks ────────────────────────────────────────────────────────────────────────
+// Faucet coins are free, so they must not buy stake: stake is what stops one person from
+// running a crowd of nodes. A faucet grant marks the coins it pays, and the mark travels
+// with them when they are sent on, so sending them to a fresh address does not wash it
+// off. Stake can only come from unmarked coins.
+
+fn faucet_mark_key(addr: &str) -> Vec<u8> {
+    format!("faucet_mark:{addr}").into_bytes()
+}
+
+fn faucet_mark_in(db: &DB, addr: &str) -> u64 {
+    db.cf_handle(CF_META)
+        .and_then(|cf| db.get_cf(cf, faucet_mark_key(addr)).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0)
+}
+
+pub fn faucet_mark(addr: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    faucet_mark_in(&db, addr)
+}
+
+/// Moves marks for one tx. `mark_of` reads the committed mark for an address the map
+/// has not touched yet. Marked coins are spent first, so the sender keeps its clean ones.
+pub fn apply_faucet_marks(
+    marks: &mut std::collections::HashMap<String, u64>,
+    tx: &LedgerTx,
+    mut mark_of: impl FnMut(&str) -> u64,
+) {
+    if tx.tx_type == "faucet" && tx.from == NODE_POOL_ADDR {
+        let m = marks.entry(tx.to.clone()).or_insert_with(|| mark_of(&tx.to));
+        *m = m.saturating_add(tx.amount);
+        return;
+    }
+    if tx.from.is_empty() || is_unstake_tx(tx) {
+        return;
+    }
+    let (spent, delivered) = if crate::ledger::pays_fee_from_amount(tx) {
+        (tx.amount, tx.amount.saturating_sub(tx.fee_uegoc))
+    } else if is_stake_tx(tx) {
+        (tx.fee_uegoc, 0)
+    } else {
+        (tx.amount.saturating_add(tx.fee_uegoc), tx.amount)
+    };
+    let from_mark = marks.entry(tx.from.clone()).or_insert_with(|| mark_of(&tx.from));
+    let used = spent.min(*from_mark);
+    *from_mark -= used;
+    let carried = used.min(delivered);
+    if carried > 0 && !tx.to.is_empty() {
+        let to_mark = marks.entry(tx.to.clone()).or_insert_with(|| mark_of(&tx.to));
+        *to_mark = to_mark.saturating_add(carried);
+    }
+}
+
 fn uptime_last_paid_in(db: &DB, addr: &str) -> Option<i64> {
     let cf = db.cf_handle(CF_META)?;
     db.get_cf(cf, uptime_last_key(addr))
@@ -1984,6 +2077,11 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         // the QC verifier can reject signers using unregistered keys.
         if tx.tx_type == TX_UPTIME_REWARD && tx.from == NODE_POOL_ADDR {
             batch.put_cf(cf_meta, uptime_last_key(&tx.to), block.timestamp.to_le_bytes());
+            let (count, last) = next_uptime_streak(uptime_streak_in(&db, &tx.to), block.timestamp);
+            let mut rec = Vec::with_capacity(12);
+            rec.extend_from_slice(&count.to_le_bytes());
+            rec.extend_from_slice(&last.to_le_bytes());
+            batch.put_cf(cf_meta, uptime_streak_key(&tx.to), rec);
         }
 
         if tx.tx_type == crate::storage_proof::POST_PROOF_TX {
@@ -2126,6 +2224,18 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
                 &tx.from,
                 &tx.public_key_ed25519,
             );
+        }
+    }
+
+    if seat_rules_active(block.height) {
+        let mut marks: std::collections::HashMap<String, u64> = Default::default();
+        for tx in &fresh_txs {
+            if market_plan.takes_effect(&tx.hash) {
+                apply_faucet_marks(&mut marks, tx, |a| faucet_mark_in(&db, a));
+            }
+        }
+        for (addr, mark) in &marks {
+            batch.put_cf(cf_meta, faucet_mark_key(addr), u64_le(*mark));
         }
     }
 
@@ -3757,6 +3867,13 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         {
             return false;
         }
+        if is_stake_tx(tx) && seat_rules_active(height) {
+            let balance = db.get_cf(cf_bal, tx.from.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            if tx.amount.saturating_add(tx.fee_uegoc) > balance.saturating_sub(faucet_mark_in(&db, &tx.from)) {
+                eprintln!("[TX] {:.12} Rejected — it would stake faucet coins", tx.hash);
+                return false;
+            }
+        }
         if tx.nonce > 0 && blocked_senders.contains(&tx.from) {
             held_back.push((*tx).clone());
             return false;
@@ -4419,7 +4536,21 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
     let mut simulated_balances: std::collections::HashMap<String, u64> = Default::default();
     let mut simulated_nonces: std::collections::HashMap<String, u64> = Default::default();
     let mut simulated_stakes: std::collections::HashMap<String, u64> = Default::default();
+    let mut simulated_marks: std::collections::HashMap<String, u64> = Default::default();
+    let marks_apply = seat_rules_active(block.height);
     for tx in &sorted_txs {
+        if marks_apply && is_stake_tx(tx) {
+            let balance = simulated_balances.get(&tx.from).copied().unwrap_or_else(|| {
+                db.get_cf(cf_bal, tx.from.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+            });
+            let mark = simulated_marks.get(&tx.from).copied().unwrap_or_else(|| faucet_mark_in(db, &tx.from));
+            if tx.amount.saturating_add(tx.fee_uegoc) > balance.saturating_sub(mark) {
+                return Err(format!("stake tx {} would stake faucet coins", tx.hash));
+            }
+        }
+        if marks_apply {
+            apply_faucet_marks(&mut simulated_marks, tx, |a| faucet_mark_in(db, a));
+        }
         if crate::ledger::is_protocol_system_tx(tx) {
             continue;
         }
@@ -8726,5 +8857,55 @@ mod uptime_tests {
         assert_eq!(paid[0].amount, UPTIME_REWARD_UEGOC);
         assert_eq!(paid[0].from, NODE_POOL_ADDR);
         assert_eq!(paid[0].hash, uptime_reward_tx(&txs[0], UPTIME_FROM_HEIGHT, 1_900_000_000).hash);
+    }
+}
+
+#[cfg(test)]
+mod faucet_mark_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn tx(kind: &str, from: &str, to: &str, amount: u64, fee: u64) -> LedgerTx {
+        LedgerTx { tx_type: kind.into(), from: from.into(), to: to.into(), amount, fee_uegoc: fee, ..LedgerTx::default() }
+    }
+
+    #[test]
+    fn faucet_coins_stay_marked_when_passed_on() {
+        let mut m: HashMap<String, u64> = HashMap::new();
+        apply_faucet_marks(&mut m, &tx("faucet", NODE_POOL_ADDR, "a", 1_000, 0), |_| 0);
+        assert_eq!(m["a"], 1_000);
+        apply_faucet_marks(&mut m, &tx("transfer", "a", "b", 600, 10), |_| 0);
+        assert_eq!(m["a"], 390);
+        assert_eq!(m["b"], 600);
+        apply_faucet_marks(&mut m, &tx("transfer", "b", "c", 600, 0), |_| 0);
+        assert_eq!(m["b"], 0);
+        assert_eq!(m["c"], 600);
+    }
+
+    #[test]
+    fn clean_coins_stay_clean_and_marked_ones_go_first() {
+        let mut m: HashMap<String, u64> = HashMap::new();
+        m.insert("a".into(), 100);
+        apply_faucet_marks(&mut m, &tx("transfer", "a", "b", 500, 0), |_| 0);
+        assert_eq!(m["a"], 0);
+        assert_eq!(m["b"], 100);
+        apply_faucet_marks(&mut m, &tx("transfer", "a", "d", 500, 0), |_| 0);
+        assert_eq!(m.get("d").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn staking_never_moves_a_mark_into_the_staking_contract() {
+        let mut m: HashMap<String, u64> = HashMap::new();
+        m.insert("a".into(), 300);
+        apply_faucet_marks(&mut m, &tx("stake", "a", STAKING_ADDR, 1_000, 5), |_| 0);
+        assert_eq!(m["a"], 295);
+        assert_eq!(m.get(STAKING_ADDR).copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn an_uptime_streak_breaks_after_a_long_gap() {
+        assert_eq!(next_uptime_streak((0, 0), 1_000), (1, 1_000));
+        assert_eq!(next_uptime_streak((3, 1_000), 1_000 + UPTIME_STREAK_GAP_SECS), (4, 1_000 + UPTIME_STREAK_GAP_SECS));
+        assert_eq!(next_uptime_streak((3, 1_000), 1_001 + UPTIME_STREAK_GAP_SECS), (1, 1_001 + UPTIME_STREAK_GAP_SECS));
     }
 }
