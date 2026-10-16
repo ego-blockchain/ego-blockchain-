@@ -201,38 +201,6 @@ impl ShardedMempool {
             crate::ledger::get_validator_stake(&tx.from)
         } else { 0 };
 
-        if !is_system {
-            let small_network = crate::p2p::known_validator_count() < 4;
-            if !small_network {
-                let current_height = crate::chain_db::latest_block_info().0;
-                let in_grace = crate::sharding::is_in_grace_period(current_height);
-                if !in_grace {
-                    let tx_shard = crate::sharding::shard_for_address_agreed(&tx.from);
-                    let my_addr = crate::ledger::Ledger::load().address;
-                    let map = crate::sharding::load_shard_map();
-                    let all_nodes: Vec<String> = map
-                        .assignments
-                        .iter()
-                        .map(|a| a.node_address.clone())
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    let my_shard_ids: Vec<u32> =
-                        crate::sharding::my_shards(&my_addr, &map, &all_nodes)
-                            .into_iter()
-                            .map(|(id, _)| id)
-                            .collect();
-                    if !my_shard_ids.contains(&tx_shard) {
-                        let shard_id = tx_shard;
-                        let tx_clone = tx;
-                        tokio::spawn(async move {
-                            crate::p2p::route_tx_to_shard_master(shard_id, tx_clone).await;
-                        });
-                        return Ok(()); // Routed
-                    }
-                }
-            }
-        }
 
         if !is_system {
             if !is_validator_reg && !crate::market_chain::is_settle(&tx) {

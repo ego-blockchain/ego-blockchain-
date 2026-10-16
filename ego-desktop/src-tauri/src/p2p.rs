@@ -1006,6 +1006,8 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
                 // block zero. Waiting for each member to announce would make an offline
                 // member stop the network from ever starting.
                 k
+            } else if let Some(k) = crate::chain_db::registered_dilithium_key(addr) {
+                k
             } else {
                 match pubkeys.get(addr).and_then(|h| hex::decode(h).ok()) {
                     Some(b) if !b.is_empty() => b,
@@ -5565,17 +5567,6 @@ pub async fn broadcast_master_promotion(shard_id: u32, new_master: &str, new_end
     }
 }
 
-pub async fn route_tx_to_shard_master(shard_id: u32, tx: crate::ledger::LedgerTx) {
-    if let Some(endpoint) = crate::sharding::get_shard_master(shard_id) {
-        let msg = P2PMessage::ShardTxRoute { shard_id, tx: tx.clone() };
-        if let Err(_) = send_message_any(&[endpoint], &msg).await {
-            let _ = crate::mempool::get_mempool().push(tx);
-        }
-    } else {
-        let _ = crate::mempool::get_mempool().push(tx);
-    }
-}
-
 pub async fn propose_shard_rebalance(new_count: u32) {
     let current_height = crate::chain_db::latest_block_info().0;
     let effective_at_height = current_height + 100;
@@ -8318,24 +8309,10 @@ async fn handle_event(
                     _ => {}
                 }
             } else if topic == "ego-shard-txs-v1" {
-                if let Ok(P2PMessage::ShardTxRoute { shard_id, tx }) =
+                if let Ok(P2PMessage::ShardTxRoute { tx, .. }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
-                    let my_addr = crate::ledger::Ledger::load().address;
-                    let map = crate::sharding::load_shard_map();
-                    let all_nodes: Vec<String> = map.assignments.iter()
-                        .map(|a| a.node_address.clone())
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter().collect();
-                    let my_shard_ids: Vec<u32> = crate::sharding::my_shards(&my_addr, &map, &all_nodes)
-                        .into_iter().map(|(id, _)| id).collect();
-                    if my_shard_ids.contains(&shard_id) {
-                        let _ = crate::mempool::get_mempool().push(tx);
-                    } else {
-                        tokio::spawn(async move {
-                            route_tx_to_shard_master(shard_id, tx).await;
-                        });
-                    }
+                    let _ = crate::mempool::get_mempool().push(tx);
                 }
             } else if topic == "ego-shard-rebalance-v1" {
                 if let Ok(P2PMessage::ShardRebalance { proposed_shard_count, effective_at_height, proposer }) =
@@ -10034,22 +10011,8 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
 
         P2PMessage::ShardRebalance { .. } => {}
 
-        P2PMessage::ShardTxRoute { shard_id, tx } => {
-            let my_addr = crate::ledger::Ledger::load().address;
-            let map = crate::sharding::load_shard_map();
-            let all_nodes: Vec<String> = map.assignments.iter()
-                .map(|a| a.node_address.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter().collect();
-            let my_shard_ids: Vec<u32> = crate::sharding::my_shards(&my_addr, &map, &all_nodes)
-                .into_iter().map(|(id, _)| id).collect();
-            if my_shard_ids.contains(&shard_id) {
-                        let _ = crate::mempool::get_mempool().push(tx);
-            } else {
-                tokio::spawn(async move {
-                    route_tx_to_shard_master(shard_id, tx).await;
-                });
-            }
+        P2PMessage::ShardTxRoute { tx, .. } => {
+            let _ = crate::mempool::get_mempool().push(tx);
         }
 
         P2PMessage::StorageProofResponse { block_cid, nonce, response_hash, prover } => {
@@ -11478,6 +11441,10 @@ pub fn maybe_emit_validator_registration() {
     };
     let sign_bytes = crate::ledger::tx_signing_bytes_for(&tx);
     tx.signature = hex::encode(sk.sign(&sign_bytes).to_bytes());
+    if let Ok(kp) = ego_core::KeyPair::from_bytes(&seed) {
+        tx.dilithium_pubkey = hex::encode(&kp.dilithium_public_key().key_data);
+        tx.dilithium_signature = hex::encode(&kp.sign_dilithium(&sign_bytes).signature_data);
+    }
     tx.hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
 
     match crate::mempool::get_mempool().push(tx.clone()) {

@@ -539,6 +539,36 @@ fn val_seated_key(addr: &str) -> Vec<u8> {
     format!("val_seated:{addr}").into_bytes()
 }
 
+fn val_dil_key(addr: &str) -> Vec<u8> {
+    format!("val_dil:{addr}").into_bytes()
+}
+
+/// The Dilithium key a registration proves it holds: the tx carries the key and a
+/// Dilithium signature over its own signing bytes. Recording it on chain lets every
+/// node seat the validator from chain state alone, instead of waiting to hear its
+/// announcement, which a node that missed it would never get.
+pub fn registration_dilithium_key(tx: &LedgerTx) -> Option<Vec<u8>> {
+    if tx.dilithium_pubkey.is_empty() || tx.dilithium_signature.is_empty() {
+        return None;
+    }
+    let pk = hex::decode(&tx.dilithium_pubkey).ok()?;
+    let sig = hex::decode(&tx.dilithium_signature).ok()?;
+    let msg = crate::ledger::tx_signing_bytes_for(tx);
+    let valid = ego_core::verify_signature(
+        &ego_core::PublicKey::dilithium2(pk.clone()),
+        &msg,
+        &ego_core::Signature::dilithium2(sig),
+    )
+    .ok()?;
+    valid.then_some(pk)
+}
+
+pub fn registered_dilithium_key(addr: &str) -> Option<Vec<u8>> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_META)?;
+    db.get_cf(cf, val_dil_key(addr)).ok().flatten().filter(|k| !k.is_empty())
+}
+
 /// How long a committee stays fixed. The set that votes on a height is read from a
 /// snapshot taken at an earlier boundary, never from whatever a node happens to hold
 /// right now: two nodes at different tips hold different state, so a committee derived
@@ -1779,6 +1809,11 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
 
         if let Some((addr, bls_hex)) = parse_validator_registration(tx) {
             batch.put_cf(cf_meta, bls_reg_key(&bls_hex), addr.as_bytes());
+            if db.get_cf(cf_meta, val_dil_key(&addr)).ok().flatten().is_none() {
+                if let Some(pk) = registration_dilithium_key(tx) {
+                    batch.put_cf(cf_meta, val_dil_key(&addr), pk);
+                }
+            }
             // First seating only. Re-registering to leave jail must not move a validator
             // forward into a later epoch, or it would drop out of the snapshot that the
             // committee deciding this height already agreed on.
@@ -8282,5 +8317,49 @@ mod credits_pricing_tests {
         // charge is never rounded away to free.
         assert_eq!(usd_to_credits(0.004), 0);
         assert_eq!(usd_to_credits(0.006), 1);
+    }
+}
+
+#[cfg(test)]
+mod registration_key_tests {
+    use super::*;
+
+    fn registration(kp: &ego_core::KeyPair) -> LedgerTx {
+        let addr = ego_core::EgoAddress::from_public_key_bytes(kp.ed25519_public_key().as_bytes(), 1, ego_core::AddressType::EOA)
+            .to_bech32("egot").unwrap();
+        let mut tx = LedgerTx {
+            from: addr.clone(),
+            to: addr,
+            nonce: 1,
+            timestamp: 1_800_000_000,
+            chain_id: 1,
+            tx_version: 2,
+            tx_type: "validator_register".into(),
+            memo: Some("valreg:aa:bb".into()),
+            ..LedgerTx::default()
+        };
+        let msg = crate::ledger::tx_signing_bytes_for(&tx);
+        tx.dilithium_pubkey = hex::encode(&kp.dilithium_public_key().key_data);
+        tx.dilithium_signature = hex::encode(&kp.sign_dilithium(&msg).signature_data);
+        tx
+    }
+
+    #[test]
+    fn a_registration_proves_its_dilithium_key() {
+        let kp = ego_core::KeyPair::generate();
+        let tx = registration(&kp);
+        assert_eq!(registration_dilithium_key(&tx), Some(kp.dilithium_public_key().key_data));
+    }
+
+    #[test]
+    fn a_key_the_sender_cannot_sign_with_is_not_recorded() {
+        let kp = ego_core::KeyPair::generate();
+        let other = ego_core::KeyPair::generate();
+        let mut tx = registration(&kp);
+        tx.dilithium_pubkey = hex::encode(&other.dilithium_public_key().key_data);
+        assert_eq!(registration_dilithium_key(&tx), None);
+        let mut unsigned = registration(&kp);
+        unsigned.dilithium_signature.clear();
+        assert_eq!(registration_dilithium_key(&unsigned), None);
     }
 }
