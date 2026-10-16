@@ -11452,6 +11452,13 @@ pub fn maybe_emit_validator_registration() {
             && tx.memo.as_deref() == Some(memo.as_str()));
     if already { return; }
 
+    if let Some(pending) = crate::mempool::get_mempool().peek_all().into_iter().find(|t| {
+        t.from == addr && t.tx_type == "validator_register" && t.memo.as_deref() == Some(memo.as_str())
+    }) {
+        tauri::async_runtime::spawn(async move { broadcast_pending_tx(pending).await; });
+        return;
+    }
+
     let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
     let ts = chrono::Utc::now().timestamp();
     let mut tx = crate::ledger::LedgerTx {
@@ -11473,11 +11480,12 @@ pub fn maybe_emit_validator_registration() {
     tx.signature = hex::encode(sk.sign(&sign_bytes).to_bytes());
     tx.hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
 
-    match crate::mempool::get_mempool().push(tx) {
+    match crate::mempool::get_mempool().push(tx.clone()) {
         Ok(()) => {
             let mut l = crate::ledger::Ledger::load();
             l.nonce = nonce;
             let _ = l.save();
+            tauri::async_runtime::spawn(async move { broadcast_pending_tx(tx).await; });
             eprintln!("[Validator] Emitted on-chain registration binding {} ↔ BLS key", &addr[..addr.len().min(16)]);
         }
         Err(e) => eprintln!("[Validator] Registration NOT emitted: {}", e),
