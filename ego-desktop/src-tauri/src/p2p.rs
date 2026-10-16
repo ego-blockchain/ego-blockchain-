@@ -1201,6 +1201,19 @@ pub fn committee_source() -> (Vec<String>, bool) {
         .filter(|a| !allowlist_only || genesis.is_empty() || genesis.contains(a))
         .filter(|a| (grace && genesis.contains(a)) || qualifies_for_seat(a))
         .collect();
+    // Seats are open, so they must cost something and fill gradually: a joiner needs the
+    // seat stake, and joiners are seated one per epoch in registration order. Without
+    // this, anyone could register a handful of free nodes and outvote the committee.
+    // The starting committee keeps its seats without the stake.
+    if crate::chain_db::seat_rules_active(deciding) {
+        let joiners: Vec<(String, u64)> = crate::chain_db::registered_validators_with_seat_heights()
+            .into_iter()
+            .filter(|(a, _)| !genesis.contains(a))
+            .filter(|(a, _)| crate::ledger::get_validator_stake(a) >= crate::chain_db::MIN_SEAT_STAKE_UEGOC)
+            .collect();
+        let admitted = crate::chain_db::admitted_joiners(&joiners, boundary, crate::chain_db::COMMITTEE_EPOCH);
+        on_chain.retain(|a| genesis.contains(a) || admitted.contains(a));
+    }
     // The starting committee keeps its seats until it is slashed or unseated for going
     // quiet — registering on-chain is how OTHERS join, not a hurdle the founding members
     // have to clear again. Without this the committee collapsed to whichever one or two

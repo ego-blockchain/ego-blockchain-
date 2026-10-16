@@ -186,6 +186,10 @@ impl ShardedMempool {
             }
         }
 
+        if is_pool_faucet {
+            crate::chain_db::faucet_grant_fits(&tx)?;
+        }
+
         if !is_pool_faucet {
             if let Err(reason) = crate::ledger::verify_incoming_tx(&tx) {
                 eprintln!("[Mempool] REJECTED {:.12} — {}", tx.hash, reason);
@@ -682,7 +686,7 @@ mod tests {
             hash: hash.to_string(),
             from: crate::chain_db::NODE_POOL_ADDR.to_string(),
             to: "egot1recv".to_string(),
-            amount: 0,
+            amount: 100_000_000,
             fee_uegoc: 0,
             tx_type: "faucet".to_string(),
             timestamp: 0,

@@ -582,6 +582,16 @@ pub const COMMITTEE_EPOCH: u64 = 100;
 /// committee cannot quietly become a permanent authority.
 pub const GENESIS_GRACE_BLOCKS: u64 = 10_000;
 
+/// From this height a seat outside the starting committee needs real stake, joiners are
+/// seated one per committee epoch, and the faucet is held to its per-address total.
+pub const SEAT_RULES_FROM_HEIGHT: u64 = 30_000;
+pub const MIN_SEAT_STAKE_UEGOC: u64 = 10_000 * 1_000_000;
+pub const NEW_SEATS_PER_EPOCH: usize = 1;
+
+pub fn seat_rules_active(height: u64) -> bool {
+    height >= SEAT_RULES_FROM_HEIGHT
+}
+
 /// The snapshot a decision at `height` reads from. A node deciding `height` has applied
 /// every block below it, so it necessarily holds this snapshot, which is what makes the
 /// committee a pure function of the height rather than of local progress.
@@ -849,6 +859,81 @@ pub fn registered_validators_as_of(boundary: u64) -> Vec<String> {
         }
     }
     set.into_iter().collect()
+}
+
+/// Every registered validator with the height its registration committed, oldest first.
+pub fn registered_validators_with_seat_heights() -> Vec<(String, u64)> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    backfill_bls_registry(&db);
+    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new(); };
+    let mut set = std::collections::BTreeMap::new();
+    for item in db.prefix_iterator_cf(cf, b"bls_reg:") {
+        let Ok((k, v)) = item else { break };
+        if !k.starts_with(b"bls_reg:") { break; }
+        let Ok(addr) = String::from_utf8(v.to_vec()) else { continue };
+        if addr.is_empty() { continue; }
+        let seated = db
+            .get_cf(cf, val_seated_key(&addr))
+            .ok()
+            .flatten()
+            .and_then(|b| b.get(..8).map(|x| u64::from_le_bytes(x.try_into().unwrap())))
+            .unwrap_or(0);
+        let entry = set.entry(addr).or_insert(seated);
+        *entry = (*entry).min(seated);
+    }
+    let mut out: Vec<(String, u64)> = set.into_iter().collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// The joiners a committee deciding at `boundary` may seat. Joiners are admitted in
+/// registration order, at most `NEW_SEATS_PER_EPOCH` per epoch, so nobody can register a
+/// crowd of nodes and outvote the existing committee in one step.
+pub fn admitted_joiners(registrations: &[(String, u64)], boundary: u64, epoch: u64) -> Vec<String> {
+    let epoch = epoch.max(1);
+    let mut taken: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    let mut floor_epoch = 0u64;
+    let mut admitted = Vec::new();
+    for (addr, seated) in registrations {
+        let mut at = seated.div_ceil(epoch).max(floor_epoch);
+        while taken.get(&at).copied().unwrap_or(0) >= NEW_SEATS_PER_EPOCH {
+            at += 1;
+        }
+        *taken.entry(at).or_insert(0) += 1;
+        floor_epoch = at;
+        if at.saturating_mul(epoch) <= boundary {
+            admitted.push(addr.clone());
+        }
+    }
+    admitted
+}
+
+fn faucet_total_to_in(db: &DB, address: &str) -> u64 {
+    let (Some(cf_addr), Some(cf_txs)) = (db.cf_handle(CF_ADDR_TXS), db.cf_handle(CF_TXS)) else { return 0 };
+    let mut prefix = address.as_bytes().to_vec();
+    prefix.push(b':');
+    let mut total: u64 = 0;
+    for item in db.prefix_iterator_cf(cf_addr, &prefix) {
+        let Ok((k, _)) = item else { break };
+        if !k.starts_with(&prefix) { break; }
+        let hash_start = prefix.len() + 8;
+        if k.len() <= hash_start { continue; }
+        let Some(tx) = db.get_cf(cf_txs, &k[hash_start..]).ok().flatten().and_then(|v| decode::<LedgerTx>(&v)) else { continue };
+        if tx.tx_type == "faucet" && tx.from == NODE_POOL_ADDR && tx.to == address {
+            total = total.saturating_add(tx.amount);
+        }
+    }
+    total
+}
+
+/// A faucet grant is only valid within the per-grant step and, from the seat-rules
+/// height, the per-address lifetime cap. Without this a faucet tx minted any amount
+/// from the node pool, and any node could gossip one.
+pub fn faucet_grant_fits(tx: &LedgerTx) -> Result<(), String> {
+    if tx.amount == 0 || tx.amount > FAUCET_STEP_UEGOC {
+        return Err(format!("faucet grant of {} uEGOC is outside 1..={} uEGOC", tx.amount, FAUCET_STEP_UEGOC));
+    }
+    Ok(())
 }
 
 pub fn registered_validators_sorted() -> Vec<String> {
@@ -4156,8 +4241,28 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
             if !is_coinbase && !is_faucet && !is_system_emission_type(&tx.tx_type) {
                 return Err(format!("unexpected protocol system tx {} (type: '{}')", tx.hash, tx.tx_type));
             }
-            if is_post_reward && (tx.to.is_empty() || tx.amount == 0) {
-                return Err(format!("malformed post_reward tx {}", tx.hash));
+            if is_post_reward {
+                return Err(format!(
+                    "post_reward tx {} refused: nothing in the protocol issues one, and it would pay any amount from the node pool",
+                    tx.hash
+                ));
+            }
+            if is_faucet {
+                faucet_grant_fits(tx).map_err(|e| format!("faucet tx {}: {e}", tx.hash))?;
+                if seat_rules_active(block.height) {
+                    let in_block: u64 = sorted_txs
+                        .iter()
+                        .filter(|t| t.tx_type == "faucet" && t.from == NODE_POOL_ADDR && t.to == tx.to)
+                        .map(|t| t.amount)
+                        .sum();
+                    let total = faucet_total_to_in(db, &tx.to).saturating_add(in_block);
+                    if total > FAUCET_CAP_UEGOC {
+                        return Err(format!(
+                            "faucet tx {} would take {} past the {} uEGOC faucet total",
+                            tx.hash, tx.to, FAUCET_CAP_UEGOC
+                        ));
+                    }
+                }
             }
         } else if crate::ledger::is_reserved_system_source(&tx.from) {
                 // C1 fix: an operational reward tx is only valid if it credits the
@@ -8361,5 +8466,47 @@ mod registration_key_tests {
         let mut unsigned = registration(&kp);
         unsigned.dilithium_signature.clear();
         assert_eq!(registration_dilithium_key(&unsigned), None);
+    }
+}
+
+#[cfg(test)]
+mod seat_rule_tests {
+    use super::*;
+
+    fn regs(list: &[(&str, u64)]) -> Vec<(String, u64)> {
+        list.iter().map(|(a, h)| (a.to_string(), *h)).collect()
+    }
+
+    #[test]
+    fn joiners_are_seated_one_per_epoch_in_registration_order() {
+        let r = regs(&[("a", 30_010), ("b", 30_020), ("c", 30_030)]);
+        assert!(admitted_joiners(&r, 30_000, 100).is_empty());
+        assert_eq!(admitted_joiners(&r, 30_100, 100), vec!["a"]);
+        assert_eq!(admitted_joiners(&r, 30_200, 100), vec!["a", "b"]);
+        assert_eq!(admitted_joiners(&r, 30_300, 100), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_joiner_is_never_seated_before_its_registration_commits() {
+        let r = regs(&[("a", 30_150)]);
+        assert!(admitted_joiners(&r, 30_100, 100).is_empty());
+        assert_eq!(admitted_joiners(&r, 30_200, 100), vec!["a"]);
+    }
+
+    #[test]
+    fn a_crowd_registering_at_once_waits_its_turn() {
+        let crowd: Vec<(String, u64)> = (0..10).map(|i| (format!("n{i}"), 30_001)).collect();
+        assert_eq!(admitted_joiners(&crowd, 30_100, 100).len(), 1);
+        assert_eq!(admitted_joiners(&crowd, 30_500, 100).len(), 5);
+    }
+
+    #[test]
+    fn faucet_grants_stay_within_one_step() {
+        let ok = LedgerTx { tx_type: "faucet".into(), from: NODE_POOL_ADDR.into(), amount: FAUCET_STEP_UEGOC, ..LedgerTx::default() };
+        assert!(faucet_grant_fits(&ok).is_ok());
+        let huge = LedgerTx { amount: 300_000_000 * 1_000_000, ..ok.clone() };
+        assert!(faucet_grant_fits(&huge).is_err());
+        let zero = LedgerTx { amount: 0, ..ok };
+        assert!(faucet_grant_fits(&zero).is_err());
     }
 }
