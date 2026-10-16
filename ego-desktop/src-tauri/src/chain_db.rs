@@ -592,6 +592,111 @@ pub fn seat_rules_active(height: u64) -> bool {
     height >= SEAT_RULES_FROM_HEIGHT
 }
 
+/// Uptime pay: a staked node that checks in is paid from the node pool, at most once per
+/// interval. The check-in quotes a recent block, so only a node following the chain can
+/// make one, and the stake floor is what keeps one person from running a crowd of them.
+pub const UPTIME_FROM_HEIGHT: u64 = 32_000;
+pub const UPTIME_MIN_STAKE_UEGOC: u64 = 1_000 * 1_000_000;
+pub const UPTIME_INTERVAL_SECS: i64 = 6 * 3600;
+pub const UPTIME_REWARD_UEGOC: u64 = 2 * 1_000_000;
+pub const UPTIME_CHECKIN_MAX_AGE: u64 = 100;
+pub const TX_UPTIME: &str = "uptime";
+pub const TX_UPTIME_REWARD: &str = "uptime_reward";
+
+fn uptime_last_key(addr: &str) -> Vec<u8> {
+    format!("uptime_last:{addr}").into_bytes()
+}
+
+fn uptime_last_paid_in(db: &DB, addr: &str) -> Option<i64> {
+    let cf = db.cf_handle(CF_META)?;
+    db.get_cf(cf, uptime_last_key(addr))
+        .ok()
+        .flatten()
+        .and_then(|b| b.get(..8).map(|x| i64::from_le_bytes(x.try_into().unwrap())))
+}
+
+pub fn uptime_last_paid(addr: &str) -> Option<i64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    uptime_last_paid_in(&db, addr)
+}
+
+pub fn uptime_checkin_memo(height: u64, block_hash: &str) -> String {
+    format!("uptime:{height}:{block_hash}")
+}
+
+pub fn is_uptime_checkin(tx: &LedgerTx) -> bool {
+    tx.tx_type == TX_UPTIME && !tx.from.is_empty() && tx.to == tx.from && tx.amount == 0
+}
+
+/// The check-in quotes a block from the last `UPTIME_CHECKIN_MAX_AGE` before `tip`.
+pub fn uptime_checkin_fresh(
+    tx: &LedgerTx,
+    tip: u64,
+    block_hash_at: impl Fn(u64) -> Option<String>,
+) -> Result<(), String> {
+    if !is_uptime_checkin(tx) {
+        return Err("an uptime check-in is a zero-amount tx to the sender itself".into());
+    }
+    let memo = tx.memo.as_deref().unwrap_or("");
+    let mut parts = memo.splitn(3, ':');
+    let (Some("uptime"), Some(h), Some(hash)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("an uptime check-in memo is uptime:<height>:<block hash>".into());
+    };
+    let h: u64 = h.parse().map_err(|_| "uptime check-in height is not a number".to_string())?;
+    if h > tip || tip - h > UPTIME_CHECKIN_MAX_AGE {
+        return Err(format!("uptime check-in quotes block {h}, the chain is at {tip}"));
+    }
+    if block_hash_at(h).as_deref() != Some(hash) {
+        return Err(format!("uptime check-in quotes a block {h} this chain does not have"));
+    }
+    Ok(())
+}
+
+fn uptime_checkin_counts_in(db: &DB, checkin: &LedgerTx, block_ts: i64) -> bool {
+    crate::ledger::get_validator_stake(&checkin.from) >= UPTIME_MIN_STAKE_UEGOC
+        && uptime_last_paid_in(db, &checkin.from)
+            .map(|last| block_ts.saturating_sub(last) >= UPTIME_INTERVAL_SECS)
+            .unwrap_or(true)
+}
+
+pub fn uptime_reward_tx(checkin: &LedgerTx, height: u64, timestamp: i64) -> LedgerTx {
+    LedgerTx {
+        hash: format!("0x{}", blake3::hash(format!("uptime_reward:{}", checkin.hash).as_bytes()).to_hex()),
+        from: NODE_POOL_ADDR.to_string(),
+        to: checkin.from.clone(),
+        amount: UPTIME_REWARD_UEGOC,
+        memo: Some(checkin.hash.clone()),
+        timestamp,
+        status: "Confirmed".to_string(),
+        block_height: Some(height),
+        tx_type: TX_UPTIME_REWARD.to_string(),
+        signature: "coinbase".to_string(),
+        ..LedgerTx::default()
+    }
+}
+
+/// The uptime payouts a block at `height` must carry for the check-ins in it: one per
+/// address, only for a staked address whose last payout is at least an interval old.
+fn expected_uptime_rewards_in(db: &DB, txs: &[LedgerTx], height: u64, timestamp: i64) -> Vec<LedgerTx> {
+    if height < UPTIME_FROM_HEIGHT {
+        return Vec::new();
+    }
+    let mut paid: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut checkins: Vec<&LedgerTx> = txs.iter().filter(|t| is_uptime_checkin(t)).collect();
+    checkins.sort_by(|a, b| a.hash.cmp(&b.hash));
+    for c in checkins {
+        if paid.contains(c.from.as_str()) {
+            continue;
+        }
+        if uptime_checkin_counts_in(db, c, timestamp) {
+            paid.insert(c.from.as_str());
+            out.push(uptime_reward_tx(c, height, timestamp));
+        }
+    }
+    out
+}
+
 /// The snapshot a decision at `height` reads from. A node deciding `height` has applied
 /// every block below it, so it necessarily holds this snapshot, which is what makes the
 /// committee a pure function of the height rather than of local progress.
@@ -1877,6 +1982,10 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         // On-chain BLS validator registry: bind (address ↔ BLS key) the moment a
         // verified validator_register tx commits, atomically with the block, so
         // the QC verifier can reject signers using unregistered keys.
+        if tx.tx_type == TX_UPTIME_REWARD && tx.from == NODE_POOL_ADDR {
+            batch.put_cf(cf_meta, uptime_last_key(&tx.to), block.timestamp.to_le_bytes());
+        }
+
         if tx.tx_type == crate::storage_proof::POST_PROOF_TX {
             if let Ok(body) = crate::storage_proof::parse_body(&tx.call_args) {
                 record_storage_proof(&mut batch, &db, &tx.from, &body.cid, body.bytes_proven(), block.height);
@@ -3437,6 +3546,9 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         stamped.push(coinbase);
     }
 
+    let uptime_rewards = expected_uptime_rewards_in(&db, &stamped, height, timestamp);
+    stamped.extend(uptime_rewards);
+
     let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
     if contributor_fee > 0 {
         let sf_hash = format!("0x{}", blake3::hash(
@@ -3639,6 +3751,12 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             eprintln!("[TX] {:.12} Rejected — {e}", tx.hash);
             return false;
         }
+        if tx.tx_type == TX_UPTIME
+            && (height < UPTIME_FROM_HEIGHT
+                || uptime_checkin_fresh(tx, height.saturating_sub(1), |h| block_hash_at_in(&db, h)).is_err())
+        {
+            return false;
+        }
         if tx.nonce > 0 && blocked_senders.contains(&tx.from) {
             held_back.push((*tx).clone());
             return false;
@@ -3784,6 +3902,9 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         };
         stamped.push(coinbase);
     }
+
+    let uptime_rewards = expected_uptime_rewards_in(&db, &stamped, height, timestamp);
+    stamped.extend(uptime_rewards);
 
     let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
     if contributor_fee > 0 {
@@ -4234,6 +4355,9 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
             let is_coinbase = Some(&tx.hash) == block.coinbase_tx.as_ref();
             let is_post_reward = tx.tx_type == "post_reward";
             let is_faucet = tx.tx_type == "faucet";
+            if tx.tx_type == TX_UPTIME_REWARD {
+                continue;
+            }
             // H3: accept by tx TYPE, not by a magic `signature` string. The block's
             // single coinbase is validated above (is_coinbase); any other
             // coinbase-signed/reward-typed tx is rejected. Faucet + the known
@@ -4436,6 +4560,40 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
             validate_credits_tx(tx)?;
         } else if tx.tx_type == "credits_escrow" {
             validate_credits_escrow_tx(tx, block.timestamp)?;
+        }
+    }
+    // Uptime: every check-in must quote a recent block, and the block's payouts must be
+    // exactly the ones the rules give for its check-ins, so no proposer can pay itself or
+    // anyone else more often or more than the rules allow.
+    if block.height >= UPTIME_FROM_HEIGHT {
+        for tx in txs.iter().filter(|t| t.tx_type == TX_UPTIME) {
+            uptime_checkin_fresh(tx, block.height.saturating_sub(1), get_block_hash_at)
+                .map_err(|e| format!("uptime check-in {} rejected: {e}", tx.hash))?;
+        }
+    }
+    {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let mut expected: Vec<String> = expected_uptime_rewards_in(&db, txs, block.height, block.timestamp)
+            .into_iter()
+            .map(|t| format!("{}:{}:{}", t.hash, t.to, t.amount))
+            .collect();
+        let mut carried: Vec<String> = txs
+            .iter()
+            .filter(|t| t.tx_type == TX_UPTIME_REWARD)
+            .map(|t| {
+                if t.from != NODE_POOL_ADDR || t.signature != "coinbase" {
+                    return String::from("invalid");
+                }
+                format!("{}:{}:{}", t.hash, t.to, t.amount)
+            })
+            .collect();
+        expected.sort();
+        carried.sort();
+        if expected != carried {
+            return Err(format!(
+                "block {} carries uptime payouts {:?}, the rules give {:?}",
+                block.height, carried, expected
+            ));
         }
     }
     // A storage proof is checked against the chain that carries it: the challenge comes
@@ -5305,7 +5463,11 @@ pub fn first_missing_height(tip: u64) -> Option<u64> {
 
 pub fn get_block_hash_at(height: u64) -> Option<String> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf = db.cf_handle(CF_BLOCKS).unwrap();
+    block_hash_at_in(&db, height)
+}
+
+fn block_hash_at_in(db: &DB, height: u64) -> Option<String> {
+    let cf = db.cf_handle(CF_BLOCKS)?;
     db.get_cf(cf, height_key(height)).ok().flatten()
         .and_then(|v| decode::<LedgerBlock>(&v))
         .map(|b| b.hash)
@@ -8508,5 +8670,61 @@ mod seat_rule_tests {
         assert!(faucet_grant_fits(&huge).is_err());
         let zero = LedgerTx { amount: 0, ..ok };
         assert!(faucet_grant_fits(&zero).is_err());
+    }
+}
+
+#[cfg(test)]
+mod uptime_tests {
+    use super::*;
+
+    fn checkin(from: &str, hash: &str, memo: &str) -> LedgerTx {
+        LedgerTx {
+            hash: hash.into(),
+            from: from.into(),
+            to: from.into(),
+            amount: 0,
+            tx_type: TX_UPTIME.into(),
+            memo: Some(memo.into()),
+            ..LedgerTx::default()
+        }
+    }
+
+    fn chain(h: u64) -> Option<String> {
+        Some(format!("hash{h}"))
+    }
+
+    #[test]
+    fn a_checkin_must_quote_a_recent_block_of_this_chain() {
+        let ok = checkin("egot1a", "0x1", &uptime_checkin_memo(32_050, "hash32050"));
+        assert!(uptime_checkin_fresh(&ok, 32_100, chain).is_ok());
+        let old = checkin("egot1a", "0x2", &uptime_checkin_memo(31_000, "hash31000"));
+        assert!(uptime_checkin_fresh(&old, 32_100, chain).is_err());
+        let forged = checkin("egot1a", "0x3", &uptime_checkin_memo(32_050, "somethingelse"));
+        assert!(uptime_checkin_fresh(&forged, 32_100, chain).is_err());
+        let future = checkin("egot1a", "0x4", &uptime_checkin_memo(32_200, "hash32200"));
+        assert!(uptime_checkin_fresh(&future, 32_100, chain).is_err());
+        let mut paying = checkin("egot1a", "0x5", &uptime_checkin_memo(32_050, "hash32050"));
+        paying.amount = 1;
+        assert!(uptime_checkin_fresh(&paying, 32_100, chain).is_err());
+    }
+
+    #[test]
+    fn payouts_follow_stake_switch_on_and_one_per_address() {
+        let staked = "egot1uptimetest00000000000000000000000staked";
+        let unstaked = "egot1uptimetest0000000000000000000000unstaked";
+        crate::ledger::record_validator_stake(staked, UPTIME_MIN_STAKE_UEGOC, true);
+        let txs = vec![
+            checkin(staked, "0xa1", "uptime:1:x"),
+            checkin(staked, "0xa2", "uptime:1:x"),
+            checkin(unstaked, "0xb1", "uptime:1:x"),
+        ];
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(expected_uptime_rewards_in(&db, &txs, UPTIME_FROM_HEIGHT - 1, 1_900_000_000).is_empty());
+        let paid = expected_uptime_rewards_in(&db, &txs, UPTIME_FROM_HEIGHT, 1_900_000_000);
+        assert_eq!(paid.len(), 1);
+        assert_eq!(paid[0].to, staked);
+        assert_eq!(paid[0].amount, UPTIME_REWARD_UEGOC);
+        assert_eq!(paid[0].from, NODE_POOL_ADDR);
+        assert_eq!(paid[0].hash, uptime_reward_tx(&txs[0], UPTIME_FROM_HEIGHT, 1_900_000_000).hash);
     }
 }

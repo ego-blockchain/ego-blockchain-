@@ -509,6 +509,7 @@ fn headless_main() {
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
             loop {
                 tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
+                tokio::task::spawn_blocking(crate::p2p::maybe_send_uptime_checkin).await.ok();
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             }
         });
@@ -1486,6 +1487,7 @@ fn main() {
                     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
                     loop {
                         tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
+                        tokio::task::spawn_blocking(crate::p2p::maybe_send_uptime_checkin).await.ok();
                         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                     }
                 });

@@ -337,13 +337,13 @@ const EarningsPage: React.FC = () => {
           <div className="space-y-1 md:pr-8">
             <div className="text-[10px] font-black text-slate-500 uppercase tracking-[0.25em] mb-2 flex items-center gap-2">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.8)]"></span>
-              This Session
+              This Session (estimate)
             </div>
             <div className="text-4xl font-mono font-black text-emerald-400 tabular-nums tracking-tighter drop-shadow-[0_0_15px_rgba(16,185,129,0.3)]">
               {fmtEgoc(sessionEarned, 6)}
             </div>
             <div className="text-[9px] font-bold text-slate-600 uppercase tracking-widest pt-1">
-              EGOC since app start
+              Estimated from your node's rate. Real payouts appear in your Wallet history.
             </div>
           </div>
 

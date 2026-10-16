@@ -11472,6 +11472,59 @@ pub fn maybe_emit_validator_registration() {
     }
 }
 
+/// Sends this node's uptime check-in once it is due. Only a staked node checks in, at most
+/// once per payout interval, and a pending check-in is re-sent rather than replaced.
+pub fn maybe_send_uptime_checkin() {
+    if is_observer() { return; }
+    let tip = crate::chain_db::local_chain_height();
+    if tip.saturating_add(1) < crate::chain_db::UPTIME_FROM_HEIGHT { return; }
+    let ledger = crate::ledger::Ledger::load();
+    let addr = ledger.address.clone();
+    if addr.is_empty() { return; }
+    if crate::ledger::get_validator_stake(&addr) < crate::chain_db::UPTIME_MIN_STAKE_UEGOC { return; }
+    let now = chrono::Utc::now().timestamp();
+    if let Some(last) = crate::chain_db::uptime_last_paid(&addr) {
+        if now.saturating_sub(last) < crate::chain_db::UPTIME_INTERVAL_SECS { return; }
+    }
+    let pending = crate::mempool::get_mempool().peek_all().into_iter().find(|t| {
+        t.from == addr
+            && crate::chain_db::is_uptime_checkin(t)
+            && crate::chain_db::uptime_checkin_fresh(t, tip, crate::chain_db::get_block_hash_at).is_ok()
+    });
+    if let Some(pending) = pending {
+        tauri::async_runtime::spawn(async move { broadcast_pending_tx(pending).await; });
+        return;
+    }
+    let Some(block_hash) = crate::chain_db::get_block_hash_at(tip) else { return };
+    let Some(seed) = get_ed25519_seed() else { return };
+    let Ok(kp) = ego_core::KeyPair::from_bytes(&seed) else { return };
+    let nonce = crate::ledger::next_nonce_for(&addr, ledger.nonce);
+    let mut tx = crate::ledger::LedgerTx {
+        from: addr.clone(),
+        to: addr.clone(),
+        amount: 0,
+        fee_uegoc: 0,
+        memo: Some(crate::chain_db::uptime_checkin_memo(tip, &block_hash)),
+        timestamp: now,
+        status: "Pending".into(),
+        nonce,
+        tx_type: crate::chain_db::TX_UPTIME.into(),
+        chain_id: 1,
+        ..crate::ledger::LedgerTx::default()
+    };
+    crate::ledger::seal_tx(&mut tx, &kp, false);
+    match crate::mempool::get_mempool().push(tx.clone()) {
+        Ok(()) => {
+            let mut l = crate::ledger::Ledger::load();
+            l.nonce = nonce;
+            let _ = l.save();
+            tauri::async_runtime::spawn(async move { broadcast_pending_tx(tx).await; });
+            eprintln!("[Uptime] check-in sent at block {tip}");
+        }
+        Err(e) => eprintln!("[Uptime] check-in not sent: {e}"),
+    }
+}
+
 fn proposal_signing_data(block_hash: &str, height: u64) -> String {
     format!("proposal:{}:{}", block_hash, height)
 }

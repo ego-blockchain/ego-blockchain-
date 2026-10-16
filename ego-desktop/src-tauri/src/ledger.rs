@@ -1606,7 +1606,7 @@ pub fn is_protocol_system_tx(tx: &LedgerTx) -> bool {
     }
     tx.from == crate::chain_db::NODE_POOL_ADDR
         && tx.signature == "coinbase"
-        && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward")
+        && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward" | "uptime_reward")
 }
 
 pub fn is_reserved_system_source(addr: &str) -> bool {
@@ -1786,6 +1786,21 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     let is_validator_reg = tx.tx_type == "validator_register"
         && tx.from == tx.to
         && tx.amount == 0;
+    let is_uptime = crate::chain_db::is_uptime_checkin(tx);
+    if is_uptime {
+        let next = crate::chain_db::local_chain_height().saturating_add(1);
+        if next < crate::chain_db::UPTIME_FROM_HEIGHT {
+            return Err(format!("uptime check-ins count from block {}", crate::chain_db::UPTIME_FROM_HEIGHT));
+        }
+        if get_validator_stake(&tx.from) < crate::chain_db::UPTIME_MIN_STAKE_UEGOC {
+            return Err(format!(
+                "uptime check-in from {} refused: it needs {} EGOC staked",
+                tx.from,
+                crate::chain_db::UPTIME_MIN_STAKE_UEGOC / 1_000_000
+            ));
+        }
+        crate::chain_db::uptime_checkin_fresh(tx, next.saturating_sub(1), crate::chain_db::get_block_hash_at)?;
+    }
 
     // Under emission v2, registration mints emission weight — it must cost
     // real stake or ghost validators inflate the emission rate for free.
@@ -1804,7 +1819,7 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         }
     }
 
-    if !is_validator_reg && tx.fee_uegoc < crate::tokenomics::FEE_FLOOR_UEGOC {
+    if !is_validator_reg && !is_uptime && tx.fee_uegoc < crate::tokenomics::FEE_FLOOR_UEGOC {
         return Err(format!(
             "tx from {} rejected: fee {} uEGOC below absolute floor {} uEGOC. Zero-fee transactions are disabled to prevent network spam.",
             tx.from, tx.fee_uegoc,
