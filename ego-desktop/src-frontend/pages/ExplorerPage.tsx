@@ -70,7 +70,6 @@ function fmtBytes(b: number) {
 }
 function timeAgo(ts: number) {
   const diff = Math.floor(Date.now() / 1000 - ts);
-  if (diff < -120)  return 'clock ahead';
   if (diff < 5)     return 'just now';
   if (diff < 60)    return `${diff}s ago`;
   if (diff < 3600)  return `${Math.floor(diff / 60)}m ago`;
