@@ -87,7 +87,7 @@ pub fn my_coverage_score() -> u64 {
 }
 
 pub fn current_slot() -> u64 {
-    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    let now_ms = crate::clock::now_ms().max(0) as u64;
     now_ms / crate::mempool::BATCH_INTERVAL_MS
 }
 

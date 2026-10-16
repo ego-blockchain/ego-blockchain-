@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod clock;
 mod autostart;
 mod offline_guard;
 mod onetime;
@@ -500,6 +501,7 @@ fn headless_main() {
         });
 
         crate::contract_exec::start();
+        crate::clock::start();
 
         tokio::spawn(async {
             crate::p2p::run_power_event_loop().await;
@@ -1688,6 +1690,7 @@ fn main() {
             });
 
             crate::contract_exec::start();
+            crate::clock::start();
 
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_power_event_loop().await;

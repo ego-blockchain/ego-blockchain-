@@ -3979,7 +3979,7 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     };
 
     let height    = latest_height + 1;
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = crate::clock::now();
 
     let user_tx_count = txs.iter().filter(|t| {
         !t.from.is_empty() && t.tx_type != "reward" && t.tx_type != "coinbase" && t.tx_type != "post_reward"
@@ -4185,7 +4185,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     };
 
     let height    = latest_height + 1;
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = crate::clock::now();
 
     let cf_bal = db.cf_handle(CF_BALANCES).expect("CF_BALANCES missing");
     let mut sim_balances: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
@@ -5048,7 +5048,7 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
         return Err("block hash/merkle verification failed".into());
     }
     if is_proposal {
-        let skew = block.timestamp - chrono::Utc::now().timestamp();
+        let skew = block.timestamp - crate::clock::now();
         if skew.abs() > MAX_PROPOSAL_CLOCK_SKEW_SECS {
             return Err(format!(
                 "proposal #{} is stamped {}s {} this node's clock; its producer's clock is wrong",
