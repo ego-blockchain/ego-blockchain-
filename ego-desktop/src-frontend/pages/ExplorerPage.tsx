@@ -68,6 +68,37 @@ function fmtBytes(b: number) {
   if (b >= 1e3) return (b / 1e3).toFixed(1) + ' KB';
   return b + ' B';
 }
+// A block stamped in the future (its producer's clock was wrong) can't have been made
+// after the blocks that follow it, or after now. Such blocks are placed between the last
+// block with a believable time and the next one, in height order, so every viewer sees a
+// past time that fits the chain.
+function shownTimes(list: { height: number; timestamp: number }[]): Map<number, number> {
+  const now = Math.floor(Date.now() / 1000);
+  const asc = [...list].sort((a, b) => a.height - b.height);
+  const out = new Map<number, number>();
+  let anchor: { height: number; ts: number } | null = null;
+  let pending: number[] = [];
+  const settle = (end: { height: number; ts: number }) => {
+    const start = anchor ?? { height: end.height - pending.length - 1, ts: end.ts - (pending.length + 1) * 10 };
+    const span = Math.max(1, end.height - start.height);
+    for (const h of pending) {
+      out.set(h, Math.round(start.ts + ((end.ts - start.ts) * (h - start.height)) / span));
+    }
+    pending = [];
+  };
+  for (const b of asc) {
+    if (b.timestamp <= now && (!anchor || b.timestamp >= anchor.ts)) {
+      settle({ height: b.height, ts: b.timestamp });
+      out.set(b.height, b.timestamp);
+      anchor = { height: b.height, ts: b.timestamp };
+    } else {
+      pending.push(b.height);
+    }
+  }
+  if (pending.length) settle({ height: pending[pending.length - 1] + 1, ts: now });
+  return out;
+}
+
 function timeAgo(ts: number) {
   const diff = Math.floor(Date.now() / 1000 - ts);
   if (diff < 5)     return 'just now';
@@ -136,6 +167,7 @@ const ExplorerPage: React.FC = () => {
   const [netStats, setNetStats] = useState<NetworkStats | null>(null);
   const [tokenomics, setTokenomics] = useState<Tokenomics | null>(null);
   const [selectedBlock, setSelectedBlock] = useState<LedgerBlock | null>(null);
+  const blockTimes = shownTimes(blocks);
   const [selectedTx, setSelectedTx] = useState<LedgerTx | null>(null);
   const [selectedFile, setSelectedFile] = useState<FileEvent | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -347,7 +379,7 @@ const ExplorerPage: React.FC = () => {
                           <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(block.miner)}</td>
                           <td className="px-5 py-3 text-right text-gray-300">{block.tx_count}</td>
                           <td className="px-5 py-3 text-right text-green-400">{(block.reward / 1_000_000).toFixed(3)} EGOC</td>
-                          <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(block.timestamp)}</td>
+                          <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(blockTimes.get(block.height) ?? block.timestamp)}</td>
                         </tr>
                       ))
                     )}
@@ -607,7 +639,7 @@ const ExplorerPage: React.FC = () => {
                 { label: 'Height',       val: `#${selectedBlock.height.toLocaleString()}` },
                 { label: 'Hash',         val: selectedBlock.hash,      mono: true },
                 { label: 'Prev Hash',    val: selectedBlock.prev_hash, mono: true },
-                { label: 'Timestamp',    val: sfTime(selectedBlock.timestamp) },
+                { label: 'Timestamp',    val: sfTime(blockTimes.get(selectedBlock.height) ?? Math.min(selectedBlock.timestamp, Math.floor(Date.now() / 1000))) },
                 { label: 'Miner',        val: selectedBlock.miner,     mono: true },
                 { label: 'Reward',       val: `${(selectedBlock.reward / 1_000_000).toFixed(3)} EGOC` },
                 { label: 'Transactions', val: String(selectedBlock.tx_count) },

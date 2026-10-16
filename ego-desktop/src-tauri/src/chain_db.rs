@@ -584,7 +584,7 @@ pub const GENESIS_GRACE_BLOCKS: u64 = 10_000;
 
 /// From this height a seat outside the starting committee needs real stake, joiners are
 /// seated one per committee epoch, and the faucet is held to its per-address total.
-pub const SEAT_RULES_FROM_HEIGHT: u64 = 30_000;
+pub const SEAT_RULES_FROM_HEIGHT: u64 = 29_306;
 
 /// How far a proposed block's time may be from a voter's clock. Only proposals are held to
 /// it; a block already finalized is accepted whatever its stamp, so syncing never breaks.
