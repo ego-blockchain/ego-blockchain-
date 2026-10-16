@@ -592,6 +592,328 @@ pub fn seat_rules_active(height: u64) -> bool {
     height >= SEAT_RULES_FROM_HEIGHT
 }
 
+// ── Storage pay ───────────────────────────────────────────────────────────────────────────
+// Hosts are paid for holding files that owners actually pay to store. An owner records each
+// file on chain with a signed `storage_file` tx carrying the commitment to its encrypted
+// bytes. A host's proof counts for that file only if it matches the recorded commitment and
+// carries the challenged pieces themselves. Every 100 blocks the first three hosts proving a
+// file share 80% of what the owner's plan is worth for that stretch of time, converted to
+// EGOC at the median price the validators report. The owner's payment is burned, so paying
+// yourself to host your own files always loses money.
+
+pub const STORAGE_PAY_FROM_HEIGHT: u64 = 34_000;
+pub const STORAGE_PAY_EPOCH: u64 = 100;
+pub const STORAGE_PAY_HOSTS: u64 = 3;
+pub const STORAGE_PAY_SHARE_PERCENT: u64 = 80;
+pub const STORAGE_PROOF_FRESH_SECS: i64 = 86_400;
+pub const STORAGE_PAY_MAX_EPOCH_SECS: i64 = 86_400;
+pub const PRICE_LOOKBACK_EPOCHS: u64 = 10;
+pub const TX_STORAGE_FILE: &str = "storage_file";
+pub const TX_PRICE_REPORT: &str = "price_report";
+pub const TX_STORAGE_REWARD: &str = "storage_reward";
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StorageFileRecord {
+    pub cid: String,
+    pub comm_d: String,
+    pub n_real_leaves: u64,
+    pub n_padded_leaves: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedStorageFile {
+    pub owner: String,
+    pub record: StorageFileRecord,
+    pub height: u64,
+}
+
+fn sfile_key(cid: &str) -> Vec<u8> {
+    format!("sfile:{cid}").into_bytes()
+}
+
+fn sproof_prefix(cid: &str) -> Vec<u8> {
+    format!("sproof:{cid}:").into_bytes()
+}
+
+fn sproof_key(cid: &str, prover: &str) -> Vec<u8> {
+    format!("sproof:{cid}:{prover}").into_bytes()
+}
+
+fn price_rep_prefix(epoch: u64) -> Vec<u8> {
+    format!("price_rep:{epoch:020}:").into_bytes()
+}
+
+fn price_rep_key(epoch: u64, addr: &str) -> Vec<u8> {
+    format!("price_rep:{epoch:020}:{addr}").into_bytes()
+}
+
+pub fn is_storage_file_tx(tx: &LedgerTx) -> bool {
+    tx.tx_type == TX_STORAGE_FILE && !tx.from.is_empty() && tx.to == tx.from && tx.amount == 0
+}
+
+pub fn is_price_report(tx: &LedgerTx) -> bool {
+    tx.tx_type == TX_PRICE_REPORT && !tx.from.is_empty() && tx.to == tx.from && tx.amount == 0
+}
+
+pub fn parse_storage_file(tx: &LedgerTx) -> Result<Option<StorageFileRecord>, String> {
+    if !is_storage_file_tx(tx) {
+        return Err("a storage_file tx is a zero-amount tx to the owner itself".into());
+    }
+    let rec: StorageFileRecord =
+        serde_json::from_str(&tx.call_args).map_err(|e| format!("storage_file body is not readable: {e}"))?;
+    if rec.cid.trim().is_empty() || rec.cid.len() > 128 {
+        return Err("storage_file names no file".into());
+    }
+    if tx.memo.as_deref() == Some("storage_file:delete") {
+        return Ok(None);
+    }
+    let comm = hex::decode(&rec.comm_d).map_err(|_| "comm_d is not hex".to_string())?;
+    if comm.len() != 32 {
+        return Err("comm_d is not 32 bytes".into());
+    }
+    let chunk = crate::proof::CHUNK_SIZE as u64;
+    if rec.n_real_leaves == 0
+        || rec.n_padded_leaves != rec.n_real_leaves.next_power_of_two()
+        || rec.bytes == 0
+        || rec.bytes > rec.n_real_leaves.saturating_mul(chunk)
+        || rec.bytes <= (rec.n_real_leaves - 1).saturating_mul(chunk)
+    {
+        return Err("storage_file sizes don't describe one file".into());
+    }
+    Ok(Some(rec))
+}
+
+fn recorded_file_in(db: &DB, cid: &str) -> Option<RecordedStorageFile> {
+    let cf = db.cf_handle(CF_META)?;
+    db.get_cf(cf, sfile_key(cid)).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok())
+}
+
+pub fn recorded_storage_file(cid: &str) -> Option<RecordedStorageFile> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    recorded_file_in(&db, cid)
+}
+
+/// Only the owner who first recorded a file may change or remove its record.
+pub fn storage_file_owner_ok(db: &DB, tx: &LedgerTx) -> Result<(), String> {
+    let Ok(rec) = parse_storage_file(tx) else { return Ok(()) };
+    let cid = match &rec {
+        Some(r) => r.cid.clone(),
+        None => serde_json::from_str::<StorageFileRecord>(&tx.call_args).map(|r| r.cid).unwrap_or_default(),
+    };
+    match recorded_file_in(db, &cid) {
+        Some(existing) if existing.owner != tx.from => Err(format!("{cid} is recorded by another owner")),
+        _ => Ok(()),
+    }
+}
+
+fn price_report_value(tx: &LedgerTx) -> Option<u64> {
+    let v: u64 = tx.memo.as_deref()?.strip_prefix("price:")?.parse().ok()?;
+    (1..=1_000_000_000_000).contains(&v).then_some(v)
+}
+
+/// Who may report a price: the starting committee, or anyone holding a seat's stake.
+pub fn may_report_price(addr: &str) -> bool {
+    crate::genesis::addresses().iter().any(|a| a == addr)
+        || crate::ledger::get_validator_stake(addr) >= MIN_SEAT_STAKE_UEGOC
+}
+
+pub fn price_report_ok(tx: &LedgerTx) -> Result<(), String> {
+    if !is_price_report(tx) {
+        return Err("a price report is a zero-amount tx to the reporter itself".into());
+    }
+    price_report_value(tx).ok_or("a price report memo is price:<micro-USD per EGOC>")?;
+    if !may_report_price(&tx.from) {
+        return Err(format!("{} may not report a price", tx.from));
+    }
+    Ok(())
+}
+
+/// The median of the price reports from the most recent epoch that has any, looking back
+/// from `epoch - 1`. Micro-USD per EGOC.
+fn consensus_price_in(db: &DB, epoch: u64) -> Option<u64> {
+    let cf = db.cf_handle(CF_META)?;
+    for back in 1..=PRICE_LOOKBACK_EPOCHS {
+        let Some(e) = epoch.checked_sub(back) else { break };
+        let prefix = price_rep_prefix(e);
+        let mut values: Vec<u64> = db
+            .prefix_iterator_cf(cf, &prefix)
+            .filter_map(|item| item.ok())
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| read_u64_le(&v))
+            .filter(|v| *v > 0)
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        values.sort_unstable();
+        return Some(values[values.len() / 2]);
+    }
+    None
+}
+
+pub fn egusd_plan_active(owner: &str) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    egusd_plan_in(&db, owner, chrono::Utc::now().timestamp()).is_some()
+}
+
+pub fn consensus_price_micro_usd() -> Option<u64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let next = local_chain_height_in(&db).saturating_add(1);
+    consensus_price_in(&db, next / STORAGE_PAY_EPOCH)
+}
+
+fn local_chain_height_in(db: &DB) -> u64 {
+    db.cf_handle(CF_META)
+        .and_then(|cf| db.get_cf(cf, META_LATEST_HEIGHT).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0)
+}
+
+fn block_ts_at_in(db: &DB, height: u64) -> Option<i64> {
+    let cf = db.cf_handle(CF_BLOCKS)?;
+    db.get_cf(cf, height_key(height)).ok().flatten().and_then(|v| decode::<LedgerBlock>(&v)).map(|b| b.timestamp)
+}
+
+/// The owner's active plan bought with EGUSD at `at`: (plan bytes, price micro-USD, period
+/// seconds). Payments are dated by the block that carried them, never by the sender's clock.
+fn egusd_plan_in(db: &DB, owner: &str, at: i64) -> Option<(u64, u64, i64)> {
+    let (Some(cf_addr), Some(cf_txs)) = (db.cf_handle(CF_ADDR_TXS), db.cf_handle(CF_TXS)) else { return None };
+    let mut prefix = owner.as_bytes().to_vec();
+    prefix.push(b':');
+    let mut payments: Vec<(i64, u64, u64, i64)> = Vec::new();
+    for item in db.prefix_iterator_cf(cf_addr, &prefix) {
+        let Ok((k, _)) = item else { break };
+        if !k.starts_with(&prefix) { break; }
+        let hash_start = prefix.len() + 8;
+        if k.len() <= hash_start { continue; }
+        let Some(tx) = db.get_cf(cf_txs, &k[hash_start..]).ok().flatten().and_then(|v| decode::<LedgerTx>(&v)) else { continue };
+        if tx.tx_type != "credits_pay" || tx.from != owner || tx.to != crate::commands::storage::STORAGE_FEE_SINK {
+            continue;
+        }
+        let Some((gb, price, period)) = crate::commands::storage::egusd_plan_terms(tx.memo.as_deref().unwrap_or("")) else { continue };
+        let paid_at = tx.block_height.and_then(|h| block_ts_at_in(db, h)).unwrap_or(tx.timestamp);
+        payments.push((paid_at, gb, price, period));
+    }
+    payments.sort();
+    let mut active: Option<(i64, i64, u64, u64, i64)> = None;
+    for (paid_at, gb, price, period) in payments {
+        if paid_at > at { break; }
+        let start = match active {
+            Some((_, expires, ..)) if expires > paid_at => expires,
+            _ => paid_at,
+        };
+        active = Some((start, start + period, gb, price, period));
+    }
+    let (start, expires, gb, price, period) = active?;
+    (start <= at && at < expires).then_some((gb.saturating_mul(1_000_000_000), price, period))
+}
+
+/// A proof counts toward pay when it matches the file's record, carries the challenged
+/// pieces, and comes from a staked host that isn't the owner.
+pub fn storage_proof_earns_in(db: &DB, tx: &LedgerTx) -> Option<String> {
+    let body = crate::storage_proof::parse_body(&tx.call_args).ok()?;
+    let rec = recorded_file_in(db, &body.cid)?;
+    (rec.owner != tx.from
+        && rec.record.comm_d == body.comm_d
+        && rec.record.n_real_leaves == body.n_real_leaves
+        && rec.record.n_padded_leaves == body.n_padded_leaves
+        && crate::storage_proof::chunks_match(&body)
+        && crate::ledger::get_validator_stake(&tx.from) >= UPTIME_MIN_STAKE_UEGOC)
+        .then_some(body.cid)
+}
+
+pub fn storage_reward_tx(host: &str, amount: u64, height: u64, timestamp: i64) -> LedgerTx {
+    LedgerTx {
+        hash: format!("0x{}", blake3::hash(format!("storage_reward:{height}:{host}").as_bytes()).to_hex()),
+        from: NODE_POOL_ADDR.to_string(),
+        to: host.to_string(),
+        amount,
+        memo: Some(format!("Storage pay, blocks {}..{}", height.saturating_sub(STORAGE_PAY_EPOCH), height)),
+        timestamp,
+        status: "Confirmed".to_string(),
+        block_height: Some(height),
+        tx_type: TX_STORAGE_REWARD.to_string(),
+        signature: "coinbase".to_string(),
+        ..LedgerTx::default()
+    }
+}
+
+/// The storage payouts the block at `height` must carry. Only blocks on an epoch boundary
+/// carry any.
+fn expected_storage_rewards_in(db: &DB, height: u64, timestamp: i64) -> Vec<LedgerTx> {
+    if height < STORAGE_PAY_FROM_HEIGHT || height % STORAGE_PAY_EPOCH != 0 {
+        return Vec::new();
+    }
+    let Some(price) = consensus_price_in(db, height / STORAGE_PAY_EPOCH) else { return Vec::new() };
+    let Some(prev_ts) = block_ts_at_in(db, height - STORAGE_PAY_EPOCH) else { return Vec::new() };
+    let epoch_secs = timestamp.saturating_sub(prev_ts).clamp(0, STORAGE_PAY_MAX_EPOCH_SECS) as u128;
+    if epoch_secs == 0 {
+        return Vec::new();
+    }
+    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new() };
+
+    let mut files: Vec<RecordedStorageFile> = db
+        .prefix_iterator_cf(cf, b"sfile:")
+        .filter_map(|item| item.ok())
+        .take_while(|(k, _)| k.starts_with(b"sfile:"))
+        .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
+        .collect();
+    files.sort_by(|a, b| a.record.cid.cmp(&b.record.cid));
+
+    let mut owner_bytes: std::collections::BTreeMap<String, u64> = Default::default();
+    for f in &files {
+        *owner_bytes.entry(f.owner.clone()).or_insert(0) += f.record.bytes;
+    }
+    let mut plans: std::collections::BTreeMap<String, Option<(u64, u64, i64)>> = Default::default();
+    let mut pay: std::collections::BTreeMap<String, u128> = Default::default();
+
+    for f in &files {
+        let plan = *plans
+            .entry(f.owner.clone())
+            .or_insert_with(|| egusd_plan_in(db, &f.owner, timestamp));
+        let Some((plan_bytes, plan_price, period)) = plan else { continue };
+        if period <= 0 { continue; }
+        let denom_bytes = owner_bytes.get(&f.owner).copied().unwrap_or(0).max(plan_bytes).max(1) as u128;
+
+        let prefix = sproof_prefix(&f.record.cid);
+        let mut hosts: Vec<(u64, String)> = db
+            .prefix_iterator_cf(cf, &prefix)
+            .filter_map(|item| item.ok())
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .filter_map(|(k, v)| {
+                let prover = String::from_utf8(k[prefix.len()..].to_vec()).ok()?;
+                let first = v.get(..8).map(|x| u64::from_le_bytes(x.try_into().unwrap()))?;
+                let last = v.get(8..16).map(|x| i64::from_le_bytes(x.try_into().unwrap()))?;
+                (timestamp.saturating_sub(last) <= STORAGE_PROOF_FRESH_SECS
+                    && prover != f.owner
+                    && crate::ledger::get_validator_stake(&prover) >= UPTIME_MIN_STAKE_UEGOC)
+                    .then_some((first, prover))
+            })
+            .collect();
+        hosts.sort();
+        hosts.truncate(STORAGE_PAY_HOSTS as usize);
+
+        let numerator = plan_price as u128
+            * epoch_secs
+            * f.record.bytes as u128
+            * STORAGE_PAY_SHARE_PERCENT as u128
+            * 1_000_000u128;
+        let denominator = period as u128 * denom_bytes * 100u128 * STORAGE_PAY_HOSTS as u128 * price as u128;
+        let each = numerator / denominator.max(1);
+        if each == 0 { continue; }
+        for (_, host) in hosts {
+            *pay.entry(host).or_insert(0) += each;
+        }
+    }
+
+    pay.into_iter()
+        .filter(|(_, amount)| *amount > 0)
+        .map(|(host, amount)| storage_reward_tx(&host, amount.min(u64::MAX as u128) as u64, height, timestamp))
+        .collect()
+}
+
+
 /// Uptime pay: a staked node that checks in is paid from the node pool, at most once per
 /// interval. The check-in quotes a recent block, so only a node following the chain can
 /// make one, and the stake floor is what keeps one person from running a crowd of them.
@@ -2075,6 +2397,45 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         // On-chain BLS validator registry: bind (address ↔ BLS key) the moment a
         // verified validator_register tx commits, atomically with the block, so
         // the QC verifier can reject signers using unregistered keys.
+        if block.height >= STORAGE_PAY_FROM_HEIGHT {
+            if is_storage_file_tx(tx) && storage_file_owner_ok(&db, tx).is_ok() {
+                match parse_storage_file(tx) {
+                    Ok(Some(rec)) => {
+                        let entry = RecordedStorageFile { owner: tx.from.clone(), record: rec.clone(), height: block.height };
+                        if let Ok(v) = serde_json::to_vec(&entry) {
+                            batch.put_cf(cf_meta, sfile_key(&rec.cid), v);
+                        }
+                    }
+                    Ok(None) => {
+                        if let Ok(r) = serde_json::from_str::<StorageFileRecord>(&tx.call_args) {
+                            batch.delete_cf(cf_meta, sfile_key(&r.cid));
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            if tx.tx_type == crate::storage_proof::POST_PROOF_TX {
+                if let Some(cid) = storage_proof_earns_in(&db, tx) {
+                    let key = sproof_key(&cid, &tx.from);
+                    let first = db
+                        .get_cf(cf_meta, &key)
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.get(..8).map(|x| u64::from_le_bytes(x.try_into().unwrap())))
+                        .unwrap_or(block.height);
+                    let mut v = Vec::with_capacity(16);
+                    v.extend_from_slice(&first.to_le_bytes());
+                    v.extend_from_slice(&block.timestamp.to_le_bytes());
+                    batch.put_cf(cf_meta, key, v);
+                }
+            }
+            if is_price_report(tx) && price_report_ok(tx).is_ok() {
+                if let Some(v) = price_report_value(tx) {
+                    batch.put_cf(cf_meta, price_rep_key(block.height / STORAGE_PAY_EPOCH, &tx.from), u64_le(v));
+                }
+            }
+        }
+
         if tx.tx_type == TX_UPTIME_REWARD && tx.from == NODE_POOL_ADDR {
             batch.put_cf(cf_meta, uptime_last_key(&tx.to), block.timestamp.to_le_bytes());
             let (count, last) = next_uptime_streak(uptime_streak_in(&db, &tx.to), block.timestamp);
@@ -3658,6 +4019,8 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
 
     let uptime_rewards = expected_uptime_rewards_in(&db, &stamped, height, timestamp);
     stamped.extend(uptime_rewards);
+    let storage_rewards = expected_storage_rewards_in(&db, height, timestamp);
+    stamped.extend(storage_rewards);
 
     let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
     if contributor_fee > 0 {
@@ -4022,6 +4385,8 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
 
     let uptime_rewards = expected_uptime_rewards_in(&db, &stamped, height, timestamp);
     stamped.extend(uptime_rewards);
+    let storage_rewards = expected_storage_rewards_in(&db, height, timestamp);
+    stamped.extend(storage_rewards);
 
     let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
     if contributor_fee > 0 {
@@ -4472,7 +4837,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
             let is_coinbase = Some(&tx.hash) == block.coinbase_tx.as_ref();
             let is_post_reward = tx.tx_type == "post_reward";
             let is_faucet = tx.tx_type == "faucet";
-            if tx.tx_type == TX_UPTIME_REWARD {
+            if tx.tx_type == TX_UPTIME_REWARD || tx.tx_type == TX_STORAGE_REWARD {
                 continue;
             }
             // H3: accept by tx TYPE, not by a magic `signature` string. The block's
@@ -4725,6 +5090,39 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
                 "block {} carries uptime payouts {:?}, the rules give {:?}",
                 block.height, carried, expected
             ));
+        }
+        let mut expected_storage: Vec<String> = expected_storage_rewards_in(&db, block.height, block.timestamp)
+            .into_iter()
+            .map(|t| format!("{}:{}:{}", t.hash, t.to, t.amount))
+            .collect();
+        let mut carried_storage: Vec<String> = txs
+            .iter()
+            .filter(|t| t.tx_type == TX_STORAGE_REWARD)
+            .map(|t| {
+                if t.from != NODE_POOL_ADDR || t.signature != "coinbase" {
+                    return String::from("invalid");
+                }
+                format!("{}:{}:{}", t.hash, t.to, t.amount)
+            })
+            .collect();
+        expected_storage.sort();
+        carried_storage.sort();
+        if expected_storage != carried_storage {
+            return Err(format!(
+                "block {} carries storage payouts {:?}, the rules give {:?}",
+                block.height, carried_storage, expected_storage
+            ));
+        }
+        if block.height >= STORAGE_PAY_FROM_HEIGHT {
+            for tx in txs.iter() {
+                if is_storage_file_tx(tx) {
+                    parse_storage_file(tx).map_err(|e| format!("storage_file {} rejected: {e}", tx.hash))?;
+                    storage_file_owner_ok(&db, tx).map_err(|e| format!("storage_file {} rejected: {e}", tx.hash))?;
+                }
+                if tx.tx_type == TX_PRICE_REPORT {
+                    price_report_ok(tx).map_err(|e| format!("price report {} rejected: {e}", tx.hash))?;
+                }
+            }
         }
     }
     // A storage proof is checked against the chain that carries it: the challenge comes
@@ -8907,5 +9305,144 @@ mod faucet_mark_tests {
         assert_eq!(next_uptime_streak((0, 0), 1_000), (1, 1_000));
         assert_eq!(next_uptime_streak((3, 1_000), 1_000 + UPTIME_STREAK_GAP_SECS), (4, 1_000 + UPTIME_STREAK_GAP_SECS));
         assert_eq!(next_uptime_streak((3, 1_000), 1_001 + UPTIME_STREAK_GAP_SECS), (1, 1_001 + UPTIME_STREAK_GAP_SECS));
+    }
+}
+
+#[cfg(test)]
+mod storage_pay_tests {
+    use super::*;
+
+    fn rec(cid: &str, n_real: u64, bytes: u64) -> StorageFileRecord {
+        StorageFileRecord {
+            cid: cid.into(),
+            comm_d: "11".repeat(32),
+            n_real_leaves: n_real,
+            n_padded_leaves: n_real.next_power_of_two(),
+            bytes,
+        }
+    }
+
+    fn file_tx(owner: &str, r: &StorageFileRecord) -> LedgerTx {
+        LedgerTx {
+            from: owner.into(),
+            to: owner.into(),
+            tx_type: TX_STORAGE_FILE.into(),
+            call_args: serde_json::to_string(r).unwrap(),
+            ..LedgerTx::default()
+        }
+    }
+
+    #[test]
+    fn a_file_record_must_describe_one_file() {
+        assert!(parse_storage_file(&file_tx("o", &rec("egomfd1a", 3, 2_500))).unwrap().is_some());
+        assert!(parse_storage_file(&file_tx("o", &rec("egomfd1a", 3, 4_000))).is_err());
+        assert!(parse_storage_file(&file_tx("o", &rec("egomfd1a", 3, 1_000))).is_err());
+        let mut bad_pad = rec("egomfd1a", 3, 2_500);
+        bad_pad.n_padded_leaves = 8;
+        assert!(parse_storage_file(&file_tx("o", &bad_pad)).is_err());
+        let mut to_other = file_tx("o", &rec("egomfd1a", 3, 2_500));
+        to_other.to = "x".into();
+        assert!(parse_storage_file(&to_other).is_err());
+    }
+
+    #[test]
+    fn a_proof_from_real_blocks_carries_pieces_that_match() {
+        let a = vec![7u8; 3_000];
+        let b = vec![9u8; 2_100];
+        let ca = "egoblk1storagepaytest0000000000000000000000000000000000000000000aaaa";
+        let cb = "egoblk1storagepaytest0000000000000000000000000000000000000000000bbbb";
+        crate::blocks::save_block(ca, &a).unwrap();
+        crate::blocks::save_block(cb, &b).unwrap();
+        let manifest = crate::blocks::FileManifest {
+            manifest_cid: "egomfd1storagepaytest".into(),
+            file_name: "t".into(),
+            total_size: 5_100,
+            blocks: vec![
+                crate::blocks::BlockEntry { block_cid: ca.into(), nonce_hex: String::new(), size: 3_000, comm_r: String::new() },
+                crate::blocks::BlockEntry { block_cid: cb.into(), nonce_hex: String::new(), size: 2_100, comm_r: String::new() },
+            ],
+        };
+        let (comm_d, n_real, n_padded, bytes) = crate::storage_proof::manifest_commitment(&manifest).unwrap();
+        assert_eq!(bytes, 5_100);
+        assert_eq!(n_real, 5);
+        let mut all = a.clone();
+        all.extend_from_slice(&b);
+        assert_eq!(comm_d, hex::encode(crate::proof::MerkleTree::build(&all).root));
+
+        let body = crate::storage_proof::manifest_proof(&manifest, "egomfd1storagepaytest", "egot1host", 10, "hash10").unwrap();
+        assert_eq!(body.comm_d, comm_d);
+        assert_eq!(body.n_padded_leaves, n_padded);
+        assert!(crate::storage_proof::chunks_match(&body));
+        let tx = LedgerTx {
+            from: "egot1host".into(),
+            to: "egot1host".into(),
+            tx_type: crate::storage_proof::POST_PROOF_TX.into(),
+            call_args: serde_json::to_string(&body).unwrap(),
+            ..LedgerTx::default()
+        };
+        assert!(crate::storage_proof::validate_against_chain(&tx, 11, |h| Some(format!("hash{h}"))).is_ok());
+
+        let mut tampered = body.clone();
+        tampered.proofs[0].chunk = hex::encode(vec![0u8; 10]);
+        assert!(!crate::storage_proof::chunks_match(&tampered));
+        let mut bare = body;
+        bare.proofs[0].chunk.clear();
+        assert!(!crate::storage_proof::chunks_match(&bare));
+    }
+
+    #[test]
+    fn hosts_share_the_paid_plan_and_the_owner_never_pays_itself() {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let cf_meta = db.cf_handle(CF_META).unwrap();
+        let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
+        let cf_txs = db.cf_handle(CF_TXS).unwrap();
+        let cf_addr = db.cf_handle(CF_ADDR_TXS).unwrap();
+
+        let h = STORAGE_PAY_FROM_HEIGHT + 900;
+        let t0: i64 = 1_900_000_000;
+        let t1 = t0 + 86_400;
+        let owner = "egot1spayowner000000000000000000000000000000";
+        let hosts = ["egot1spayhosta", "egot1spayhostb", "egot1spayhostc", "egot1spayhostd"];
+
+        let prev = LedgerBlock { height: h - STORAGE_PAY_EPOCH, timestamp: t0, ..LedgerBlock::default() };
+        db.put_cf(cf_blocks, height_key(prev.height), encode(&prev)).unwrap();
+        let paid_block = LedgerBlock { height: h - 500, timestamp: t0 - 1_000, ..LedgerBlock::default() };
+        db.put_cf(cf_blocks, height_key(paid_block.height), encode(&paid_block)).unwrap();
+
+        let plan_tx = LedgerTx {
+            hash: "0xspayplan".into(),
+            from: owner.into(),
+            to: crate::commands::storage::STORAGE_FEE_SINK.into(),
+            tx_type: "credits_pay".into(),
+            memo: Some("credits_pay:79:plan:Basic:monthly".into()),
+            timestamp: t0 - 1_000,
+            block_height: Some(paid_block.height),
+            ..LedgerTx::default()
+        };
+        db.put_cf(cf_txs, plan_tx.hash.as_bytes(), encode(&plan_tx)).unwrap();
+        db.put_cf(cf_addr, addr_txs_key(owner, plan_tx.timestamp, &plan_tx.hash), (0i64).to_le_bytes()).unwrap();
+
+        let entry = RecordedStorageFile { owner: owner.into(), record: rec("egomfd1spayfile", 48_828_125, 50_000_000_000), height: h - 600 };
+        db.put_cf(cf_meta, sfile_key("egomfd1spayfile"), serde_json::to_vec(&entry).unwrap()).unwrap();
+        for (i, host) in hosts.iter().enumerate() {
+            crate::ledger::record_validator_stake(host, UPTIME_MIN_STAKE_UEGOC, true);
+            let mut v = Vec::new();
+            v.extend_from_slice(&(h - 400 + i as u64).to_le_bytes());
+            v.extend_from_slice(&(t1 - 3_600).to_le_bytes());
+            db.put_cf(cf_meta, sproof_key("egomfd1spayfile", host), v).unwrap();
+        }
+        crate::ledger::record_validator_stake(owner, UPTIME_MIN_STAKE_UEGOC, true);
+        let mut own = Vec::new();
+        own.extend_from_slice(&(h - 999).to_le_bytes());
+        own.extend_from_slice(&(t1 - 3_600).to_le_bytes());
+        db.put_cf(cf_meta, sproof_key("egomfd1spayfile", owner), own).unwrap();
+        db.put_cf(cf_meta, price_rep_key(h / STORAGE_PAY_EPOCH - 1, "egot1spayvalidator"), u64_le(8_000)).unwrap();
+
+        let paid = expected_storage_rewards_in(&db, h, t1);
+        let to: Vec<&str> = paid.iter().map(|t| t.to.as_str()).collect();
+        assert_eq!(to, vec!["egot1spayhosta", "egot1spayhostb", "egot1spayhostc"]);
+        assert!(paid.iter().all(|t| t.amount == 877_777 && t.from == NODE_POOL_ADDR));
+        assert!(expected_storage_rewards_in(&db, h + 1, t1).is_empty());
+        assert!(expected_storage_rewards_in(&db, STORAGE_PAY_FROM_HEIGHT - STORAGE_PAY_EPOCH, t1).is_empty());
     }
 }

@@ -20,6 +20,109 @@ pub struct ProofLeaf {
     pub leaf_index: u64,
     pub leaf: String,
     pub path: Vec<String>,
+    /// The challenged piece itself. A path alone only shows the prover kept the leaf
+    /// hashes, about 3% of the file; the piece shows it kept the data.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub chunk: String,
+}
+
+/// Every challenged piece is present and hashes to its leaf.
+pub fn chunks_match(body: &PostProofBody) -> bool {
+    !body.proofs.is_empty()
+        && body.proofs.iter().all(|p| {
+            let (Ok(chunk), Some(leaf)) = (hex::decode(&p.chunk), hex32(&p.leaf)) else { return false };
+            !chunk.is_empty() && chunk.len() <= crate::proof::CHUNK_SIZE && crate::proof::leaf_hash(&chunk) == leaf
+        })
+}
+
+/// The bytes a stored file is proven over: its encrypted blocks in manifest order. The
+/// owner and every host hold exactly these bytes, so each computes the same commitment.
+pub struct ManifestReader {
+    blocks: std::vec::IntoIter<String>,
+    current: std::io::Cursor<Vec<u8>>,
+}
+
+impl ManifestReader {
+    pub fn new(manifest: &crate::blocks::FileManifest) -> Self {
+        let blocks: Vec<String> = manifest.blocks.iter().map(|b| b.block_cid.clone()).collect();
+        Self { blocks: blocks.into_iter(), current: std::io::Cursor::new(Vec::new()) }
+    }
+}
+
+impl std::io::Read for ManifestReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = self.current.read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            let Some(cid) = self.blocks.next() else { return Ok(0) };
+            let bytes = crate::blocks::load_block(&cid)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
+            self.current = std::io::Cursor::new(bytes);
+        }
+    }
+}
+
+/// (comm_d hex, n_real_leaves, n_padded_leaves, bytes) for a stored file.
+pub fn manifest_commitment(manifest: &crate::blocks::FileManifest) -> std::io::Result<(String, u64, u64, u64)> {
+    let tree = crate::proof::MerkleTree::build_from_reader(ManifestReader::new(manifest))?;
+    let mut bytes = 0u64;
+    for b in &manifest.blocks {
+        bytes += std::fs::metadata(crate::blocks::block_path(&b.block_cid))?.len();
+    }
+    Ok((hex::encode(tree.root), tree.n_real as u64, tree.n_padded as u64, bytes))
+}
+
+/// A proof for a stored file that carries the challenged pieces.
+pub fn manifest_proof(
+    manifest: &crate::blocks::FileManifest,
+    cid: &str,
+    prover: &str,
+    challenge_height: u64,
+    block_hash: &str,
+) -> std::io::Result<PostProofBody> {
+    use std::io::Read;
+    let tree = crate::proof::MerkleTree::build_from_reader(ManifestReader::new(manifest))?;
+    let seed = challenge_seed(block_hash, cid, prover);
+    let indices = crate::proof::derive_challenge_indices(&seed, tree.n_real);
+    let mut wanted: std::collections::BTreeMap<usize, Vec<u8>> = indices.iter().map(|i| (*i, Vec::new())).collect();
+    let mut reader = std::io::BufReader::new(ManifestReader::new(manifest));
+    let mut chunk = vec![0u8; crate::proof::CHUNK_SIZE];
+    let mut index = 0usize;
+    loop {
+        let mut filled = 0usize;
+        while filled < chunk.len() {
+            let n = reader.read(&mut chunk[filled..])?;
+            if n == 0 { break; }
+            filled += n;
+        }
+        if filled == 0 { break; }
+        if let Some(slot) = wanted.get_mut(&index) {
+            *slot = chunk[..filled].to_vec();
+        }
+        index += 1;
+    }
+    let proofs = indices
+        .iter()
+        .map(|&i| {
+            let p = tree.proof(i);
+            ProofLeaf {
+                leaf_index: p.leaf_index,
+                leaf: hex::encode(p.leaf),
+                path: p.path.iter().map(hex::encode).collect(),
+                chunk: hex::encode(wanted.get(&i).cloned().unwrap_or_default()),
+            }
+        })
+        .collect();
+    Ok(PostProofBody {
+        cid: cid.to_string(),
+        comm_d: hex::encode(tree.root),
+        n_real_leaves: tree.n_real as u64,
+        n_padded_leaves: tree.n_padded as u64,
+        challenge_height,
+        proofs,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,6 +273,7 @@ mod tests {
                     leaf_index: p.leaf_index,
                     leaf: hex::encode(p.leaf),
                     path: p.path.iter().map(hex::encode).collect(),
+                    chunk: String::new(),
                 })
                 .collect(),
         }

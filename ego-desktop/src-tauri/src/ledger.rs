@@ -1606,7 +1606,26 @@ pub fn is_protocol_system_tx(tx: &LedgerTx) -> bool {
     }
     tx.from == crate::chain_db::NODE_POOL_ADDR
         && tx.signature == "coinbase"
-        && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward" | "uptime_reward")
+        && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward" | "uptime_reward" | "storage_reward")
+}
+
+/// Txs a node may send without a fee: the network's own housekeeping, from nodes that
+/// have stake behind them, so they can't be used to flood the mempool for free.
+pub fn fee_exempt(tx: &LedgerTx) -> bool {
+    let staked = || get_validator_stake(&tx.from) >= crate::chain_db::UPTIME_MIN_STAKE_UEGOC;
+    if tx.tx_type == "validator_register" && tx.from == tx.to && tx.amount == 0 {
+        return true;
+    }
+    if crate::chain_db::is_uptime_checkin(tx) {
+        return staked();
+    }
+    if tx.tx_type == crate::storage_proof::POST_PROOF_TX && tx.from == tx.to && tx.amount == 0 {
+        return staked();
+    }
+    if crate::chain_db::is_price_report(tx) {
+        return crate::chain_db::may_report_price(&tx.from);
+    }
+    false
 }
 
 pub fn is_reserved_system_source(addr: &str) -> bool {
@@ -1819,7 +1838,14 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         }
     }
 
-    if !is_validator_reg && !is_uptime && tx.fee_uegoc < crate::tokenomics::FEE_FLOOR_UEGOC {
+    if crate::chain_db::is_price_report(tx) {
+        crate::chain_db::price_report_ok(tx)?;
+    }
+    if crate::chain_db::is_storage_file_tx(tx) {
+        crate::chain_db::parse_storage_file(tx)?;
+    }
+
+    if !is_validator_reg && !is_uptime && !fee_exempt(tx) && tx.fee_uegoc < crate::tokenomics::FEE_FLOOR_UEGOC {
         return Err(format!(
             "tx from {} rejected: fee {} uEGOC below absolute floor {} uEGOC. Zero-fee transactions are disabled to prevent network spam.",
             tx.from, tx.fee_uegoc,

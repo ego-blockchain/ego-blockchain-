@@ -153,7 +153,16 @@ const STORAGE_PLANS: [(&str, u64, f64, f64); 3] = [
     ("Max", 1024, 4.99, 49.90),
 ];
 const PLAN_PRICE_TOLERANCE: f64 = 0.5;
-const STORAGE_FEE_SINK: &str = "egot1feesink0000000000000000000000000000000";
+pub(crate) const STORAGE_FEE_SINK: &str = "egot1feesink0000000000000000000000000000000";
+
+/// (GB, price in micro-USD, period in seconds) of a plan bought with EGUSD, from its memo.
+pub(crate) fn egusd_plan_terms(memo: &str) -> Option<(u64, u64, i64)> {
+    plan_paid_in_egusd(memo)?;
+    let mut parts = memo.split(':').skip(3);
+    let (name, billing) = (parts.next()?, parts.next()?);
+    let (gb, price_usd, period_secs) = plan_price_usd(name, billing)?;
+    Some((gb, (price_usd * 1_000_000.0).round() as u64, period_secs))
+}
 
 fn plan_price_usd(name: &str, billing: &str) -> Option<(u64, f64, i64)> {
     let (_, gb, monthly, annual) = STORAGE_PLANS.iter().find(|(n, ..)| *n == name)?;
@@ -977,6 +986,7 @@ pub async fn delete_stored_file(
         ledger.stored_files.iter().any(|f| f.cid == cid && (f.owner.is_empty() || f.owner == ledger.address))
     };
     if own_file {
+        crate::commands::consensus::unrecord_stored_file(&cid).await;
         if let Some(kp) = _state.get_keypair() {
             let notice = crate::file_delete::DeleteNotice::sign(&kp, &cid, chrono::Utc::now().timestamp());
             crate::file_delete::delete_everywhere(notice).await;

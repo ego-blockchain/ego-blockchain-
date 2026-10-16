@@ -12,6 +12,10 @@ fn hash_bytes(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
+pub fn leaf_hash(chunk: &[u8]) -> [u8; 32] {
+    hash_bytes(chunk)
+}
+
 fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(left);
@@ -37,9 +41,14 @@ impl MerkleTree {
     }
 
     pub fn build_from_path(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Self::build_from_reader(file)
+    }
+
+    /// Builds the tree over everything `reader` yields, in `CHUNK_SIZE` leaves.
+    pub fn build_from_reader(reader: impl std::io::Read) -> std::io::Result<Self> {
         use std::io::Read;
-        let file   = std::fs::File::open(path)?;
-        let mut reader = std::io::BufReader::with_capacity(CHUNK_SIZE * 64, file);
+        let mut reader = std::io::BufReader::with_capacity(CHUNK_SIZE * 64, reader);
         let mut leaves = Vec::new();
         let mut chunk  = vec![0u8; CHUNK_SIZE];
         loop {
@@ -242,7 +251,7 @@ pub const POST_SUSPEND_SECS:        i64 = 7 * 24 * 3600;
 /// How often a node re-proves its storage to the chain. Proofs expire, so a validator that
 /// stops proving loses its seat; this keeps an honest node's evidence current without
 /// filling blocks with proofs.
-const ONCHAIN_PROOF_INTERVAL_SECS: i64 = 3_600;
+const ONCHAIN_PROOF_INTERVAL_SECS: i64 = 6 * 3_600;
 static LAST_ONCHAIN_PROOF: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 async fn publish_storage_proofs_if_due() {
@@ -253,6 +262,10 @@ async fn publish_storage_proofs_if_due() {
         return;
     }
     LAST_ONCHAIN_PROOF.store(now, Ordering::Relaxed);
+    let recorded = crate::commands::consensus::record_my_stored_files().await;
+    if recorded > 0 {
+        eprintln!("[PoSt] recorded {recorded} of your file(s) on-chain so their hosts can be paid");
+    }
     match crate::commands::consensus::prove_stored_files().await {
         Ok(r) if r.proofs_submitted > 0 => {
             eprintln!("[PoSt] published {} storage proof(s) on-chain", r.proofs_submitted);
@@ -266,6 +279,7 @@ async fn publish_storage_proofs_if_due() {
 
 pub async fn run_post_checks(app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let now = chrono::Utc::now().timestamp();
+    crate::commands::consensus::report_price_if_due().await;
     publish_storage_proofs_if_due().await;
     let mut ledger = crate::ledger::Ledger::load();
     let my_addr = ledger.address.clone();

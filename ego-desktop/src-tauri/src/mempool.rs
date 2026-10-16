@@ -170,10 +170,7 @@ impl ShardedMempool {
             || tx.tx_type == "faucet"
             || tx.from.starts_with("egot1faucet");
 
-        let is_validator_reg = (tx.tx_type == "validator_register"
-            && tx.from == tx.to
-            && tx.amount == 0)
-            || crate::chain_db::is_uptime_checkin(&tx);
+        let is_validator_reg = crate::ledger::fee_exempt(&tx);
 
         if is_system && !is_pool_faucet {
             tracing::warn!("Mempool rejected {} - system txs are only valid inside verified blocks", tx.hash);

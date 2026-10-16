@@ -64,71 +64,108 @@ pub async fn get_porep_status() -> Result<Vec<SectorStatus>, EgoDesktopError> {
 /// by whoever receives it and nobody has to be trusted to hand out challenges. The answer
 /// goes into a transaction, so what a node has proven becomes chain state that consensus
 /// can read, instead of gossip that every receiver discards.
+fn node_keypair() -> Option<ego_core::KeyPair> {
+    if let Some(kp) = crate::app::global_app_state().get_keypair() {
+        return Some(kp);
+    }
+    let seed = crate::ledger::load_seed().ok().flatten()?;
+    let seed: [u8; 32] = seed.get(..32)?.try_into().ok()?;
+    ego_core::KeyPair::from_bytes(&seed).ok()
+}
+
+fn send_signed(tx: &mut crate::ledger::LedgerTx, kp: &ego_core::KeyPair) -> Result<(), String> {
+    crate::ledger::seal_tx(tx, kp, false);
+    crate::mempool::get_mempool().push(tx.clone()).map_err(|e| e.to_string())?;
+    crate::commands::tx_pending::add(tx);
+    let gossip = tx.clone();
+    tauri::async_runtime::spawn(async move { crate::p2p::broadcast_pending_tx(gossip).await; });
+    Ok(())
+}
+
+/// Prove, on chain, the files this node holds for other people.
+///
+/// The challenge comes from a recent committed block, so every node derives the same
+/// question and nobody hands out challenges. A proof only counts toward pay when it matches
+/// the owner's on-chain record of the file and carries the challenged pieces, and only a
+/// staked host may send proofs without a fee.
 #[tauri::command]
 pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError> {
     let ledger = Ledger::load();
     let prover_addr = ledger.address.clone();
+    let empty = |detail: String| PostChallengeResult { challenges_found: 0, proofs_submitted: 0, failures: 0, details: vec![detail] };
     if prover_addr.is_empty() {
-        return Ok(PostChallengeResult { challenges_found: 0, proofs_submitted: 0, failures: 0, details: vec![] });
+        return Ok(empty("No wallet yet".into()));
     }
-
+    if crate::ledger::get_validator_stake(&prover_addr) < crate::chain_db::UPTIME_MIN_STAKE_UEGOC {
+        return Ok(empty(format!(
+            "Stake {} EGOC to be paid for the files you host",
+            crate::chain_db::UPTIME_MIN_STAKE_UEGOC / 1_000_000
+        )));
+    }
     let tip = crate::chain_db::local_chain_height();
-    let challenge_height = tip.saturating_sub(crate::storage_proof::CHALLENGE_MIN_AGE.max(1));
-    if challenge_height == 0 {
-        return Ok(PostChallengeResult {
-            challenges_found: 0, proofs_submitted: 0, failures: 0,
-            details: vec!["The chain has no blocks to draw a challenge from yet".into()],
-        });
+    if tip.saturating_add(1) < crate::chain_db::STORAGE_PAY_FROM_HEIGHT {
+        return Ok(empty(format!("Storage pay starts at block {}", crate::chain_db::STORAGE_PAY_FROM_HEIGHT)));
     }
+    let challenge_height = tip.saturating_sub(crate::storage_proof::CHALLENGE_MIN_AGE.max(1));
     let Some(block_hash) = crate::chain_db::get_block_hash_at(challenge_height) else {
-        return Ok(PostChallengeResult {
-            challenges_found: 0, proofs_submitted: 0, failures: 0,
-            details: vec![format!("Block {challenge_height} is not on this node yet")],
-        });
+        return Ok(empty(format!("Block {challenge_height} is not on this node yet")));
     };
+    let Some(kp) = node_keypair() else { return Ok(empty("Wallet is locked".into())) };
 
-    let provable: Vec<_> = ledger.stored_files.iter()
-        .filter(|f| f.status == "Active" && !f.comm_d.is_empty() && f.n_real_leaves > 0)
-        .filter(|f| f.key_nonce_hex != "public")
+    let hosted: Vec<_> = ledger.stored_files.iter()
+        .filter(|f| f.status == "Active" && !f.owner.is_empty() && f.owner != prover_addr)
+        .filter(|f| f.blocks_total == 0 || f.blocks_received >= f.blocks_total)
         .cloned()
         .collect();
 
+    let mut nonce = crate::ledger::next_nonce_for(&prover_addr, ledger.nonce);
     let mut submitted = 0usize;
     let mut failures = 0usize;
+    let mut found = 0usize;
     let mut details = Vec::new();
 
-    for f in &provable {
-        let seed = crate::storage_proof::challenge_seed(&block_hash, &f.cid, &prover_addr);
-        let n_real = f.n_real_leaves as usize;
-        let proofs = match crate::proof::generate_post_proofs_from_path(
-            std::path::Path::new(&f.local_path), &seed, n_real,
-        ) {
-            Ok(p) => p,
+    for f in &hosted {
+        let Some(record) = crate::chain_db::recorded_storage_file(&f.cid) else { continue };
+        let Ok(manifest) = crate::blocks::load_manifest(&f.cid) else { continue };
+        found += 1;
+        let (cid, prover, hash) = (f.cid.clone(), prover_addr.clone(), block_hash.clone());
+        let body = tokio::task::spawn_blocking(move || {
+            crate::storage_proof::manifest_proof(&manifest, &cid, &prover, challenge_height, &hash)
+        })
+        .await
+        .map_err(|e| EgoDesktopError::FileSystemError(e.to_string()))?;
+        let body = match body {
+            Ok(b) => b,
             Err(e) => {
                 failures += 1;
-                details.push(format!("Cannot read {}: {e}", f.name));
+                details.push(format!("{}: {e}", f.name));
                 continue;
             }
         };
-
-        let body = crate::storage_proof::PostProofBody {
-            cid: f.cid.clone(),
-            comm_d: f.comm_d.clone(),
-            n_real_leaves: f.n_real_leaves as u64,
-            n_padded_leaves: n_real.next_power_of_two() as u64,
-            challenge_height,
-            proofs: proofs.iter().map(|p| crate::storage_proof::ProofLeaf {
-                leaf_index: p.leaf_index,
-                leaf: hex::encode(p.leaf),
-                path: p.path.iter().map(hex::encode).collect(),
-            }).collect(),
+        if body.comm_d != record.record.comm_d {
+            failures += 1;
+            details.push(format!("{}: the copy here doesn't match the owner's record", f.name));
+            continue;
+        }
+        let mut tx = crate::ledger::LedgerTx {
+            from: prover_addr.clone(),
+            to: prover_addr.clone(),
+            amount: 0,
+            fee_uegoc: 0,
+            tx_type: crate::storage_proof::POST_PROOF_TX.to_string(),
+            call_args: serde_json::to_string(&body).map_err(|e| EgoDesktopError::SerializationError(e.to_string()))?,
+            timestamp: chrono::Utc::now().timestamp(),
+            nonce,
+            chain_id: 1,
+            status: "Pending".to_string(),
+            ..Default::default()
         };
-
-        match submit_storage_proof(&prover_addr, &body).await {
+        match send_signed(&mut tx, &kp) {
             Ok(()) => {
+                nonce += 1;
                 submitted += 1;
-                details.push(format!("Proved {} ({} GB)", f.name, body.bytes_proven() / 1_000_000_000));
                 update_post_status(&f.cid, "proved", Some(chrono::Utc::now().timestamp()));
+                details.push(format!("Proved {}", f.name));
             }
             Err(e) => {
                 failures += 1;
@@ -136,47 +173,143 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
             }
         }
     }
+    if submitted > 0 {
+        let _guard = crate::ledger::TX_MUTEX.lock().await;
+        let mut l = Ledger::load();
+        l.nonce = l.nonce.max(nonce.saturating_sub(1));
+        let _ = l.save();
+    }
 
-    Ok(PostChallengeResult {
-        challenges_found: provable.len(),
-        proofs_submitted: submitted,
-        failures,
-        details,
-    })
+    Ok(PostChallengeResult { challenges_found: found, proofs_submitted: submitted, failures, details })
 }
 
-async fn submit_storage_proof(
-    prover: &str,
-    body: &crate::storage_proof::PostProofBody,
-) -> Result<(), String> {
-    let call_args = serde_json::to_string(body).map_err(|e| e.to_string())?;
-    let timestamp = chrono::Utc::now().timestamp();
-    let nonce = crate::ledger::last_confirmed_nonce(prover).saturating_add(1);
-    let sign_bytes = format!("{}:{}:{}:{}", prover, body.cid, body.challenge_height, timestamp).into_bytes();
-    let (signature, public_key_ed25519) = sign_payload(&sign_bytes).ok_or("signing key unavailable")?;
+/// Record this node's own files on chain, so the hosts holding them can be paid. Only files
+/// covered by a plan bought with EGUSD are recorded: that payment is what funds the hosts.
+pub async fn record_my_stored_files() -> usize {
+    let ledger = Ledger::load();
+    let me = ledger.address.clone();
+    if me.is_empty() { return 0; }
+    if crate::chain_db::local_chain_height().saturating_add(1) < crate::chain_db::STORAGE_PAY_FROM_HEIGHT { return 0; }
+    if !crate::chain_db::egusd_plan_active(&me) { return 0; }
+    let Some(kp) = node_keypair() else { return 0 };
+    let pending: std::collections::HashSet<String> = crate::mempool::get_mempool()
+        .peek_all()
+        .into_iter()
+        .filter(|t| t.from == me && crate::chain_db::is_storage_file_tx(t))
+        .filter_map(|t| serde_json::from_str::<crate::chain_db::StorageFileRecord>(&t.call_args).ok())
+        .map(|r| r.cid)
+        .collect();
+    let mine: Vec<_> = ledger.stored_files.iter()
+        .filter(|f| f.status == "Active" && (f.owner.is_empty() || f.owner == me) && f.cid.starts_with("egomfd1"))
+        .filter(|f| !pending.contains(&f.cid) && crate::chain_db::recorded_storage_file(&f.cid).is_none())
+        .take(20)
+        .cloned()
+        .collect();
+    let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", crate::ledger::get_validator_stake(&me) > 0)
+        .max(crate::mempool::MIN_FEE_UEGOC);
+    let mut nonce = crate::ledger::next_nonce_for(&me, ledger.nonce);
+    let mut sent = 0usize;
+    for f in mine {
+        let Ok(manifest) = crate::blocks::load_manifest(&f.cid) else { continue };
+        let Ok(Ok((comm_d, n_real, n_padded, bytes))) =
+            tokio::task::spawn_blocking(move || crate::storage_proof::manifest_commitment(&manifest)).await
+        else { continue };
+        let record = crate::chain_db::StorageFileRecord { cid: f.cid.clone(), comm_d, n_real_leaves: n_real, n_padded_leaves: n_padded, bytes };
+        let Ok(call_args) = serde_json::to_string(&record) else { continue };
+        let mut tx = crate::ledger::LedgerTx {
+            from: me.clone(),
+            to: me.clone(),
+            amount: 0,
+            fee_uegoc: fee,
+            tx_type: crate::chain_db::TX_STORAGE_FILE.to_string(),
+            memo: Some("storage_file".into()),
+            call_args,
+            timestamp: chrono::Utc::now().timestamp(),
+            nonce,
+            chain_id: 1,
+            status: "Pending".to_string(),
+            ..Default::default()
+        };
+        if send_signed(&mut tx, &kp).is_ok() {
+            nonce += 1;
+            sent += 1;
+        }
+    }
+    if sent > 0 {
+        let _guard = crate::ledger::TX_MUTEX.lock().await;
+        let mut l = Ledger::load();
+        l.nonce = l.nonce.max(nonce.saturating_sub(1));
+        let _ = l.save();
+    }
+    sent
+}
 
+/// Remove a deleted file's on-chain record, so it no longer counts against the owner's plan.
+pub async fn unrecord_stored_file(cid: &str) {
+    let me = Ledger::load().address;
+    let Some(rec) = crate::chain_db::recorded_storage_file(cid) else { return };
+    if rec.owner != me { return; }
+    let Some(kp) = node_keypair() else { return };
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
+    let mut ledger = Ledger::load();
+    let nonce = crate::ledger::next_nonce_for(&me, ledger.nonce);
+    let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", crate::ledger::get_validator_stake(&me) > 0)
+        .max(crate::mempool::MIN_FEE_UEGOC);
     let mut tx = crate::ledger::LedgerTx {
-        from: prover.to_string(),
-        to: prover.to_string(),
+        from: me.clone(),
+        to: me.clone(),
         amount: 0,
-        fee_uegoc: 0,
-        tx_type: crate::storage_proof::POST_PROOF_TX.to_string(),
-        call_args,
-        timestamp,
+        fee_uegoc: fee,
+        tx_type: crate::chain_db::TX_STORAGE_FILE.to_string(),
+        memo: Some("storage_file:delete".into()),
+        call_args: serde_json::to_string(&rec.record).unwrap_or_default(),
+        timestamp: chrono::Utc::now().timestamp(),
         nonce,
-        signature,
-        public_key_ed25519,
+        chain_id: 1,
         status: "Pending".to_string(),
         ..Default::default()
     };
-    tx.hash = format!("0x{}", ego_core::hash_data(
-        format!("{}:{}:{}:{}", tx.from, body.cid, body.challenge_height, timestamp).as_bytes()
-    ).to_hex());
+    if send_signed(&mut tx, &kp).is_ok() {
+        ledger.nonce = nonce;
+        let _ = ledger.save();
+    }
+}
 
-    crate::mempool::get_mempool().push(tx.clone()).map_err(|e| e.to_string())?;
-    crate::commands::tx_pending::add(&tx);
-    crate::p2p::broadcast_pending_tx(tx).await;
-    Ok(())
+/// Validators report the EGOC price they see once per payout epoch; the chain pays storage
+/// at the median of those reports.
+pub async fn report_price_if_due() {
+    let me = Ledger::load().address;
+    if me.is_empty() || !crate::chain_db::may_report_price(&me) { return; }
+    let next = crate::chain_db::local_chain_height().saturating_add(1);
+    if next.saturating_add(crate::chain_db::STORAGE_PAY_EPOCH) < crate::chain_db::STORAGE_PAY_FROM_HEIGHT { return; }
+    let epoch = next / crate::chain_db::STORAGE_PAY_EPOCH;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    if LAST.load(std::sync::atomic::Ordering::Relaxed) == epoch { return; }
+    let usd = crate::p2p::get_egoc_price_usd();
+    if !(usd.is_finite() && usd > 0.0) { return; }
+    let micro = (usd * 1_000_000.0).round() as u64;
+    let Some(kp) = node_keypair() else { return };
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
+    let mut ledger = Ledger::load();
+    let nonce = crate::ledger::next_nonce_for(&me, ledger.nonce);
+    let mut tx = crate::ledger::LedgerTx {
+        from: me.clone(),
+        to: me.clone(),
+        amount: 0,
+        fee_uegoc: 0,
+        tx_type: crate::chain_db::TX_PRICE_REPORT.to_string(),
+        memo: Some(format!("price:{micro}")),
+        timestamp: chrono::Utc::now().timestamp(),
+        nonce,
+        chain_id: 1,
+        status: "Pending".to_string(),
+        ..Default::default()
+    };
+    if send_signed(&mut tx, &kp).is_ok() {
+        ledger.nonce = nonce;
+        let _ = ledger.save();
+        LAST.store(epoch, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[tauri::command]
