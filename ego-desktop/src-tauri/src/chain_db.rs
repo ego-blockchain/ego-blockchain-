@@ -585,6 +585,10 @@ pub const GENESIS_GRACE_BLOCKS: u64 = 10_000;
 /// From this height a seat outside the starting committee needs real stake, joiners are
 /// seated one per committee epoch, and the faucet is held to its per-address total.
 pub const SEAT_RULES_FROM_HEIGHT: u64 = 30_000;
+
+/// How far a proposed block's time may be from a voter's clock. Only proposals are held to
+/// it; a block already finalized is accepted whatever its stamp, so syncing never breaks.
+pub const MAX_PROPOSAL_CLOCK_SKEW_SECS: i64 = 120;
 pub const MIN_SEAT_STAKE_UEGOC: u64 = 10_000 * 1_000_000;
 pub const NEW_SEATS_PER_EPOCH: usize = 1;
 
@@ -5042,6 +5046,17 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
     }
     if !verify_block_hash(block, txs) {
         return Err("block hash/merkle verification failed".into());
+    }
+    if is_proposal {
+        let skew = block.timestamp - chrono::Utc::now().timestamp();
+        if skew.abs() > MAX_PROPOSAL_CLOCK_SKEW_SECS {
+            return Err(format!(
+                "proposal #{} is stamped {}s {} this node's clock; its producer's clock is wrong",
+                block.height,
+                skew.abs(),
+                if skew > 0 { "ahead of" } else { "behind" }
+            ));
+        }
     }
     check_block_producer(block)?;
     if escrow_rule_active(block.height) {

@@ -1673,7 +1673,46 @@ pub async fn force_v2_proposal_as_elected_leader() {
     emit_v2_proposal().await;
 }
 
+/// Whether this computer's clock agrees with the web, within a minute. A node with a wrong
+/// clock stamps its blocks with a wrong time, which every other validator refuses, so it
+/// sits its turns out instead. Checked at most every 30 minutes; if the check can't be
+/// made the clock is trusted, so being offline never stops a node.
+async fn clock_is_right() -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    static CHECKED_AT: AtomicI64 = AtomicI64::new(0);
+    static RIGHT: AtomicBool = AtomicBool::new(true);
+    let now = chrono::Utc::now().timestamp();
+    if now.saturating_sub(CHECKED_AT.load(Ordering::Relaxed)) < 1_800 {
+        return RIGHT.load(Ordering::Relaxed);
+    }
+    CHECKED_AT.store(now, Ordering::Relaxed);
+    let Ok(client) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(8)).build() else { return true };
+    let Ok(resp) = client.head("https://www.egoblockchain.com").send().await else { return true };
+    let Some(server) = resp
+        .headers()
+        .get(reqwest::header::DATE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| chrono::DateTime::parse_from_rfc2822(s).ok())
+    else {
+        return true;
+    };
+    let offset = chrono::Utc::now().timestamp() - server.timestamp();
+    let right = offset.abs() <= 60;
+    if !right {
+        eprintln!(
+            "[Clock] This computer's clock is {}s {} the real time. Blocks it makes would be refused, so it won't propose until the clock is fixed (turn on automatic time in your system settings).",
+            offset.abs(),
+            if offset > 0 { "ahead of" } else { "behind" }
+        );
+    }
+    RIGHT.store(right, Ordering::Relaxed);
+    right
+}
+
 async fn emit_v2_proposal() {
+    if !clock_is_right().await {
+        return;
+    }
     // Build the candidate (real txs in LIVE, empty otherwise) OFF the lock.
     let (candidate, stamped) = if consensus_v2_live_enabled() {
         match build_live_candidate().await { Some(v) => v, None => return }
