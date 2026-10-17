@@ -981,6 +981,29 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
 
     let my_addr = crate::ledger::Ledger::load().address;
     if my_addr.is_empty() { return None; }
+
+    let next_height = crate::chain_db::latest_block_info().0 + 1;
+    if crate::chain_db::drs_active(next_height) {
+        let committee = crate::chain_db::committee_for_height(next_height, crate::clock::now())?;
+        let mine = committee.iter().find(|(a, _)| a == &my_addr)?.1.clone();
+        let seed = get_ed25519_seed()?;
+        let kp = ego_core::KeyPair::from_bytes(&seed).ok()?;
+        if kp.dilithium_public_key().key_data != mine {
+            eprintln!("[ConsensusV2] on the committee for h={next_height}, but this wallet's signing key is not the one registered on chain — sitting out");
+            return None;
+        }
+        let set: Vec<ego_core::Address> = committee.iter().map(|(_, k)| address_from_dilithium(k.clone())).collect();
+        eprintln!(
+            "[ConsensusV2] DRS committee ({}) for h={}: {}",
+            set.len(),
+            next_height,
+            committee.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(" "),
+        );
+        let host = ConsensusHost::new(kp, set);
+        host.seed_height(next_height);
+        return Some(host);
+    }
+
     let seed = get_ed25519_seed()?;
     let kp = ego_core::KeyPair::from_bytes(&seed).ok()?;
     let my_dil_raw = kp.dilithium_public_key().key_data;
@@ -1055,6 +1078,24 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
 }
 
 const V2_TOPIC: &str = "ego-bftv2-v1";
+
+type CollectedVotes = HashMap<u64, HashMap<ego_core::Address, Vec<ego_consensus_core::bft::Vote>>>;
+static V2_COLLECTED_VOTES: std::sync::OnceLock<std::sync::Mutex<CollectedVotes>> = std::sync::OnceLock::new();
+fn v2_collected_votes() -> std::sync::MutexGuard<'static, CollectedVotes> {
+    V2_COLLECTED_VOTES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+static V2_PENDING_HEADERS: std::sync::OnceLock<std::sync::Mutex<HashMap<ego_core::Hash, ego_consensus_core::bft::BlockHeader>>> =
+    std::sync::OnceLock::new();
+fn v2_pending_headers() -> std::sync::MutexGuard<'static, HashMap<ego_core::Hash, ego_consensus_core::bft::BlockHeader>> {
+    V2_PENDING_HEADERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// How many rounds ahead a peer may be before we stop chasing its view. Wide enough to
 /// cross an ordinary reconfiguration gap, narrow enough that a peer claiming a wild round
@@ -1163,6 +1204,13 @@ pub fn committee_quorum() -> Option<(usize, usize)> {
 }
 
 pub fn committee_source() -> (Vec<String>, bool) {
+    let next = crate::chain_db::local_chain_height().saturating_add(1);
+    if crate::chain_db::drs_active(next) {
+        let members = crate::chain_db::committee_for_height(next, crate::clock::now())
+            .map(|c| c.into_iter().map(|(a, _)| a).collect())
+            .unwrap_or_default();
+        return (members, true);
+    }
     let slashed = slashed_validators();
     // Both filters come from committed chain state, so every node applying the same blocks
     // seats the same committee.
@@ -1266,6 +1314,9 @@ pub fn committee_source() -> (Vec<String>, bool) {
 /// rota its peers had left behind — with no event, no timeout, and no way back.
 fn live_committee_sig() -> String {
     let (members, from_chain) = committee_source();
+    if crate::chain_db::drs_active(crate::chain_db::local_chain_height().saturating_add(1)) {
+        return format!("drs|{}", members.join(","));
+    }
     // Each member carries its own weight, so this says nothing about order — which matters,
     // because this list is sorted by bech32 address and the engine's is not.
     let parts: Vec<String> = members
@@ -1288,27 +1339,39 @@ async fn maybe_reconfigure_committee() {
         if !v2_pending_sig().is_empty() { v2_pending_sig().clear(); }
         return;
     }
-    {
-        let mut pending = v2_pending_sig();
-        if *pending != cur_sig {
-            *pending = cur_sig.clone();
-            V2_PENDING_SINCE.store(now, Ordering::Relaxed);
+    let drs = crate::chain_db::drs_active(crate::chain_db::latest_block_info().0 + 1);
+    if !drs {
+        {
+            let mut pending = v2_pending_sig();
+            if *pending != cur_sig {
+                *pending = cur_sig.clone();
+                V2_PENDING_SINCE.store(now, Ordering::Relaxed);
+                return;
+            }
+        }
+        if now - V2_PENDING_SINCE.load(Ordering::Relaxed) < V2_RECONFIG_STABILITY_SECS { return; }
+
+        if live_validators().len() < crate::mempool::MIN_VALIDATORS_FOR_FINALITY {
             return;
         }
     }
-    if now - V2_PENDING_SINCE.load(Ordering::Relaxed) < V2_RECONFIG_STABILITY_SECS { return; }
-
-    if live_validators().len() < crate::mempool::MIN_VALIDATORS_FOR_FINALITY {
-        return;
-    }
 
     let built = tokio::task::spawn_blocking(build_shadow_consensus_host).await.ok().flatten();
+    if built.is_none() && drs {
+        *shadow_host_lock() = None;
+        *v2_committee_sig() = cur_sig;
+        v2_pending_sig().clear();
+        eprintln!("[ConsensusV2/LIVE] not on this height's committee — following the chain");
+        return;
+    }
     if let Some(host) = built {
         let tip = crate::chain_db::latest_block_info().0 + 1;
         // Carry the view counter across the rebuild. Peers reconfigure on their own
         // timers, so a node that resets to round 0 while the rest sit at round R elects a
         // different proposer and the chain halts until they realign by chance.
-        let carry = {
+        let carry = if drs {
+            0
+        } else {
             let g = shadow_host_lock();
             g.as_ref()
                 .filter(|h| h.current_height() == tip)
@@ -1324,11 +1387,155 @@ async fn maybe_reconfigure_committee() {
         // proposals as coming from the wrong proposer.
         let (n, q) = (host.validator_set().len(), host.quorum_size());
         *shadow_host_lock() = Some(host);
-        v2_future_proposals().clear();
-        v2_future_votes().clear();
+        if drs {
+            v2_future_proposals().retain(|&h, _| h >= tip);
+            v2_future_votes().retain(|&h, _| h >= tip);
+        } else {
+            v2_future_proposals().clear();
+            v2_future_votes().clear();
+        }
         *v2_committee_sig() = cur_sig;
         v2_pending_sig().clear();
         eprintln!("[ConsensusV2/LIVE] committee reconfigured → validators={} quorum={} (seeded h={})", n, q, tip);
+    }
+}
+
+async fn realign_drs_host() {
+    V2_RECONFIG_LAST_CHECK.store(0, Ordering::Relaxed);
+    if shadow_host_lock().is_none() {
+        ensure_shadow_host().await;
+    } else {
+        maybe_reconfigure_committee().await;
+    }
+}
+
+fn drs_host_matches(block: &crate::ledger::LedgerBlock) -> bool {
+    let Some(committee) = crate::chain_db::committee_for_height(block.height, block.timestamp) else { return false };
+    let set: Vec<ego_core::Address> = committee
+        .iter()
+        .map(|(_, k)| crate::consensus_host::address_from_dilithium(k.clone()))
+        .collect();
+    shadow_host_lock().as_ref().map_or(false, |h| h.validator_set() == set.as_slice())
+}
+
+fn drs_voter_check(
+    header: &ego_consensus_core::bft::BlockHeader,
+    block: &crate::ledger::LedgerBlock,
+) -> Result<(), String> {
+    let committee = crate::chain_db::committee_for_height(block.height, block.timestamp)
+        .ok_or("no committee is known for this height")?;
+    let proposer = committee
+        .iter()
+        .find(|(_, k)| crate::consensus_host::address_from_dilithium(k.clone()) == header.proposer)
+        .map(|(a, _)| a.clone());
+    if proposer.as_deref() != Some(block.miner.as_str()) {
+        return Err(format!("miner {} is not the member that proposed", block.miner));
+    }
+    if !drs_host_matches(block) {
+        return Err("the block's committee is not the one this node sits on".into());
+    }
+    let (attempt_now, open) = crate::chain_db::committee_window(block.height, crate::clock::now())
+        .ok_or("the parent block is missing")?;
+    let attempt_block = crate::chain_db::block_attempt(block).ok_or("the parent block is missing")?;
+    if !open || attempt_now != attempt_block {
+        return Err(format!(
+            "outside the committee's time window (block attempt {attempt_block}, now {attempt_now}, open={open})"
+        ));
+    }
+    Ok(())
+}
+
+fn drs_vote_candidates(height: u64) -> std::collections::HashSet<ego_core::Address> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(u64, std::collections::HashSet<ego_core::Address>)>> =
+        std::sync::OnceLock::new();
+    let epoch = crate::chain_db::drs_epoch_of(height);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new((u64::MAX, Default::default())));
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if g.0 == epoch {
+        return g.1.clone();
+    }
+    let (candidates, settled) = crate::chain_db::committee_candidates(height);
+    let set: std::collections::HashSet<ego_core::Address> = candidates
+        .into_iter()
+        .map(|(_, k)| crate::consensus_host::address_from_dilithium(k))
+        .collect();
+    if settled {
+        *g = (epoch, set.clone());
+    }
+    set
+}
+
+fn collect_drs_vote(vote: &ego_consensus_core::bft::Vote) {
+    if !crate::chain_db::drs_active(vote.height) {
+        return;
+    }
+    if crate::consensus_host::address_from_dilithium(vote.voter_public_key.key_data.clone()) != vote.voter
+        || !matches!(vote.verify(), Ok(true))
+        || !drs_vote_candidates(vote.height).contains(&vote.voter)
+    {
+        return;
+    }
+    let mut votes = v2_collected_votes();
+    votes.retain(|&h, _| h + 3 >= vote.height);
+    let per_voter = votes.entry(vote.height).or_default().entry(vote.voter.clone()).or_default();
+    if per_voter.len() < 4 && !per_voter.iter().any(|v| v.block_hash == vote.block_hash && v.round == vote.round) {
+        per_voter.push(vote.clone());
+    }
+}
+
+fn build_commit_cert(
+    header: &ego_consensus_core::bft::BlockHeader,
+    block: &crate::ledger::LedgerBlock,
+) -> Option<crate::chain_db::CommitCert> {
+    let committee = crate::chain_db::committee_for_height(block.height, block.timestamp)?;
+    let members: Vec<ego_core::Address> = committee
+        .iter()
+        .map(|(_, k)| crate::consensus_host::address_from_dilithium(k.clone()))
+        .collect();
+    let hash = header.block_hash();
+    let mut chosen: Vec<(String, String)> = {
+        let votes = v2_collected_votes();
+        let at_height = votes.get(&header.height)?;
+        members
+            .iter()
+            .filter_map(|m| {
+                at_height.get(m)?.iter().find(|v| {
+                    v.block_hash == hash && v.round == header.round && v.epoch == header.epoch
+                })
+            })
+            .map(|v| (v.voter.to_hex(), crate::chain_db::encode_vote_sig(&v.signature.signature_data)))
+            .collect()
+    };
+    let quorum = crate::chain_db::quorum_of(members.len());
+    if chosen.len() < quorum {
+        return None;
+    }
+    chosen.sort();
+    chosen.truncate(quorum);
+    Some(crate::chain_db::CommitCert { header: crate::chain_db::CertHeader::from_engine(header), votes: chosen })
+}
+
+async fn drs_observer_try_commit(hash: ego_core::Hash) {
+    let Some(header) = v2_pending_headers().get(&hash).cloned() else { return };
+    let Some((mut block, txs)) = v2_pending_blocks().get(&hash).cloned() else { return };
+    let (tip_h, tip_hash) = crate::chain_db::latest_block_info();
+    if block.height != tip_h + 1 || block.prev_hash != tip_hash {
+        return;
+    }
+    let Some(cert) = build_commit_cert(&header, &block) else { return };
+    let vc = cert.votes.len() as u32;
+    block.commit_cert = serde_json::to_string(&cert).unwrap_or_default();
+    let height = block.height;
+    let for_oracle = (block.clone(), txs.clone());
+    let persisted = tokio::task::spawn_blocking(move || crate::chain_db::commit_staged_block(&block, &txs, vc))
+        .await
+        .unwrap_or(false);
+    if persisted {
+        v2_pending_blocks().retain(|_, (b, _)| b.height > height);
+        v2_pending_headers().retain(|_, h| h.height > height);
+        touch_proposal_timestamp();
+        eprintln!("[ConsensusV2/LIVE] followed h={height} — {vc} committee votes checked");
+        tokio::spawn(async move { push_block_to_oracle(&for_oracle.0, &for_oracle.1).await; });
     }
 }
 
@@ -1425,6 +1632,7 @@ pub async fn shadow_on_proposal(
         }
         if header.tx_root != crate::consensus_host::hash_from_hex(&block.tx_merkle_root)
             || header.state_root != crate::consensus_host::hash_from_hex(&block.state_root)
+            || header.receipts_root != crate::consensus_host::roots_from_ledger_block(&block).receipts_root
         {
             eprintln!("[ConsensusV2/LIVE] reject #{} — header roots do not commit to the block", header.height);
             return;
@@ -1437,6 +1645,21 @@ pub async fn shadow_on_proposal(
             evict_poison_txs(&e, &txs);
             repair_pool_if_blamed(&e).await;
             return;
+        }
+        if crate::chain_db::drs_active(block.height) {
+            v2_pending_headers().insert(header.block_hash(), header.clone());
+            v2_pending_blocks().insert(header.block_hash(), (block.clone(), txs.clone()));
+            if !drs_host_matches(&block) {
+                realign_drs_host().await;
+            }
+            if shadow_host_lock().is_none() {
+                drs_observer_try_commit(header.block_hash()).await;
+                return;
+            }
+            if let Err(e) = drs_voter_check(&header, &block) {
+                eprintln!("[ConsensusV2/LIVE] not voting for #{} — {}", header.height, e);
+                return;
+            }
         }
         v2_pending_blocks().insert(header.block_hash(), (block, txs));
     }
@@ -1470,6 +1693,12 @@ pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
         }
     }
 
+    collect_drs_vote(&vote);
+    if crate::chain_db::drs_active(vote.height) && shadow_host_lock().is_none() {
+        drs_observer_try_commit(vote.block_hash).await;
+        return;
+    }
+
     let decided = {
         let guard = shadow_host_lock();
         guard.as_ref().and_then(|h| {
@@ -1478,16 +1707,24 @@ pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
                     let ht = hdr.height;
                     let hash = hdr.block_hash();
                     let vc = qc.voter_count() as u32;
+                    let kept = hdr.clone();
                     let ok = h.finalize(hdr, qc);
-                    (ht, hash, vc, ok)
+                    (ht, hash, vc, ok, kept)
                 })
             })
         })
     };
-    let Some((ht, hash, vc, ok)) = decided else { return };
+    let Some((ht, hash, vc, ok, cert_hdr)) = decided else { return };
     if consensus_v2_live_enabled() {
         let payload = v2_pending_blocks().remove(&hash);
-        if let Some((block, txs)) = payload {
+        v2_pending_headers().remove(&hash);
+        if let Some((mut block, txs)) = payload {
+            if crate::chain_db::drs_active(block.height) {
+                match build_commit_cert(&cert_hdr, &block) {
+                    Some(cert) => block.commit_cert = serde_json::to_string(&cert).unwrap_or_default(),
+                    None => eprintln!("[ConsensusV2/LIVE] h={} reached quorum in the engine but the votes on hand do not make a certificate", ht),
+                }
+            }
             let bh = block.hash.clone();
             // Copy for the explorer feed before the block is moved into the commit task.
             let (block_for_oracle, txs_for_oracle) = (block.clone(), txs.clone());
@@ -1615,6 +1852,16 @@ pub async fn shadow_v2_tick() {
         }
     }
 
+    if consensus_v2_live_enabled() {
+        let next = crate::chain_db::latest_block_info().0 + 1;
+        if crate::chain_db::drs_active(next)
+            && !crate::chain_db::committee_window(next, crate::clock::now()).map_or(false, |(_, open)| open)
+        {
+            V2_VIEW_ENTERED_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+            return;
+        }
+    }
+
     // ── Pacemaker ─────────────────────────────────────────────────────────────
     // If we sit at the same (height, round) too long without finalizing — the elected
     // proposer is offline, can't build a block, or its proposal isn't reaching us — rotate
@@ -1721,9 +1968,23 @@ async fn build_live_candidate() -> Option<(crate::ledger::LedgerBlock, Vec<Ledge
         format!("{}:{}", hex::encode(ticket), hex::encode(sig.to_bytes()))
     };
 
-    tokio::task::spawn_blocking(move || {
+    let drained = all_txs.clone();
+    let (mut block, txs) = tokio::task::spawn_blocking(move || {
         crate::chain_db::build_block_proposal(&all_txs, &miner, &combined_ticket, poc_slot)
-    }).await.ok()
+    }).await.ok()?;
+    {
+        let included: std::collections::HashSet<&str> = txs.iter().map(|t| t.hash.as_str()).collect();
+        let back: Vec<LedgerTx> = drained.into_iter().filter(|t| included.contains(t.hash.as_str())).collect();
+        crate::mempool::get_mempool().requeue(back);
+    }
+    if crate::chain_db::drs_active(block.height) {
+        let Some(sk) = BLS_SECRET_KEY.get() else {
+            eprintln!("[ConsensusV2/LIVE] no BLS key loaded — cannot sign block #{}'s randomness", block.height);
+            return None;
+        };
+        block.randao_reveal = hex::encode(crate::bls_agg::bls_sign(sk, &crate::chain_db::randao_message(block.height)));
+    }
+    Some((block, txs))
 }
 
 pub fn register_validator_pubkey(address: &str, dilithium_pubkey_hex: &str) {
@@ -3244,6 +3505,8 @@ pub enum P2PMessage {
         requester_endpoint: String,
         #[serde(default)]
         have_height: u64,
+        #[serde(default)]
+        checkpoint: u64,
         /// The requester cannot move forward by ordinary sync: the next block cannot be
         /// assembled from anything any peer will serve. Without this a server applies the
         /// lag rule and stays silent, and a node nine blocks behind an unreadable height
@@ -4750,11 +5013,20 @@ pub async fn broadcast_poc_beacon() -> Option<String> {
     let (cell, _lat, _lon) = my_coverage_cell_and_geo();
     let now   = chrono::Utc::now().timestamp();
     let epoch = crate::poc::poc_epoch(now);
-    let mut nonce = [0u8; 8];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let beacon_id = hex::encode(blake3::hash(
-        format!("{}:{}:{}", my_addr, epoch, hex::encode(nonce)).as_bytes()
-    ).as_bytes());
+    let tip = crate::chain_db::local_chain_height();
+    let challenge = (tip >= 1 && tip.saturating_add(1) >= crate::chain_db::CHECKIN_FROM_HEIGHT)
+        .then(|| tip - 1)
+        .and_then(|h| crate::chain_db::get_block_hash_at(h).map(|hash| (h, hash)));
+    let beacon_id = match &challenge {
+        Some((_, hash)) => crate::coverage_proof::beacon_id_for(hash, &my_addr),
+        None => {
+            let mut nonce = [0u8; 8];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+            hex::encode(blake3::hash(
+                format!("{}:{}:{}", my_addr, epoch, hex::encode(nonce)).as_bytes()
+            ).as_bytes())
+        }
+    };
     let transport = "internet".to_string();
     let bytes = crate::poc::beacon_signing_bytes(&beacon_id, &my_addr, &machine_id, &cell, epoch, now, &transport);
     let signature = crate::poc::sign_with_node_key(&bytes)?;
@@ -4770,6 +5042,7 @@ pub async fn broadcast_poc_beacon() -> Option<String> {
     };
     let data = serde_json::to_vec(&msg).ok()?;
     crate::poc::start_beacon(&beacon_id, now);
+    crate::poc::set_beacon_challenge(challenge.map(|(h, _)| h));
     publish_gossip("ego-poc-v1", data).await;
     eprintln!("[PoC] beacon {} published (epoch {})", &beacon_id[..12], epoch);
     Some(beacon_id)
@@ -4856,6 +5129,7 @@ async fn handle_poc_witness(
         machine_id: witness_machine_id,
         cell:       witness_cell,
         latency_ms,
+        rssi_dbm,
         timestamp,
         signature,
     });
@@ -7840,11 +8114,13 @@ async fn handle_event(
                     }
                 }
             } else if topic == "ego-snapshot-v1" {
-                if let Ok(P2PMessage::SnapshotRequest { requester_endpoint, have_height, stuck }) =
+                if let Ok(P2PMessage::SnapshotRequest { requester_endpoint, have_height, stuck, checkpoint }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     let local_tip = crate::chain_db::latest_block_info().0;
-                    if snapshot_serve_allowed(local_tip, have_height, stuck)
+                    if checkpoint > have_height && !requester_endpoint.is_empty() && sync_reply_allowed(&requester_endpoint) {
+                        tokio::spawn(serve_state_checkpoint(requester_endpoint, checkpoint));
+                    } else if snapshot_serve_allowed(local_tip, have_height, stuck)
                         && !requester_endpoint.is_empty()
                         && sync_reply_allowed(&requester_endpoint)
                     {
@@ -8027,20 +8303,34 @@ async fn handle_event(
                             }).await.ok();
                         });
                     }
-                    Ok(P2PMessage::ComputeJobComplete { job_id, output_cid, .. }) => {
+                    Ok(P2PMessage::ComputeJobComplete { job_id, output_cid, worker }) => {
                         tokio::spawn(async move {
-                            tokio::task::spawn_blocking(move || {
-                                if let Some(mut job) = crate::chain_db::get_compute_job(&job_id) {
-                                    if (job.status == "accepted" || job.status == "running")
-                                        && !job.worker_address.is_empty()
+                            let payable = tokio::task::spawn_blocking(move || {
+                                let mut job = crate::chain_db::get_compute_job(&job_id)?;
+                                if (job.status == "accepted" || job.status == "running")
+                                    && !job.worker_address.is_empty()
+                                    && job.worker_address == worker
+                                {
+                                    job.status       = "completed".to_string();
+                                    job.output_cid   = output_cid;
+                                    job.completed_at = Some(chrono::Utc::now().timestamp());
+                                    crate::chain_db::upsert_compute_job(&job);
+                                    let me = crate::ledger::Ledger::load().address;
+                                    if job.poster_address == me
+                                        && crate::commands::direct_pay::paid_periods(&me, &job.worker_address, "compute_job_pay", &job.job_id) == 0
                                     {
-                                        job.status       = "completed".to_string();
-                                        job.output_cid   = output_cid;
-                                        job.completed_at = Some(chrono::Utc::now().timestamp());
-                                        crate::chain_db::upsert_compute_job(&job);
+                                        return Some((job.worker_address.clone(), job.bid_uegoc, job.job_id.clone()));
                                     }
                                 }
-                            }).await.ok();
+                                None
+                            }).await.ok().flatten();
+                            if let Some((to, bid, id)) = payable {
+                                let memo = crate::commands::direct_pay::pay_memo("compute_job_pay", &id, 1);
+                                match crate::commands::direct_pay::pay(&to, bid, false, memo).await {
+                                    Ok(_) => eprintln!("[Compute] paid {} uEGOC to {:.16} for job {}", bid, to, id),
+                                    Err(e) => eprintln!("[Compute] could not pay for job {}: {}", id, e),
+                                }
+                            }
                         });
                     }
                     Ok(P2PMessage::ComputeJobCancel { job_id, .. }) => {
@@ -8137,6 +8427,12 @@ async fn handle_event(
                                         if node.provider_address == provider_address {
                                             node.last_heartbeat_at = now;
                                             node.status = "active".to_string();
+                                            if let Some(mut res) = crate::chain_db::get_compute_reservation(&node.reservation_id) {
+                                                if res.provider_address == provider_address && res.status == "active" {
+                                                    res.last_heartbeat_at = now;
+                                                    crate::chain_db::upsert_compute_reservation(&res);
+                                                }
+                                            }
                                             break;
                                         }
                                     }
@@ -8227,14 +8523,18 @@ async fn handle_event(
                     }
                     Ok(P2PMessage::StorageDealProof { deal_id, provider, timestamp }) => {
                         tokio::spawn(async move {
-                            tokio::task::spawn_blocking(move || {
-                                if let Some(mut deal) = crate::chain_db::get_storage_deal(&deal_id) {
-                                    if deal.provider_address == provider && deal.status == "active" {
-                                        deal.last_proof_at = timestamp;
-                                        crate::chain_db::upsert_storage_deal(&deal);
-                                    }
+                            let deal = tokio::task::spawn_blocking(move || {
+                                let mut deal = crate::chain_db::get_storage_deal(&deal_id)?;
+                                if deal.provider_address == provider && deal.status == "active" {
+                                    deal.last_proof_at = timestamp;
+                                    crate::chain_db::upsert_storage_deal(&deal);
+                                    return Some(deal);
                                 }
-                            }).await.ok();
+                                None
+                            }).await.ok().flatten();
+                            if let Some(deal) = deal {
+                                crate::commands::storage_deals::pay_due_days(deal).await;
+                            }
                         });
                     }
                     Ok(P2PMessage::StorageDealTerminated { deal_id, .. }) => {
@@ -9242,9 +9542,11 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
             }
         }
 
-        P2PMessage::SnapshotRequest { requester_endpoint, have_height, stuck } => {
+        P2PMessage::SnapshotRequest { requester_endpoint, have_height, stuck, checkpoint } => {
             let local_tip = crate::chain_db::latest_block_info().0;
-            if snapshot_serve_allowed(local_tip, have_height, stuck)
+            if checkpoint > have_height && !requester_endpoint.is_empty() && sync_reply_allowed(&requester_endpoint) {
+                tokio::spawn(serve_state_checkpoint(requester_endpoint, checkpoint));
+            } else if snapshot_serve_allowed(local_tip, have_height, stuck)
                 && !requester_endpoint.is_empty()
                 && sync_reply_allowed(&requester_endpoint)
             {
@@ -9266,11 +9568,17 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
                 eprintln!("[P2PSnapshot] refused a snapshot at height {} that this node didn't ask for", snapshot.height);
                 return;
             }
-            if let Err(e) = snapshot.verify() {
+            let checkpointed = {
+                let s = snapshot.clone();
+                tokio::task::spawn_blocking(move || crate::chain_db::state_checkpoint_matches(&s)).await.unwrap_or(false)
+            };
+            if checkpointed {
+                eprintln!("[P2PSnapshot] snapshot at height {} matches the state checkpoint this release ships", snapshot.height);
+            } else if let Err(e) = snapshot.verify() {
                 eprintln!("[P2PSnapshot] refused a snapshot at height {}: {e}", snapshot.height);
                 return;
             }
-            if !snapshot_is_from_our_network(&snapshot) {
+            if !checkpointed && !snapshot_is_from_our_network(&snapshot) {
                 eprintln!(
                     "[P2PSnapshot] refused a snapshot at height {} — none of its recent blocks were produced by this network's starting committee",
                     snapshot.height
@@ -10515,7 +10823,7 @@ fn snapshot_is_from_our_network(snap: &crate::chain_db::StateSnapshot) -> bool {
     if snap.blocks.is_empty() {
         return false;
     }
-    snap.blocks.iter().any(|b| crate::genesis::is_member(&b.miner))
+    snap.blocks.iter().any(|b| crate::genesis::is_member(&b.miner) || crate::chain_db::drs_active(b.height))
 }
 
 /// Whether a batch of blocks belongs to the chain this build is part of. Fork choice is
@@ -10532,7 +10840,7 @@ fn blocks_are_from_our_network(blocks: &[LedgerBlock]) -> bool {
     }
     blocks
         .iter()
-        .any(|b| b.height == 0 || crate::genesis::is_member(&b.miner))
+        .any(|b| b.height == 0 || crate::genesis::is_member(&b.miner) || crate::chain_db::drs_active(b.height))
 }
 
 pub async fn request_snapshot_from_peers(have_height: u64) {
@@ -10563,11 +10871,24 @@ fn signed_state_snapshot() -> Option<crate::chain_db::StateSnapshot> {
     Some(snap)
 }
 
+async fn serve_state_checkpoint(requester_endpoint: String, height: u64) {
+    let snap = tokio::task::spawn_blocking(move || crate::chain_db::load_state_checkpoint(height))
+        .await
+        .ok()
+        .flatten();
+    if let Some(snapshot) = snap {
+        let resp = P2PMessage::SnapshotResponse { snapshot };
+        let _ = send_message(&requester_endpoint, &resp).await;
+    }
+}
+
 async fn ask_peers_for_snapshot(have_height: u64, stuck: bool) {
     SNAPSHOT_ASKED_AT.store(Utc::now().timestamp(), Ordering::Relaxed);
     let my_endpoint = get_public_endpoint().await;
     if my_endpoint.is_empty() { return; }
-    let msg = P2PMessage::SnapshotRequest { requester_endpoint: my_endpoint, have_height, stuck };
+    let latest = crate::chain_db::latest_state_checkpoint_height();
+    let checkpoint = if latest > have_height { latest } else { 0 };
+    let msg = P2PMessage::SnapshotRequest { requester_endpoint: my_endpoint, have_height, stuck, checkpoint };
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-snapshot-v1", data).await;
     }
@@ -11534,11 +11855,8 @@ pub fn maybe_send_uptime_checkin() {
     let ledger = crate::ledger::Ledger::load();
     let addr = ledger.address.clone();
     if addr.is_empty() { return; }
-    if crate::ledger::get_validator_stake(&addr) < crate::chain_db::UPTIME_MIN_STAKE_UEGOC { return; }
     let now = crate::clock::now();
-    if let Some(last) = crate::chain_db::uptime_last_paid(&addr) {
-        if now.saturating_sub(last) < crate::chain_db::UPTIME_INTERVAL_SECS { return; }
-    }
+    if !crate::chain_db::checkin_due(&addr, now) { return; }
     let pending = crate::mempool::get_mempool().peek_all().into_iter().find(|t| {
         t.from == addr
             && crate::chain_db::is_uptime_checkin(t)

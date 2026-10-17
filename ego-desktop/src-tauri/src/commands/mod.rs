@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod direct_pay;
 pub mod updates;
 pub mod auth;
 pub mod wallet;

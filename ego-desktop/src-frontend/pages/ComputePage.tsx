@@ -177,7 +177,7 @@ export default function ComputePage() {
   const [offerCoreHourEgoc, setOfferCoreHourEgoc] = useState(0.02);
   const [offerMinHours,     setOfferMinHours]     = useState(1);
   const [offerMaxHours,     setOfferMaxHours]     = useState(8760);
-  const [offerBonded,       setOfferBonded]       = useState(true);
+  const [offerBonded] = useState(false);
   const [offerPosting,      setOfferPosting]      = useState(false);
   const [offerMsg,          setOfferMsg]          = useState('');
 
@@ -917,9 +917,6 @@ export default function ComputePage() {
                           <div className="flex items-center gap-2 flex-wrap">
                             <p className="text-white text-sm font-medium">{gpuLabel(o)}</p>
                             <span className="text-xs text-gray-400">· {o.cpu_cores} cores · {o.ram_gb}GB RAM</span>
-                            {o.bonded
-                              ? <span className="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded-full">✓ Protected</span>
-                              : <span className="text-xs bg-orange-900 text-orange-300 px-2 py-0.5 rounded-full">Basic</span>}
                             <StatusBadge s={o.status} />
                           </div>
                           <p className="text-yellow-400 text-sm font-semibold">{fmt(rate)} EGOC/hr</p>
@@ -945,8 +942,8 @@ export default function ComputePage() {
           {/* My active bookings as provider */}
           {reservations.filter(r => r.provider_address === myAddr && r.status === 'active').length > 0 && (
             <div className="bg-gray-800 rounded-xl border border-gray-700 p-5 space-y-3">
-              <h2 className="text-white font-semibold">Active rentals — claim your payment</h2>
-              <p className="text-gray-400 text-xs">Send a check-in each period to receive your payment from escrow.</p>
+              <h2 className="text-white font-semibold">Active rentals</h2>
+              <p className="text-gray-400 text-xs">The renter pays you on chain at the start of each period. If a payment doesn't arrive, the rental stops.</p>
               {reservations.filter(r => r.provider_address === myAddr && r.status === 'active').map(r => {
                 const totalPeriods = r.period_minutes > 0 ? Math.round(r.duration_minutes / r.period_minutes) : 1;
                 const earned = r.period_rate_uegoc * r.periods_paid;
@@ -1058,16 +1055,13 @@ export default function ComputePage() {
                 const rate = hourlyRate(o);
                 const tags = aiSuitability(o);
                 return (
-                  <div key={o.offer_id} className={`rounded-xl border p-4 space-y-3 ${o.bonded ? 'bg-gray-800 border-gray-700' : 'bg-gray-800 border-orange-800/40'}`}>
+                  <div key={o.offer_id} className="rounded-xl border p-4 space-y-3 bg-gray-800 border-gray-700">
                     <div className="flex items-start justify-between gap-3">
                       <div className="space-y-1.5 flex-1">
                         <div className="flex items-center gap-2 flex-wrap">
                           {o.gpu_count > 0
                             ? <p className="text-white font-bold text-base">{gpuLabel(o)}</p>
                             : <p className="text-white font-bold text-base">{o.cpu_cores}-core CPU · {o.ram_gb}GB RAM</p>}
-                          {o.bonded
-                            ? <span className="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded-full">✓ Protected</span>
-                            : <span className="text-xs bg-orange-900 text-orange-300 px-2 py-0.5 rounded-full">Unprotected</span>}
                         </div>
                         {o.gpu_count > 0 && (
                           <p className="text-gray-400 text-xs">{o.gpu_count}× GPU · {o.gpu_vram_gb}GB VRAM · {o.cpu_cores} cores · {o.ram_gb}GB RAM</p>
@@ -1163,7 +1157,7 @@ export default function ComputePage() {
                             {r.started_at
                               ? <p className="text-white text-sm font-bold">{fmtDuration(minsLeft)} left</p>
                               : <p className="text-yellow-400 text-sm font-bold">Ready — not started</p>}
-                            <p className="text-gray-400 text-xs">{fmt(r.escrow_remaining)} EGOC in escrow</p>
+                            <p className="text-gray-400 text-xs">{fmt(r.escrow_remaining)} EGOC still to pay</p>
                           </div>
                         )}
                         {isProvider && (
@@ -1209,20 +1203,17 @@ export default function ComputePage() {
                           <button onClick={() => setConfirmTermRes(r.reservation_id)}
                             disabled={busyRes === r.reservation_id}
                             className="w-full py-2 bg-red-700 hover:bg-red-600 text-white text-sm rounded-lg disabled:opacity-60">
-                            {busyRes === r.reservation_id ? 'Processing…'
-                              : r.collateral_uegoc > 0
-                                ? 'End Rental — Get Refund + Security Deposit'
-                                : 'End Rental — Get Unused Escrow Refunded'}
+                            {busyRes === r.reservation_id ? 'Processing…' : 'End Rental'}
                           </button>
                         ) : (
                           <>
                             <p className="text-gray-500 text-xs text-center mt-1 mb-2">
-                              Payments release automatically each period. If the provider goes offline you'll be refunded.
+                              You pay the provider at the start of each period while the machine is online. If it goes offline, payments stop.
                             </p>
                             <button onClick={() => setConfirmTermEarly({ id: r.reservation_id, penalty: r.period_rate_uegoc })}
                               disabled={busyRes === r.reservation_id}
                               className="w-full py-2 bg-gray-700 hover:bg-red-900 text-white hover:text-red-100 text-sm rounded-lg transition-colors disabled:opacity-60 border border-red-900/30">
-                              {busyRes === r.reservation_id ? 'Processing…' : 'Terminate Early (Pay 1 Period Penalty)'}
+                              {busyRes === r.reservation_id ? 'Processing…' : 'End Rental Early'}
                             </button>
                           </>
                         )}
@@ -1475,20 +1466,9 @@ export default function ComputePage() {
               </div>
             </div>
 
-            <div className={`border rounded-xl p-3 space-y-2 cursor-pointer ${offerBonded ? 'border-green-700 bg-green-950/20' : 'border-gray-600 bg-gray-750'}`}
-              onClick={() => setOfferBonded(b => !b)}>
-              <div className="flex items-center justify-between">
-                <p className={`text-sm font-medium ${offerBonded ? 'text-green-300' : 'text-gray-300'}`}>
-                  {offerBonded ? '✓ Protected listing (recommended)' : 'Basic listing (no deposit)'}
-                </p>
-                <div className={`w-10 h-5 rounded-full transition-colors ${offerBonded ? 'bg-green-600' : 'bg-gray-600'}`}>
-                  <div className={`w-4 h-4 bg-white rounded-full m-0.5 transition-transform ${offerBonded ? 'translate-x-5' : ''}`} />
-                </div>
-              </div>
+            <div className="border border-gray-600 rounded-xl p-3">
               <p className="text-gray-400 text-xs">
-                {offerBonded
-                  ? `You lock a security deposit (30% of each booking). Buyers trust you more and you can charge higher prices. Deposit returned when booking ends normally.`
-                  : 'No deposit needed. Renters get unused escrow back automatically if you go offline, but no extra penalty for you.'}
+                Renters pay you on chain at the start of each period while the rental runs. If a renter stops paying, the rental stops.
               </p>
             </div>
 
@@ -1522,12 +1502,9 @@ export default function ComputePage() {
           <div className="bg-gray-800 rounded-xl border border-gray-700 p-6 w-full max-w-md space-y-4 max-h-[90vh] overflow-y-auto">
             <h3 className="text-white font-semibold text-lg">Rent this hardware</h3>
 
-            <div className={`border rounded-xl p-3 space-y-1 ${bookOpen.bonded ? 'border-green-700 bg-green-950/10' : 'border-orange-700/40 bg-orange-950/10'}`}>
+            <div className="border rounded-xl p-3 space-y-1 border-gray-600">
               <div className="flex items-center gap-2">
                 <p className="text-white font-medium">{gpuLabel(bookOpen)}</p>
-                {bookOpen.bonded
-                  ? <span className="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded-full">✓ Protected</span>
-                  : <span className="text-xs bg-orange-900 text-orange-300 px-2 py-0.5 rounded-full">Basic</span>}
               </div>
               <p className="text-gray-400 text-xs">{bookOpen.cpu_cores} CPU cores · {bookOpen.ram_gb}GB RAM · {fmt(hourlyRate(bookOpen))} EGOC/hr</p>
               <p className="text-gray-400 text-xs">Provider: {fmtAddr(bookOpen.provider_address)}</p>
@@ -1555,30 +1532,21 @@ export default function ComputePage() {
                 <span className="text-white">{fmt(hourlyRate(bookOpen))} EGOC/hr</span>
               </div>
               <div className="flex justify-between border-t border-gray-600 pt-2">
-                <span className="text-gray-400">Total you pay now</span>
+                <span className="text-gray-400">You pay now (first period)</span>
                 <span className="text-yellow-400 font-bold">
-                  {fmt(Math.round(hourlyRate(bookOpen) * bookDurationMins / 60))} EGOC
+                  {fmt(Math.round(hourlyRate(bookOpen) * (bookDurationMins < 60 ? bookDurationMins : bookDurationMins <= 1440 ? 60 : 1440) / 60))} EGOC
                 </span>
               </div>
-              {bookOpen.bonded && (
-                <div className="flex justify-between">
-                  <span className="text-gray-400">Provider's security deposit</span>
-                  <span className="text-green-400">{fmt(Math.round(hourlyRate(bookOpen) * bookDurationMins / 60 * 0.3))} EGOC</span>
-                </div>
-              )}
+              <div className="flex justify-between">
+                <span className="text-gray-400">Total for the full time</span>
+                <span className="text-white">{fmt(Math.round(hourlyRate(bookOpen) * bookDurationMins / 60))} EGOC</span>
+              </div>
             </div>
 
-            {bookOpen.bonded ? (
-              <div className="bg-green-950/20 border border-green-800/40 rounded-lg p-3 text-xs text-green-300 space-y-1">
-                <p className="font-medium">✓ Your payment is protected</p>
-                <p className="text-green-400/70">If the provider goes offline, your unused escrow is refunded automatically. You also receive their security deposit as compensation.</p>
-              </div>
-            ) : (
-              <div className="bg-orange-950/20 border border-orange-800/40 rounded-lg p-3 text-xs text-orange-300 space-y-1">
-                <p className="font-medium">Basic protection</p>
-                <p className="text-orange-400/70">If the provider goes offline, your unused escrow is refunded automatically. No extra penalty for the provider.</p>
-              </div>
-            )}
+            <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-3 text-xs text-gray-300 space-y-1">
+              <p className="font-medium">Pay as you go</p>
+              <p className="text-gray-400">Each period is paid to the provider on chain when it starts, from this app. If the machine goes offline, payments stop, so you never pay ahead by more than one period. Keep the app running during the rental.</p>
+            </div>
 
             {bookMsg && <p className="text-red-400 text-sm">{bookMsg}</p>}
             <div className="flex gap-3">
@@ -1639,7 +1607,7 @@ export default function ComputePage() {
               <div>
                 <h3 className="text-white font-semibold">Stop this rental?</h3>
                 <p className="text-gray-400 text-sm mt-1">
-                  You will stop earning rewards. Remaining escrow will be refunded to the buyer. Your security deposit will be returned.
+                  The renter loses access now. The unused part of the period they already paid for is sent back to them from your wallet.
                 </p>
               </div>
             </div>
@@ -1701,7 +1669,7 @@ export default function ComputePage() {
               <div>
                 <h3 className="text-white font-semibold">Terminate Early?</h3>
                 <p className="text-gray-400 text-sm mt-1">
-                  You will be charged a penalty of <span className="text-yellow-400 font-bold">{fmt(confirmTermEarly.penalty)} EGOC</span> (1 period). The rest of your unused escrow will be refunded.
+                  You have paid through the current period (<span className="text-yellow-400 font-bold">{fmt(confirmTermEarly.penalty)} EGOC</span>). Nothing more will be charged.
                 </p>
               </div>
             </div>
@@ -1755,7 +1723,7 @@ export default function ComputePage() {
               <div>
                 <h3 className="text-white font-semibold">Terminate Cluster?</h3>
                 <p className="text-gray-400 text-sm mt-1">
-                  Are you sure you want to end this cluster? Any unused escrow will be refunded to you.
+                  Are you sure you want to end this cluster? You have paid through the current period and nothing more will be charged.
                 </p>
               </div>
             </div>

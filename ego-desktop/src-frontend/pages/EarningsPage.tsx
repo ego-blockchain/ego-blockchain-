@@ -19,6 +19,22 @@ interface EarningsData {
   reward_suspended_until: number | null;
 }
 
+interface ChainDrs {
+  active: boolean;
+  from_height: number;
+  checkins_from_height: number;
+  height: number;
+  epoch: number;
+  registered: boolean;
+  uptime_streak: number;
+  streak_needed: number;
+  my_weight: number;
+  total_weight: number;
+  nodes: number;
+  on_committee: boolean;
+  committee: string[];
+}
+
 interface StorageMetrics {
   storage_allocated_bytes: number;
   space_used_bytes: number;
@@ -80,6 +96,7 @@ const EarningsPage: React.FC = () => {
   const [computeEarnings, setComputeEarnings] = useState<ComputeEarnings | null>(null);
   const [computeStatus,   setComputeStatus]   = useState<ComputeStatus | null>(null);
 
+  const [chainDrs, setChainDrs] = useState<ChainDrs | null>(null);
   const [sessionEarned, setSessionEarned] = useState(0);
   const [egocUsd, setEgocUsd] = useState(0);
   useEffect(() => {
@@ -140,6 +157,7 @@ const EarningsPage: React.FC = () => {
 
   async function loadAll() {
     try {
+      invoke<ChainDrs>('get_chain_drs').then(setChainDrs).catch(() => {});
       const [e, m, cov, ce, cs] = await Promise.all([
         invoke<EarningsData>('get_earnings_data'),
         invoke<StorageMetrics>('get_storage_metrics'),
@@ -526,14 +544,67 @@ const EarningsPage: React.FC = () => {
             </div>
           </div>
 
+          {chainDrs && (
+            <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
+              <h3 className="font-semibold mb-2">Block Lottery (DRS)</h3>
+              <p className="text-xs text-gray-400 mb-3">
+                Every 100 blocks, 4 nodes are drawn at random to make blocks, weighted by DRS from what the chain
+                has recorded: uptime check-ins, paid storage you prove you hold, and coverage. Any 3 of the 4 make a
+                block. A node that just sat waits while others take their turn. No stake is needed.
+              </p>
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Status</span>
+                  {chainDrs.active ? (
+                    <span className="text-green-400 font-medium">Live</span>
+                  ) : (
+                    <span className="text-yellow-400 font-medium">Starts at block {chainDrs.from_height.toLocaleString()}</span>
+                  )}
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Registered node</span>
+                  <span className={chainDrs.registered ? 'text-green-400' : 'text-gray-500'}>{chainDrs.registered ? 'Yes' : 'Not yet'}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Uptime check-ins in a row</span>
+                  <span className={chainDrs.uptime_streak >= chainDrs.streak_needed ? 'text-green-400' : 'text-gray-300'}>
+                    {chainDrs.uptime_streak} / {chainDrs.streak_needed} needed
+                  </span>
+                </div>
+                {chainDrs.height < chainDrs.checkins_from_height && (
+                  <div className="text-xs text-gray-500">Check-ins count from block {chainDrs.checkins_from_height.toLocaleString()}.</div>
+                )}
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Your DRS this epoch</span>
+                  <span className="text-gray-300 font-mono">
+                    {chainDrs.my_weight.toLocaleString()}
+                    {chainDrs.total_weight > 0 && (
+                      <span className="text-gray-500"> ({((chainDrs.my_weight / chainDrs.total_weight) * 100).toFixed(2)}%)</span>
+                    )}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Nodes in the draw</span>
+                  <span className="text-gray-300">{chainDrs.nodes.toLocaleString()}</span>
+                </div>
+                {chainDrs.active && (
+                  <div className="flex justify-between">
+                    <span className="text-gray-400">Making blocks now</span>
+                    <span className={chainDrs.on_committee ? 'text-green-400 font-semibold' : 'text-gray-500'}>
+                      {chainDrs.on_committee ? 'Yes, your node' : 'Other nodes'}
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Stake rewards */}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <h3 className="font-semibold mb-2">Stake Your Rewards</h3>
             <p className="text-xs text-gray-400 mb-4">
-              Lock earned EGOC to earn staking APR and gain governance rights. Stake also gates
-              whether your validator vote counts toward consensus quorum, and gives a new node a
-              small starting reward score. It does not raise your DRS multiplier once you are
-              earning: that is measured from coverage and storage proofs.
+              Lock earned EGOC to earn staking APR and gain governance rights. Staking does not
+              decide who makes blocks or how node rewards are split: that comes from your DRS.
             </p>
             <div className="space-y-2 text-sm mb-4">
               <div className="flex justify-between">
@@ -561,8 +632,8 @@ const EarningsPage: React.FC = () => {
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <h3 className="font-semibold mb-2">Block Production</h3>
             <p className="text-xs text-gray-400 mb-3">
-              Every transaction mines a new block. BFT validators earn block rewards that halve every
-              ~4 years over a 120-year emission schedule.
+              The node that makes a block earns its reward. Rewards halve every ~4 years over a
+              120-year emission schedule.
             </p>
             <div className="flex justify-between text-sm mb-1">
               <span className="text-gray-400">Era-0 block reward</span>
@@ -574,7 +645,7 @@ const EarningsPage: React.FC = () => {
             </div>
             <div className="flex justify-between text-sm mb-3">
               <span className="text-gray-400">Consensus</span>
-              <span className="text-gray-300">sBFT validator</span>
+              <span className="text-gray-300">DRS committee, 3 of 4</span>
             </div>
             <div className="text-xs text-gray-500 bg-gray-900 rounded-lg p-2.5">
               Block rewards are fixed in EGOC (not USD). As EGOC appreciates, each block reward

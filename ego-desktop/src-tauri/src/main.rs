@@ -1105,6 +1105,8 @@ fn main() {
             commands::consensus::prove_stored_files,
             commands::consensus::get_post_score,
             commands::consensus::get_combined_drs,
+            commands::consensus::get_chain_drs,
+            commands::consensus::resync_chain,
             commands::consensus::get_tokenomics,
             commands::contracts::compile_urego,
             commands::contracts::deploy_contract,

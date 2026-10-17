@@ -955,12 +955,12 @@ const StoragePage: React.FC = () => {
         </div>
       </div>
 
-      {/* ── Storage Deals (escrow) ── */}
+      {/* ── Storage Deals ── */}
       {deals.length > 0 && (
         <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
           <div className="px-5 py-4 border-b border-gray-700">
             <h3 className="font-semibold">Storage Deals</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Payment is held in escrow — provider earns daily, unused balance refunded automatically if they go offline.</p>
+            <p className="text-xs text-gray-400 mt-0.5">You pay the provider on chain one day at a time, each time they prove they still hold your file. If they stop proving it, payments stop.</p>
           </div>
           <div className="divide-y divide-gray-700/50">
             {deals.map(d => {
@@ -994,7 +994,7 @@ const StoragePage: React.FC = () => {
                       {isClient && d.status === 'active' && (
                         <>
                           <p className="text-white text-sm font-bold">{daysLeft} days left</p>
-                          <p className="text-gray-400 text-xs">{fmtEgoc(d.escrow_remaining)} EGOC in escrow</p>
+                          <p className="text-gray-400 text-xs">{fmtEgoc(d.escrow_remaining)} EGOC still to pay</p>
                         </>
                       )}
                       {isProvider && (

@@ -597,6 +597,12 @@ pub struct LedgerBlock {
 
     #[serde(default)]
     pub bls_pubkeys: Vec<String>,
+
+    #[serde(default)]
+    pub commit_cert: String,
+
+    #[serde(default)]
+    pub randao_reveal: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1057,6 +1063,8 @@ impl Ledger {
             base_fee_uegoc: 1_000,
             agg_bls_sig: String::new(),
             bls_pubkeys: Vec::new(),
+            commit_cert: String::new(),
+            randao_reveal: String::new(),
         });
     }
 
@@ -1109,6 +1117,8 @@ pub fn genesis_block() -> LedgerBlock {
         base_fee_uegoc: 1_000,
         agg_bls_sig: String::new(),
         bls_pubkeys: Vec::new(),
+        commit_cert: String::new(),
+        randao_reveal: String::new(),
     }
 }
 
@@ -1180,6 +1190,8 @@ impl SharedChain {
             base_fee_uegoc: 1_000,
             agg_bls_sig: String::new(),
             bls_pubkeys: Vec::new(),
+            commit_cert: String::new(),
+            randao_reveal: String::new(),
         });
     }
 
@@ -1248,6 +1260,8 @@ impl SharedChain {
             base_fee_uegoc: 1_000,
             agg_bls_sig: String::new(),
             bls_pubkeys: Vec::new(),
+            commit_cert: String::new(),
+            randao_reveal: String::new(),
         };
         self.blocks.push(block.clone());
         block
@@ -1609,18 +1623,19 @@ pub fn is_protocol_system_tx(tx: &LedgerTx) -> bool {
         && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward" | "uptime_reward" | "storage_reward")
 }
 
-/// Txs a node may send without a fee: the network's own housekeeping, from nodes that
-/// have stake behind them, so they can't be used to flood the mempool for free.
+/// Txs a registered node may send without a fee: the network's own housekeeping. A block
+/// carries at most `MAX_FREE_TXS_PER_BLOCK` of them, and a check-in only when it is due, so
+/// they can't flood blocks.
 pub fn fee_exempt(tx: &LedgerTx) -> bool {
-    let staked = || get_validator_stake(&tx.from) >= crate::chain_db::UPTIME_MIN_STAKE_UEGOC;
+    let registered = || crate::chain_db::is_registered_node(&tx.from);
     if tx.tx_type == "validator_register" && tx.from == tx.to && tx.amount == 0 {
         return true;
     }
     if crate::chain_db::is_uptime_checkin(tx) {
-        return staked();
+        return registered();
     }
     if tx.tx_type == crate::storage_proof::POST_PROOF_TX && tx.from == tx.to && tx.amount == 0 {
-        return staked();
+        return registered();
     }
     if crate::chain_db::is_price_report(tx) {
         return crate::chain_db::may_report_price(&tx.from);
@@ -1811,11 +1826,10 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         if next < crate::chain_db::UPTIME_FROM_HEIGHT {
             return Err(format!("uptime check-ins count from block {}", crate::chain_db::UPTIME_FROM_HEIGHT));
         }
-        if get_validator_stake(&tx.from) < crate::chain_db::UPTIME_MIN_STAKE_UEGOC {
+        if !crate::chain_db::checkin_due(&tx.from, crate::clock::now()) {
             return Err(format!(
-                "uptime check-in from {} refused: it needs {} EGOC staked",
-                tx.from,
-                crate::chain_db::UPTIME_MIN_STAKE_UEGOC / 1_000_000
+                "uptime check-in from {} refused: the node isn't registered or its last check-in is too recent",
+                tx.from
             ));
         }
         crate::chain_db::uptime_checkin_fresh(tx, next.saturating_sub(1), crate::chain_db::get_block_hash_at)?;

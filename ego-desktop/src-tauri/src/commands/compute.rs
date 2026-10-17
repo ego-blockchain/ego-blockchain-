@@ -1,26 +1,18 @@
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use crate::app::AppState;
-use crate::chain_db::{
-    ComputeCapacityOffer, ComputeJob, ComputeNodeRecord, ComputeReservation,
-    COMPUTE_COLLATERAL_BPS, COMPUTE_ESCROW_ADDR,
-    HEARTBEAT_INTERVAL_SECS,
-    RESERVATION_ESCROW_ADDR, RESERVATION_SLA_BPS,
-};
+use crate::chain_db::{ComputeCapacityOffer, ComputeJob, ComputeNodeRecord, ComputeReservation};
 
 use crate::commands::wallet::get_reservation_connect_info;
 const HEARTBEAT_GRACE_SECS: i64 = 7_200;
 const BREACH_THRESHOLD_BONDED:   u32 = 3;
 const BREACH_THRESHOLD_UNBONDED: u32 = 1;
 use crate::error::EgoDesktopError;
-use crate::ledger::{tx_signing_bytes, LedgerTx};
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use uuid::Uuid;
 use serde_json::json;
 use reqwest;
 
-const NODE_POOL_ADDR: &str = crate::chain_db::NODE_POOL_ADDR;
-const SLASH_BASE_UEGOC: u64 = 1_000_000; // 1 EGOC minimum slash regardless of bid
 /// Periods a rented provider may miss its heartbeat before the renter declares an SLA
 /// breach (matches the cluster breach threshold).
 const SLA_BREACH_PERIODS: i64 = 3;
@@ -101,50 +93,6 @@ fn compute_score(cpu_cores: u32, ram_gb: u32, gpu_vram_gb: u32, gpu_count: u32) 
     cpu_score + ram_score + gpu_score
 }
 
-fn collateral_for(bid: u64) -> u64 {
-    (bid * COMPUTE_COLLATERAL_BPS / 10_000).max(SLASH_BASE_UEGOC)
-}
-
-fn push_system_tx(from: &str, to: &str, amount: u64, memo: &str, nonce: u64) -> String {
-    let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(from, to, amount, nonce, ts);
-    let hash       = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-    crate::mempool::get_mempool().push(LedgerTx {
-        hash:      hash.clone(),
-        from:      from.to_string(),
-        to:        to.to_string(),
-        amount,
-        memo:      Some(memo.to_string()),
-        timestamp: ts,
-        signature: "compute_escrow_system".to_string(),
-        status:    "Pending".into(),
-        nonce,
-        tx_type:   "compute_escrow".to_string(),
-        ..LedgerTx::default()
-    });
-    hash
-}
-
-fn push_credits_escrow_tx(to: &str, credits: u64, action: &str, deal_id: &str) {
-    let ts = chrono::Utc::now().timestamp();
-    let memo = format!("credits_release:{}:{}:{}", credits, action, deal_id);
-    let sign_bytes = tx_signing_bytes(crate::chain_db::RESERVATION_ESCROW_ADDR, to, 0, credits, ts);
-    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-    let _ = crate::mempool::get_mempool().push(LedgerTx {
-        hash,
-        from:      crate::chain_db::RESERVATION_ESCROW_ADDR.to_string(),
-        to:        to.to_string(),
-        amount:    0,
-        memo:      Some(memo),
-        timestamp: ts,
-        signature: "credits_escrow_system".to_string(),
-        status:    "Pending".into(),
-        nonce:     credits,
-        tx_type:   "credits_escrow".to_string(),
-        ..LedgerTx::default()
-    });
-}
-
 /// Renter-side SLA enforcement: a provider we rented from has gone dark. Compute can't
 /// live-migrate a running container, so the resilience guarantee is COMPENSATION — refund
 /// the renter's unused escrow AND award them the provider's SLA bond, then free the
@@ -152,26 +100,9 @@ fn push_credits_escrow_tx(to: &str, credits: u64, action: &str, deal_id: &str) {
 async fn refund_breached_reservation(res: crate::chain_db::ComputeReservation) {
     let provider_short: String = res.provider_address.chars().take(12).collect();
     let rid    = res.reservation_id.clone();
-    let refund = res.escrow_remaining;     // renter's unspent funds
-    let bond   = res.collateral_uegoc;     // provider's SLA collateral → renter
 
     tokio::task::spawn_blocking(move || {
         let mut r = res;
-        let buyer = r.buyer_address.clone();
-        if refund > 0 {
-            if r.paid_in_egusd {
-                push_credits_escrow_tx(&buyer, refund, "sla_breach_refund", &r.reservation_id);
-            } else {
-                crate::chain_db::internal_balance_transfer(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, refund);
-                push_system_tx(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, refund,
-                    &format!("sla_breach_refund:{}", r.reservation_id), 0);
-            }
-        }
-        if bond > 0 {
-            crate::chain_db::internal_balance_transfer(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, bond);
-            push_system_tx(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, bond,
-                &format!("sla_breach_bond:{}", r.reservation_id), 0);
-        }
         r.status           = "breached".to_string();
         r.escrow_remaining = 0;
         r.breach_count     = r.breach_count.saturating_add(SLA_BREACH_PERIODS as u32);
@@ -184,8 +115,7 @@ async fn refund_breached_reservation(res: crate::chain_db::ComputeReservation) {
         }
     }).await.ok();
 
-    eprintln!("[Compute] SLA breach: provider {} went dark on {} — refunded {} escrow + {} bond to renter",
-        provider_short, rid, refund, bond);
+    eprintln!("[Compute] provider {} went dark on {} — payments stopped", provider_short, rid);
 }
 
 fn check_and_apply_timeout(job: &mut ComputeJob) -> bool {
@@ -198,20 +128,6 @@ fn check_and_apply_timeout(job: &mut ComputeJob) -> bool {
     job.status       = "timed_out".to_string();
     job.completed_at = Some(now);
 
-    let collateral = job.collateral_uegoc;
-    let bid        = job.bid_uegoc;
-
-    if collateral > 0 {
-        crate::chain_db::internal_balance_transfer(COMPUTE_ESCROW_ADDR, NODE_POOL_ADDR, collateral);
-        push_system_tx(COMPUTE_ESCROW_ADDR, NODE_POOL_ADDR, collateral,
-            &format!("compute_slash:{}", job.job_id), 0);
-    }
-    if bid > 0 {
-        crate::chain_db::internal_balance_transfer(COMPUTE_ESCROW_ADDR, &job.poster_address, bid);
-        push_system_tx(COMPUTE_ESCROW_ADDR, &job.poster_address, bid,
-            &format!("compute_refund:{}", job.job_id), 0);
-    }
-
     job.escrow_active = false;
 
     if !job.worker_address.is_empty() {
@@ -223,8 +139,7 @@ fn check_and_apply_timeout(job: &mut ComputeJob) -> bool {
         }
     }
 
-    eprintln!("[Compute] Job {} timed out — slashed {} uEGOC, refunded {} uEGOC to poster",
-        job.job_id, collateral, bid);
+    eprintln!("[Compute] Job {} timed out — nothing was paid for it", job.job_id);
     true
 }
 
@@ -385,6 +300,8 @@ pub async fn compute_node_heartbeat() {
     for res in breached {
         refund_breached_reservation(res).await;
     }
+
+    pay_due_rentals(&owner).await;
 
     // Auto-claim payment for cluster nodes when a period has elapsed
     let owner_cl = owner.clone();
@@ -625,7 +542,7 @@ pub async fn post_compute_job(
         return Err(EgoDesktopError::InvalidInput("Duration must be > 0".into()));
     }
 
-    let mut ledger = crate::ledger::Ledger::load();
+    let ledger = crate::ledger::Ledger::load();
     let from = ledger.address.clone();
 
     let chain_balance = crate::chain_db::balance_of(&from);
@@ -635,37 +552,11 @@ pub async fn post_compute_job(
             chain_balance, bid_uegoc
         )));
     }
-
-    let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
-    let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(&from, COMPUTE_ESCROW_ADDR, bid_uegoc, nonce, ts);
-    let sig_hex    = if let Some(kp) = state.get_keypair() {
-        hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes())
-    } else {
+    if state.get_keypair().is_none() {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
-    };
-    let job_id   = Uuid::new_v4().to_string();
-    let lock_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-
-    crate::mempool::get_mempool().push(LedgerTx {
-        hash:               lock_hash.clone(),
-        from:               from.clone(),
-        to:                 COMPUTE_ESCROW_ADDR.to_string(),
-        amount:             bid_uegoc,
-        memo:               Some(format!("compute_lock:{}", job_id)),
-        timestamp:          ts,
-        signature:          sig_hex,
-        status:             "Pending".into(),
-        block_height:       None,
-        nonce,
-        tx_type:            "compute_escrow".to_string(),
-        ..LedgerTx::default()
-    });
-
-    crate::chain_db::internal_balance_transfer(&from, COMPUTE_ESCROW_ADDR, bid_uegoc);
-
-    ledger.nonce = nonce;
-    ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+    }
+    let ts     = chrono::Utc::now().timestamp();
+    let job_id = Uuid::new_v4().to_string();
 
     let job = ComputeJob {
         job_id:            job_id.clone(),
@@ -684,7 +575,7 @@ pub async fn post_compute_job(
         accepted_at:       None,
         completed_at:      None,
         collateral_uegoc:  0,
-        escrow_active:     true,
+        escrow_active:     false,
         min_bid_uegoc:     0,
     };
 
@@ -699,9 +590,9 @@ pub async fn post_compute_job(
 #[tauri::command]
 pub async fn cancel_compute_job(
     job_id: String,
-    state:  State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> Result<(), EgoDesktopError> {
-    let mut ledger = crate::ledger::Ledger::load();
+    let ledger = crate::ledger::Ledger::load();
     let my_addr    = ledger.address.clone();
 
     let mut job = crate::chain_db::get_compute_job(&job_id)
@@ -714,12 +605,6 @@ pub async fn cancel_compute_job(
         return Err(EgoDesktopError::InvalidInput(
             "Can only cancel jobs that have not been accepted yet".into()
         ));
-    }
-
-    if job.escrow_active && job.bid_uegoc > 0 {
-        crate::chain_db::internal_balance_transfer(COMPUTE_ESCROW_ADDR, &my_addr, job.bid_uegoc);
-        push_system_tx(COMPUTE_ESCROW_ADDR, &my_addr, job.bid_uegoc,
-            &format!("compute_cancel_refund:{}", job_id), 0);
     }
 
     job.status       = "cancelled".to_string();
@@ -808,49 +693,18 @@ pub async fn accept_compute_job(
         )));
     }
 
-    let collateral = collateral_for(job.bid_uegoc);
-    let my_balance = crate::chain_db::balance_of(&my_addr);
-    if my_balance < collateral {
-        return Err(EgoDesktopError::InvalidInput(format!(
-            "Insufficient balance for collateral: need {} uEGOC (20% of bid), have {}",
-            collateral, my_balance
-        )));
-    }
-
-    let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
-    let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(&my_addr, COMPUTE_ESCROW_ADDR, collateral, nonce, ts);
-    let sig_hex    = if let Some(kp) = state.get_keypair() {
-        hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes())
-    } else {
+    if state.get_keypair().is_none() {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
-    };
-    let col_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-
-    crate::mempool::get_mempool().push(LedgerTx {
-        hash:      col_hash.clone(),
-        from:      my_addr.clone(),
-        to:        COMPUTE_ESCROW_ADDR.to_string(),
-        amount:    collateral,
-        memo:      Some(format!("compute_collateral:{}", job_id)),
-        timestamp: ts,
-        signature: sig_hex,
-        status:    "Pending".into(),
-        nonce,
-        tx_type:   "compute_escrow".to_string(),
-        ..LedgerTx::default()
-    });
-
-    crate::chain_db::internal_balance_transfer(&my_addr, COMPUTE_ESCROW_ADDR, collateral);
+    }
+    let ts = chrono::Utc::now().timestamp();
 
     job.status           = "accepted".to_string();
     job.worker_address   = my_addr.clone();
     job.accepted_at      = Some(ts);
-    job.collateral_uegoc = collateral;
+    job.collateral_uegoc = 0;
     job.min_bid_uegoc    = min_bid;
     crate::chain_db::upsert_compute_job(&job);
 
-    ledger.nonce                += 1;
     ledger.compute_locked_cores  += job.required_cores;
     ledger.compute_locked_ram_gb += job.required_vram_gb;
     ledger.save().map_err(EgoDesktopError::FileSystemError)?;
@@ -920,17 +774,6 @@ async fn complete_job_internal(job_id: &str, output_cid: &str, worker_addr: &str
         None    => return,
     };
 
-    let total_release = job.bid_uegoc + job.collateral_uegoc;
-    if job.escrow_active && total_release > 0 {
-        crate::chain_db::internal_balance_transfer(COMPUTE_ESCROW_ADDR, worker_addr, total_release);
-        push_system_tx(COMPUTE_ESCROW_ADDR, worker_addr, job.bid_uegoc,
-            &format!("compute_payment:{}", job_id), 0);
-        if job.collateral_uegoc > 0 {
-            push_system_tx(COMPUTE_ESCROW_ADDR, worker_addr, job.collateral_uegoc,
-                &format!("compute_collateral_return:{}", job_id), 0);
-        }
-    }
-
     let now = chrono::Utc::now().timestamp();
     job.status       = "completed".to_string();
     job.output_cid   = output_cid.to_string();
@@ -966,11 +809,6 @@ async fn slash_job_internal(job_id: &str, worker_addr: &str, reason: &str) {
         Some(j) => j,
         None    => return,
     };
-
-    if job.escrow_active && job.collateral_uegoc > 0 {
-        push_system_tx(COMPUTE_ESCROW_ADDR, NODE_POOL_ADDR, job.collateral_uegoc,
-            &format!("compute_slash:{}", job_id), 0);
-    }
 
     job.status       = "timed_out".to_string();
     job.escrow_active = false;
@@ -1083,17 +921,6 @@ pub async fn complete_compute_job(
     }
     if job.status != "accepted" && job.status != "running" {
         return Err(EgoDesktopError::InvalidInput(format!("Job is {}", job.status)));
-    }
-
-    let total_release = job.bid_uegoc + job.collateral_uegoc;
-    if job.escrow_active && total_release > 0 {
-        crate::chain_db::internal_balance_transfer(COMPUTE_ESCROW_ADDR, &my_addr, total_release);
-        push_system_tx(COMPUTE_ESCROW_ADDR, &my_addr, job.bid_uegoc,
-            &format!("compute_payment:{}", job_id), 0);
-        if job.collateral_uegoc > 0 {
-            push_system_tx(COMPUTE_ESCROW_ADDR, &my_addr, job.collateral_uegoc,
-                &format!("compute_collateral_return:{}", job_id), 0);
-        }
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -1242,9 +1069,9 @@ pub async fn book_reservation(
     offer_id:         String,
     duration_minutes: u64,
     pay_with_egusd:   Option<bool>,
-    state:            State<'_, AppState>,
+    _state:           State<'_, AppState>,
 ) -> Result<String, EgoDesktopError> {
-    let mut ledger = crate::ledger::Ledger::load();
+    let ledger     = crate::ledger::Ledger::load();
     let my_addr    = ledger.address.clone();
     let now        = chrono::Utc::now().timestamp();
 
@@ -1280,7 +1107,6 @@ pub async fn book_reservation(
     let period_rate = hourly_rate * period_minutes / 60;
 
     let pay_egusd = pay_with_egusd.unwrap_or(false);
-    let egoc_total_cost = total_cost;
     let (total_cost, period_rate) = if pay_egusd {
         // Bill from the rate the operator listed, not from converting their coin figure at
         // this moment. The offer said what it costs in dollars; that is the price, and it
@@ -1304,129 +1130,21 @@ pub async fn book_reservation(
         (total_cost, period_rate)
     };
 
-    let collateral;
-    if pay_egusd {
-        let have = crate::chain_db::credits_balance(&my_addr);
-        if have < total_cost {
-            return Err(EgoDesktopError::WalletError(format!(
-                "Insufficient EGUSD: need {:.2}, have {:.2}",
-                total_cost as f64 / 100.0,
-                have as f64 / 100.0
-            )));
-        }
-
-        collateral = if offer.bonded {
-            let required = (egoc_total_cost * RESERVATION_SLA_BPS / 10_000).max(1_000_000);
-            let provider_balance = crate::chain_db::balance_of(&offer.provider_address);
-            if provider_balance < required {
-                return Err(EgoDesktopError::InvalidInput(
-                    format!("Provider cannot meet SLA bond of {} uEGOC (has {})", required, provider_balance)
-                ));
-            }
-            if !crate::chain_db::internal_balance_transfer(&offer.provider_address, RESERVATION_ESCROW_ADDR, required) {
-                return Err(EgoDesktopError::WalletError("Failed to lock provider SLA collateral".into()));
-            }
-            push_system_tx(&offer.provider_address, RESERVATION_ESCROW_ADDR, required,
-                &format!("reservation_escrow_collateral:{}", offer_id), 0);
-            required
-        } else {
-            0
-        };
-
-        let is_staker = ledger.staked_amount > 0;
-        let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
-        if crate::chain_db::balance_of(&my_addr) < fee {
-            return Err(EgoDesktopError::WalletError("Insufficient EGOC for the network fee".into()));
-        }
-        let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
-        let memo  = format!("credits_pay:{}:resv:{}", total_cost, offer_id);
-        let kp = state.get_keypair()
-            .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
-        let mut tx = LedgerTx {
-            from:                my_addr.clone(),
-            to:                  RESERVATION_ESCROW_ADDR.to_string(),
-            amount:              0,
-            memo:                Some(memo),
-            timestamp:           now,
-            status:              "Pending".into(),
-            nonce,
-            fee_uegoc:           fee,
-            tx_type:             "credits_pay".to_string(),
-            chain_id:            1,
-            ..LedgerTx::default()
-        };
-        crate::ledger::seal_tx(&mut tx, &kp, true);
-        let _ = crate::mempool::get_mempool().push(tx);
-        ledger.nonce = nonce;
-        ledger.save().map_err(EgoDesktopError::FileSystemError)?;
-    } else {
-        let my_balance = crate::chain_db::balance_of(&my_addr);
-        if my_balance < total_cost {
-            return Err(EgoDesktopError::WalletError(
-                format!("Insufficient balance: need {} uEGOC, have {}", total_cost, my_balance)
-            ));
-        }
-
-        if !crate::chain_db::internal_balance_transfer(&my_addr, RESERVATION_ESCROW_ADDR, total_cost) {
-            return Err(EgoDesktopError::WalletError("Failed to lock buyer payment in escrow".into()));
-        }
-
-        let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
-        let sign_bytes = tx_signing_bytes(&my_addr, RESERVATION_ESCROW_ADDR, total_cost, nonce, now);
-        let kp = state.get_keypair().ok_or_else(|| {
-            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
-            EgoDesktopError::WalletError("Wallet not initialized".into())
-        })?;
-        let sig_hex    = hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes());
-        let dil_sig    = kp.sign_dilithium(&sign_bytes);
-        let pubkey_hex = hex::encode(kp.ed25519_public_key().as_bytes());
-        let dil_pk_hex = hex::encode(&kp.dilithium_public_key().key_data);
-        let dil_sig_hex= hex::encode(&dil_sig.signature_data);
-        let tx_hash    = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-        crate::mempool::get_mempool().push(LedgerTx {
-            hash:                 tx_hash,
-            from:                 my_addr.clone(),
-            to:                   RESERVATION_ESCROW_ADDR.to_string(),
-            amount:               total_cost,
-            memo:                 Some(format!("reservation_escrow_buyer:{}", offer_id)),
-            timestamp:            now,
-            signature:            sig_hex,
-            status:               "Pending".into(),
-            nonce,
-            public_key_ed25519:   pubkey_hex,
-            dilithium_pubkey:     dil_pk_hex,
-            dilithium_signature:  dil_sig_hex,
-            tx_type:              "reservation_escrow".to_string(),
-            tx_version:           2,
-            chain_id:             1,
-            ..LedgerTx::default()
-        });
-        ledger.nonce = nonce;
-        ledger.save().map_err(EgoDesktopError::FileSystemError)?;
-
-        collateral = if offer.bonded {
-            let required = (total_cost * RESERVATION_SLA_BPS / 10_000).max(1_000_000);
-            let provider_balance = crate::chain_db::balance_of(&offer.provider_address);
-            if provider_balance < required {
-                crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
-                return Err(EgoDesktopError::InvalidInput(
-                    format!("Provider cannot meet SLA bond of {} uEGOC (has {})", required, provider_balance)
-                ));
-            }
-            if !crate::chain_db::internal_balance_transfer(&offer.provider_address, RESERVATION_ESCROW_ADDR, required) {
-                crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
-                return Err(EgoDesktopError::WalletError("Failed to lock provider SLA collateral".into()));
-            }
-            push_system_tx(&offer.provider_address, RESERVATION_ESCROW_ADDR, required,
-                &format!("reservation_escrow_collateral:{}", offer_id), 0);
-            required
-        } else {
-            0
-        };
-    }
+    let reservation_id = Uuid::new_v4().to_string();
+    let total_periods  = (duration_minutes / period_minutes.max(1)).max(1);
+    let first          = crate::commands::direct_pay::period_amount(total_cost, period_rate, 1, total_periods);
+    crate::commands::direct_pay::pay(
+        &offer.provider_address,
+        first,
+        pay_egusd,
+        crate::commands::direct_pay::pay_memo("reservation_pay", &reservation_id, 1),
+    )
+    .await
+    .map_err(EgoDesktopError::WalletError)?;
+    let collateral = 0;
 
     let reservation = ComputeReservation {
-        reservation_id:    Uuid::new_v4().to_string(),
+        reservation_id:    reservation_id.clone(),
         offer_id:          offer_id.clone(),
         buyer_address:     my_addr.clone(),
         provider_address:  offer.provider_address.clone(),
@@ -1442,9 +1160,9 @@ pub async fn book_reservation(
         created_at:        now,
         expires_at:        now + duration_minutes as i64 * 60,
         last_heartbeat_at: now,
-        periods_paid:      0,
+        periods_paid:      1,
         breach_count:      0,
-        escrow_remaining:  total_cost,
+        escrow_remaining:  total_cost.saturating_sub(first),
         days:              0,
         days_paid:         0,
         daily_rate_uegoc:  0,
@@ -1552,8 +1270,7 @@ pub async fn send_reservation_heartbeat(reservation_id: String) -> Result<(), Eg
         return Ok(());
     }
 
-    let bonded        = crate::chain_db::get_compute_offer(&res.offer_id).map(|o| o.bonded).unwrap_or(false);
-    let threshold     = if bonded { BREACH_THRESHOLD_BONDED } else { BREACH_THRESHOLD_UNBONDED };
+    let threshold     = BREACH_THRESHOLD_UNBONDED;
     let period_secs   = res.period_minutes as i64 * 60;
     let elapsed       = now - res.last_heartbeat_at;
     let total_periods = res.duration_minutes / res.period_minutes.max(1);
@@ -1561,15 +1278,6 @@ pub async fn send_reservation_heartbeat(reservation_id: String) -> Result<(), Eg
 
     if missed > 0 {
         res.breach_count += missed;
-        if bonded && res.collateral_uegoc > 0 {
-            let slash = (res.collateral_uegoc / total_periods.max(1) * missed as u64)
-                .min(res.collateral_uegoc);
-            if slash > 0 {
-                crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, crate::chain_db::NODE_POOL_ADDR, slash);
-                push_system_tx(RESERVATION_ESCROW_ADDR, crate::chain_db::NODE_POOL_ADDR, slash,
-                    &format!("reservation_breach_slash:{}", reservation_id), 0);
-            }
-        }
         if res.breach_count >= threshold {
             res.status = "breached".to_string();
             crate::chain_db::upsert_compute_reservation(&res);
@@ -1577,34 +1285,37 @@ pub async fn send_reservation_heartbeat(reservation_id: String) -> Result<(), Eg
         }
     }
 
-    let payment = res.period_rate_uegoc;
-    if res.escrow_remaining >= payment {
-        if res.paid_in_egusd {
-            push_credits_escrow_tx(&my_addr, payment, "period_payment", &reservation_id);
-        } else {
-            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, payment);
-            push_system_tx(RESERVATION_ESCROW_ADDR, &my_addr, payment,
-                &format!("reservation_period_payment:{}", reservation_id), 0);
-            ledger.compute_reservation_earnings_uegoc += payment;
+    let start = res.started_at.unwrap_or(res.created_at);
+    let paid = crate::commands::direct_pay::paid_periods(&res.buyer_address, &my_addr, "reservation_pay", &reservation_id);
+    if paid > res.periods_paid {
+        let earned: u64 = (res.periods_paid + 1..=paid)
+            .map(|p| crate::commands::direct_pay::period_amount(res.total_cost_uegoc, res.period_rate_uegoc, p, total_periods))
+            .sum();
+        if !res.paid_in_egusd {
+            ledger.compute_reservation_earnings_uegoc += earned;
             ledger.save().map_err(EgoDesktopError::FileSystemError)?;
         }
-        res.escrow_remaining = res.escrow_remaining.saturating_sub(payment);
-        res.periods_paid += 1;
+        res.escrow_remaining = res.escrow_remaining.saturating_sub(earned);
+        res.periods_paid = paid;
+    }
+    let due = crate::commands::direct_pay::periods_due(start, now, period_secs, total_periods);
+    if due > paid.saturating_add(1) {
+        res.status = "unpaid".to_string();
+        crate::chain_db::upsert_compute_reservation(&res);
+        crate::compute_admission::end(&reservation_id, now);
+        let msg = crate::p2p::P2PMessage::ReservationTerminated {
+            reservation_id: reservation_id.clone(),
+            by:     "provider".to_string(),
+            reason: "unpaid".to_string(),
+        };
+        crate::p2p::broadcast_compute_msg(msg).await;
+        return Err(EgoDesktopError::InvalidInput("The renter stopped paying, so the rental was stopped".into()));
     }
 
     res.last_heartbeat_at = now;
 
-    if res.periods_paid >= total_periods || res.escrow_remaining == 0 {
+    if now >= res.expires_at && res.periods_paid >= total_periods {
         res.status = "completed".to_string();
-        if res.collateral_uegoc > 0 {
-            let slashed   = res.collateral_uegoc / total_periods.max(1) * res.breach_count as u64;
-            let remaining = res.collateral_uegoc.saturating_sub(slashed);
-            if remaining > 0 {
-                crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, remaining);
-                push_system_tx(RESERVATION_ESCROW_ADDR, &my_addr, remaining,
-                    &format!("reservation_collateral_return:{}", reservation_id), 0);
-            }
-        }
         if let Some(mut node) = crate::chain_db::get_compute_node(&my_addr) {
             node.locked_cores  = node.locked_cores.saturating_sub(res.cpu_cores);
             node.locked_ram_gb = node.locked_ram_gb.saturating_sub(res.ram_gb);
@@ -1624,6 +1335,54 @@ pub async fn send_reservation_heartbeat(reservation_id: String) -> Result<(), Eg
     Ok(())
 }
 
+async fn pay_due_rentals(owner: &str) {
+    let owner_q = owner.to_string();
+    let mine: Vec<ComputeReservation> = tokio::task::spawn_blocking(move || {
+        crate::chain_db::list_compute_reservations()
+            .into_iter()
+            .filter(|r| r.buyer_address == owner_q && r.status == "active" && r.period_minutes > 0)
+            .collect()
+    }).await.unwrap_or_default();
+    let now = chrono::Utc::now().timestamp();
+    for mut r in mine {
+        let Some(start) = r.started_at else { continue };
+        let period_secs = r.period_minutes as i64 * 60;
+        let total = (r.duration_minutes / r.period_minutes.max(1)).max(1);
+        let due = crate::commands::direct_pay::periods_due(start, now, period_secs, total);
+        let (buyer, provider, rid) = (r.buyer_address.clone(), r.provider_address.clone(), r.reservation_id.clone());
+        let on_chain = tokio::task::spawn_blocking(move || {
+            crate::commands::direct_pay::paid_periods(&buyer, &provider, "reservation_pay", &rid)
+        }).await.unwrap_or(0);
+        let paid = r.periods_paid.max(on_chain);
+        if paid >= total {
+            if now >= r.expires_at {
+                r.status = "completed".to_string();
+                crate::chain_db::upsert_compute_reservation(&r);
+            }
+            continue;
+        }
+        if paid >= due {
+            continue;
+        }
+        let provider_alive = now - r.last_heartbeat_at.max(start) < period_secs * SLA_BREACH_PERIODS;
+        if !provider_alive {
+            continue;
+        }
+        let period = paid + 1;
+        let amount = crate::commands::direct_pay::period_amount(r.total_cost_uegoc, r.period_rate_uegoc, period, total);
+        let memo = crate::commands::direct_pay::pay_memo("reservation_pay", &r.reservation_id, period);
+        match crate::commands::direct_pay::pay(&r.provider_address, amount, r.paid_in_egusd, memo).await {
+            Ok(_) => {
+                r.periods_paid = period;
+                r.escrow_remaining = r.escrow_remaining.saturating_sub(amount);
+                crate::chain_db::upsert_compute_reservation(&r);
+                eprintln!("[Compute] paid period {period}/{total} of rental {}", r.reservation_id);
+            }
+            Err(e) => eprintln!("[Compute] could not pay period {period} of rental {}: {e}", r.reservation_id),
+        }
+    }
+}
+
 fn passive_breach_tick(res: &mut ComputeReservation, bonded: bool) -> bool {
     if res.status != "active" { return false; }
     if res.started_at.is_none() { return false; }
@@ -1636,32 +1395,8 @@ fn passive_breach_tick(res: &mut ComputeReservation, bonded: bool) -> bool {
     res.last_heartbeat_at += period_secs;
     res.breach_count      += 1;
 
-    let total_periods = res.duration_minutes / res.period_minutes.max(1);
-    if bonded && res.collateral_uegoc > 0 {
-        let slash = (res.collateral_uegoc / total_periods.max(1)).min(res.collateral_uegoc);
-        if slash > 0 {
-            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, crate::chain_db::NODE_POOL_ADDR, slash);
-            push_system_tx(RESERVATION_ESCROW_ADDR, crate::chain_db::NODE_POOL_ADDR, slash,
-                &format!("reservation_breach_slash:{}", res.reservation_id), 0);
-        }
-    }
-
     let threshold = if bonded { BREACH_THRESHOLD_BONDED } else { BREACH_THRESHOLD_UNBONDED };
     if res.breach_count >= threshold {
-        if res.escrow_remaining > 0 {
-            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.escrow_remaining);
-            push_system_tx(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.escrow_remaining,
-                &format!("reservation_auto_refund:{}", res.reservation_id), 0);
-        }
-        if bonded {
-            let slashed   = res.collateral_uegoc / total_periods.max(1) * res.breach_count as u64;
-            let remaining = res.collateral_uegoc.saturating_sub(slashed);
-            if remaining > 0 {
-                crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &res.buyer_address, remaining);
-                push_system_tx(RESERVATION_ESCROW_ADDR, &res.buyer_address, remaining,
-                    &format!("reservation_auto_penalty:{}", res.reservation_id), 0);
-            }
-        }
         res.escrow_remaining = 0;
         res.status = "auto_terminated".to_string();
 
@@ -2221,28 +1956,6 @@ pub async fn terminate_reservation(
     if res.status != "active" && res.status != "breached" {
         return Err(EgoDesktopError::InvalidInput(format!("Reservation is {}", res.status)));
     }
-    let bonded = crate::chain_db::get_compute_offer(&res.offer_id)
-        .map(|o| o.bonded)
-        .unwrap_or(false);
-
-    if res.escrow_remaining > 0 {
-        crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, res.escrow_remaining);
-        push_system_tx(RESERVATION_ESCROW_ADDR, &my_addr, res.escrow_remaining,
-            &format!("reservation_terminate_refund:{}", reservation_id), crate::ledger::next_nonce_for(&ledger.address, ledger.nonce));
-    }
-
-    if bonded && res.collateral_uegoc > 0 {
-        if res.breach_count > 0 {
-            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, res.collateral_uegoc);
-            push_system_tx(RESERVATION_ESCROW_ADDR, &my_addr, res.collateral_uegoc,
-                &format!("reservation_terminate_penalty:{}", reservation_id), 0);
-        } else {
-            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &res.provider_address, res.collateral_uegoc);
-            push_system_tx(RESERVATION_ESCROW_ADDR, &res.provider_address, res.collateral_uegoc,
-                &format!("reservation_cancel_collateral_return:{}", reservation_id), 0);
-        }
-    }
-
     res.status           = "terminated".to_string();
     res.escrow_remaining = 0;
     crate::chain_db::upsert_compute_reservation(&res);
@@ -2312,21 +2025,18 @@ pub async fn provider_terminate_reservation(
         return Err(EgoDesktopError::InvalidInput(format!("Reservation is {}", res.status)));
     }
 
-    // Refund all remaining escrow to the buyer (provider chose to end early — buyer loses access).
-    if res.escrow_remaining > 0 {
-        crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.escrow_remaining);
-        push_system_tx(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.escrow_remaining,
-            &format!("provider_terminate_refund:{}", reservation_id), 0);
-    }
-
-    // Provider broke the contract → collateral penalty goes to the buyer.
-    let bonded = crate::chain_db::get_compute_offer(&res.offer_id)
-        .map(|o| o.bonded)
-        .unwrap_or(false);
-    if bonded && res.collateral_uegoc > 0 {
-        crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.collateral_uegoc);
-        push_system_tx(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.collateral_uegoc,
-            &format!("provider_terminate_penalty:{}", reservation_id), 0);
+    let period_secs = res.period_minutes.max(1) as i64 * 60;
+    let start = res.started_at.unwrap_or(res.created_at);
+    let paid = crate::commands::direct_pay::paid_periods(&res.buyer_address, &my_addr, "reservation_pay", &reservation_id);
+    let covered_until = start.saturating_add(period_secs.saturating_mul(paid as i64));
+    if covered_until > now {
+        let unused = ((res.period_rate_uegoc as u128 * (covered_until - now).min(period_secs) as u128) / period_secs as u128) as u64;
+        if unused > 0 {
+            let memo = crate::commands::direct_pay::pay_memo("reservation_refund", &reservation_id, 1);
+            if let Err(e) = crate::commands::direct_pay::pay(&res.buyer_address, unused, res.paid_in_egusd, memo).await {
+                eprintln!("[Compute] could not refund the unused time on {}: {}", reservation_id, e);
+            }
+        }
     }
 
     res.status           = "terminated".to_string();

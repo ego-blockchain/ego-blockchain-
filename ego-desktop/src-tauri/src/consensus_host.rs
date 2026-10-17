@@ -60,9 +60,15 @@ pub fn address_from_ed25519(ed25519_pk: [u8; 32]) -> Address {
 /// `tx_root` + `state_root` are populated today (the desktop block has no distinct
 /// receipts/rollup/da roots yet); zero is the agreed placeholder for the rest.
 pub fn roots_from_ledger_block(b: &LedgerBlock) -> BlockRoots {
+    let receipts_root = if crate::chain_db::drs_active(b.height) {
+        hash_from_hex(&crate::chain_db::ledger_hash_root(b))
+    } else {
+        BlockRoots::empty().receipts_root
+    };
     BlockRoots {
         tx_root: hash_from_hex(&b.tx_merkle_root),
         state_root: hash_from_hex(&b.state_root),
+        receipts_root,
         ..BlockRoots::empty()
     }
 }

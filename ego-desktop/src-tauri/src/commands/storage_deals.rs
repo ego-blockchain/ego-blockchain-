@@ -1,29 +1,41 @@
-use crate::chain_db::{
-    StorageDeal, STORAGE_ESCROW_ADDR, STORAGE_DEAL_HEARTBEAT_SECS, STORAGE_DEAL_GRACE_SECS,
-};
+use crate::chain_db::{StorageDeal, STORAGE_DEAL_HEARTBEAT_SECS, STORAGE_DEAL_GRACE_SECS};
 use crate::error::EgoDesktopError;
-use crate::ledger::{tx_signing_bytes, LedgerTx};
 use uuid::Uuid;
 
 const BREACH_THRESHOLD: u32 = 1;
 
-fn push_system_tx(from: &str, to: &str, amount: u64, memo: &str, nonce: u64) {
-    let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(from, to, amount, nonce, ts);
-    let hash       = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-    crate::mempool::get_mempool().push(LedgerTx {
-        hash,
-        from:      from.to_string(),
-        to:        to.to_string(),
-        amount,
-        memo:      Some(memo.to_string()),
-        timestamp: ts,
-        signature: "storage_escrow_system".to_string(),
-        status:    "Pending".into(),
-        nonce,
-        tx_type:   "storage_escrow".to_string(),
-        ..LedgerTx::default()
-    });
+pub async fn pay_due_days(mut deal: StorageDeal) {
+    let me = crate::ledger::Ledger::load().address;
+    if deal.client_address != me || deal.status != "active" {
+        return;
+    }
+    let total = (deal.duration_days as u64).max(1);
+    let due = crate::commands::direct_pay::periods_due(deal.created_at, chrono::Utc::now().timestamp(), 86_400, total);
+    let (client, provider, id) = (deal.client_address.clone(), deal.provider_address.clone(), deal.deal_id.clone());
+    let on_chain = tokio::task::spawn_blocking(move || {
+        crate::commands::direct_pay::paid_periods(&client, &provider, "storage_deal_pay", &id)
+    }).await.unwrap_or(0);
+    let mut paid = (deal.days_paid as u64).max(on_chain);
+    while deal.status == "active" && paid < due && paid < total {
+        let day = paid + 1;
+        let amount = crate::commands::direct_pay::period_amount(deal.total_cost_uegoc, deal.daily_rate_uegoc, day, total);
+        let memo = crate::commands::direct_pay::pay_memo("storage_deal_pay", &deal.deal_id, day);
+        match crate::commands::direct_pay::pay(&deal.provider_address, amount, false, memo).await {
+            Ok(_) => {
+                paid = day;
+                deal.days_paid = day as u32;
+                deal.escrow_remaining = deal.escrow_remaining.saturating_sub(amount);
+                if day >= total {
+                    deal.status = "completed".to_string();
+                }
+                crate::chain_db::upsert_storage_deal(&deal);
+            }
+            Err(e) => {
+                eprintln!("[StorageDeal] could not pay day {day} of {}: {e}", deal.deal_id);
+                break;
+            }
+        }
+    }
 }
 
 fn passive_breach_tick(deal: &mut StorageDeal) -> bool {
@@ -36,13 +48,6 @@ fn passive_breach_tick(deal: &mut StorageDeal) -> bool {
     deal.breach_count  += 1;
 
     if deal.breach_count >= BREACH_THRESHOLD {
-        if deal.escrow_remaining > 0 {
-            crate::chain_db::internal_balance_transfer(
-                STORAGE_ESCROW_ADDR, &deal.client_address, deal.escrow_remaining,
-            );
-            push_system_tx(STORAGE_ESCROW_ADDR, &deal.client_address, deal.escrow_remaining,
-                &format!("storage_auto_refund:{}", deal.deal_id), 0);
-        }
         deal.escrow_remaining = 0;
         deal.status = "auto_terminated".to_string();
         eprintln!("[StorageDeal] {} auto-terminated after {} breach(es)", deal.deal_id, deal.breach_count);
@@ -71,18 +76,16 @@ pub async fn create_storage_deal(
         return Err(EgoDesktopError::InvalidInput("Cannot create a deal with yourself".into()));
     }
 
-    let my_balance = crate::chain_db::balance_of(&my_addr);
-    if my_balance < total_cost + crate::mempool::MIN_FEE_UEGOC {
-        return Err(EgoDesktopError::WalletError(
-            format!("Insufficient balance: need {} uEGOC (+fee), have {}", total_cost, my_balance)
-        ));
-    }
-
-    if !crate::chain_db::internal_balance_transfer(&my_addr, STORAGE_ESCROW_ADDR, total_cost) {
-        return Err(EgoDesktopError::WalletError("Failed to lock payment in escrow".into()));
-    }
-    push_system_tx(&my_addr, STORAGE_ESCROW_ADDR, total_cost,
-        &format!("storage_deal_escrow:{}", provider_address), crate::ledger::next_nonce_for(&ledger.address, ledger.nonce));
+    let deal_id = Uuid::new_v4().to_string();
+    let first = crate::commands::direct_pay::period_amount(total_cost, daily_rate_uegoc, 1, days as u64);
+    crate::commands::direct_pay::pay(
+        &provider_address,
+        first,
+        false,
+        crate::commands::direct_pay::pay_memo("storage_deal_pay", &deal_id, 1),
+    )
+    .await
+    .map_err(EgoDesktopError::WalletError)?;
 
     let cid_str = cid.unwrap_or_default();
     let (comm_d_hex, n_real_leaves, n_padded_leaves) = if !cid_str.is_empty() {
@@ -106,15 +109,15 @@ pub async fn create_storage_deal(
     };
 
     let deal = StorageDeal {
-        deal_id:          Uuid::new_v4().to_string(),
+        deal_id:          deal_id.clone(),
         provider_address: provider_address.clone(),
         client_address:   my_addr.clone(),
         size_gb,
         duration_days:    days,
         daily_rate_uegoc,
         total_cost_uegoc: total_cost,
-        escrow_remaining: total_cost,
-        days_paid:        0,
+        escrow_remaining: total_cost.saturating_sub(first),
+        days_paid:        1,
         breach_count:     0,
         last_proof_at:    now,
         status:           "active".to_string(),
@@ -218,20 +221,21 @@ pub async fn send_storage_proof(deal_id: String) -> Result<(), EgoDesktopError> 
         eprintln!("[StorageDeal] {} Merkle proof verified (window={}, cid={})", deal_id, window_number, &deal.cid[..16.min(deal.cid.len())]);
     }
 
-    let payment = deal.daily_rate_uegoc;
-    if deal.escrow_remaining >= payment {
-        crate::chain_db::internal_balance_transfer(STORAGE_ESCROW_ADDR, &my_addr, payment);
-        push_system_tx(STORAGE_ESCROW_ADDR, &my_addr, payment,
-            &format!("storage_daily_payment:{}", deal_id), 0);
-        deal.escrow_remaining = deal.escrow_remaining.saturating_sub(payment);
-        deal.days_paid += 1;
-        ledger.storage_deal_earnings_uegoc += payment;
+    let total = (deal.duration_days as u64).max(1);
+    let paid = crate::commands::direct_pay::paid_periods(&deal.client_address, &my_addr, "storage_deal_pay", &deal_id);
+    if paid > deal.days_paid as u64 {
+        let earned: u64 = (deal.days_paid as u64 + 1..=paid)
+            .map(|d| crate::commands::direct_pay::period_amount(deal.total_cost_uegoc, deal.daily_rate_uegoc, d, total))
+            .sum();
+        ledger.storage_deal_earnings_uegoc += earned;
         ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+        deal.escrow_remaining = deal.escrow_remaining.saturating_sub(earned);
+        deal.days_paid = paid as u32;
     }
 
     deal.last_proof_at = now;
 
-    if deal.days_paid >= deal.duration_days || deal.escrow_remaining == 0 {
+    if now >= deal.expires_at && deal.days_paid as u64 >= total {
         deal.status = "completed".to_string();
     }
 
@@ -284,12 +288,6 @@ pub async fn terminate_storage_deal(deal_id: String) -> Result<(), EgoDesktopErr
         return Err(EgoDesktopError::InvalidInput(
             format!("Need {} missed day(s) to terminate; currently {}", BREACH_THRESHOLD, deal.breach_count)
         ));
-    }
-
-    if deal.escrow_remaining > 0 {
-        crate::chain_db::internal_balance_transfer(STORAGE_ESCROW_ADDR, &my_addr, deal.escrow_remaining);
-        push_system_tx(STORAGE_ESCROW_ADDR, &my_addr, deal.escrow_remaining,
-            &format!("storage_terminate_refund:{}", deal_id), crate::ledger::next_nonce_for(&ledger.address, ledger.nonce));
     }
 
     deal.status           = "terminated".to_string();

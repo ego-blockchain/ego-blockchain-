@@ -147,6 +147,67 @@ pub fn derive_h3_cell(lat: f64, lon: f64) -> String {
     format!("892{:09x}ff", n % 1_000_000_000)
 }
 
+async fn submit_coverage_proof(challenge_height: u64, cell: String, records: Vec<crate::poc::PocWitnessRecord>) {
+    static LAST_SENT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    const MIN_INTERVAL_SECS: i64 = 3_600;
+    let now = chrono::Utc::now().timestamp();
+    if now - LAST_SENT.load(std::sync::atomic::Ordering::Relaxed) < MIN_INTERVAL_SECS {
+        return;
+    }
+    let me = crate::ledger::Ledger::load().address;
+    if me.is_empty() || !crate::chain_db::is_registered_node(&me) {
+        return;
+    }
+    let tip = crate::chain_db::local_chain_height();
+    if tip.saturating_sub(challenge_height) > crate::coverage_proof::CHALLENGE_MAX_AGE * 4 / 5 {
+        eprintln!("[PoC] coverage proof not sent: its beacon is already {} blocks old", tip.saturating_sub(challenge_height));
+        return;
+    }
+    let mut machines: std::collections::HashSet<String> = Default::default();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    let witnesses: Vec<crate::coverage_proof::CoverageWitness> = records
+        .into_iter()
+        .filter(|r| r.witness != me && crate::chain_db::is_registered_node(&r.witness))
+        .filter(|r| seen.insert(r.witness.clone()))
+        .filter(|r| r.machine_id.trim().is_empty() || machines.insert(r.machine_id.clone()))
+        .filter_map(|r| {
+            let pk = crate::p2p::get_peer_ed25519_pubkey(&r.witness)?;
+            Some(crate::coverage_proof::CoverageWitness {
+                address: r.witness,
+                ed25519_pubkey: hex::encode(pk),
+                machine_id: r.machine_id,
+                cell: r.cell,
+                latency_ms: r.latency_ms,
+                rssi_dbm: r.rssi_dbm,
+                timestamp: r.timestamp,
+                signature: r.signature,
+            })
+        })
+        .take(crate::coverage_proof::MAX_WITNESSES)
+        .collect();
+    if witnesses.is_empty() {
+        return;
+    }
+    let count = witnesses.len();
+    let body = crate::coverage_proof::PocProofBody { challenge_height, cell, witnesses };
+    let Ok(call_args) = serde_json::to_string(&body) else { return };
+    let tx = crate::ledger::LedgerTx {
+        to: me.clone(),
+        amount: 0,
+        tx_type: crate::coverage_proof::POC_PROOF_TX.to_string(),
+        memo: Some("poc_proof".into()),
+        call_args,
+        ..Default::default()
+    };
+    match crate::commands::direct_pay::submit_own(tx).await {
+        Ok(hash) => {
+            LAST_SENT.store(now, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[PoC] coverage proof with {count} witness(es) sent on chain ({:.12})", hash);
+        }
+        Err(e) => eprintln!("[PoC] coverage proof not sent: {e}"),
+    }
+}
+
 fn maybe_record_poc_event(status: &CoverageStatus, witnesses: Option<Vec<crate::poc::PocWitnessRecord>>) {
     let now    = chrono::Utc::now().timestamp();
     let mut events = crate::ledger::load_poc_events();
@@ -341,8 +402,13 @@ async fn tick_coverage(
 
     if is_online {
         let now = chrono::Utc::now().timestamp();
-        if let Some((_beacon_id, records)) = crate::poc::take_beacon_older_than(now - 60) {
+        let challenge = crate::poc::beacon_challenge();
+        if let Some((_beacon_id, records)) = crate::poc::take_beacon_older_than(now - 30) {
             eprintln!("[PoC] beacon finalized — {} signed witness receipt(s)", records.len());
+            if let Some(height) = challenge {
+                let cell = status.location.as_ref().map(|l| derive_h3_cell(l.latitude, l.longitude)).unwrap_or_default();
+                submit_coverage_proof(height, cell, records.clone()).await;
+            }
             maybe_record_poc_event(&status, Some(records));
         }
         let last_event_ts = crate::ledger::load_poc_events().last().map(|e| e.timestamp).unwrap_or(0);

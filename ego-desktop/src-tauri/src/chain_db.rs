@@ -115,6 +115,53 @@ impl DbWrapper {
 pub fn get_db() -> DbWrapper {
     DbWrapper(CHAIN_DB.get_or_init(|| {
         let db_path = base_data_dir().join("chain_rocksdb");
+        if resync_requested() {
+            wipe_local_chain(&db_path);
+        }
+        let db = open_chain_db(&db_path);
+        let db = if rules_need_resync(&db) {
+            eprintln!("[ChainDB] This chain copy was applied under older rules past block {RULES_DERIVED_FROM_HEIGHT} — downloading it again from the network");
+            drop(db);
+            wipe_local_chain(&db_path);
+            open_chain_db(&db_path)
+        } else {
+            db
+        };
+        stamp_rules_version(&db);
+        migrate_drs_index(&db);
+        db
+    }))
+}
+
+const RESYNC_FLAG: &str = "resync_chain.flag";
+
+fn resync_requested() -> bool {
+    base_data_dir().join(RESYNC_FLAG).exists()
+}
+
+pub fn request_resync() -> Result<(), String> {
+    std::fs::write(base_data_dir().join(RESYNC_FLAG), b"1").map_err(|e| e.to_string())
+}
+
+fn wipe_local_chain(db_path: &std::path::Path) {
+    if db_path.exists() {
+        if let Err(e) = std::fs::remove_dir_all(db_path) {
+            eprintln!("[ChainDB] could not remove {:?}: {e}", db_path);
+        }
+    }
+    let stamp = chrono::Utc::now().timestamp();
+    for legacy in ["chain.db", "chain.json"] {
+        let p = base_data_dir().join(legacy);
+        if p.exists() {
+            let _ = std::fs::rename(&p, base_data_dir().join(format!("{legacy}.{stamp}.bak")));
+        }
+    }
+    let _ = std::fs::remove_file(base_data_dir().join(RESYNC_FLAG));
+    eprintln!("[ChainDB] local chain removed; it will be downloaded again from the network");
+}
+
+fn open_chain_db(db_path: &std::path::Path) -> DB {
+    {
         eprintln!("[ChainDB] Opening RocksDB at {:?}", db_path);
 
         let mut db_opts = Options::default();
@@ -147,7 +194,7 @@ pub fn get_db() -> DbWrapper {
             ColumnFamilyDescriptor::new(*name, cf_opts)
         }).collect();
 
-        let db = match DB::open_cf_descriptors(&db_opts, &db_path, cf_descs) {
+        let db = match DB::open_cf_descriptors(&db_opts, db_path, cf_descs) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("\n[FATAL ERROR] Could not open the blockchain database at:");
@@ -192,9 +239,9 @@ pub fn get_db() -> DbWrapper {
                 let _ = db.put_cf(cf_meta, META_POOLS_SEEDED, b"1");
             }
         }
-        
+
         db
-    }))
+    }
 }
 
 static FAUCET_KEYPAIR: std::sync::OnceLock<ego_core::KeyPair> = std::sync::OnceLock::new();
@@ -716,18 +763,29 @@ fn price_report_value(tx: &LedgerTx) -> Option<u64> {
     (1..=1_000_000_000_000).contains(&v).then_some(v)
 }
 
-/// Who may report a price: the starting committee, or anyone holding a seat's stake.
 pub fn may_report_price(addr: &str) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let next = local_chain_height_in(&db).saturating_add(1);
+    may_report_price_in(&db, addr, next)
+}
+
+fn may_report_price_in(db: &DB, addr: &str, height: u64) -> bool {
     crate::genesis::addresses().iter().any(|a| a == addr)
-        || crate::ledger::get_validator_stake(addr) >= MIN_SEAT_STAKE_UEGOC
+        || drs_weight_in(db, drs_epoch_of(height), addr) > 0
 }
 
 pub fn price_report_ok(tx: &LedgerTx) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let next = local_chain_height_in(&db).saturating_add(1);
+    price_report_ok_in(&db, tx, next)
+}
+
+fn price_report_ok_in(db: &DB, tx: &LedgerTx, height: u64) -> Result<(), String> {
     if !is_price_report(tx) {
         return Err("a price report is a zero-amount tx to the reporter itself".into());
     }
     price_report_value(tx).ok_or("a price report memo is price:<micro-USD per EGOC>")?;
-    if !may_report_price(&tx.from) {
+    if !may_report_price_in(db, &tx.from, height) {
         return Err(format!("{} may not report a price", tx.from));
     }
     Ok(())
@@ -822,8 +880,7 @@ pub fn storage_proof_earns_in(db: &DB, tx: &LedgerTx) -> Option<String> {
         && rec.record.comm_d == body.comm_d
         && rec.record.n_real_leaves == body.n_real_leaves
         && rec.record.n_padded_leaves == body.n_padded_leaves
-        && crate::storage_proof::chunks_match(&body)
-        && crate::ledger::get_validator_stake(&tx.from) >= UPTIME_MIN_STAKE_UEGOC)
+        && crate::storage_proof::chunks_match(&body))
         .then_some(body.cid)
 }
 
@@ -889,9 +946,7 @@ fn expected_storage_rewards_in(db: &DB, height: u64, timestamp: i64) -> Vec<Ledg
                 let prover = String::from_utf8(k[prefix.len()..].to_vec()).ok()?;
                 let first = v.get(..8).map(|x| u64::from_le_bytes(x.try_into().unwrap()))?;
                 let last = v.get(8..16).map(|x| i64::from_le_bytes(x.try_into().unwrap()))?;
-                (timestamp.saturating_sub(last) <= STORAGE_PROOF_FRESH_SECS
-                    && prover != f.owner
-                    && crate::ledger::get_validator_stake(&prover) >= UPTIME_MIN_STAKE_UEGOC)
+                (timestamp.saturating_sub(last) <= STORAGE_PROOF_FRESH_SECS && prover != f.owner)
                     .then_some((first, prover))
             })
             .collect();
@@ -918,13 +973,21 @@ fn expected_storage_rewards_in(db: &DB, height: u64, timestamp: i64) -> Vec<Ledg
 }
 
 
-/// Uptime pay: a staked node that checks in is paid from the node pool, at most once per
-/// interval. The check-in quotes a recent block, so only a node following the chain can
-/// make one, and the stake floor is what keeps one person from running a crowd of them.
-pub const UPTIME_FROM_HEIGHT: u64 = 32_000;
+pub const UPTIME_FROM_HEIGHT: u64 = CHECKIN_FROM_HEIGHT;
+
+fn checkin_due_in(db: &DB, addr: &str, at: i64) -> bool {
+    is_registered_in(db, addr)
+        && uptime_last_paid_in(db, addr)
+            .map(|last| at.saturating_sub(last) >= UPTIME_INTERVAL_SECS)
+            .unwrap_or(true)
+}
+
+pub fn checkin_due(addr: &str, at: i64) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    checkin_due_in(&db, addr, at)
+}
 pub const UPTIME_MIN_STAKE_UEGOC: u64 = 1_000 * 1_000_000;
 pub const UPTIME_INTERVAL_SECS: i64 = 6 * 3600;
-pub const UPTIME_REWARD_UEGOC: u64 = 2 * 1_000_000;
 pub const UPTIME_CHECKIN_MAX_AGE: u64 = 100;
 pub const TX_UPTIME: &str = "uptime";
 pub const TX_UPTIME_REWARD: &str = "uptime_reward";
@@ -1071,19 +1134,12 @@ pub fn uptime_checkin_fresh(
     Ok(())
 }
 
-fn uptime_checkin_counts_in(db: &DB, checkin: &LedgerTx, block_ts: i64) -> bool {
-    crate::ledger::get_validator_stake(&checkin.from) >= UPTIME_MIN_STAKE_UEGOC
-        && uptime_last_paid_in(db, &checkin.from)
-            .map(|last| block_ts.saturating_sub(last) >= UPTIME_INTERVAL_SECS)
-            .unwrap_or(true)
-}
-
-pub fn uptime_reward_tx(checkin: &LedgerTx, height: u64, timestamp: i64) -> LedgerTx {
+pub fn uptime_reward_tx(checkin: &LedgerTx, amount: u64, height: u64, timestamp: i64) -> LedgerTx {
     LedgerTx {
         hash: format!("0x{}", blake3::hash(format!("uptime_reward:{}", checkin.hash).as_bytes()).to_hex()),
         from: NODE_POOL_ADDR.to_string(),
         to: checkin.from.clone(),
-        amount: UPTIME_REWARD_UEGOC,
+        amount,
         memo: Some(checkin.hash.clone()),
         timestamp,
         status: "Confirmed".to_string(),
@@ -1094,23 +1150,27 @@ pub fn uptime_reward_tx(checkin: &LedgerTx, height: u64, timestamp: i64) -> Ledg
     }
 }
 
-/// The uptime payouts a block at `height` must carry for the check-ins in it: one per
-/// address, only for a staked address whose last payout is at least an interval old.
 fn expected_uptime_rewards_in(db: &DB, txs: &[LedgerTx], height: u64, timestamp: i64) -> Vec<LedgerTx> {
-    if height < UPTIME_FROM_HEIGHT {
+    if !drs_active(height) {
         return Vec::new();
     }
-    let mut paid: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut out = Vec::new();
+    let epoch = drs_epoch_of(height);
+    let (total, _) = drs_sum_in(db, epoch);
+    if total == 0 {
+        return Vec::new();
+    }
+    let per_checkin = NODE_REWARD_PER_DAY_UEGOC as u128 * UPTIME_INTERVAL_SECS as u128 / 86_400;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut checkins: Vec<&LedgerTx> = txs.iter().filter(|t| is_uptime_checkin(t)).collect();
     checkins.sort_by(|a, b| a.hash.cmp(&b.hash));
+    let mut out = Vec::new();
     for c in checkins {
-        if paid.contains(c.from.as_str()) {
+        if !seen.insert(c.from.as_str()) || !checkin_due_in(db, &c.from, timestamp) {
             continue;
         }
-        if uptime_checkin_counts_in(db, c, timestamp) {
-            paid.insert(c.from.as_str());
-            out.push(uptime_reward_tx(c, height, timestamp));
+        let amount = (per_checkin * drs_weight_in(db, epoch, &c.from) as u128 / total as u128) as u64;
+        if amount > 0 {
+            out.push(uptime_reward_tx(c, amount, height, timestamp));
         }
     }
     out
@@ -1879,6 +1939,8 @@ fn seed_genesis(db: &DB) {
         base_fee_uegoc: 1_000,
         agg_bls_sig: String::new(),
         bls_pubkeys: Vec::new(),
+        commit_cert: String::new(),
+        randao_reveal: String::new(),
     };
     write_block_batch(db, &genesis, &[]);
 
@@ -1923,6 +1985,8 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             base_fee_uegoc: 1_000,
             agg_bls_sig: String::new(),
             bls_pubkeys: Vec::new(),
+            commit_cert: String::new(),
+            randao_reveal: String::new(),
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -2021,6 +2085,7 @@ pub const CHECKPOINTS: &[(u64, &str)] = &[
     // (height, expected_block_hash)
     // Genesis is always checkpoint 0 — immovable anchor.
     (0, "ego00000000000000000000000000000000000000000000000000000000genesis2"),
+    (29_000, "1d05b4bbeab6179e6ae7de51303377385fc76141a17a4e58e4ba0b0f80fd9cd1"),
     // Production checkpoints added here after each major milestone.
     // Dynamic checkpoints are also stored in RocksDB (see below).
 ];
@@ -2374,6 +2439,21 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     // Block record.
     batch.put_cf(cf_blocks, height_k, encode(block));
 
+    let (drs_puts, drs_prune) = drs_epoch_writes_in(&db, block);
+    for (from, to) in drs_prune {
+        batch.delete_range_cf(cf_meta, from, to);
+    }
+    for (k, v) in drs_puts {
+        batch.put_cf(cf_meta, k, v);
+    }
+    if drs_active(block.height) {
+        if let Some(mix) = randao_mix_write_in(&db, block) {
+            batch.put_cf(cf_meta, META_RANDAO_MIX, mix);
+        }
+        batch.put_cf(cf_meta, drs_served_key(&block.miner), u64_le(drs_epoch_of(block.height)));
+    }
+    let mut counted_checkins: std::collections::HashSet<String> = Default::default();
+
     // Transactions + all secondary indices.
     for (ordinal, tx) in confirmed_txs.iter().enumerate() {
         // A block has to appear in its own transaction index, whatever else is true of the
@@ -2433,20 +2513,25 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
                     batch.put_cf(cf_meta, key, v);
                 }
             }
-            if is_price_report(tx) && price_report_ok(tx).is_ok() {
+            if is_price_report(tx) && price_report_ok_in(&db, tx, block.height).is_ok() {
                 if let Some(v) = price_report_value(tx) {
                     batch.put_cf(cf_meta, price_rep_key(block.height / STORAGE_PAY_EPOCH, &tx.from), u64_le(v));
                 }
             }
         }
 
-        if tx.tx_type == TX_UPTIME_REWARD && tx.from == NODE_POOL_ADDR {
-            batch.put_cf(cf_meta, uptime_last_key(&tx.to), block.timestamp.to_le_bytes());
-            let (count, last) = next_uptime_streak(uptime_streak_in(&db, &tx.to), block.timestamp);
+        if block.height >= CHECKIN_FROM_HEIGHT
+            && is_uptime_checkin(tx)
+            && !counted_checkins.contains(&tx.from)
+            && checkin_due_in(&db, &tx.from, block.timestamp)
+        {
+            counted_checkins.insert(tx.from.clone());
+            batch.put_cf(cf_meta, uptime_last_key(&tx.from), block.timestamp.to_le_bytes());
+            let (count, last) = next_uptime_streak(uptime_streak_in(&db, &tx.from), block.timestamp);
             let mut rec = Vec::with_capacity(12);
             rec.extend_from_slice(&count.to_le_bytes());
             rec.extend_from_slice(&last.to_le_bytes());
-            batch.put_cf(cf_meta, uptime_streak_key(&tx.to), rec);
+            batch.put_cf(cf_meta, uptime_streak_key(&tx.from), rec);
         }
 
         if tx.tx_type == crate::storage_proof::POST_PROOF_TX {
@@ -2460,12 +2545,18 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             if let Ok(witnesses) =
                 crate::coverage_proof::validate_against_chain(tx, tip, get_block_hash_at)
             {
-                record_coverage_proof(&mut batch, &db, &tx.from, witnesses, block.height);
+                let counted = if drs_active(block.height) {
+                    live_coverage_witnesses_in(&db, tx, block.timestamp)
+                } else {
+                    witnesses
+                };
+                record_coverage_proof(&mut batch, &db, &tx.from, counted, block.height);
             }
         }
 
         if let Some((addr, bls_hex)) = parse_validator_registration(tx) {
             batch.put_cf(cf_meta, bls_reg_key(&bls_hex), addr.as_bytes());
+            batch.put_cf(cf_meta, val_bls_key(&addr), bls_hex.as_bytes());
             if db.get_cf(cf_meta, val_dil_key(&addr)).ok().flatten().is_none() {
                 if let Some(pk) = registration_dilithium_key(tx) {
                     batch.put_cf(cf_meta, val_dil_key(&addr), pk);
@@ -2648,6 +2739,10 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         return false;
     }
     tracing::debug!("[ChainDB] db.write(batch) done — block #{}", block.height);
+    if block.height > 0 && block.height % STATE_CHECKPOINT_EVERY == 0 && !cfg!(test) {
+        let h = block.height;
+        std::thread::spawn(move || save_state_checkpoint(h));
+    }
     crate::shielded_chain::check_invariants(db, block.height);
     if !market_plan.is_empty() {
         crate::market_chain::check_invariants(db, block.height);
@@ -3939,6 +4034,9 @@ pub fn export_state_snapshot() -> StateSnapshot {
 /// Callers MUST first write the recent block window (so the tip block exists in
 /// CF_BLOCKS) before relying on the new tip.
 pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
+    let mut canonical = snap.clone();
+    canonicalize_snapshot(&mut canonical);
+    let snap = &canonical;
     let _contracts_paused = crate::contract_exec::exclusive();
     {
         let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
@@ -4110,8 +4208,12 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     }
 
     // ── 2. Merkle root over all txs in this block.
-    let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
-    let tx_merkle_root = compute_merkle_root(&tx_hashes);
+    let tx_merkle_root = if drs_active(height) {
+        sorted_tx_root(&stamped)
+    } else {
+        let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
+        compute_merkle_root(&tx_hashes)
+    };
 
     // Precompute unstake APR rewards sequentially (the RocksDB guard is not Sync,
     // so it can't be touched inside the parallel closure below).
@@ -4193,6 +4295,8 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         base_fee_uegoc: new_base_fee,
         agg_bls_sig: String::new(),
         bls_pubkeys: Vec::new(),
+        commit_cert: String::new(),
+        randao_reveal: String::new(),
     };
 
     write_block_batch(&db, &block, &stamped);
@@ -4272,6 +4376,8 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     }
     let mut blocked_senders: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut held_back: Vec<LedgerTx> = Vec::new();
+    let mut checkin_senders: std::collections::HashSet<String> = Default::default();
+    let mut free_count = 0usize;
     let valid_txs: Vec<&LedgerTx> = sorted_txs.iter().filter(|tx| {
         if tx.hash.is_empty() {
             eprintln!("[TX] Rejected — empty hash (from={:.16})", tx.from);
@@ -4293,9 +4399,18 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         }
         if tx.tx_type == TX_UPTIME
             && (height < UPTIME_FROM_HEIGHT
-                || uptime_checkin_fresh(tx, height.saturating_sub(1), |h| block_hash_at_in(&db, h)).is_err())
+                || uptime_checkin_fresh(tx, height.saturating_sub(1), |h| block_hash_at_in(&db, h)).is_err()
+                || !checkin_due_in(&db, &tx.from, timestamp)
+                || !checkin_senders.insert(tx.from.clone()))
         {
             return false;
+        }
+        if height >= CHECKIN_FROM_HEIGHT && is_free_housekeeping(tx) {
+            if free_count >= MAX_FREE_TXS_PER_BLOCK {
+                held_back.push((*tx).clone());
+                return false;
+            }
+            free_count += 1;
         }
         if is_stake_tx(tx) && seat_rules_active(height) {
             let balance = db.get_cf(cf_bal, tx.from.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
@@ -4475,8 +4590,12 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         });
     }
 
-    let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
-    let tx_merkle_root = compute_merkle_root(&tx_hashes);
+    let tx_merkle_root = if drs_active(height) {
+        sorted_tx_root(&stamped)
+    } else {
+        let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
+        compute_merkle_root(&tx_hashes)
+    };
 
     let state_root = {
         let cf_bal = db.cf_handle(CF_BALANCES).expect("CF_BALANCES missing");
@@ -4538,6 +4657,8 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         producer_sig: String::new(),
         agg_bls_sig: String::new(),
         bls_pubkeys: Vec::new(),
+        commit_cert: String::new(),
+        randao_reveal: String::new(),
     };
 
     (sign_block_as_producer(block), stamped)
@@ -4633,10 +4754,15 @@ pub fn commit_staged_block(block: &LedgerBlock, stamped: &[LedgerTx], vote_count
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
     };
     if block.height == current_tip + 1 {
+        if drs_active(block.height) {
+            if let Err(e) = verify_block_certificate_in(&db, block) {
+                tracing::warn!("commit_staged_block: block #{} refused — {}", block.height, e);
+                return false;
+            }
+        }
         let mut b = block.clone();
         b.vote_count = vote_count;
-        write_block_batch(&db, &b, stamped);
-        return true;
+        return write_block_batch(&db, &b, stamped);
     }
     // The sync path may have written this block before BFT finalization arrived.
     // If the same block is already at this height, treat as committed and update
@@ -4951,11 +5077,12 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                     && tx.from == crate::shielded_chain::SHIELDED_POOL_ADDR;
                 let is_settle = tx.tx_type == crate::market_chain::TX_SETTLE
                     && tx.from == crate::market_chain::MARKET_ESCROW_ADDR;
+                let is_contributor_fee = is_contributor_fee_tx(tx);
                 // A system pool pays out only through a kind of payment whose amount and
                 // recipient the rules check. Accepting any "emission type" bounded only by
                 // the pool's balance let a block producer pay itself the whole staking or
                 // node pool by naming the payment an escrow release.
-                if !is_reward && !is_unshield && !is_settle {
+                if !is_reward && !is_unshield && !is_settle && !is_contributor_fee {
                     return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
                 }
         } else {
@@ -5193,6 +5320,27 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
                 block.height, carried_storage, expected_storage
             ));
         }
+        if block.height >= CHECKIN_FROM_HEIGHT {
+            let mut senders: std::collections::HashSet<&str> = Default::default();
+            for tx in txs.iter().filter(|t| t.tx_type == TX_UPTIME) {
+                if !checkin_due_in(&db, &tx.from, block.timestamp) || !senders.insert(tx.from.as_str()) {
+                    return Err(format!("uptime check-in {} is not due or repeats a sender", tx.hash));
+                }
+            }
+            let mut registrants: std::collections::HashSet<&str> = Default::default();
+            for tx in txs.iter().filter(|t| t.tx_type == "validator_register") {
+                if !registrants.insert(tx.from.as_str()) {
+                    return Err(format!("block {} registers {} more than once", block.height, tx.from));
+                }
+            }
+            let free = txs.iter().filter(|t| is_free_housekeeping(t)).count();
+            if free > MAX_FREE_TXS_PER_BLOCK {
+                return Err(format!("block {} carries {free} fee-free txs, more than {MAX_FREE_TXS_PER_BLOCK}", block.height));
+            }
+        }
+        if drs_active(block.height) {
+            drs_block_rules_in(&db, block, txs, is_proposal)?;
+        }
         if block.height >= STORAGE_PAY_FROM_HEIGHT {
             for tx in txs.iter() {
                 if is_storage_file_tx(tx) {
@@ -5200,7 +5348,7 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
                     storage_file_owner_ok(&db, tx).map_err(|e| format!("storage_file {} rejected: {e}", tx.hash))?;
                 }
                 if tx.tx_type == TX_PRICE_REPORT {
-                    price_report_ok(tx).map_err(|e| format!("price report {} rejected: {e}", tx.hash))?;
+                    price_report_ok_in(&db, tx, block.height).map_err(|e| format!("price report {} rejected: {e}", tx.hash))?;
                 }
             }
         }
@@ -7522,7 +7670,11 @@ pub(crate) fn expected_block_reward_inner(
         let parent_ts = if height > 0 { block_ts_inner(db, height - 1) } else { 0 };
         let parent_ts = if parent_ts > 0 { parent_ts } else { block_ts };
         let genesis_ts = block_ts_inner(db, 0);
-        let n = registered_validator_count_inner(db).max(1);
+        let n = if drs_active(height) {
+            drs_sum_in(db, drs_epoch_of(height)).1.max(1)
+        } else {
+            registered_validator_count_inner(db).max(1)
+        };
         crate::tokenomics::compute_block_reward_v2(
             crate::tokenomics::emission_v2_base(genesis_ts, parent_ts, block_ts, n),
             tx_fees_sum,
@@ -7668,20 +7820,6 @@ pub fn validate_escrow_release_tx(tx: &crate::ledger::LedgerTx, block_time: i64)
     }
 
     Ok(())
-}
-
-pub fn internal_balance_transfer(from: &str, to: &str, amount: u64) -> bool {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf = db.cf_handle(CF_BALANCES).unwrap();
-    let from_bal = db.get_cf(cf, from.as_bytes())
-        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    if from_bal < amount { return false; }
-    let to_bal = db.get_cf(cf, to.as_bytes())
-        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    let mut batch = rocksdb::WriteBatch::default();
-    batch.put_cf(cf, from.as_bytes(), u64_le(from_bal - amount));
-    batch.put_cf(cf, to.as_bytes(), u64_le(to_bal + amount));
-    db.write(batch).is_ok()
 }
 
 pub fn upsert_compute_node(node: &ComputeNodeRecord) {
@@ -9317,25 +9455,6 @@ mod uptime_tests {
         assert!(uptime_checkin_fresh(&paying, 32_100, chain).is_err());
     }
 
-    #[test]
-    fn payouts_follow_stake_switch_on_and_one_per_address() {
-        let staked = "egot1uptimetest00000000000000000000000staked";
-        let unstaked = "egot1uptimetest0000000000000000000000unstaked";
-        crate::ledger::record_validator_stake(staked, UPTIME_MIN_STAKE_UEGOC, true);
-        let txs = vec![
-            checkin(staked, "0xa1", "uptime:1:x"),
-            checkin(staked, "0xa2", "uptime:1:x"),
-            checkin(unstaked, "0xb1", "uptime:1:x"),
-        ];
-        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-        assert!(expected_uptime_rewards_in(&db, &txs, UPTIME_FROM_HEIGHT - 1, 1_900_000_000).is_empty());
-        let paid = expected_uptime_rewards_in(&db, &txs, UPTIME_FROM_HEIGHT, 1_900_000_000);
-        assert_eq!(paid.len(), 1);
-        assert_eq!(paid[0].to, staked);
-        assert_eq!(paid[0].amount, UPTIME_REWARD_UEGOC);
-        assert_eq!(paid[0].from, NODE_POOL_ADDR);
-        assert_eq!(paid[0].hash, uptime_reward_tx(&txs[0], UPTIME_FROM_HEIGHT, 1_900_000_000).hash);
-    }
 }
 
 #[cfg(test)]
@@ -9524,5 +9643,1060 @@ mod storage_pay_tests {
         assert!(paid.iter().all(|t| t.amount == 877_777 && t.from == NODE_POOL_ADDR));
         assert!(expected_storage_rewards_in(&db, h + 1, t1).is_empty());
         assert!(expected_storage_rewards_in(&db, STORAGE_PAY_FROM_HEIGHT - STORAGE_PAY_EPOCH, t1).is_empty());
+    }
+}
+
+pub const CHECKIN_FROM_HEIGHT: u64 = 31_000;
+pub const DRS_FROM_HEIGHT: u64 = 33_000;
+pub const DRS_EPOCH: u64 = 100;
+pub const DRS_TABLE_LEAD: u64 = 50;
+pub const DRS_COMMITTEE_SIZE: usize = 4;
+pub const DRS_ROTA_LEN: usize = 32;
+pub const COMMITTEE_REDRAW_SECS: i64 = 300;
+pub const COMMITTEE_GUARD_SECS: i64 = 30;
+pub const MAX_COMMITTEE_ATTEMPT: i64 = 10_000;
+pub const DRS_KEEP_EPOCHS: u64 = 4;
+pub const DRS_UPTIME_CAP: u64 = 120;
+pub const DRS_STORAGE_POINTS_PER_GB: u64 = 10;
+pub const DRS_STORAGE_CAP: u64 = 10_000;
+pub const DRS_COVERAGE_POINTS_PER_WITNESS: u64 = 2;
+pub const DRS_COVERAGE_CAP_WITNESSES: u64 = 20;
+pub const NODE_REWARD_PER_DAY_UEGOC: u64 = 50_000 * 1_000_000;
+pub const MAX_FREE_TXS_PER_BLOCK: usize = 256;
+pub const RULES_VERSION: u64 = 1;
+pub const RULES_DERIVED_FROM_HEIGHT: u64 = CHECKIN_FROM_HEIGHT;
+const META_RULES_VERSION: &[u8] = b"rules_version";
+const META_DRS_INDEX: &[u8] = b"drs_index_v1";
+const META_RANDAO_MIX: &[u8] = b"randao_mix";
+
+pub fn drs_active(height: u64) -> bool {
+    height >= DRS_FROM_HEIGHT
+}
+
+pub fn drs_epoch_of(height: u64) -> u64 {
+    height.saturating_sub(1) / DRS_EPOCH
+}
+
+fn drs_weight_key(epoch: u64, addr: &str) -> Vec<u8> {
+    format!("drs_w:{epoch:020}:{addr}").into_bytes()
+}
+
+fn drs_weight_prefix(epoch: u64) -> Vec<u8> {
+    format!("drs_w:{epoch:020}:").into_bytes()
+}
+
+fn drs_sum_key(epoch: u64) -> Vec<u8> {
+    format!("drs_sum:{epoch:020}").into_bytes()
+}
+
+fn drs_rota_key(epoch: u64) -> Vec<u8> {
+    format!("drs_rota:{epoch:020}").into_bytes()
+}
+
+fn drs_served_key(addr: &str) -> Vec<u8> {
+    format!("drs_served:{addr}").into_bytes()
+}
+
+fn val_bls_key(addr: &str) -> Vec<u8> {
+    format!("val_bls:{addr}").into_bytes()
+}
+
+fn drs_meta(db: &DB, key: &[u8]) -> Option<Vec<u8>> {
+    let cf = db.cf_handle(CF_META)?;
+    db.get_cf(cf, key).ok().flatten()
+}
+
+fn is_registered_in(db: &DB, addr: &str) -> bool {
+    drs_meta(db, &val_seated_key(addr)).is_some()
+}
+
+pub fn is_registered_node(addr: &str) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    is_registered_in(&db, addr)
+}
+
+fn registered_addrs_in(db: &DB) -> Vec<String> {
+    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new() };
+    let prefix: &[u8] = b"val_seated:";
+    db.prefix_iterator_cf(cf, prefix)
+        .filter_map(|i| i.ok())
+        .take_while(|(k, _)| k.starts_with(prefix))
+        .filter_map(|(k, _)| String::from_utf8(k[prefix.len()..].to_vec()).ok())
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
+fn dilithium_key_in(db: &DB, addr: &str) -> Option<Vec<u8>> {
+    crate::genesis::dilithium_pubkey_for(addr)
+        .or_else(|| drs_meta(db, &val_dil_key(addr)).filter(|k| !k.is_empty()))
+}
+
+fn val_bls_in(db: &DB, addr: &str) -> Option<Vec<u8>> {
+    drs_meta(db, &val_bls_key(addr))
+        .and_then(|v| hex::decode(v).ok())
+        .filter(|k| k.len() == 48)
+}
+
+fn drs_table_in(db: &DB, at: i64, tip: u64) -> Vec<(String, u64)> {
+    let mut storage_bytes: std::collections::BTreeMap<String, u64> = Default::default();
+    if let Some(cf) = db.cf_handle(CF_META) {
+        let files: std::collections::BTreeMap<String, u64> = db
+            .prefix_iterator_cf(cf, b"sfile:")
+            .filter_map(|i| i.ok())
+            .take_while(|(k, _)| k.starts_with(b"sfile:"))
+            .filter_map(|(_, v)| serde_json::from_slice::<RecordedStorageFile>(&v).ok())
+            .map(|f| (f.record.cid.clone(), f.record.bytes))
+            .collect();
+        for item in db.prefix_iterator_cf(cf, b"sproof:") {
+            let Ok((k, v)) = item else { break };
+            if !k.starts_with(b"sproof:") { break; }
+            let Ok(key) = String::from_utf8(k[b"sproof:".len()..].to_vec()) else { continue };
+            let Some((cid, prover)) = key.rsplit_once(':') else { continue };
+            let Some(last) = v.get(8..16).map(|x| i64::from_le_bytes(x.try_into().unwrap())) else { continue };
+            if at.saturating_sub(last) > STORAGE_PROOF_FRESH_SECS { continue; }
+            if let Some(bytes) = files.get(cid) {
+                let e = storage_bytes.entry(prover.to_string()).or_insert(0);
+                *e = e.saturating_add(*bytes);
+            }
+        }
+    }
+    let mut table = Vec::new();
+    for addr in registered_addrs_in(db) {
+        if dilithium_key_in(db, &addr).is_none() || val_bls_in(db, &addr).is_none() { continue; }
+        let (count, last) = uptime_streak_in(db, &addr);
+        if count < SEAT_MIN_UPTIME_STREAK || at.saturating_sub(last) > UPTIME_STREAK_GAP_SECS {
+            continue;
+        }
+        let uptime = (count as u64).min(DRS_UPTIME_CAP);
+        let storage = (storage_bytes.get(&addr).copied().unwrap_or(0) / 1_000_000_000)
+            .saturating_mul(DRS_STORAGE_POINTS_PER_GB)
+            .min(DRS_STORAGE_CAP);
+        let coverage = proven_witnesses_in(db, &addr, tip).min(DRS_COVERAGE_CAP_WITNESSES) * DRS_COVERAGE_POINTS_PER_WITNESS;
+        table.push((addr, uptime + storage + coverage));
+    }
+    table
+}
+
+fn drs_weight_in(db: &DB, epoch: u64, addr: &str) -> u64 {
+    drs_meta(db, &drs_weight_key(epoch, addr)).map(|v| read_u64_le(&v)).unwrap_or(0)
+}
+
+fn drs_sum_in(db: &DB, epoch: u64) -> (u64, u64) {
+    drs_meta(db, &drs_sum_key(epoch))
+        .filter(|v| v.len() >= 16)
+        .map(|v| (read_u64_le(&v[..8]), read_u64_le(&v[8..16])))
+        .unwrap_or((0, 0))
+}
+
+fn drs_epoch_table_in(db: &DB, epoch: u64) -> Vec<(String, u64)> {
+    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new() };
+    let prefix = drs_weight_prefix(epoch);
+    db.prefix_iterator_cf(cf, &prefix)
+        .filter_map(|i| i.ok())
+        .take_while(|(k, _)| k.starts_with(&prefix))
+        .filter_map(|(k, v)| Some((String::from_utf8(k[prefix.len()..].to_vec()).ok()?, read_u64_le(&v))))
+        .collect()
+}
+
+pub fn drs_weight_of(addr: &str) -> (u64, u64, u64) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let epoch = drs_epoch_of(local_chain_height_in(&db).saturating_add(1));
+    let (total, count) = drs_sum_in(&db, epoch);
+    (drs_weight_in(&db, epoch, addr), total, count)
+}
+
+fn drs_rota_in(db: &DB, epoch: u64) -> Vec<String> {
+    drs_meta(db, &drs_rota_key(epoch)).and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
+}
+
+fn drs_served_in(db: &DB, addr: &str) -> Option<u64> {
+    drs_meta(db, &drs_served_key(addr)).map(|v| read_u64_le(&v))
+}
+
+pub fn draw_committee(table: &[(String, u64)], seed: &str, attempt: i64, k: usize) -> Vec<String> {
+    let mut pool: Vec<(String, u64)> = table.iter().filter(|(_, w)| *w > 0).cloned().collect();
+    pool.sort();
+    let mut total: u128 = pool.iter().map(|(_, w)| *w as u128).sum();
+    let mut out = Vec::new();
+    let mut i: u64 = 0;
+    while out.len() < k && !pool.is_empty() && total > 0 {
+        let mut h = blake3::Hasher::new();
+        h.update(b"ego/committee/v1:");
+        h.update(seed.as_bytes());
+        h.update(&attempt.to_le_bytes());
+        h.update(&i.to_le_bytes());
+        let r = u128::from_le_bytes(h.finalize().as_bytes()[..16].try_into().unwrap()) % total;
+        let mut acc: u128 = 0;
+        let mut pick = pool.len() - 1;
+        for (j, (_, w)) in pool.iter().enumerate() {
+            acc += *w as u128;
+            if r < acc {
+                pick = j;
+                break;
+            }
+        }
+        let (addr, w) = pool.remove(pick);
+        total -= w as u128;
+        out.push(addr);
+        i += 1;
+    }
+    out
+}
+
+pub fn build_rota(table: &[(String, u64)], served: impl Fn(&str) -> Option<u64>, epoch: u64, seed: &str) -> Vec<String> {
+    let cooldown = (table.len() / (2 * DRS_COMMITTEE_SIZE)) as u64;
+    let rested = |a: &str| cooldown == 0 || served(a).map_or(true, |e| e.saturating_add(cooldown) < epoch);
+    let (fresh, recent): (Vec<(String, u64)>, Vec<(String, u64)>) =
+        table.iter().cloned().partition(|(a, _)| rested(a));
+    let mut rota = draw_committee(&fresh, seed, 0, DRS_ROTA_LEN);
+    if rota.len() < DRS_ROTA_LEN {
+        rota.extend(draw_committee(&recent, seed, 1, DRS_ROTA_LEN - rota.len()));
+    }
+    rota
+}
+
+pub fn committee_attempt(parent_ts: i64, stamp: i64) -> i64 {
+    (stamp.saturating_sub(parent_ts).max(0) / COMMITTEE_REDRAW_SECS).min(MAX_COMMITTEE_ATTEMPT)
+}
+
+pub fn proposal_window_open(parent_ts: i64, stamp: i64) -> bool {
+    let attempt = committee_attempt(parent_ts, stamp);
+    if attempt >= MAX_COMMITTEE_ATTEMPT {
+        return true;
+    }
+    let start = parent_ts.saturating_add(attempt * COMMITTEE_REDRAW_SECS);
+    let end = start.saturating_add(COMMITTEE_REDRAW_SECS);
+    (attempt == 0 || stamp >= start.saturating_add(COMMITTEE_GUARD_SECS))
+        && stamp < end.saturating_sub(COMMITTEE_GUARD_SECS)
+}
+
+fn committee_for_height_in(db: &DB, height: u64, stamp: i64) -> Option<Vec<(String, Vec<u8>)>> {
+    let parent_ts = block_ts_at_in(db, height.checked_sub(1)?)?;
+    let attempt = committee_attempt(parent_ts, stamp);
+    let rota = drs_rota_in(db, drs_epoch_of(height));
+    let mut members: Vec<String> = if rota.len() > DRS_COMMITTEE_SIZE {
+        let start = (attempt as usize).wrapping_mul(DRS_COMMITTEE_SIZE) % rota.len();
+        (0..DRS_COMMITTEE_SIZE).map(|j| rota[(start + j) % rota.len()].clone()).collect()
+    } else {
+        rota
+    };
+    if members.len() < DRS_COMMITTEE_SIZE {
+        for g in crate::genesis::addresses() {
+            if members.len() >= DRS_COMMITTEE_SIZE { break; }
+            if !members.contains(&g) && dilithium_key_in(db, &g).is_some() {
+                members.push(g);
+            }
+        }
+    }
+    let out: Vec<(String, Vec<u8>)> = members
+        .into_iter()
+        .filter_map(|a| dilithium_key_in(db, &a).map(|k| (a, k)))
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+pub fn committee_for_height(height: u64, stamp: i64) -> Option<Vec<(String, Vec<u8>)>> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    committee_for_height_in(&db, height, stamp)
+}
+
+pub fn committee_candidates(height: u64) -> (Vec<(String, Vec<u8>)>, bool) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let epoch = drs_epoch_of(height);
+    let settled = drs_meta(&db, &drs_rota_key(epoch)).is_some();
+    let mut names = drs_rota_in(&db, epoch);
+    for g in crate::genesis::addresses() {
+        if !names.contains(&g) {
+            names.push(g);
+        }
+    }
+    let out = names.into_iter().filter_map(|a| dilithium_key_in(&db, &a).map(|k| (a, k))).collect();
+    (out, settled)
+}
+
+pub fn committee_window(height: u64, now: i64) -> Option<(i64, bool)> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let parent_ts = block_ts_at_in(&db, height.checked_sub(1)?)?;
+    Some((committee_attempt(parent_ts, now), proposal_window_open(parent_ts, now)))
+}
+
+pub fn block_attempt(block: &LedgerBlock) -> Option<i64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let parent_ts = block_ts_at_in(&db, block.height.checked_sub(1)?)?;
+    Some(committee_attempt(parent_ts, block.timestamp))
+}
+
+pub fn randao_message(height: u64) -> Vec<u8> {
+    let mut m = b"ego/randao/v1:".to_vec();
+    m.extend_from_slice(&height.to_le_bytes());
+    m
+}
+
+fn randao_reveal_in(db: &DB, block: &LedgerBlock) -> Result<Vec<u8>, String> {
+    let pk = val_bls_in(db, &block.miner)
+        .ok_or_else(|| format!("{} has no registered BLS key to reveal block #{}'s randomness with", block.miner, block.height))?;
+    let raw = hex::decode(&block.randao_reveal)
+        .map_err(|_| format!("block #{} randomness reveal is not hex", block.height))?;
+    crate::bls_agg::verify_unique(&raw, &pk, &randao_message(block.height))
+        .ok_or_else(|| format!("block #{} randomness reveal does not verify", block.height))
+}
+
+fn randao_mix_in(db: &DB) -> Option<(u64, [u8; 32])> {
+    let v = drs_meta(db, META_RANDAO_MIX)?;
+    if v.len() != 40 {
+        return None;
+    }
+    Some((read_u64_le(&v[..8]), v[8..40].try_into().ok()?))
+}
+
+fn randao_init(parent_hash: &str) -> [u8; 32] {
+    *blake3::hash(format!("ego/randao/init:{parent_hash}").as_bytes()).as_bytes()
+}
+
+pub fn next_randao_mix(prev: [u8; 32], reveal: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"ego/randao/mix/v1:");
+    h.update(&prev);
+    h.update(reveal);
+    *h.finalize().as_bytes()
+}
+
+fn randao_mix_write_in(db: &DB, block: &LedgerBlock) -> Option<Vec<u8>> {
+    if !drs_active(block.height) {
+        return None;
+    }
+    let reveal = randao_reveal_in(db, block).ok()?;
+    let prev = match randao_mix_in(db) {
+        Some((h, _)) if h >= block.height => return None,
+        Some((_, m)) => m,
+        None => randao_init(&block.prev_hash),
+    };
+    let mut v = block.height.to_le_bytes().to_vec();
+    v.extend_from_slice(&next_randao_mix(prev, &reveal));
+    Some(v)
+}
+
+fn rota_seed_in(db: &DB, block: &LedgerBlock) -> String {
+    hex::encode(randao_mix_in(db).map(|(_, m)| m).unwrap_or_else(|| randao_init(&block.prev_hash)))
+}
+
+fn drs_epoch_writes_in(db: &DB, block: &LedgerBlock) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>) {
+    let mut puts = Vec::new();
+    let mut prune = Vec::new();
+    if block.height % DRS_EPOCH == DRS_EPOCH - DRS_TABLE_LEAD {
+        let epoch = (block.height + DRS_TABLE_LEAD) / DRS_EPOCH;
+        if epoch * DRS_EPOCH + DRS_EPOCH >= DRS_FROM_HEIGHT && drs_meta(db, &drs_sum_key(epoch)).is_none() {
+            let table = drs_table_in(db, block.timestamp, block.height.saturating_sub(1));
+            let total = table.iter().fold(0u64, |a, (_, w)| a.saturating_add(*w));
+            let mut sum = u64_le(total).to_vec();
+            sum.extend_from_slice(&u64_le(table.len() as u64));
+            for (addr, w) in &table {
+                puts.push((drs_weight_key(epoch, addr), u64_le(*w).to_vec()));
+            }
+            puts.push((drs_sum_key(epoch), sum));
+            if let Some(cut) = epoch.checked_sub(DRS_KEEP_EPOCHS) {
+                prune.push((drs_weight_prefix(0), drs_weight_prefix(cut)));
+                prune.push((drs_sum_key(0), drs_sum_key(cut)));
+                prune.push((drs_rota_key(0), drs_rota_key(cut)));
+            }
+        }
+    }
+    if block.height % DRS_EPOCH == 0 {
+        let epoch = block.height / DRS_EPOCH;
+        if epoch * DRS_EPOCH + DRS_EPOCH >= DRS_FROM_HEIGHT && drs_meta(db, &drs_rota_key(epoch)).is_none() {
+            let table = drs_epoch_table_in(db, epoch);
+            let rota = build_rota(&table, |a| drs_served_in(db, a), epoch, &rota_seed_in(db, block));
+            if let Ok(v) = serde_json::to_vec(&rota) {
+                puts.push((drs_rota_key(epoch), v));
+            }
+        }
+    }
+    (puts, prune)
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CertHeader {
+    pub height: u64,
+    pub epoch: u64,
+    pub slot: u64,
+    pub round: u32,
+    pub prev_hash: String,
+    pub proposer: String,
+    pub tx_root: String,
+    pub state_root: String,
+    pub receipts_root: String,
+    pub events_root_post: String,
+    pub events_root_poc: String,
+    pub rollup_root: String,
+    pub da_root: String,
+    pub vrf_output: String,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CommitCert {
+    pub header: CertHeader,
+    pub votes: Vec<(String, String)>,
+}
+
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    hex::decode(s).ok()?.try_into().ok()
+}
+
+impl CertHeader {
+    pub fn from_engine(h: &ego_consensus_core::bft::BlockHeader) -> Self {
+        Self {
+            height: h.height,
+            epoch: h.epoch,
+            slot: h.slot,
+            round: h.round,
+            prev_hash: h.prev_hash.to_hex(),
+            proposer: h.proposer.to_hex(),
+            tx_root: h.tx_root.to_hex(),
+            state_root: h.state_root.to_hex(),
+            receipts_root: h.receipts_root.to_hex(),
+            events_root_post: h.events_root_post.to_hex(),
+            events_root_poc: h.events_root_poc.to_hex(),
+            rollup_root: h.rollup_root.to_hex(),
+            da_root: h.da_root.to_hex(),
+            vrf_output: h.vrf_output.to_hex(),
+            timestamp_ms: h.timestamp.as_millis(),
+        }
+    }
+
+    pub fn block_hash(&self) -> Option<[u8; 32]> {
+        let proposer: [u8; 20] = hex::decode(&self.proposer).ok()?.try_into().ok()?;
+        let parts = [
+            hex32(&self.prev_hash)?, hex32(&self.tx_root)?, hex32(&self.state_root)?,
+            hex32(&self.receipts_root)?, hex32(&self.events_root_post)?, hex32(&self.events_root_poc)?,
+            hex32(&self.rollup_root)?, hex32(&self.da_root)?, hex32(&self.vrf_output)?,
+        ];
+        Some(*ego_core::hash_multiple(&[
+            &self.height.to_le_bytes(), &self.epoch.to_le_bytes(), &self.slot.to_le_bytes(),
+            &self.round.to_le_bytes(),
+            &parts[0], &proposer,
+            &parts[1], &parts[2], &parts[3], &parts[4], &parts[5], &parts[6], &parts[7], &parts[8],
+            &self.timestamp_ms.to_le_bytes(),
+        ]).as_bytes())
+    }
+}
+
+pub fn vote_message(block_hash: &[u8; 32], height: u64, epoch: u64, round: u32) -> Vec<u8> {
+    let mut d = b"ego/vote/v1:".to_vec();
+    d.extend_from_slice(block_hash);
+    d.extend_from_slice(&height.to_le_bytes());
+    d.extend_from_slice(&epoch.to_le_bytes());
+    d.extend_from_slice(&round.to_le_bytes());
+    d
+}
+
+pub fn ledger_hash_root(block: &LedgerBlock) -> String {
+    let h = hex32(&block.hash).unwrap_or_else(|| *blake3::hash(block.hash.as_bytes()).as_bytes());
+    hex::encode(h)
+}
+
+pub fn encode_vote_sig(sig: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(sig)
+}
+
+fn decode_vote_sig(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+pub fn quorum_of(n: usize) -> usize {
+    (2 * n) / 3 + 1
+}
+
+impl CommitCert {
+    pub fn verify(&self, block: &LedgerBlock, committee: &[(String, Vec<u8>)]) -> Result<(), String> {
+        let h = &self.header;
+        if h.height != block.height {
+            return Err("certificate is for another height".into());
+        }
+        let root = |s: &str| crate::consensus_host::hash_from_hex(s).to_hex();
+        if h.tx_root != root(&block.tx_merkle_root) || h.state_root != root(&block.state_root) {
+            return Err("certificate does not commit to this block's roots".into());
+        }
+        if h.receipts_root != ledger_hash_root(block) {
+            return Err("certificate does not commit to this block".into());
+        }
+        let members: Vec<(String, String, Vec<u8>)> = committee
+            .iter()
+            .map(|(a, pk)| (crate::consensus_host::address_from_dilithium(pk.clone()).to_hex(), a.clone(), pk.clone()))
+            .collect();
+        match members.iter().find(|(engine, _, _)| *engine == h.proposer) {
+            Some((_, addr, _)) if *addr == block.miner => {}
+            Some(_) => return Err(format!("block #{} names a miner other than the member that proposed it", block.height)),
+            None => return Err(format!("block #{} was proposed from outside its committee", block.height)),
+        }
+        let hh = h.block_hash().ok_or("certificate header is malformed")?;
+        let msg = vote_message(&hh, h.height, h.epoch, h.round);
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        for (voter, sig_b64) in &self.votes {
+            let Some((_, _, pk)) = members.iter().find(|(engine, _, _)| engine == voter) else {
+                return Err(format!("{voter} is not on this height's committee"));
+            };
+            let sig = decode_vote_sig(sig_b64).ok_or_else(|| "a vote signature is not base64".to_string())?;
+            let ok = ego_core::verify_signature(
+                &ego_core::PublicKey::dilithium2(pk.clone()),
+                &msg,
+                &ego_core::Signature::dilithium2(sig),
+            )
+            .unwrap_or(false);
+            if !ok {
+                return Err(format!("vote from {voter} does not verify"));
+            }
+            seen.insert(voter.clone());
+        }
+        let quorum = quorum_of(members.len());
+        if seen.len() < quorum {
+            return Err(format!("certificate has {} of the {} votes it needs", seen.len(), quorum));
+        }
+        Ok(())
+    }
+}
+
+fn live_coverage_witnesses_in(db: &DB, tx: &LedgerTx, at: i64) -> u64 {
+    let Ok(body) = crate::coverage_proof::parse_body(&tx.call_args) else { return 0 };
+    let mut counted: std::collections::BTreeSet<&str> = Default::default();
+    for w in &body.witnesses {
+        if w.address == tx.from || !is_registered_in(db, &w.address) {
+            continue;
+        }
+        let (count, last) = uptime_streak_in(db, &w.address);
+        if count >= SEAT_MIN_UPTIME_STREAK && at.saturating_sub(last) <= UPTIME_STREAK_GAP_SECS {
+            counted.insert(w.address.as_str());
+        }
+    }
+    counted.len() as u64
+}
+
+fn verify_block_certificate_in(db: &DB, block: &LedgerBlock) -> Result<(), String> {
+    if block.commit_cert.is_empty() {
+        return Err(format!("block #{} carries no committee votes", block.height));
+    }
+    let cert: CommitCert = serde_json::from_str(&block.commit_cert)
+        .map_err(|e| format!("block #{} certificate is unreadable: {e}", block.height))?;
+    let committee = committee_for_height_in(db, block.height, block.timestamp)
+        .ok_or_else(|| format!("no committee known for block #{}", block.height))?;
+    cert.verify(block, &committee)
+}
+
+pub fn verify_block_certificate(block: &LedgerBlock) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    verify_block_certificate_in(&db, block)
+}
+
+fn drs_block_rules_in(db: &DB, block: &LedgerBlock, txs: &[LedgerTx], is_proposal: bool) -> Result<(), String> {
+    if block.tx_merkle_root != sorted_tx_root(txs) {
+        return Err(format!("block {} tx root does not match its transactions", block.height));
+    }
+    randao_reveal_in(db, block)?;
+    let committee = committee_for_height_in(db, block.height, block.timestamp)
+        .ok_or_else(|| format!("no committee known for block #{}", block.height))?;
+    if !committee.iter().any(|(a, _)| a == &block.miner) {
+        return Err(format!("block #{} miner {} is not on its committee", block.height, block.miner));
+    }
+    if !is_proposal {
+        verify_block_certificate_in(db, block)?;
+    }
+    Ok(())
+}
+
+pub fn is_contributor_fee_tx(tx: &LedgerTx) -> bool {
+    tx.tx_type == "fee_distribution" && tx.from.is_empty() && tx.to == NODE_POOL_ADDR && tx.signature == "coinbase"
+}
+
+pub fn sorted_tx_root(txs: &[LedgerTx]) -> String {
+    let mut hashes: Vec<&str> = txs.iter().map(|t| t.hash.as_str()).collect();
+    hashes.sort_unstable();
+    compute_merkle_root(&hashes)
+}
+
+pub fn is_free_housekeeping(tx: &LedgerTx) -> bool {
+    tx.fee_uegoc == 0
+        && !tx.from.is_empty()
+        && !crate::ledger::is_reserved_system_source(&tx.from)
+        && (tx.tx_type == "validator_register"
+            || is_uptime_checkin(tx)
+            || tx.tx_type == crate::storage_proof::POST_PROOF_TX
+            || is_price_report(tx))
+}
+
+pub const STATE_CHECKPOINT_EVERY: u64 = 10_000;
+pub const STATE_CHECKPOINT_KEEP: usize = 3;
+pub const STATE_CHECKPOINTS: &[(u64, &str)] = &[];
+
+const LOCAL_META_KEYS: &[&[u8]] = &[
+    b"bls_reg_backfilled",
+    b"drs_index_v1",
+    b"finalized_height",
+    b"chain_graduated",
+    b"known_validators_v1",
+    b"migration_done",
+    b"pools_seeded_v2",
+    b"prune_below",
+    b"prune_headers_below",
+    b"rules_version",
+    b"slashed_validators",
+];
+const LOCAL_META_PREFIXES: &[&[u8]] = &[b"pvotes:", b"validator_bls:"];
+
+fn is_local_meta(key: &[u8]) -> bool {
+    LOCAL_META_KEYS.iter().any(|k| *k == key) || LOCAL_META_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+pub fn canonicalize_snapshot(snap: &mut StateSnapshot) {
+    snap.meta.retain(|(k, _)| hex::decode(k).map(|kb| !is_local_meta(&kb)).unwrap_or(false));
+    snap.balances.sort();
+    snap.meta.sort();
+    snap.contracts.sort();
+    snap.contract_txs.sort_by(|a, b| (a.0, &a.1.hash).cmp(&(b.0, &b.1.hash)));
+    snap.blocks.sort_by_key(|b| b.height);
+    snap.signer.clear();
+    snap.signer_pubkey.clear();
+    snap.signature.clear();
+}
+
+pub fn state_digest(snap: &StateSnapshot) -> String {
+    let mut c = snap.clone();
+    canonicalize_snapshot(&mut c);
+    let mut h = blake3::Hasher::new();
+    h.update(b"ego/state/v1:");
+    h.update(&c.height.to_le_bytes());
+    h.update(c.tip_hash.as_bytes());
+    let mut put = |tag: &[u8], k: &str, v: &str| {
+        h.update(tag);
+        h.update(k.as_bytes());
+        h.update(b"=");
+        h.update(v.as_bytes());
+        h.update(b";");
+    };
+    for (k, v) in &c.balances {
+        put(b"b", k, v);
+    }
+    for (k, v) in &c.meta {
+        put(b"m", k, v);
+    }
+    for (k, v) in &c.contracts {
+        put(b"c", k, v);
+    }
+    h.update(&c.contract_height.unwrap_or(0).to_le_bytes());
+    for (height, tx) in &c.contract_txs {
+        h.update(&height.to_le_bytes());
+        h.update(tx.hash.as_bytes());
+    }
+    for b in &c.blocks {
+        h.update(&b.height.to_le_bytes());
+        h.update(b.hash.as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+pub fn state_checkpoint_matches(snap: &StateSnapshot) -> bool {
+    STATE_CHECKPOINTS
+        .iter()
+        .any(|(height, digest)| *height == snap.height && state_digest(snap) == *digest)
+        && snap.blocks.iter().any(|b| b.height == snap.height && b.hash == snap.tip_hash)
+}
+
+pub fn latest_state_checkpoint_height() -> u64 {
+    STATE_CHECKPOINTS.iter().map(|(h, _)| *h).max().unwrap_or(0)
+}
+
+fn state_checkpoint_dir() -> std::path::PathBuf {
+    base_data_dir().join("state_checkpoints")
+}
+
+pub fn save_state_checkpoint(height: u64) {
+    let mut snap = export_state_snapshot();
+    if snap.height != height || local_chain_height() != height {
+        eprintln!("[StateCheckpoint] skipped block {height}: the chain moved on while it was being written");
+        return;
+    }
+    canonicalize_snapshot(&mut snap);
+    let digest = state_digest(&snap);
+    let dir = state_checkpoint_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(&snap) else { return };
+    if crate::utils::atomic_write(&dir.join(format!("{height}.json")), &bytes).is_err() {
+        return;
+    }
+    eprintln!("[StateCheckpoint] block {height} state saved, digest {digest}");
+    let mut saved: Vec<u64> = std::fs::read_dir(&dir)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str()?.strip_suffix(".json")?.parse::<u64>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    saved.sort_unstable();
+    while saved.len() > STATE_CHECKPOINT_KEEP {
+        let old = saved.remove(0);
+        let _ = std::fs::remove_file(dir.join(format!("{old}.json")));
+    }
+}
+
+pub fn load_state_checkpoint(height: u64) -> Option<StateSnapshot> {
+    let bytes = std::fs::read(state_checkpoint_dir().join(format!("{height}.json"))).ok()?;
+    let snap: StateSnapshot = serde_json::from_slice(&bytes).ok()?;
+    (snap.height == height).then_some(snap)
+}
+
+#[cfg(test)]
+mod state_checkpoint_tests {
+    use super::*;
+
+    fn snap() -> StateSnapshot {
+        StateSnapshot {
+            height: 30_000,
+            tip_hash: "aa".repeat(32),
+            state_root: String::new(),
+            balances: vec![(hex::encode("egot1b"), hex::encode([2u8; 8])), (hex::encode("egot1a"), hex::encode([1u8; 8]))],
+            meta: vec![
+                (hex::encode("val_seated:egot1a"), hex::encode([0u8; 8])),
+                (hex::encode("rules_version"), hex::encode([1u8; 8])),
+                (hex::encode("pvotes:9"), "00".into()),
+            ],
+            blocks: vec![LedgerBlock { height: 30_000, hash: "aa".repeat(32), ..LedgerBlock::default() }],
+            contract_height: None,
+            contracts: vec![],
+            contract_txs: vec![],
+            signer: "egot1founder".into(),
+            signer_pubkey: "11".repeat(32),
+            signature: "22".repeat(64),
+        }
+    }
+
+    #[test]
+    fn the_digest_ignores_order_signatures_and_local_bookkeeping() {
+        let a = snap();
+        let mut b = snap();
+        b.balances.reverse();
+        b.meta.reverse();
+        b.meta.retain(|(k, _)| *k != hex::encode("rules_version"));
+        b.signer.clear();
+        b.signature.clear();
+        assert_eq!(state_digest(&a), state_digest(&b));
+    }
+
+    #[test]
+    fn any_change_to_balances_or_chain_state_changes_the_digest() {
+        let base = state_digest(&snap());
+        let mut s = snap();
+        s.balances[0].1 = hex::encode([9u8; 8]);
+        assert_ne!(base, state_digest(&s));
+        let mut s = snap();
+        s.meta[0].1 = hex::encode([5u8; 8]);
+        assert_ne!(base, state_digest(&s));
+        let mut s = snap();
+        s.tip_hash = "bb".repeat(32);
+        assert_ne!(base, state_digest(&s));
+        let mut s = snap();
+        s.meta.push((hex::encode("drs_w:00000000000000000300:egot1x"), hex::encode([1u8; 8])));
+        assert_ne!(base, state_digest(&s));
+    }
+
+    #[test]
+    fn canonical_snapshots_drop_local_keys() {
+        let mut s = snap();
+        canonicalize_snapshot(&mut s);
+        let keys: Vec<Vec<u8>> = s.meta.iter().map(|(k, _)| hex::decode(k).unwrap()).collect();
+        assert_eq!(keys, vec![b"val_seated:egot1a".to_vec()]);
+        assert!(s.signature.is_empty());
+    }
+}
+
+pub(crate) fn migrate_drs_index(db: &DB) {
+    let Some(cf_meta) = db.cf_handle(CF_META) else { return };
+    if db.get_cf(cf_meta, META_DRS_INDEX).ok().flatten().is_some() {
+        return;
+    }
+    let Some(cf_txs) = db.cf_handle(CF_TXS) else { return };
+    let mut regs: std::collections::BTreeMap<String, Vec<(u64, String, String, Option<Vec<u8>>)>> = Default::default();
+    let mut iter = db.raw_iterator_cf(cf_txs);
+    iter.seek_to_first();
+    while iter.valid() {
+        if let Some(tx) = iter.value().and_then(decode::<LedgerTx>) {
+            if let Some((addr, bls_hex)) = parse_validator_registration(&tx) {
+                let dil = registration_dilithium_key(&tx);
+                regs.entry(addr).or_default().push((tx.block_height.unwrap_or(0), tx.hash.clone(), bls_hex, dil));
+            }
+        }
+        iter.next();
+    }
+    let mut batch = WriteBatch::default();
+    for (addr, mut list) in regs {
+        list.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        if db.get_cf(cf_meta, val_seated_key(&addr)).ok().flatten().is_none() {
+            batch.put_cf(cf_meta, val_seated_key(&addr), u64_le(0));
+        }
+        if db.get_cf(cf_meta, val_dil_key(&addr)).ok().flatten().is_none() {
+            if let Some(pk) = list.iter().find_map(|r| r.3.clone()) {
+                batch.put_cf(cf_meta, val_dil_key(&addr), pk);
+            }
+        }
+        if let Some(last) = list.last() {
+            batch.put_cf(cf_meta, val_bls_key(&addr), last.2.as_bytes());
+        }
+    }
+    batch.put_cf(cf_meta, META_DRS_INDEX, b"1");
+    let _ = db.write(batch);
+}
+
+pub(crate) fn rules_need_resync(db: &DB) -> bool {
+    let Some(cf) = db.cf_handle(CF_META) else { return false };
+    let stamp = db.get_cf(cf, META_RULES_VERSION).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    if stamp >= RULES_VERSION {
+        return false;
+    }
+    if local_chain_height_in(db) < RULES_DERIVED_FROM_HEIGHT {
+        let _ = db.put_cf(cf, META_RULES_VERSION, u64_le(RULES_VERSION));
+        return false;
+    }
+    true
+}
+
+pub(crate) fn stamp_rules_version(db: &DB) {
+    if let Some(cf) = db.cf_handle(CF_META) {
+        let _ = db.put_cf(cf, META_RULES_VERSION, u64_le(RULES_VERSION));
+    }
+}
+
+#[cfg(test)]
+mod commit_cert_tests {
+    use super::*;
+    use ego_consensus_core::bft::{BlockHeader, BlockRoots, SigScheme, Vote};
+
+    fn block() -> LedgerBlock {
+        LedgerBlock {
+            height: 33_005,
+            hash: "ab".repeat(32),
+            miner: "egot1member0".into(),
+            tx_merkle_root: "cd".repeat(32),
+            state_root: "ef".repeat(32),
+            ..LedgerBlock::default()
+        }
+    }
+
+    fn header_for(b: &LedgerBlock, proposer: &ego_core::KeyPair) -> BlockHeader {
+        let roots = BlockRoots {
+            tx_root: crate::consensus_host::hash_from_hex(&b.tx_merkle_root),
+            state_root: crate::consensus_host::hash_from_hex(&b.state_root),
+            receipts_root: crate::consensus_host::hash_from_hex(&ledger_hash_root(b)),
+            ..BlockRoots::empty()
+        };
+        BlockHeader::new(
+            b.height, 330, 7, ego_core::Hash::new([1u8; 32]),
+            SigScheme::Dilithium.address(proposer), roots, ego_core::Hash::new([2u8; 32]), vec![],
+        )
+    }
+
+    fn committee(kps: &[ego_core::KeyPair]) -> Vec<(String, Vec<u8>)> {
+        kps.iter().enumerate().map(|(i, k)| (format!("egot1member{i}"), k.dilithium_public_key().key_data)).collect()
+    }
+
+    fn cert(header: &BlockHeader, voters: &[&ego_core::KeyPair]) -> CommitCert {
+        let votes = voters
+            .iter()
+            .map(|k| {
+                let v = Vote::new(header.block_hash(), header.height, header.epoch, header.round, k, SigScheme::Dilithium).unwrap();
+                (v.voter.to_hex(), encode_vote_sig(&v.signature.signature_data))
+            })
+            .collect();
+        CommitCert { header: CertHeader::from_engine(header), votes }
+    }
+
+    #[test]
+    fn the_recomputed_header_hash_matches_the_engine() {
+        let k = ego_core::KeyPair::generate();
+        let h = header_for(&block(), &k);
+        assert_eq!(CertHeader::from_engine(&h).block_hash().unwrap(), *h.block_hash().as_bytes());
+    }
+
+    #[test]
+    fn three_of_four_committee_votes_finalize_and_less_does_not() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let b = block();
+        let h = header_for(&b, &kps[0]);
+        assert!(cert(&h, &[&kps[0], &kps[1], &kps[2]]).verify(&b, &c).is_ok());
+        assert!(cert(&h, &[&kps[1], &kps[2], &kps[3]]).verify(&b, &c).is_ok());
+        assert!(cert(&h, &[&kps[0], &kps[1]]).verify(&b, &c).is_err());
+        let doubled = cert(&h, &[&kps[0], &kps[0], &kps[1]]);
+        assert!(doubled.verify(&b, &c).is_err());
+    }
+
+    #[test]
+    fn votes_from_outside_the_committee_or_for_another_block_are_refused() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let outsiders: Vec<_> = (0..3).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let b = block();
+        let h = header_for(&b, &kps[0]);
+        assert!(cert(&h, &[&outsiders[0], &outsiders[1], &outsiders[2]]).verify(&b, &c).is_err());
+
+        let mut other = b.clone();
+        other.hash = "99".repeat(32);
+        assert!(cert(&h, &[&kps[0], &kps[1], &kps[2]]).verify(&other, &c).is_err());
+
+        let mut tampered = cert(&h, &[&kps[0], &kps[1], &kps[2]]);
+        tampered.header.timestamp_ms += 1;
+        assert!(tampered.verify(&b, &c).is_err());
+    }
+
+    #[test]
+    fn the_miner_must_be_the_member_that_proposed() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let mut b = block();
+        let h = header_for(&b, &kps[0]);
+        b.miner = "egot1member1".into();
+        assert!(cert(&h, &[&kps[0], &kps[1], &kps[2]]).verify(&b, &c).is_err());
+        b.miner = "egot1somebodyelse".into();
+        assert!(cert(&h, &[&kps[0], &kps[1], &kps[2]]).verify(&b, &c).is_err());
+        let stranger = ego_core::KeyPair::generate();
+        let b = block();
+        let h = header_for(&b, &stranger);
+        assert!(cert(&h, &[&kps[0], &kps[1], &kps[2]]).verify(&b, &c).is_err());
+    }
+
+    #[test]
+    fn the_committee_draw_is_weighted_ordered_and_repeatable() {
+        let table: Vec<(String, u64)> = (0..10).map(|i| (format!("n{i}"), if i == 0 { 1_000 } else { 1 })).collect();
+        let a = draw_committee(&table, "seed", 0, 4);
+        assert_eq!(a, draw_committee(&table, "seed", 0, 4));
+        assert_eq!(a.len(), 4);
+        let mut uniq = a.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 4);
+        assert_ne!(a, draw_committee(&table, "seed", 1, 4));
+        let heavy = (0..200).filter(|i| draw_committee(&table, &format!("s{i}"), 0, 1)[0] == "n0").count();
+        assert!(heavy > 150, "a node with far more DRS is drawn far more often ({heavy}/200)");
+        assert!(draw_committee(&[], "seed", 0, 4).is_empty());
+        let zero = vec![("z".to_string(), 0u64)];
+        assert!(draw_committee(&zero, "seed", 0, 4).is_empty());
+        assert_eq!(draw_committee(&table, "seed", 0, 50).len(), 10);
+    }
+
+    #[test]
+    fn equal_nodes_take_turns_and_nobody_sits_twice_running() {
+        let table: Vec<(String, u64)> = (0..16).map(|i| (format!("n{i:02}"), 120)).collect();
+        let mut served: std::collections::HashMap<String, u64> = Default::default();
+        let mut seats: std::collections::HashMap<String, u32> = Default::default();
+        let mut last: Vec<String> = Vec::new();
+        for epoch in 1..=40u64 {
+            let rota = build_rota(&table, |a| served.get(a).copied(), epoch, &format!("mix{epoch}"));
+            assert_eq!(rota.len(), 16);
+            let seated: Vec<String> = rota[..DRS_COMMITTEE_SIZE].to_vec();
+            for a in &seated {
+                assert!(!last.contains(a), "{a} sat in two epochs running");
+                served.insert(a.clone(), epoch);
+                *seats.entry(a.clone()).or_default() += 1;
+            }
+            last = seated;
+        }
+        for (a, _) in &table {
+            assert!(seats.get(a).copied().unwrap_or(0) >= 5, "{a} only sat {:?} times in 40 epochs", seats.get(a));
+        }
+    }
+
+    #[test]
+    fn a_stuck_committee_hands_over_after_the_redraw_time_with_guard_bands() {
+        let p = 1_000;
+        assert_eq!(committee_attempt(p, p), 0);
+        assert_eq!(committee_attempt(p, p - 50), 0);
+        assert_eq!(committee_attempt(p, p + 299), 0);
+        assert_eq!(committee_attempt(p, p + 300), 1);
+        assert_eq!(committee_attempt(p, p + 901), 3);
+        assert!(proposal_window_open(p, p));
+        assert!(proposal_window_open(p, p + 269));
+        assert!(!proposal_window_open(p, p + 270));
+        assert!(!proposal_window_open(p, p + 300));
+        assert!(!proposal_window_open(p, p + 329));
+        assert!(proposal_window_open(p, p + 330));
+        assert!(proposal_window_open(p, p + 569));
+        assert!(!proposal_window_open(p, p + 570));
+    }
+
+    #[test]
+    fn the_randomness_reveal_is_unique_per_key_and_height() {
+        let sk = crate::bls_agg::derive_bls_key(&[7u8; 32]);
+        let pk = crate::bls_agg::bls_pubkey(&sk);
+        let sig = crate::bls_agg::bls_sign(&sk, &randao_message(33_001));
+        let canon = crate::bls_agg::verify_unique(&sig, &pk, &randao_message(33_001)).unwrap();
+        assert_eq!(canon, sig);
+        assert!(crate::bls_agg::verify_unique(&sig, &pk, &randao_message(33_002)).is_none());
+        let other = crate::bls_agg::bls_pubkey(&crate::bls_agg::derive_bls_key(&[8u8; 32]));
+        assert!(crate::bls_agg::verify_unique(&sig, &other, &randao_message(33_001)).is_none());
+        assert_eq!(crate::bls_agg::bls_sign(&sk, &randao_message(33_001)), sig);
+        let a = next_randao_mix([0u8; 32], &sig);
+        assert_eq!(a, next_randao_mix([0u8; 32], &sig));
+        assert_ne!(a, next_randao_mix([1u8; 32], &sig));
+    }
+
+    #[test]
+    fn checkins_are_paid_from_the_epoch_budget_by_weight() {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let cf = db.cf_handle(CF_META).unwrap();
+        let epoch = 900_001u64;
+        let h = epoch * DRS_EPOCH + 7;
+        let (a, b, c) = ("egot1drspaytesta", "egot1drspaytestb", "egot1drspaytestc");
+        for addr in [a, b, c] {
+            db.put_cf(cf, val_seated_key(addr), u64_le(1)).unwrap();
+        }
+        db.put_cf(cf, drs_weight_key(epoch, a), u64_le(300)).unwrap();
+        db.put_cf(cf, drs_weight_key(epoch, b), u64_le(100)).unwrap();
+        let mut sum = u64_le(400).to_vec();
+        sum.extend_from_slice(&u64_le(2));
+        db.put_cf(cf, drs_sum_key(epoch), sum).unwrap();
+        let ci = |from: &str, hash: &str| LedgerTx {
+            hash: hash.into(), from: from.into(), to: from.into(), tx_type: TX_UPTIME.into(), ..LedgerTx::default()
+        };
+        let txs = vec![ci(a, "0xd1"), ci(b, "0xd2"), ci(c, "0xd3")];
+        let paid = expected_uptime_rewards_in(&db, &txs, h, 1_900_000_000);
+        let per = NODE_REWARD_PER_DAY_UEGOC as u128 * UPTIME_INTERVAL_SECS as u128 / 86_400;
+        assert_eq!(paid.len(), 2);
+        assert_eq!(paid[0].to, a);
+        assert_eq!(paid[0].amount as u128, per * 3 / 4);
+        assert_eq!(paid[1].to, b);
+        assert_eq!(paid[1].amount as u128, per / 4);
+        assert!(paid.iter().all(|t| t.from == NODE_POOL_ADDR && t.tx_type == TX_UPTIME_REWARD));
+        assert!(expected_uptime_rewards_in(&db, &txs, DRS_FROM_HEIGHT - 1, 1_900_000_000).is_empty());
+    }
+
+    #[test]
+    fn the_contributor_fee_payout_is_a_known_system_payment() {
+        let fee = LedgerTx {
+            hash: "0xfee".into(),
+            from: String::new(),
+            to: NODE_POOL_ADDR.into(),
+            amount: 400,
+            tx_type: "fee_distribution".into(),
+            signature: "coinbase".into(),
+            ..LedgerTx::default()
+        };
+        assert!(is_contributor_fee_tx(&fee));
+        let mut elsewhere = fee.clone();
+        elsewhere.to = "egot1someone".into();
+        assert!(!is_contributor_fee_tx(&elsewhere));
+        let mut from_pool = fee.clone();
+        from_pool.from = STAKING_POOL_ADDR.into();
+        assert!(!is_contributor_fee_tx(&from_pool));
+        let mut renamed = fee;
+        renamed.tx_type = "storage_escrow".into();
+        assert!(!is_contributor_fee_tx(&renamed));
+    }
+
+    #[test]
+    fn the_sorted_tx_root_ignores_arrival_order() {
+        let t = |h: &str| LedgerTx { hash: h.into(), ..LedgerTx::default() };
+        assert_eq!(sorted_tx_root(&[t("0xb"), t("0xa"), t("0xc")]), sorted_tx_root(&[t("0xc"), t("0xa"), t("0xb")]));
+        assert_ne!(sorted_tx_root(&[t("0xa")]), sorted_tx_root(&[t("0xb")]));
     }
 }

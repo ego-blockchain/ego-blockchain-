@@ -174,8 +174,19 @@ pub struct PocWitnessRecord {
     pub machine_id: String,
     pub cell:       String,
     pub latency_ms: u32,
+    pub rssi_dbm:   i32,
     pub timestamp:  i64,
     pub signature:  String,
+}
+
+static ACTIVE_CHALLENGE: OnceCell<Mutex<Option<u64>>> = OnceCell::new();
+
+pub fn set_beacon_challenge(height: Option<u64>) {
+    *ACTIVE_CHALLENGE.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|e| e.into_inner()) = height;
+}
+
+pub fn beacon_challenge() -> Option<u64> {
+    *ACTIVE_CHALLENGE.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 static ACTIVE_BEACON: OnceCell<Mutex<Option<(String, i64)>>> = OnceCell::new();

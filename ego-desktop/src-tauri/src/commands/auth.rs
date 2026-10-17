@@ -414,6 +414,8 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             base_fee_uegoc: 1_000,
             agg_bls_sig: String::new(),
             bls_pubkeys: Vec::new(),
+            commit_cert: String::new(),
+            randao_reveal: String::new(),
         });
         save_chain(&chain).map_err(EgoDesktopError::WalletError)?;
     }

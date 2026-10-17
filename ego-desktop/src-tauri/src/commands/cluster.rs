@@ -1,10 +1,9 @@
 use crate::app::AppState;
-use crate::chain_db::{ClusterBooking, ClusterNode, CLUSTER_ESCROW_ADDR};
+use crate::chain_db::{ClusterBooking, ClusterNode};
 use crate::error::EgoDesktopError;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use tauri::State;
 use uuid::Uuid;
-use hex;
 
 const WG_PORT: u16 = 51820;
 
@@ -87,26 +86,6 @@ fn hourly_rate_uegoc(offer: &crate::chain_db::ComputeCapacityOffer) -> u64 {
         + offer.price_per_core_hour_uegoc * offer.cpu_cores as u64
 }
 
-fn push_system_tx(from: &str, to: &str, amount: u64, memo: &str) {
-    use crate::ledger::{tx_signing_bytes, LedgerTx};
-    let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(from, to, amount, 0, ts);
-    let hash       = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-    crate::mempool::get_mempool().push(LedgerTx {
-        hash,
-        from:      from.to_string(),
-        to:        to.to_string(),
-        amount,
-        memo:      Some(memo.to_string()),
-        timestamp: ts,
-        signature: "cluster_escrow_system".to_string(),
-        status:    "Pending".into(),
-        nonce:     0,
-        tx_type:   "cluster_escrow".to_string(),
-        ..LedgerTx::default()
-    });
-}
-
 #[tauri::command]
 pub async fn create_cluster_booking(
     gpu_count:        u32,
@@ -118,7 +97,7 @@ pub async fn create_cluster_booking(
     name:             String,
     state:            State<'_, AppState>,
 ) -> Result<ClusterBooking, EgoDesktopError> {
-    let mut ledger = crate::ledger::Ledger::load();
+    let ledger = crate::ledger::Ledger::load();
     let my_addr    = ledger.address.clone();
     let now     = chrono::Utc::now().timestamp();
 
@@ -181,50 +160,14 @@ pub async fn create_cluster_booking(
     }
 
     let my_balance = crate::chain_db::balance_of(&my_addr);
-    if my_balance < total_cost {
+    let first_periods: u64 = selected.iter().map(|o| hourly_rate_uegoc(o) * period_minutes / 60).sum();
+    if my_balance < first_periods {
         return Err(EgoDesktopError::WalletError(
-            format!("Need {} uEGOC, have {}", total_cost, my_balance)
+            format!("Need {} uEGOC for the first period, have {}", first_periods, my_balance)
         ));
     }
-
-    if !crate::chain_db::internal_balance_transfer(&my_addr, CLUSTER_ESCROW_ADDR, total_cost) {
-        return Err(EgoDesktopError::WalletError("Failed to lock escrow".into()));
-    }
-
-    {
-        use crate::ledger::{tx_signing_bytes, LedgerTx};
-        let nonce      = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
-        let sign_bytes = tx_signing_bytes(&my_addr, CLUSTER_ESCROW_ADDR, total_cost, nonce, now);
-        let kp = state.get_keypair().ok_or_else(|| {
-            crate::chain_db::internal_balance_transfer(CLUSTER_ESCROW_ADDR, &my_addr, total_cost);
-            EgoDesktopError::WalletError("Wallet not initialized".into())
-        })?;
-        let sig_hex     = hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes());
-        let dil_sig     = kp.sign_dilithium(&sign_bytes);
-        let pubkey_hex  = hex::encode(kp.ed25519_public_key().as_bytes());
-        let dil_pk_hex  = hex::encode(&kp.dilithium_public_key().key_data);
-        let dil_sig_hex = hex::encode(&dil_sig.signature_data);
-        let tx_hash     = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-        crate::mempool::get_mempool().push(LedgerTx {
-            hash:                tx_hash,
-            from:                my_addr.clone(),
-            to:                  CLUSTER_ESCROW_ADDR.to_string(),
-            amount:              total_cost,
-            memo:                Some(format!("cluster_escrow:{}", cluster_id)),
-            timestamp:           now,
-            signature:           sig_hex,
-            status:              "Pending".into(),
-            nonce,
-            public_key_ed25519:  pubkey_hex,
-            dilithium_pubkey:    dil_pk_hex,
-            dilithium_signature: dil_sig_hex,
-            tx_type:             "cluster_escrow".to_string(),
-            tx_version:          2,
-            chain_id:            1,
-            ..LedgerTx::default()
-        });
-        ledger.nonce = nonce;
-        ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+    if state.get_keypair().is_none() {
+        return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     }
 
     let (buyer_priv, buyer_pub) = generate_wg_keypair();
@@ -247,9 +190,21 @@ pub async fn create_cluster_booking(
 
         let node_hourly = hourly_rate_uegoc(offer);
         let node_cost   = node_hourly * duration_minutes / 60;
+        let node_rate   = node_hourly * period_minutes / 60;
+        let node_periods = (duration_minutes / period_minutes.max(1)).max(1);
+        let reservation_id = Uuid::new_v4().to_string();
+        let first = crate::commands::direct_pay::period_amount(node_cost, node_rate, 1, node_periods);
+        crate::commands::direct_pay::pay(
+            &offer.provider_address,
+            first,
+            false,
+            crate::commands::direct_pay::pay_memo("reservation_pay", &reservation_id, 1),
+        )
+        .await
+        .map_err(EgoDesktopError::WalletError)?;
 
         let reservation = crate::chain_db::ComputeReservation {
-            reservation_id:    Uuid::new_v4().to_string(),
+            reservation_id:    reservation_id.clone(),
             offer_id:          offer.offer_id.clone(),
             buyer_address:     my_addr.clone(),
             provider_address:  offer.provider_address.clone(),
@@ -265,13 +220,13 @@ pub async fn create_cluster_booking(
             created_at:        now,
             expires_at:        now + duration_minutes as i64 * 60,
             last_heartbeat_at: now,
-            periods_paid:      0,
+            periods_paid:      1,
             breach_count:      0,
-            escrow_remaining:  node_cost,
+            escrow_remaining:  node_cost.saturating_sub(first),
             days:              0,
             days_paid:         0,
             daily_rate_uegoc:  0,
-            started_at:        None,
+            started_at:        Some(now),
             paid_in_egusd:     false,
         };
         crate::chain_db::upsert_compute_reservation(&reservation);
@@ -427,17 +382,6 @@ pub async fn terminate_cluster(cluster_id: String) -> Result<(), EgoDesktopError
     let remaining_mins = booking.duration_minutes.saturating_sub(elapsed_mins);
 
     for node in &booking.nodes {
-        let (total_node_cost, used_cost) =
-            if let Some(res) = crate::chain_db::get_compute_reservation(&node.reservation_id) {
-                (res.total_cost_uegoc, res.total_cost_uegoc.saturating_sub(res.escrow_remaining))
-            } else {
-                (0, 0)
-            };
-        let refund = total_node_cost.saturating_sub(used_cost);
-        if refund > 0 {
-            crate::chain_db::internal_balance_transfer(CLUSTER_ESCROW_ADDR, &my_addr, refund);
-        }
-
         if let Some(mut res) = crate::chain_db::get_compute_reservation(&node.reservation_id) {
             res.status = "terminated".to_string();
             res.escrow_remaining = 0;
@@ -632,18 +576,25 @@ pub async fn send_cluster_node_heartbeat(cluster_id: String) -> Result<(), EgoDe
         }
     }
 
-    if res.escrow_remaining >= period_rate {
-        crate::chain_db::internal_balance_transfer(CLUSTER_ESCROW_ADDR, &my_addr, period_rate);
-        push_system_tx(CLUSTER_ESCROW_ADDR, &my_addr, period_rate,
-            &format!("cluster_period_payment:{}:{}", cluster_id, reservation_id));
-        res.escrow_remaining  = res.escrow_remaining.saturating_sub(period_rate);
-        res.periods_paid     += 1;
-        ledger.compute_reservation_earnings_uegoc += period_rate;
+    let paid = crate::commands::direct_pay::paid_periods(&res.buyer_address, &my_addr, "reservation_pay", &reservation_id);
+    if paid > res.periods_paid {
+        let earned: u64 = (res.periods_paid + 1..=paid)
+            .map(|p| crate::commands::direct_pay::period_amount(res.total_cost_uegoc, period_rate, p, total_periods))
+            .sum();
+        ledger.compute_reservation_earnings_uegoc += earned;
         ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+        res.escrow_remaining = res.escrow_remaining.saturating_sub(earned);
+        res.periods_paid = paid;
+    }
+    let start = res.started_at.unwrap_or(res.created_at);
+    if crate::commands::direct_pay::periods_due(start, now, period_secs, total_periods) > paid.saturating_add(1) {
+        res.status = "unpaid".to_string();
+        crate::chain_db::upsert_compute_reservation(&res);
+        return Err(EgoDesktopError::InvalidInput("The renter stopped paying for this node".into()));
     }
 
     res.last_heartbeat_at = now;
-    if res.periods_paid >= total_periods || res.escrow_remaining == 0 {
+    if now >= res.expires_at && res.periods_paid >= total_periods {
         res.status = "completed".to_string();
     }
     crate::chain_db::upsert_compute_reservation(&res);

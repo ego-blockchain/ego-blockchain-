@@ -96,11 +96,8 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
     if prover_addr.is_empty() {
         return Ok(empty("No wallet yet".into()));
     }
-    if crate::ledger::get_validator_stake(&prover_addr) < crate::chain_db::UPTIME_MIN_STAKE_UEGOC {
-        return Ok(empty(format!(
-            "Stake {} EGOC to be paid for the files you host",
-            crate::chain_db::UPTIME_MIN_STAKE_UEGOC / 1_000_000
-        )));
+    if !crate::chain_db::is_registered_node(&prover_addr) {
+        return Ok(empty("This node registers itself on the network first; proofs start once it has".into()));
     }
     let tip = crate::chain_db::local_chain_height();
     if tip.saturating_add(1) < crate::chain_db::STORAGE_PAY_FROM_HEIGHT {
@@ -674,4 +671,62 @@ pub async fn run_post_loop() {
             Err(e) => eprintln!("[PoST] loop error: {e}"),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChainDrs {
+    pub active: bool,
+    pub from_height: u64,
+    pub checkins_from_height: u64,
+    pub height: u64,
+    pub epoch: u64,
+    pub registered: bool,
+    pub uptime_streak: u32,
+    pub streak_needed: u32,
+    pub my_weight: u64,
+    pub total_weight: u64,
+    pub nodes: u64,
+    pub on_committee: bool,
+    pub committee: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn get_chain_drs() -> Result<ChainDrs, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let addr = Ledger::load().address;
+        let height = crate::chain_db::local_chain_height();
+        let next = height.saturating_add(1);
+        let (my_weight, total_weight, nodes) = crate::chain_db::drs_weight_of(&addr);
+        let committee: Vec<String> = if crate::chain_db::drs_active(next) {
+            crate::chain_db::committee_for_height(next, crate::clock::now())
+                .map(|c| c.into_iter().map(|(a, _)| a).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        ChainDrs {
+            active: crate::chain_db::drs_active(next),
+            from_height: crate::chain_db::DRS_FROM_HEIGHT,
+            checkins_from_height: crate::chain_db::CHECKIN_FROM_HEIGHT,
+            height,
+            epoch: crate::chain_db::drs_epoch_of(next),
+            registered: !addr.is_empty() && crate::chain_db::is_registered_node(&addr),
+            uptime_streak: crate::chain_db::uptime_streak(&addr).0,
+            streak_needed: crate::chain_db::SEAT_MIN_UPTIME_STREAK,
+            my_weight,
+            total_weight,
+            nodes,
+            on_committee: !addr.is_empty() && committee.iter().any(|a| a == &addr),
+            committee,
+        }
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
+}
+
+#[tauri::command]
+pub async fn resync_chain(app: tauri::AppHandle) -> Result<(), EgoDesktopError> {
+    crate::chain_db::request_resync().map_err(EgoDesktopError::DatabaseError)?;
+    app.restart();
+    Ok(())
 }

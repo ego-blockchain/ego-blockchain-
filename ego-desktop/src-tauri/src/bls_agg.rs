@@ -15,6 +15,15 @@ pub fn bls_pubkey(sk: &SecretKey) -> Vec<u8> {
     sk.sk_to_pk().to_bytes().to_vec()
 }
 
+pub fn verify_unique(sig_bytes: &[u8], pk_bytes: &[u8], msg: &[u8]) -> Option<Vec<u8>> {
+    if sig_bytes.len() != 96 {
+        return None;
+    }
+    let sig = Signature::from_bytes(sig_bytes).ok()?;
+    let pk = PublicKey::from_bytes(pk_bytes).ok()?;
+    (sig.verify(true, msg, DST, &[], &pk, true) == BLST_ERROR::BLST_SUCCESS).then(|| sig.to_bytes().to_vec())
+}
+
 pub fn aggregate_signatures(sig_bytes_list: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     let sigs: Vec<Signature> = sig_bytes_list
         .iter()

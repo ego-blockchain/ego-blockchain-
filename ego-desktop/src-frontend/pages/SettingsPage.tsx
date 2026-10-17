@@ -64,6 +64,9 @@ const SettingsPage: React.FC = () => {
   const [showSeedHex, setShowSeedHex]         = useState(false);
 
   const [exportingBackup, setExportingBackup] = useState(false);
+  const [confirmResync, setConfirmResync] = useState(false);
+  const [resyncing, setResyncing] = useState(false);
+  const [resyncError, setResyncError] = useState('');
   const [importingBackup, setImportingBackup] = useState(false);
   const [backupMsg, setBackupMsg]             = useState('');
   const [backupError, setBackupError]         = useState('');
@@ -525,6 +528,54 @@ const SettingsPage: React.FC = () => {
         )}
         {backupError && (
           <div className="text-xs px-3 py-2 rounded-lg bg-red-500/15 text-red-400">{backupError}</div>
+        )}
+      </div>
+
+      <div className="bg-gray-800/60 rounded-2xl p-5 border border-gray-700/50 space-y-3">
+        <div>
+          <h3 className="font-semibold text-white">Download the chain again</h3>
+          <p className="text-xs text-gray-400 mt-1">
+            If this node shows blocks or balances nobody else has, it may be following a copy of the chain the
+            network has left. This deletes the local copy and downloads it again from other nodes, checking every
+            block. Your wallet, keys and files stay as they are. The app restarts.
+          </p>
+        </div>
+        {confirmResync ? (
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              onClick={async () => {
+                setResyncing(true);
+                setResyncError('');
+                try {
+                  await invoke('resync_chain');
+                } catch (e) {
+                  setResyncError(String(e).replace(/^.*Error:/, '').trim());
+                  setResyncing(false);
+                }
+              }}
+              disabled={resyncing}
+              className="bg-red-600 hover:bg-red-500 disabled:opacity-40 py-2.5 rounded-xl text-sm font-semibold transition"
+            >
+              {resyncing ? 'Restarting…' : 'Delete and download again'}
+            </button>
+            <button
+              onClick={() => setConfirmResync(false)}
+              disabled={resyncing}
+              className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 py-2.5 rounded-xl text-sm font-semibold transition"
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setConfirmResync(true)}
+            className="w-full bg-gray-700 hover:bg-gray-600 py-2.5 rounded-xl text-sm font-semibold transition"
+          >
+            Download the chain again
+          </button>
+        )}
+        {resyncError && (
+          <div className="text-xs px-3 py-2 rounded-lg bg-red-500/15 text-red-400">{resyncError}</div>
         )}
       </div>
 
