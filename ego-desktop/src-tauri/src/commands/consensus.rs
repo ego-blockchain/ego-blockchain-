@@ -121,8 +121,19 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
     let mut found = 0usize;
     let mut details = Vec::new();
 
+    let now = chrono::Utc::now().timestamp();
+    let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", crate::ledger::get_validator_stake(&prover_addr) > 0)
+        .max(crate::mempool::MIN_FEE_UEGOC)
+        .max(crate::chain_db::get_current_base_fee());
     for f in &hosted {
         let Some(record) = crate::chain_db::recorded_storage_file(&f.cid) else { continue };
+        if now - crate::chain_db::storage_last_proof(&f.cid, &prover_addr) < 20 * 3600 {
+            continue;
+        }
+        if crate::chain_db::balance_of(&prover_addr) < fee.saturating_mul(submitted as u64 + 1) {
+            details.push("Not enough EGOC for the network fee on more proofs".into());
+            break;
+        }
         let Ok(manifest) = crate::blocks::load_manifest(&f.cid) else { continue };
         found += 1;
         let (cid, prover, hash) = (f.cid.clone(), prover_addr.clone(), block_hash.clone());
@@ -148,7 +159,7 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
             from: prover_addr.clone(),
             to: prover_addr.clone(),
             amount: 0,
-            fee_uegoc: 0,
+            fee_uegoc: fee,
             tx_type: crate::storage_proof::POST_PROOF_TX.to_string(),
             call_args: serde_json::to_string(&body).map_err(|e| EgoDesktopError::SerializationError(e.to_string()))?,
             timestamp: chrono::Utc::now().timestamp(),
@@ -219,7 +230,7 @@ pub async fn record_my_stored_files() -> usize {
             amount: 0,
             fee_uegoc: fee,
             tx_type: crate::chain_db::TX_STORAGE_FILE.to_string(),
-            memo: Some("storage_file".into()),
+            memo: Some(crate::chain_db::storage_file_memo(&call_args, false)),
             call_args,
             timestamp: chrono::Utc::now().timestamp(),
             nonce,
@@ -258,7 +269,7 @@ pub async fn unrecord_stored_file(cid: &str) {
         amount: 0,
         fee_uegoc: fee,
         tx_type: crate::chain_db::TX_STORAGE_FILE.to_string(),
-        memo: Some("storage_file:delete".into()),
+        memo: Some(crate::chain_db::storage_file_memo(&serde_json::to_string(&rec.record).unwrap_or_default(), true)),
         call_args: serde_json::to_string(&rec.record).unwrap_or_default(),
         timestamp: chrono::Utc::now().timestamp(),
         nonce,
@@ -681,11 +692,15 @@ pub struct ChainDrs {
     pub height: u64,
     pub epoch: u64,
     pub registered: bool,
+    pub key_proven: bool,
     pub uptime_streak: u32,
     pub streak_needed: u32,
+    pub checkin_every_hours: u32,
     pub my_weight: u64,
     pub total_weight: u64,
     pub nodes: u64,
+    pub earned_uegoc: u64,
+    pub committee_size: usize,
     pub on_committee: bool,
     pub committee: Vec<String>,
 }
@@ -697,25 +712,27 @@ pub async fn get_chain_drs() -> Result<ChainDrs, EgoDesktopError> {
         let height = crate::chain_db::local_chain_height();
         let next = height.saturating_add(1);
         let (my_weight, total_weight, nodes) = crate::chain_db::drs_weight_of(&addr);
-        let committee: Vec<String> = if crate::chain_db::drs_active(next) {
-            crate::chain_db::committee_for_height(next, crate::clock::now())
-                .map(|c| c.into_iter().map(|(a, _)| a).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let rec = crate::chain_db::drs_node(&addr);
+        let committee: Vec<String> = crate::chain_db::committee_for_height(next, crate::clock::now())
+            .filter(|_| crate::chain_db::drs_active(next))
+            .map(|c| c.into_iter().map(|(a, _)| a).collect())
+            .unwrap_or_default();
         ChainDrs {
             active: crate::chain_db::drs_active(next),
             from_height: crate::chain_db::DRS_FROM_HEIGHT,
             checkins_from_height: crate::chain_db::CHECKIN_FROM_HEIGHT,
             height,
             epoch: crate::chain_db::drs_epoch_of(next),
-            registered: !addr.is_empty() && crate::chain_db::is_registered_node(&addr),
-            uptime_streak: crate::chain_db::uptime_streak(&addr).0,
-            streak_needed: crate::chain_db::SEAT_MIN_UPTIME_STREAK,
+            registered: rec.is_some(),
+            key_proven: rec.as_ref().map_or(false, |r| !r.pop_key.is_empty()),
+            uptime_streak: rec.as_ref().map_or(0, |r| r.streak),
+            streak_needed: crate::drs::MIN_STREAK,
+            checkin_every_hours: (crate::drs::CHECKIN_INTERVAL_SECS / 3600) as u32,
             my_weight,
             total_weight,
             nodes,
+            earned_uegoc: rec.as_ref().map_or(0, |r| r.earned),
+            committee_size: crate::drs::COMMITTEE_SIZE,
             on_committee: !addr.is_empty() && committee.iter().any(|a| a == &addr),
             committee,
         }

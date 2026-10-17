@@ -1691,7 +1691,7 @@ fn tx_hash_must_match_standard_signing(tx: &LedgerTx) -> bool {
 }
 
 pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
-    if is_protocol_system_tx(tx) {
+    if is_protocol_system_tx(tx) || crate::drs::is_batch_tx(tx) || crate::chain_db::is_contributor_fee_tx(tx) {
         return Ok(());
     }
     if crate::shielded_chain::unshield_is_well_formed(tx) || crate::market_chain::settle_is_well_formed(tx) {
@@ -1821,18 +1821,8 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         && tx.from == tx.to
         && tx.amount == 0;
     let is_uptime = crate::chain_db::is_uptime_checkin(tx);
-    if is_uptime {
-        let next = crate::chain_db::local_chain_height().saturating_add(1);
-        if next < crate::chain_db::UPTIME_FROM_HEIGHT {
-            return Err(format!("uptime check-ins count from block {}", crate::chain_db::UPTIME_FROM_HEIGHT));
-        }
-        if !crate::chain_db::checkin_due(&tx.from, crate::clock::now()) {
-            return Err(format!(
-                "uptime check-in from {} refused: the node isn't registered or its last check-in is too recent",
-                tx.from
-            ));
-        }
-        crate::chain_db::uptime_checkin_fresh(tx, next.saturating_sub(1), crate::chain_db::get_block_hash_at)?;
+    if is_uptime || tx.tx_type == crate::chain_db::TX_UPTIME {
+        return Err("check-ins are signed with BLS and sent to the committee now, not as transactions".into());
     }
 
     // Under emission v2, registration mints emission weight — it must cost

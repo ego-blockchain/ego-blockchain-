@@ -76,16 +76,24 @@ fn source() -> String {
     BAKED_IN.to_string()
 }
 
-pub fn validators() -> Vec<GenesisValidator> {
+fn validators_ref() -> &'static [GenesisValidator] {
     static CACHE: std::sync::OnceLock<Vec<GenesisValidator>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| parse(&source())).clone()
+    CACHE.get_or_init(|| parse(&source()))
+}
+
+pub fn validators() -> Vec<GenesisValidator> {
+    validators_ref().to_vec()
 }
 
 /// Membership test that does not rebuild the list. Every block arriving over sync is
 /// checked against the starting committee, so this runs far too often to re-read and
 /// re-parse the file each time.
 pub fn is_member(address: &str) -> bool {
-    validators().iter().any(|v| v.address == address)
+    validators_ref().iter().any(|v| v.address == address)
+}
+
+pub fn has_key(address: &str) -> bool {
+    validators_ref().iter().any(|v| v.address == address && !v.dilithium_pubkey.is_empty())
 }
 
 /// The starting committee, by wallet address, in the order every node will agree on.
@@ -115,10 +123,10 @@ pub fn is_engine_member(addr: &ego_core::Address) -> bool {
 }
 
 pub fn dilithium_pubkey_for(address: &str) -> Option<Vec<u8>> {
-    validators()
-        .into_iter()
+    validators_ref()
+        .iter()
         .find(|v| v.address == address)
-        .and_then(|v| hex::decode(v.dilithium_pubkey).ok())
+        .and_then(|v| hex::decode(&v.dilithium_pubkey).ok())
         .filter(|b| !b.is_empty())
 }
 

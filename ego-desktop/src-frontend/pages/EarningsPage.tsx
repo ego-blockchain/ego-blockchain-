@@ -26,11 +26,15 @@ interface ChainDrs {
   height: number;
   epoch: number;
   registered: boolean;
+  key_proven: boolean;
   uptime_streak: number;
   streak_needed: number;
+  checkin_every_hours: number;
   my_weight: number;
   total_weight: number;
   nodes: number;
+  earned_uegoc: number;
+  committee_size: number;
   on_committee: boolean;
   committee: string[];
 }
@@ -134,7 +138,7 @@ const EarningsPage: React.FC = () => {
         'submit_poc_event',
         { quality: coverageQuality, peers: coveragePeers, h3Cell: null }
       );
-      if (result.success) {
+      if (result.success && result.reward_uegoc > 0) {
         setLastPocMsg(`+${(result.reward_uegoc / 1_000_000).toFixed(6)} EGOC PoC reward`);
         loadPocScore();
       }
@@ -548,9 +552,10 @@ const EarningsPage: React.FC = () => {
             <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
               <h3 className="font-semibold mb-2">Block Lottery (DRS)</h3>
               <p className="text-xs text-gray-400 mb-3">
-                Every 100 blocks, 4 nodes are drawn at random to make blocks, weighted by DRS from what the chain
-                has recorded: uptime check-ins, paid storage you prove you hold, and coverage. Any 3 of the 4 make a
-                block. A node that just sat waits while others take their turn. No stake is needed.
+                Every 100 blocks, {chainDrs.committee_size} nodes are drawn at random to make blocks, weighted by DRS from what the
+                chain has recorded: uptime check-ins, paid storage you prove you hold, and coverage. Two thirds of them make a
+                block. A node that just sat waits while others take their turn. No stake is needed. Every check-in also pays
+                your share of the daily node budget.
               </p>
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
@@ -562,11 +567,13 @@ const EarningsPage: React.FC = () => {
                   )}
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-400">Registered node</span>
-                  <span className={chainDrs.registered ? 'text-green-400' : 'text-gray-500'}>{chainDrs.registered ? 'Yes' : 'Not yet'}</span>
+                  <span className="text-gray-400">Node registered with a proven key</span>
+                  <span className={chainDrs.key_proven ? 'text-green-400' : 'text-gray-500'}>
+                    {chainDrs.key_proven ? 'Yes' : chainDrs.registered ? 'Proving its key' : 'Not yet'}
+                  </span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-400">Uptime check-ins in a row</span>
+                  <span className="text-gray-400">Check-ins in a row (every {chainDrs.checkin_every_hours}h)</span>
                   <span className={chainDrs.uptime_streak >= chainDrs.streak_needed ? 'text-green-400' : 'text-gray-300'}>
                     {chainDrs.uptime_streak} / {chainDrs.streak_needed} needed
                   </span>
@@ -575,11 +582,11 @@ const EarningsPage: React.FC = () => {
                   <div className="text-xs text-gray-500">Check-ins count from block {chainDrs.checkins_from_height.toLocaleString()}.</div>
                 )}
                 <div className="flex justify-between">
-                  <span className="text-gray-400">Your DRS this epoch</span>
+                  <span className="text-gray-400">Your DRS</span>
                   <span className="text-gray-300 font-mono">
                     {chainDrs.my_weight.toLocaleString()}
                     {chainDrs.total_weight > 0 && (
-                      <span className="text-gray-500"> ({((chainDrs.my_weight / chainDrs.total_weight) * 100).toFixed(2)}%)</span>
+                      <span className="text-gray-500"> ({((chainDrs.my_weight / chainDrs.total_weight) * 100).toFixed(3)}%)</span>
                     )}
                   </span>
                 </div>
@@ -587,11 +594,15 @@ const EarningsPage: React.FC = () => {
                   <span className="text-gray-400">Nodes in the draw</span>
                   <span className="text-gray-300">{chainDrs.nodes.toLocaleString()}</span>
                 </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Earned from check-ins</span>
+                  <span className="text-green-400 font-mono">{(chainDrs.earned_uegoc / 1_000_000).toFixed(4)} EGOC</span>
+                </div>
                 {chainDrs.active && (
                   <div className="flex justify-between">
                     <span className="text-gray-400">Making blocks now</span>
                     <span className={chainDrs.on_committee ? 'text-green-400 font-semibold' : 'text-gray-500'}>
-                      {chainDrs.on_committee ? 'Yes, your node' : 'Other nodes'}
+                      {chainDrs.on_committee ? 'Yes, your node' : `${chainDrs.committee.length} other nodes`}
                     </span>
                   </div>
                 )}
@@ -645,7 +656,7 @@ const EarningsPage: React.FC = () => {
             </div>
             <div className="flex justify-between text-sm mb-3">
               <span className="text-gray-400">Consensus</span>
-              <span className="text-gray-300">DRS committee, 3 of 4</span>
+              <span className="text-gray-300">DRS committee, 2/3 of 32</span>
             </div>
             <div className="text-xs text-gray-500 bg-gray-900 rounded-lg p-2.5">
               Block rewards are fixed in EGOC (not USD). As EGOC appreciates, each block reward

@@ -25,6 +25,8 @@ mod block_heal;
 mod blocks;
 mod ecvrf;
 mod chain_db;
+mod drs;
+mod storage_pay;
 mod contract_exec;
 mod dao_chat;
 mod gateway;

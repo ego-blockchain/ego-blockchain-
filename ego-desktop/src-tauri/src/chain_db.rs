@@ -129,6 +129,7 @@ pub fn get_db() -> DbWrapper {
         };
         stamp_rules_version(&db);
         migrate_drs_index(&db);
+        migrate_drs_v2(&db);
         db
     }))
 }
@@ -586,7 +587,7 @@ fn val_seated_key(addr: &str) -> Vec<u8> {
     format!("val_seated:{addr}").into_bytes()
 }
 
-fn val_dil_key(addr: &str) -> Vec<u8> {
+pub(crate) fn val_dil_key(addr: &str) -> Vec<u8> {
     format!("val_dil:{addr}").into_bytes()
 }
 
@@ -652,7 +653,7 @@ pub fn seat_rules_active(height: u64) -> bool {
 // EGOC at the median price the validators report. The owner's payment is burned, so paying
 // yourself to host your own files always loses money.
 
-pub const STORAGE_PAY_FROM_HEIGHT: u64 = 34_000;
+pub const STORAGE_PAY_FROM_HEIGHT: u64 = 35_000;
 pub const STORAGE_PAY_EPOCH: u64 = 100;
 pub const STORAGE_PAY_HOSTS: u64 = 3;
 pub const STORAGE_PAY_SHARE_PERCENT: u64 = 80;
@@ -716,7 +717,8 @@ pub fn parse_storage_file(tx: &LedgerTx) -> Result<Option<StorageFileRecord>, St
     if rec.cid.trim().is_empty() || rec.cid.len() > 128 {
         return Err("storage_file names no file".into());
     }
-    if tx.memo.as_deref() == Some("storage_file:delete") {
+    let memo = tx.memo.as_deref().unwrap_or("");
+    if memo == "storage_file:delete" || memo.starts_with("storage_file:delete:") {
         return Ok(None);
     }
     let comm = hex::decode(&rec.comm_d).map_err(|_| "comm_d is not hex".to_string())?;
@@ -771,7 +773,7 @@ pub fn may_report_price(addr: &str) -> bool {
 
 fn may_report_price_in(db: &DB, addr: &str, height: u64) -> bool {
     crate::genesis::addresses().iter().any(|a| a == addr)
-        || drs_weight_in(db, drs_epoch_of(height), addr) > 0
+        || crate::drs::rota_position(&crate::drs::Ov::new(db), drs_epoch_of(height), addr).is_some()
 }
 
 pub fn price_report_ok(tx: &LedgerTx) -> Result<(), String> {
@@ -884,117 +886,12 @@ pub fn storage_proof_earns_in(db: &DB, tx: &LedgerTx) -> Option<String> {
         .then_some(body.cid)
 }
 
-pub fn storage_reward_tx(host: &str, amount: u64, height: u64, timestamp: i64) -> LedgerTx {
-    LedgerTx {
-        hash: format!("0x{}", blake3::hash(format!("storage_reward:{height}:{host}").as_bytes()).to_hex()),
-        from: NODE_POOL_ADDR.to_string(),
-        to: host.to_string(),
-        amount,
-        memo: Some(format!("Storage pay, blocks {}..{}", height.saturating_sub(STORAGE_PAY_EPOCH), height)),
-        timestamp,
-        status: "Confirmed".to_string(),
-        block_height: Some(height),
-        tx_type: TX_STORAGE_REWARD.to_string(),
-        signature: "coinbase".to_string(),
-        ..LedgerTx::default()
-    }
-}
-
-/// The storage payouts the block at `height` must carry. Only blocks on an epoch boundary
-/// carry any.
-fn expected_storage_rewards_in(db: &DB, height: u64, timestamp: i64) -> Vec<LedgerTx> {
-    if height < STORAGE_PAY_FROM_HEIGHT || height % STORAGE_PAY_EPOCH != 0 {
-        return Vec::new();
-    }
-    let Some(price) = consensus_price_in(db, height / STORAGE_PAY_EPOCH) else { return Vec::new() };
-    let Some(prev_ts) = block_ts_at_in(db, height - STORAGE_PAY_EPOCH) else { return Vec::new() };
-    let epoch_secs = timestamp.saturating_sub(prev_ts).clamp(0, STORAGE_PAY_MAX_EPOCH_SECS) as u128;
-    if epoch_secs == 0 {
-        return Vec::new();
-    }
-    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new() };
-
-    let mut files: Vec<RecordedStorageFile> = db
-        .prefix_iterator_cf(cf, b"sfile:")
-        .filter_map(|item| item.ok())
-        .take_while(|(k, _)| k.starts_with(b"sfile:"))
-        .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
-        .collect();
-    files.sort_by(|a, b| a.record.cid.cmp(&b.record.cid));
-
-    let mut owner_bytes: std::collections::BTreeMap<String, u64> = Default::default();
-    for f in &files {
-        *owner_bytes.entry(f.owner.clone()).or_insert(0) += f.record.bytes;
-    }
-    let mut plans: std::collections::BTreeMap<String, Option<(u64, u64, i64)>> = Default::default();
-    let mut pay: std::collections::BTreeMap<String, u128> = Default::default();
-
-    for f in &files {
-        let plan = *plans
-            .entry(f.owner.clone())
-            .or_insert_with(|| egusd_plan_in(db, &f.owner, timestamp));
-        let Some((plan_bytes, plan_price, period)) = plan else { continue };
-        if period <= 0 { continue; }
-        let denom_bytes = owner_bytes.get(&f.owner).copied().unwrap_or(0).max(plan_bytes).max(1) as u128;
-
-        let prefix = sproof_prefix(&f.record.cid);
-        let mut hosts: Vec<(u64, String)> = db
-            .prefix_iterator_cf(cf, &prefix)
-            .filter_map(|item| item.ok())
-            .take_while(|(k, _)| k.starts_with(&prefix))
-            .filter_map(|(k, v)| {
-                let prover = String::from_utf8(k[prefix.len()..].to_vec()).ok()?;
-                let first = v.get(..8).map(|x| u64::from_le_bytes(x.try_into().unwrap()))?;
-                let last = v.get(8..16).map(|x| i64::from_le_bytes(x.try_into().unwrap()))?;
-                (timestamp.saturating_sub(last) <= STORAGE_PROOF_FRESH_SECS && prover != f.owner)
-                    .then_some((first, prover))
-            })
-            .collect();
-        hosts.sort();
-        hosts.truncate(STORAGE_PAY_HOSTS as usize);
-
-        let numerator = plan_price as u128
-            * epoch_secs
-            * f.record.bytes as u128
-            * STORAGE_PAY_SHARE_PERCENT as u128
-            * 1_000_000u128;
-        let denominator = period as u128 * denom_bytes * 100u128 * STORAGE_PAY_HOSTS as u128 * price as u128;
-        let each = numerator / denominator.max(1);
-        if each == 0 { continue; }
-        for (_, host) in hosts {
-            *pay.entry(host).or_insert(0) += each;
-        }
-    }
-
-    pay.into_iter()
-        .filter(|(_, amount)| *amount > 0)
-        .map(|(host, amount)| storage_reward_tx(&host, amount.min(u64::MAX as u128) as u64, height, timestamp))
-        .collect()
-}
-
-
-pub const UPTIME_FROM_HEIGHT: u64 = CHECKIN_FROM_HEIGHT;
-
-fn checkin_due_in(db: &DB, addr: &str, at: i64) -> bool {
-    is_registered_in(db, addr)
-        && uptime_last_paid_in(db, addr)
-            .map(|last| at.saturating_sub(last) >= UPTIME_INTERVAL_SECS)
-            .unwrap_or(true)
-}
-
-pub fn checkin_due(addr: &str, at: i64) -> bool {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    checkin_due_in(&db, addr, at)
-}
+pub const UPTIME_FROM_HEIGHT: u64 = LEGACY_CHECKIN_FROM_HEIGHT;
 pub const UPTIME_MIN_STAKE_UEGOC: u64 = 1_000 * 1_000_000;
 pub const UPTIME_INTERVAL_SECS: i64 = 6 * 3600;
 pub const UPTIME_CHECKIN_MAX_AGE: u64 = 100;
 pub const TX_UPTIME: &str = "uptime";
 pub const TX_UPTIME_REWARD: &str = "uptime_reward";
-
-fn uptime_last_key(addr: &str) -> Vec<u8> {
-    format!("uptime_last:{addr}").into_bytes()
-}
 
 fn uptime_streak_key(addr: &str) -> Vec<u8> {
     format!("uptime_streak:{addr}").into_bytes()
@@ -1017,15 +914,6 @@ fn uptime_streak_in(db: &DB, addr: &str) -> (u32, i64) {
 pub fn uptime_streak(addr: &str) -> (u32, i64) {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     uptime_streak_in(&db, addr)
-}
-
-pub fn next_uptime_streak(prev: (u32, i64), paid_at: i64) -> (u32, i64) {
-    let (count, last) = prev;
-    if count > 0 && paid_at.saturating_sub(last) <= UPTIME_STREAK_GAP_SECS {
-        (count.saturating_add(1), paid_at)
-    } else {
-        (1, paid_at)
-    }
 }
 
 /// Whether a joiner has been reliably online: an unbroken uptime streak long enough, and
@@ -1089,23 +977,6 @@ pub fn apply_faucet_marks(
     }
 }
 
-fn uptime_last_paid_in(db: &DB, addr: &str) -> Option<i64> {
-    let cf = db.cf_handle(CF_META)?;
-    db.get_cf(cf, uptime_last_key(addr))
-        .ok()
-        .flatten()
-        .and_then(|b| b.get(..8).map(|x| i64::from_le_bytes(x.try_into().unwrap())))
-}
-
-pub fn uptime_last_paid(addr: &str) -> Option<i64> {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    uptime_last_paid_in(&db, addr)
-}
-
-pub fn uptime_checkin_memo(height: u64, block_hash: &str) -> String {
-    format!("uptime:{height}:{block_hash}")
-}
-
 pub fn is_uptime_checkin(tx: &LedgerTx) -> bool {
     tx.tx_type == TX_UPTIME && !tx.from.is_empty() && tx.to == tx.from && tx.amount == 0
 }
@@ -1132,48 +1003,6 @@ pub fn uptime_checkin_fresh(
         return Err(format!("uptime check-in quotes a block {h} this chain does not have"));
     }
     Ok(())
-}
-
-pub fn uptime_reward_tx(checkin: &LedgerTx, amount: u64, height: u64, timestamp: i64) -> LedgerTx {
-    LedgerTx {
-        hash: format!("0x{}", blake3::hash(format!("uptime_reward:{}", checkin.hash).as_bytes()).to_hex()),
-        from: NODE_POOL_ADDR.to_string(),
-        to: checkin.from.clone(),
-        amount,
-        memo: Some(checkin.hash.clone()),
-        timestamp,
-        status: "Confirmed".to_string(),
-        block_height: Some(height),
-        tx_type: TX_UPTIME_REWARD.to_string(),
-        signature: "coinbase".to_string(),
-        ..LedgerTx::default()
-    }
-}
-
-fn expected_uptime_rewards_in(db: &DB, txs: &[LedgerTx], height: u64, timestamp: i64) -> Vec<LedgerTx> {
-    if !drs_active(height) {
-        return Vec::new();
-    }
-    let epoch = drs_epoch_of(height);
-    let (total, _) = drs_sum_in(db, epoch);
-    if total == 0 {
-        return Vec::new();
-    }
-    let per_checkin = NODE_REWARD_PER_DAY_UEGOC as u128 * UPTIME_INTERVAL_SECS as u128 / 86_400;
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut checkins: Vec<&LedgerTx> = txs.iter().filter(|t| is_uptime_checkin(t)).collect();
-    checkins.sort_by(|a, b| a.hash.cmp(&b.hash));
-    let mut out = Vec::new();
-    for c in checkins {
-        if !seen.insert(c.from.as_str()) || !checkin_due_in(db, &c.from, timestamp) {
-            continue;
-        }
-        let amount = (per_checkin * drs_weight_in(db, epoch, &c.from) as u128 / total as u128) as u64;
-        if amount > 0 {
-            out.push(uptime_reward_tx(c, amount, height, timestamp));
-        }
-    }
-    out
 }
 
 /// The snapshot a decision at `height` reads from. A node deciding `height` has applied
@@ -2417,6 +2246,37 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         new_tx_count += 1;
     }
 
+    let mut drs_ov = crate::drs::Ov::new(db);
+    {
+        let pool_now = db
+            .get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
+            .ok()
+            .flatten()
+            .map(|v| read_u64_le(&v))
+            .unwrap_or(0) as i128
+            + balance_delta.get(NODE_POOL_ADDR).copied().unwrap_or(0);
+        let seed = rota_seed_in(db, block);
+        let applied = crate::drs::apply_block(&mut drs_ov, block, &confirmed_txs, pool_now.max(0) as u64, &seed);
+        let mut pool_left = pool_now.max(0) as u128;
+        let mut credits = applied.credits;
+        for (_, pay) in &credits {
+            pool_left = pool_left.saturating_sub(*pay as u128);
+        }
+        if block.height >= STORAGE_PAY_FROM_HEIGHT {
+            for (host, pay) in storage_pay_in(db, &mut drs_ov, block, &confirmed_txs) {
+                let pay = (pay as u128).min(pool_left) as u64;
+                pool_left -= pay as u128;
+                if pay > 0 {
+                    credits.push((host, pay));
+                }
+            }
+        }
+        for (addr, pay) in credits {
+            *balance_delta.entry(addr).or_insert(0) += pay as i128;
+            *balance_delta.entry(NODE_POOL_ADDR.to_string()).or_insert(0) -= pay as i128;
+        }
+    }
+
     // Read current balances for affected addresses.
     let mut new_balances: std::collections::HashMap<String, u64> = Default::default();
     for addr in balance_delta.keys() {
@@ -2439,20 +2299,11 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     // Block record.
     batch.put_cf(cf_blocks, height_k, encode(block));
 
-    let (drs_puts, drs_prune) = drs_epoch_writes_in(&db, block);
-    for (from, to) in drs_prune {
-        batch.delete_range_cf(cf_meta, from, to);
-    }
-    for (k, v) in drs_puts {
-        batch.put_cf(cf_meta, k, v);
-    }
     if drs_active(block.height) {
         if let Some(mix) = randao_mix_write_in(&db, block) {
             batch.put_cf(cf_meta, META_RANDAO_MIX, mix);
         }
-        batch.put_cf(cf_meta, drs_served_key(&block.miner), u64_le(drs_epoch_of(block.height)));
     }
-    let mut counted_checkins: std::collections::HashSet<String> = Default::default();
 
     // Transactions + all secondary indices.
     for (ordinal, tx) in confirmed_txs.iter().enumerate() {
@@ -2520,20 +2371,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             }
         }
 
-        if block.height >= CHECKIN_FROM_HEIGHT
-            && is_uptime_checkin(tx)
-            && !counted_checkins.contains(&tx.from)
-            && checkin_due_in(&db, &tx.from, block.timestamp)
-        {
-            counted_checkins.insert(tx.from.clone());
-            batch.put_cf(cf_meta, uptime_last_key(&tx.from), block.timestamp.to_le_bytes());
-            let (count, last) = next_uptime_streak(uptime_streak_in(&db, &tx.from), block.timestamp);
-            let mut rec = Vec::with_capacity(12);
-            rec.extend_from_slice(&count.to_le_bytes());
-            rec.extend_from_slice(&last.to_le_bytes());
-            batch.put_cf(cf_meta, uptime_streak_key(&tx.from), rec);
-        }
-
         if tx.tx_type == crate::storage_proof::POST_PROOF_TX {
             if let Ok(body) = crate::storage_proof::parse_body(&tx.call_args) {
                 record_storage_proof(&mut batch, &db, &tx.from, &body.cid, body.bytes_proven(), block.height);
@@ -2545,12 +2382,13 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             if let Ok(witnesses) =
                 crate::coverage_proof::validate_against_chain(tx, tip, get_block_hash_at)
             {
-                let counted = if drs_active(block.height) {
-                    live_coverage_witnesses_in(&db, tx, block.timestamp)
+                let counted = if block.height >= CHECKIN_FROM_HEIGHT {
+                    live_coverage_witnesses(&drs_ov, tx, block.timestamp)
                 } else {
                     witnesses
                 };
                 record_coverage_proof(&mut batch, &db, &tx.from, counted, block.height);
+                crate::drs::record_coverage(&mut drs_ov, &tx.from, counted, block.timestamp, block.height);
             }
         }
 
@@ -2733,6 +2571,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     crate::shielded_chain::apply_block(db, &mut batch, block.height, &fresh_txs);
     crate::market_chain::apply_plan(db, &mut batch, block.height, &market_plan);
 
+    drs_ov.flush(&mut batch);
     tracing::debug!("[ChainDB] db.write(batch) starting — block #{}", block.height);
     if let Err(e) = db.write(batch) {
         tracing::error!("write batch failed (disk full?): {e}");
@@ -4182,10 +4021,6 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         stamped.push(coinbase);
     }
 
-    let uptime_rewards = expected_uptime_rewards_in(&db, &stamped, height, timestamp);
-    stamped.extend(uptime_rewards);
-    let storage_rewards = expected_storage_rewards_in(&db, height, timestamp);
-    stamped.extend(storage_rewards);
 
     let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
     if contributor_fee > 0 {
@@ -4376,7 +4211,6 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     }
     let mut blocked_senders: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut held_back: Vec<LedgerTx> = Vec::new();
-    let mut checkin_senders: std::collections::HashSet<String> = Default::default();
     let mut free_count = 0usize;
     let valid_txs: Vec<&LedgerTx> = sorted_txs.iter().filter(|tx| {
         if tx.hash.is_empty() {
@@ -4398,12 +4232,13 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             return false;
         }
         if tx.tx_type == TX_UPTIME
-            && (height < UPTIME_FROM_HEIGHT
-                || uptime_checkin_fresh(tx, height.saturating_sub(1), |h| block_hash_at_in(&db, h)).is_err()
-                || !checkin_due_in(&db, &tx.from, timestamp)
-                || !checkin_senders.insert(tx.from.clone()))
+            || tx.tx_type == TX_UPTIME_REWARD
+            || (tx.tx_type == crate::coverage_proof::POC_PROOF_TX && height >= CHECKIN_FROM_HEIGHT)
         {
             return false;
+        }
+        if crate::drs::is_batch_tx(tx) {
+            return height >= CHECKIN_FROM_HEIGHT && tx.block_height == Some(height);
         }
         if height >= CHECKIN_FROM_HEIGHT && is_free_housekeeping(tx) {
             if free_count >= MAX_FREE_TXS_PER_BLOCK {
@@ -4565,10 +4400,6 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         stamped.push(coinbase);
     }
 
-    let uptime_rewards = expected_uptime_rewards_in(&db, &stamped, height, timestamp);
-    stamped.extend(uptime_rewards);
-    let storage_rewards = expected_storage_rewards_in(&db, height, timestamp);
-    stamped.extend(storage_rewards);
 
     let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
     if contributor_fee > 0 {
@@ -5030,9 +4861,6 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
             let is_coinbase = Some(&tx.hash) == block.coinbase_tx.as_ref();
             let is_post_reward = tx.tx_type == "post_reward";
             let is_faucet = tx.tx_type == "faucet";
-            if tx.tx_type == TX_UPTIME_REWARD || tx.tx_type == TX_STORAGE_REWARD {
-                continue;
-            }
             // H3: accept by tx TYPE, not by a magic `signature` string. The block's
             // single coinbase is validated above (is_coinbase); any other
             // coinbase-signed/reward-typed tx is rejected. Faucet + the known
@@ -5078,11 +4906,12 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                 let is_settle = tx.tx_type == crate::market_chain::TX_SETTLE
                     && tx.from == crate::market_chain::MARKET_ESCROW_ADDR;
                 let is_contributor_fee = is_contributor_fee_tx(tx);
+                let is_drs_batch = crate::drs::is_batch_tx(tx);
                 // A system pool pays out only through a kind of payment whose amount and
                 // recipient the rules check. Accepting any "emission type" bounded only by
                 // the pool's balance let a block producer pay itself the whole staking or
                 // node pool by naming the payment an escrow release.
-                if !is_reward && !is_unshield && !is_settle && !is_contributor_fee {
+                if !is_reward && !is_unshield && !is_settle && !is_contributor_fee && !is_drs_batch {
                     return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
                 }
         } else {
@@ -5265,67 +5094,24 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
             validate_credits_escrow_tx(tx, block.timestamp)?;
         }
     }
-    // Uptime: every check-in must quote a recent block, and the block's payouts must be
-    // exactly the ones the rules give for its check-ins, so no proposer can pay itself or
-    // anyone else more often or more than the rules allow.
-    if block.height >= UPTIME_FROM_HEIGHT {
-        for tx in txs.iter().filter(|t| t.tx_type == TX_UPTIME) {
+    if let Some(tx) = txs.iter().find(|t| t.tx_type == TX_UPTIME || t.tx_type == TX_UPTIME_REWARD) {
+        if block.height >= LEGACY_CHECKIN_FROM_HEIGHT {
+            return Err(format!("{} {} refused: check-ins are signed with BLS and paid in check-in batches now", tx.tx_type, tx.hash));
+        }
+        if tx.tx_type == TX_UPTIME {
             uptime_checkin_fresh(tx, block.height.saturating_sub(1), get_block_hash_at)
                 .map_err(|e| format!("uptime check-in {} rejected: {e}", tx.hash))?;
         }
     }
     {
         let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-        let mut expected: Vec<String> = expected_uptime_rewards_in(&db, txs, block.height, block.timestamp)
-            .into_iter()
-            .map(|t| format!("{}:{}:{}", t.hash, t.to, t.amount))
-            .collect();
-        let mut carried: Vec<String> = txs
-            .iter()
-            .filter(|t| t.tx_type == TX_UPTIME_REWARD)
-            .map(|t| {
-                if t.from != NODE_POOL_ADDR || t.signature != "coinbase" {
-                    return String::from("invalid");
-                }
-                format!("{}:{}:{}", t.hash, t.to, t.amount)
-            })
-            .collect();
-        expected.sort();
-        carried.sort();
-        if expected != carried {
-            return Err(format!(
-                "block {} carries uptime payouts {:?}, the rules give {:?}",
-                block.height, carried, expected
-            ));
+        if let Some(tx) = txs.iter().find(|t| t.tx_type == TX_STORAGE_REWARD) {
+            return Err(format!("storage_reward {} refused: hosts are paid when their proofs land", tx.hash));
         }
-        let mut expected_storage: Vec<String> = expected_storage_rewards_in(&db, block.height, block.timestamp)
-            .into_iter()
-            .map(|t| format!("{}:{}:{}", t.hash, t.to, t.amount))
-            .collect();
-        let mut carried_storage: Vec<String> = txs
-            .iter()
-            .filter(|t| t.tx_type == TX_STORAGE_REWARD)
-            .map(|t| {
-                if t.from != NODE_POOL_ADDR || t.signature != "coinbase" {
-                    return String::from("invalid");
-                }
-                format!("{}:{}:{}", t.hash, t.to, t.amount)
-            })
-            .collect();
-        expected_storage.sort();
-        carried_storage.sort();
-        if expected_storage != carried_storage {
-            return Err(format!(
-                "block {} carries storage payouts {:?}, the rules give {:?}",
-                block.height, carried_storage, expected_storage
-            ));
-        }
+        crate::drs::validate_batches(&crate::drs::Ov::new(db), block, txs, |h| block_hash_at_in(db, h))?;
         if block.height >= CHECKIN_FROM_HEIGHT {
-            let mut senders: std::collections::HashSet<&str> = Default::default();
-            for tx in txs.iter().filter(|t| t.tx_type == TX_UPTIME) {
-                if !checkin_due_in(&db, &tx.from, block.timestamp) || !senders.insert(tx.from.as_str()) {
-                    return Err(format!("uptime check-in {} is not due or repeats a sender", tx.hash));
-                }
+            if let Some(tx) = txs.iter().find(|t| t.tx_type == crate::coverage_proof::POC_PROOF_TX) {
+                return Err(format!("coverage proof {} refused: coverage is proven in coverage batches now", tx.hash));
             }
             let mut registrants: std::collections::HashSet<&str> = Default::default();
             for tx in txs.iter().filter(|t| t.tx_type == "validator_register") {
@@ -5344,8 +5130,11 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
         if block.height >= STORAGE_PAY_FROM_HEIGHT {
             for tx in txs.iter() {
                 if is_storage_file_tx(tx) {
-                    parse_storage_file(tx).map_err(|e| format!("storage_file {} rejected: {e}", tx.hash))?;
+                    let rec = parse_storage_file(tx).map_err(|e| format!("storage_file {} rejected: {e}", tx.hash))?;
                     storage_file_owner_ok(&db, tx).map_err(|e| format!("storage_file {} rejected: {e}", tx.hash))?;
+                    if tx.memo.as_deref() != Some(storage_file_memo(&tx.call_args, rec.is_none()).as_str()) {
+                        return Err(format!("storage_file {} rejected: its memo does not commit to the file record", tx.hash));
+                    }
                 }
                 if tx.tx_type == TX_PRICE_REPORT {
                     price_report_ok_in(&db, tx, block.height).map_err(|e| format!("price report {} rejected: {e}", tx.hash))?;
@@ -7671,7 +7460,7 @@ pub(crate) fn expected_block_reward_inner(
         let parent_ts = if parent_ts > 0 { parent_ts } else { block_ts };
         let genesis_ts = block_ts_inner(db, 0);
         let n = if drs_active(height) {
-            drs_sum_in(db, drs_epoch_of(height)).1.max(1)
+            crate::drs::eligible_count(&crate::drs::Ov::new(db), crate::drs::period_of(height)).max(1)
         } else {
             registered_validator_count_inner(db).max(1)
         };
@@ -9436,21 +9225,25 @@ mod uptime_tests {
         }
     }
 
+    fn legacy_checkin_memo(height: u64, block_hash: &str) -> String {
+        format!("uptime:{height}:{block_hash}")
+    }
+
     fn chain(h: u64) -> Option<String> {
         Some(format!("hash{h}"))
     }
 
     #[test]
     fn a_checkin_must_quote_a_recent_block_of_this_chain() {
-        let ok = checkin("egot1a", "0x1", &uptime_checkin_memo(32_050, "hash32050"));
+        let ok = checkin("egot1a", "0x1", &legacy_checkin_memo(32_050, "hash32050"));
         assert!(uptime_checkin_fresh(&ok, 32_100, chain).is_ok());
-        let old = checkin("egot1a", "0x2", &uptime_checkin_memo(31_000, "hash31000"));
+        let old = checkin("egot1a", "0x2", &legacy_checkin_memo(31_000, "hash31000"));
         assert!(uptime_checkin_fresh(&old, 32_100, chain).is_err());
-        let forged = checkin("egot1a", "0x3", &uptime_checkin_memo(32_050, "somethingelse"));
+        let forged = checkin("egot1a", "0x3", &legacy_checkin_memo(32_050, "somethingelse"));
         assert!(uptime_checkin_fresh(&forged, 32_100, chain).is_err());
-        let future = checkin("egot1a", "0x4", &uptime_checkin_memo(32_200, "hash32200"));
+        let future = checkin("egot1a", "0x4", &legacy_checkin_memo(32_200, "hash32200"));
         assert!(uptime_checkin_fresh(&future, 32_100, chain).is_err());
-        let mut paying = checkin("egot1a", "0x5", &uptime_checkin_memo(32_050, "hash32050"));
+        let mut paying = checkin("egot1a", "0x5", &legacy_checkin_memo(32_050, "hash32050"));
         paying.amount = 1;
         assert!(uptime_checkin_fresh(&paying, 32_100, chain).is_err());
     }
@@ -9499,12 +9292,6 @@ mod faucet_mark_tests {
         assert_eq!(m.get(STAKING_ADDR).copied().unwrap_or(0), 0);
     }
 
-    #[test]
-    fn an_uptime_streak_breaks_after_a_long_gap() {
-        assert_eq!(next_uptime_streak((0, 0), 1_000), (1, 1_000));
-        assert_eq!(next_uptime_streak((3, 1_000), 1_000 + UPTIME_STREAK_GAP_SECS), (4, 1_000 + UPTIME_STREAK_GAP_SECS));
-        assert_eq!(next_uptime_streak((3, 1_000), 1_001 + UPTIME_STREAK_GAP_SECS), (1, 1_001 + UPTIME_STREAK_GAP_SECS));
-    }
 }
 
 #[cfg(test)]
@@ -9588,83 +9375,17 @@ mod storage_pay_tests {
         bare.proofs[0].chunk.clear();
         assert!(!crate::storage_proof::chunks_match(&bare));
     }
-
-    #[test]
-    fn hosts_share_the_paid_plan_and_the_owner_never_pays_itself() {
-        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-        let cf_meta = db.cf_handle(CF_META).unwrap();
-        let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
-        let cf_txs = db.cf_handle(CF_TXS).unwrap();
-        let cf_addr = db.cf_handle(CF_ADDR_TXS).unwrap();
-
-        let h = STORAGE_PAY_FROM_HEIGHT + 900;
-        let t0: i64 = 1_900_000_000;
-        let t1 = t0 + 86_400;
-        let owner = "egot1spayowner000000000000000000000000000000";
-        let hosts = ["egot1spayhosta", "egot1spayhostb", "egot1spayhostc", "egot1spayhostd"];
-
-        let prev = LedgerBlock { height: h - STORAGE_PAY_EPOCH, timestamp: t0, ..LedgerBlock::default() };
-        db.put_cf(cf_blocks, height_key(prev.height), encode(&prev)).unwrap();
-        let paid_block = LedgerBlock { height: h - 500, timestamp: t0 - 1_000, ..LedgerBlock::default() };
-        db.put_cf(cf_blocks, height_key(paid_block.height), encode(&paid_block)).unwrap();
-
-        let plan_tx = LedgerTx {
-            hash: "0xspayplan".into(),
-            from: owner.into(),
-            to: crate::commands::storage::STORAGE_FEE_SINK.into(),
-            tx_type: "credits_pay".into(),
-            memo: Some("credits_pay:79:plan:Basic:monthly".into()),
-            timestamp: t0 - 1_000,
-            block_height: Some(paid_block.height),
-            ..LedgerTx::default()
-        };
-        db.put_cf(cf_txs, plan_tx.hash.as_bytes(), encode(&plan_tx)).unwrap();
-        db.put_cf(cf_addr, addr_txs_key(owner, plan_tx.timestamp, &plan_tx.hash), (0i64).to_le_bytes()).unwrap();
-
-        let entry = RecordedStorageFile { owner: owner.into(), record: rec("egomfd1spayfile", 48_828_125, 50_000_000_000), height: h - 600 };
-        db.put_cf(cf_meta, sfile_key("egomfd1spayfile"), serde_json::to_vec(&entry).unwrap()).unwrap();
-        for (i, host) in hosts.iter().enumerate() {
-            crate::ledger::record_validator_stake(host, UPTIME_MIN_STAKE_UEGOC, true);
-            let mut v = Vec::new();
-            v.extend_from_slice(&(h - 400 + i as u64).to_le_bytes());
-            v.extend_from_slice(&(t1 - 3_600).to_le_bytes());
-            db.put_cf(cf_meta, sproof_key("egomfd1spayfile", host), v).unwrap();
-        }
-        crate::ledger::record_validator_stake(owner, UPTIME_MIN_STAKE_UEGOC, true);
-        let mut own = Vec::new();
-        own.extend_from_slice(&(h - 999).to_le_bytes());
-        own.extend_from_slice(&(t1 - 3_600).to_le_bytes());
-        db.put_cf(cf_meta, sproof_key("egomfd1spayfile", owner), own).unwrap();
-        db.put_cf(cf_meta, price_rep_key(h / STORAGE_PAY_EPOCH - 1, "egot1spayvalidator"), u64_le(8_000)).unwrap();
-
-        let paid = expected_storage_rewards_in(&db, h, t1);
-        let to: Vec<&str> = paid.iter().map(|t| t.to.as_str()).collect();
-        assert_eq!(to, vec!["egot1spayhosta", "egot1spayhostb", "egot1spayhostc"]);
-        assert!(paid.iter().all(|t| t.amount == 877_777 && t.from == NODE_POOL_ADDR));
-        assert!(expected_storage_rewards_in(&db, h + 1, t1).is_empty());
-        assert!(expected_storage_rewards_in(&db, STORAGE_PAY_FROM_HEIGHT - STORAGE_PAY_EPOCH, t1).is_empty());
-    }
 }
 
-pub const CHECKIN_FROM_HEIGHT: u64 = 31_000;
-pub const DRS_FROM_HEIGHT: u64 = 33_000;
-pub const DRS_EPOCH: u64 = 100;
-pub const DRS_TABLE_LEAD: u64 = 50;
-pub const DRS_COMMITTEE_SIZE: usize = 4;
-pub const DRS_ROTA_LEN: usize = 32;
+pub use crate::drs::{CHECKIN_FROM_HEIGHT, DRS_FROM_HEIGHT};
+pub const LEGACY_CHECKIN_FROM_HEIGHT: u64 = 31_000;
+pub const DRS_EPOCH: u64 = crate::drs::EPOCH;
 pub const COMMITTEE_REDRAW_SECS: i64 = 300;
 pub const COMMITTEE_GUARD_SECS: i64 = 30;
 pub const MAX_COMMITTEE_ATTEMPT: i64 = 10_000;
-pub const DRS_KEEP_EPOCHS: u64 = 4;
-pub const DRS_UPTIME_CAP: u64 = 120;
-pub const DRS_STORAGE_POINTS_PER_GB: u64 = 10;
-pub const DRS_STORAGE_CAP: u64 = 10_000;
-pub const DRS_COVERAGE_POINTS_PER_WITNESS: u64 = 2;
-pub const DRS_COVERAGE_CAP_WITNESSES: u64 = 20;
-pub const NODE_REWARD_PER_DAY_UEGOC: u64 = 50_000 * 1_000_000;
 pub const MAX_FREE_TXS_PER_BLOCK: usize = 256;
-pub const RULES_VERSION: u64 = 1;
-pub const RULES_DERIVED_FROM_HEIGHT: u64 = CHECKIN_FROM_HEIGHT;
+pub const RULES_VERSION: u64 = 2;
+pub const RULES_DERIVED_FROM_HEIGHT: u64 = LEGACY_CHECKIN_FROM_HEIGHT;
 const META_RULES_VERSION: &[u8] = b"rules_version";
 const META_DRS_INDEX: &[u8] = b"drs_index_v1";
 const META_RANDAO_MIX: &[u8] = b"randao_mix";
@@ -9674,30 +9395,10 @@ pub fn drs_active(height: u64) -> bool {
 }
 
 pub fn drs_epoch_of(height: u64) -> u64 {
-    height.saturating_sub(1) / DRS_EPOCH
+    crate::drs::epoch_of(height)
 }
 
-fn drs_weight_key(epoch: u64, addr: &str) -> Vec<u8> {
-    format!("drs_w:{epoch:020}:{addr}").into_bytes()
-}
-
-fn drs_weight_prefix(epoch: u64) -> Vec<u8> {
-    format!("drs_w:{epoch:020}:").into_bytes()
-}
-
-fn drs_sum_key(epoch: u64) -> Vec<u8> {
-    format!("drs_sum:{epoch:020}").into_bytes()
-}
-
-fn drs_rota_key(epoch: u64) -> Vec<u8> {
-    format!("drs_rota:{epoch:020}").into_bytes()
-}
-
-fn drs_served_key(addr: &str) -> Vec<u8> {
-    format!("drs_served:{addr}").into_bytes()
-}
-
-fn val_bls_key(addr: &str) -> Vec<u8> {
+pub(crate) fn val_bls_key(addr: &str) -> Vec<u8> {
     format!("val_bls:{addr}").into_bytes()
 }
 
@@ -9715,144 +9416,240 @@ pub fn is_registered_node(addr: &str) -> bool {
     is_registered_in(&db, addr)
 }
 
-fn registered_addrs_in(db: &DB) -> Vec<String> {
-    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new() };
-    let prefix: &[u8] = b"val_seated:";
-    db.prefix_iterator_cf(cf, prefix)
-        .filter_map(|i| i.ok())
-        .take_while(|(k, _)| k.starts_with(prefix))
-        .filter_map(|(k, _)| String::from_utf8(k[prefix.len()..].to_vec()).ok())
-        .filter(|a| !a.is_empty())
-        .collect()
-}
-
-fn dilithium_key_in(db: &DB, addr: &str) -> Option<Vec<u8>> {
+pub(crate) fn dilithium_key_in(db: &DB, addr: &str) -> Option<Vec<u8>> {
     crate::genesis::dilithium_pubkey_for(addr)
         .or_else(|| drs_meta(db, &val_dil_key(addr)).filter(|k| !k.is_empty()))
 }
 
-fn val_bls_in(db: &DB, addr: &str) -> Option<Vec<u8>> {
+pub(crate) fn val_bls_in(db: &DB, addr: &str) -> Option<Vec<u8>> {
     drs_meta(db, &val_bls_key(addr))
         .and_then(|v| hex::decode(v).ok())
         .filter(|k| k.len() == 48)
 }
 
-fn drs_table_in(db: &DB, at: i64, tip: u64) -> Vec<(String, u64)> {
-    let mut storage_bytes: std::collections::BTreeMap<String, u64> = Default::default();
-    if let Some(cf) = db.cf_handle(CF_META) {
-        let files: std::collections::BTreeMap<String, u64> = db
-            .prefix_iterator_cf(cf, b"sfile:")
-            .filter_map(|i| i.ok())
-            .take_while(|(k, _)| k.starts_with(b"sfile:"))
-            .filter_map(|(_, v)| serde_json::from_slice::<RecordedStorageFile>(&v).ok())
-            .map(|f| (f.record.cid.clone(), f.record.bytes))
-            .collect();
-        for item in db.prefix_iterator_cf(cf, b"sproof:") {
-            let Ok((k, v)) = item else { break };
-            if !k.starts_with(b"sproof:") { break; }
-            let Ok(key) = String::from_utf8(k[b"sproof:".len()..].to_vec()) else { continue };
-            let Some((cid, prover)) = key.rsplit_once(':') else { continue };
-            let Some(last) = v.get(8..16).map(|x| i64::from_le_bytes(x.try_into().unwrap())) else { continue };
-            if at.saturating_sub(last) > STORAGE_PROOF_FRESH_SECS { continue; }
-            if let Some(bytes) = files.get(cid) {
-                let e = storage_bytes.entry(prover.to_string()).or_insert(0);
-                *e = e.saturating_add(*bytes);
-            }
-        }
-    }
-    let mut table = Vec::new();
-    for addr in registered_addrs_in(db) {
-        if dilithium_key_in(db, &addr).is_none() || val_bls_in(db, &addr).is_none() { continue; }
-        let (count, last) = uptime_streak_in(db, &addr);
-        if count < SEAT_MIN_UPTIME_STREAK || at.saturating_sub(last) > UPTIME_STREAK_GAP_SECS {
-            continue;
-        }
-        let uptime = (count as u64).min(DRS_UPTIME_CAP);
-        let storage = (storage_bytes.get(&addr).copied().unwrap_or(0) / 1_000_000_000)
-            .saturating_mul(DRS_STORAGE_POINTS_PER_GB)
-            .min(DRS_STORAGE_CAP);
-        let coverage = proven_witnesses_in(db, &addr, tip).min(DRS_COVERAGE_CAP_WITNESSES) * DRS_COVERAGE_POINTS_PER_WITNESS;
-        table.push((addr, uptime + storage + coverage));
-    }
-    table
-}
-
-fn drs_weight_in(db: &DB, epoch: u64, addr: &str) -> u64 {
-    drs_meta(db, &drs_weight_key(epoch, addr)).map(|v| read_u64_le(&v)).unwrap_or(0)
-}
-
-fn drs_sum_in(db: &DB, epoch: u64) -> (u64, u64) {
-    drs_meta(db, &drs_sum_key(epoch))
-        .filter(|v| v.len() >= 16)
-        .map(|v| (read_u64_le(&v[..8]), read_u64_le(&v[8..16])))
-        .unwrap_or((0, 0))
-}
-
-fn drs_epoch_table_in(db: &DB, epoch: u64) -> Vec<(String, u64)> {
-    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new() };
-    let prefix = drs_weight_prefix(epoch);
-    db.prefix_iterator_cf(cf, &prefix)
-        .filter_map(|i| i.ok())
-        .take_while(|(k, _)| k.starts_with(&prefix))
-        .filter_map(|(k, v)| Some((String::from_utf8(k[prefix.len()..].to_vec()).ok()?, read_u64_le(&v))))
-        .collect()
+pub fn drs_node(addr: &str) -> Option<crate::drs::NodeRec> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::drs::load_rec(&crate::drs::Ov::new(db), addr)
 }
 
 pub fn drs_weight_of(addr: &str) -> (u64, u64, u64) {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let epoch = drs_epoch_of(local_chain_height_in(&db).saturating_add(1));
-    let (total, count) = drs_sum_in(&db, epoch);
-    (drs_weight_in(&db, epoch, addr), total, count)
+    let ov = crate::drs::Ov::new(db);
+    let period = crate::drs::period_of(local_chain_height_in(db).saturating_add(1));
+    let mine = crate::drs::load_rec(&ov, addr).map(|r| r.weight.at(period)).unwrap_or(0);
+    (mine, crate::drs::total_weight(&ov, period), crate::drs::eligible_count(&ov, period))
 }
 
-fn drs_rota_in(db: &DB, epoch: u64) -> Vec<String> {
-    drs_meta(db, &drs_rota_key(epoch)).and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
+pub fn drs_registered_count() -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::drs::node_count(&crate::drs::Ov::new(db))
 }
 
-fn drs_served_in(db: &DB, addr: &str) -> Option<u64> {
-    drs_meta(db, &drs_served_key(addr)).map(|v| read_u64_le(&v))
+pub fn drs_checkin_verify(idx: u64, anchor: u64, sig: &[u8]) -> Option<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let tip = local_chain_height_in(db);
+    if anchor == 0 || anchor % DRS_EPOCH != 0 || anchor > tip || tip - anchor > crate::drs::ANCHOR_MAX_AGE {
+        return None;
+    }
+    let hash = block_hash_at_in(db, anchor)?;
+    let addr = crate::drs::addr_at(&ov, idx)?;
+    let rec = crate::drs::load_rec(&ov, &addr)?;
+    let pk = hex::decode(&rec.pop_key).ok()?;
+    crate::bls_agg::verify_shared(sig, &pk, &crate::drs::checkin_message(anchor, &hash)).then_some(rec.pop_key)
 }
 
-pub fn draw_committee(table: &[(String, u64)], seed: &str, attempt: i64, k: usize) -> Vec<String> {
-    let mut pool: Vec<(String, u64)> = table.iter().filter(|(_, w)| *w > 0).cloned().collect();
-    pool.sort();
-    let mut total: u128 = pool.iter().map(|(_, w)| *w as u128).sum();
+pub fn drs_ready_verify(epoch: u64, pos: u64, sig: &[u8]) -> Option<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let rota = crate::drs::load_rota(&ov, epoch)?;
+    let addr = rota.members.get(pos as usize)?;
+    let rec = crate::drs::load_rec(&ov, addr)?;
+    let pk = hex::decode(&rec.pop_key).ok()?;
+    crate::bls_agg::verify_shared(sig, &pk, &crate::drs::ready_message(epoch, &rota.seed)).then_some(rec.pop_key)
+}
+
+pub fn drs_rota_position(epoch: u64, addr: &str) -> Option<(usize, String, bool)> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let (pos, seed) = crate::drs::rota_position(&ov, epoch, addr)?;
+    let bits = crate::drs::ready_set(&ov, epoch);
+    let ready = bits.get(pos / 8).map(|b| b & (1 << (pos % 8)) != 0).unwrap_or(false);
+    Some((pos, seed, ready))
+}
+
+pub fn drs_witness_verify(witness_idx: u64, prover: &str, challenge: u64, sig: &[u8]) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let Some(hash) = block_hash_at_in(db, challenge) else { return false };
+    let Some(rec) = crate::drs::addr_at(&ov, witness_idx).and_then(|a| crate::drs::load_rec(&ov, &a)) else { return false };
+    let Ok(pk) = hex::decode(&rec.pop_key) else { return false };
+    let beacon = crate::coverage_proof::beacon_id_for(&hash, prover);
+    crate::bls_agg::verify_shared(sig, &pk, &crate::drs::witness_message(&beacon))
+}
+
+pub fn drs_coverage_verify(proof: &crate::drs::CoverageProof) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let tip = local_chain_height_in(db);
+    let probe = LedgerBlock { height: tip + 1, ..LedgerBlock::default() };
+    let batch = crate::drs::CoverageBatch { proofs: vec![proof.clone()] };
+    let Ok(args) = serde_json::to_string(&batch) else { return false };
+    let tx = crate::drs::batch_tx(crate::drs::TX_COVERAGE_BATCH, tip + 1, 0, args);
+    crate::drs::validate_batches(&ov, &probe, std::slice::from_ref(&tx), |h| block_hash_at_in(db, h)).is_ok()
+}
+
+pub struct PooledSig {
+    pub key: (u64, u64),
+    pub sig: Vec<u8>,
+    pub signer: String,
+}
+
+pub fn drs_build_batches(
+    height: u64,
+    now: i64,
+    checkins: Vec<PooledSig>,
+    readies: Vec<PooledSig>,
+    coverage: Vec<crate::drs::CoverageProof>,
+) -> Vec<LedgerTx> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
     let mut out = Vec::new();
-    let mut i: u64 = 0;
-    while out.len() < k && !pool.is_empty() && total > 0 {
-        let mut h = blake3::Hasher::new();
-        h.update(b"ego/committee/v1:");
-        h.update(seed.as_bytes());
-        h.update(&attempt.to_le_bytes());
-        h.update(&i.to_le_bytes());
-        let r = u128::from_le_bytes(h.finalize().as_bytes()[..16].try_into().unwrap()) % total;
-        let mut acc: u128 = 0;
-        let mut pick = pool.len() - 1;
-        for (j, (_, w)) in pool.iter().enumerate() {
-            acc += *w as u128;
-            if r < acc {
-                pick = j;
-                break;
+    if height < CHECKIN_FROM_HEIGHT {
+        return out;
+    }
+    let mut groups: std::collections::BTreeMap<u64, Vec<(u64, Vec<u8>)>> = Default::default();
+    let mut taken = 0usize;
+    for c in checkins {
+        let (idx, anchor) = c.key;
+        if taken >= crate::drs::MAX_CHECKINS_PER_BLOCK {
+            break;
+        }
+        if anchor == 0 || anchor % DRS_EPOCH != 0 || anchor >= height || height - anchor > crate::drs::ANCHOR_MAX_AGE - 20 {
+            continue;
+        }
+        let Some(addr) = crate::drs::addr_at(&ov, idx) else { continue };
+        let Some(rec) = crate::drs::load_rec(&ov, &addr) else { continue };
+        if rec.pop_key != c.signer || !crate::drs::checkin_due(&rec, now) || block_hash_at_in(db, anchor).is_none() {
+            continue;
+        }
+        groups.entry(anchor).or_default().push((idx, c.sig));
+        taken += 1;
+    }
+    let mut batch = crate::drs::CheckinBatch::default();
+    for (anchor, mut members) in groups {
+        members.sort_by_key(|(i, _)| *i);
+        members.dedup_by_key(|(i, _)| *i);
+        let ids: Vec<u64> = members.iter().map(|(i, _)| *i).collect();
+        let sigs: Vec<Vec<u8>> = members.into_iter().map(|(_, s)| s).collect();
+        if let Some(agg) = crate::bls_agg::aggregate_shared(&sigs) {
+            batch.groups.push(crate::drs::SignedGroup { anchor, sig: hex::encode(agg), members: crate::drs::encode_members(&ids) });
+        }
+    }
+    if !batch.groups.is_empty() {
+        if let Ok(args) = serde_json::to_string(&batch) {
+            out.push(crate::drs::batch_tx(crate::drs::TX_CHECKIN_BATCH, height, now, args));
+        }
+    }
+    let proofs: Vec<crate::drs::CoverageProof> = coverage
+        .into_iter()
+        .filter(|p| p.challenge > 0 && p.challenge < height && height - p.challenge <= crate::drs::ANCHOR_MAX_AGE - 20)
+        .filter(|p| {
+            crate::drs::addr_at(&ov, p.prover).map_or(false, |a| crate::drs::coverage_spacing_ok(&ov, &a, now))
+        })
+        .take(crate::drs::MAX_COVERAGE_PROOFS_PER_BLOCK)
+        .collect();
+    if !proofs.is_empty() {
+        if let Ok(args) = serde_json::to_string(&crate::drs::CoverageBatch { proofs }) {
+            out.push(crate::drs::batch_tx(crate::drs::TX_COVERAGE_BATCH, height, now, args));
+        }
+    }
+    let epoch = crate::drs::epoch_of(height);
+    let next = epoch + 1;
+    if height - epoch * DRS_EPOCH <= crate::drs::READY_DEADLINE {
+        if let Some(rota) = crate::drs::load_rota(&ov, next) {
+            let bits = crate::drs::ready_set(&ov, next);
+            let mut chosen: Vec<(u64, Vec<u8>)> = readies
+                .into_iter()
+                .filter(|r| r.key.0 == next)
+                .filter(|r| {
+                    let pos = r.key.1 as usize;
+                    let unset = bits.get(pos / 8).map(|b| b & (1 << (pos % 8)) == 0).unwrap_or(true);
+                    unset
+                        && rota
+                            .members
+                            .get(pos)
+                            .and_then(|a| crate::drs::load_rec(&ov, a))
+                            .map_or(false, |rec| rec.pop_key == r.signer)
+                })
+                .map(|r| (r.key.1, r.sig))
+                .collect();
+            chosen.sort_by_key(|(p, _)| *p);
+            chosen.dedup_by_key(|(p, _)| *p);
+            if !chosen.is_empty() {
+                let ids: Vec<u64> = chosen.iter().map(|(p, _)| *p).collect();
+                let sigs: Vec<Vec<u8>> = chosen.into_iter().map(|(_, s)| s).collect();
+                if let Some(agg) = crate::bls_agg::aggregate_shared(&sigs) {
+                    let rb = crate::drs::ReadyBatch { epoch: next, sig: hex::encode(agg), members: crate::drs::encode_members(&ids) };
+                    if let Ok(args) = serde_json::to_string(&rb) {
+                        out.push(crate::drs::batch_tx(crate::drs::TX_READY_BATCH, height, now, args));
+                    }
+                }
             }
         }
-        let (addr, w) = pool.remove(pick);
-        total -= w as u128;
-        out.push(addr);
-        i += 1;
     }
     out
 }
 
-pub fn build_rota(table: &[(String, u64)], served: impl Fn(&str) -> Option<u64>, epoch: u64, seed: &str) -> Vec<String> {
-    let cooldown = (table.len() / (2 * DRS_COMMITTEE_SIZE)) as u64;
-    let rested = |a: &str| cooldown == 0 || served(a).map_or(true, |e| e.saturating_add(cooldown) < epoch);
-    let (fresh, recent): (Vec<(String, u64)>, Vec<(String, u64)>) =
-        table.iter().cloned().partition(|(a, _)| rested(a));
-    let mut rota = draw_committee(&fresh, seed, 0, DRS_ROTA_LEN);
-    if rota.len() < DRS_ROTA_LEN {
-        rota.extend(draw_committee(&recent, seed, 1, DRS_ROTA_LEN - rota.len()));
+fn storage_pay_in(db: &DB, ov: &mut crate::drs::Ov, block: &LedgerBlock, txs: &[&LedgerTx]) -> Vec<(String, u64)> {
+    let at = block.timestamp;
+    let price = consensus_price_in(db, block.height / STORAGE_PAY_EPOCH);
+    crate::storage_pay::process_expiries(ov, at, block.height);
+    let mut out = Vec::new();
+    for tx in txs {
+        if let Some((bytes, price_micro, period)) = crate::storage_pay::plan_payment(tx) {
+            crate::storage_pay::add_plan(ov, &tx.from, at, bytes, price_micro, period);
+        }
+        if is_storage_file_tx(tx) && storage_file_owner_ok(db, tx).is_ok() {
+            match parse_storage_file(tx) {
+                Ok(Some(rec)) => {
+                    let old = recorded_file_in(db, &rec.cid).map(|f| f.record.bytes).unwrap_or(0);
+                    crate::storage_pay::adjust_owned(ov, &tx.from, rec.bytes as i128 - old as i128);
+                }
+                Ok(None) => {
+                    if let Ok(r) = serde_json::from_str::<StorageFileRecord>(&tx.call_args) {
+                        let old = recorded_file_in(db, &r.cid).map(|f| f.record.bytes).unwrap_or(0);
+                        crate::storage_pay::adjust_owned(ov, &tx.from, -(old as i128));
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if tx.tx_type == crate::storage_proof::POST_PROOF_TX {
+            let Some(cid) = storage_proof_earns_in(db, tx) else { continue };
+            let Some(f) = recorded_file_in(db, &cid) else { continue };
+            let file = crate::storage_pay::ProvenFile { cid, owner: f.owner, bytes: f.record.bytes };
+            let pay = crate::storage_pay::apply_proof(ov, &tx.from, &file, at, block.height, price);
+            if pay > 0 {
+                out.push((tx.from.clone(), pay));
+            }
+        }
     }
-    rota
+    out
+}
+
+pub fn storage_last_proof(cid: &str, host: &str) -> i64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::storage_pay::last_proof(&crate::drs::Ov::new(db), cid, host)
+}
+
+pub fn storage_file_memo(call_args: &str, delete: bool) -> String {
+    let h = blake3::hash(call_args.as_bytes()).to_hex();
+    if delete { format!("storage_file:delete:{h}") } else { format!("storage_file:{h}") }
+}
+
+fn founders_with_keys_in(db: &DB) -> Vec<String> {
+    crate::genesis::addresses().into_iter().filter(|g| dilithium_key_in(db, g).is_some()).collect()
 }
 
 pub fn committee_attempt(parent_ts: i64, stamp: i64) -> i64 {
@@ -9873,21 +9670,8 @@ pub fn proposal_window_open(parent_ts: i64, stamp: i64) -> bool {
 fn committee_for_height_in(db: &DB, height: u64, stamp: i64) -> Option<Vec<(String, Vec<u8>)>> {
     let parent_ts = block_ts_at_in(db, height.checked_sub(1)?)?;
     let attempt = committee_attempt(parent_ts, stamp);
-    let rota = drs_rota_in(db, drs_epoch_of(height));
-    let mut members: Vec<String> = if rota.len() > DRS_COMMITTEE_SIZE {
-        let start = (attempt as usize).wrapping_mul(DRS_COMMITTEE_SIZE) % rota.len();
-        (0..DRS_COMMITTEE_SIZE).map(|j| rota[(start + j) % rota.len()].clone()).collect()
-    } else {
-        rota
-    };
-    if members.len() < DRS_COMMITTEE_SIZE {
-        for g in crate::genesis::addresses() {
-            if members.len() >= DRS_COMMITTEE_SIZE { break; }
-            if !members.contains(&g) && dilithium_key_in(db, &g).is_some() {
-                members.push(g);
-            }
-        }
-    }
+    let ov = crate::drs::Ov::new(db);
+    let members = crate::drs::committee(&ov, height, attempt, &founders_with_keys_in(db));
     let out: Vec<(String, Vec<u8>)> = members
         .into_iter()
         .filter_map(|a| dilithium_key_in(db, &a).map(|k| (a, k)))
@@ -9902,15 +9686,16 @@ pub fn committee_for_height(height: u64, stamp: i64) -> Option<Vec<(String, Vec<
 
 pub fn committee_candidates(height: u64) -> (Vec<(String, Vec<u8>)>, bool) {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let epoch = drs_epoch_of(height);
-    let settled = drs_meta(&db, &drs_rota_key(epoch)).is_some();
-    let mut names = drs_rota_in(&db, epoch);
+    let ov = crate::drs::Ov::new(db);
+    let rota = crate::drs::load_rota(&ov, drs_epoch_of(height));
+    let settled = rota.is_some();
+    let mut names = rota.map(|r| r.members).unwrap_or_default();
     for g in crate::genesis::addresses() {
         if !names.contains(&g) {
             names.push(g);
         }
     }
-    let out = names.into_iter().filter_map(|a| dilithium_key_in(&db, &a).map(|k| (a, k))).collect();
+    let out = names.into_iter().filter_map(|a| dilithium_key_in(db, &a).map(|k| (a, k))).collect();
     (out, settled)
 }
 
@@ -9978,40 +9763,6 @@ fn randao_mix_write_in(db: &DB, block: &LedgerBlock) -> Option<Vec<u8>> {
 
 fn rota_seed_in(db: &DB, block: &LedgerBlock) -> String {
     hex::encode(randao_mix_in(db).map(|(_, m)| m).unwrap_or_else(|| randao_init(&block.prev_hash)))
-}
-
-fn drs_epoch_writes_in(db: &DB, block: &LedgerBlock) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>) {
-    let mut puts = Vec::new();
-    let mut prune = Vec::new();
-    if block.height % DRS_EPOCH == DRS_EPOCH - DRS_TABLE_LEAD {
-        let epoch = (block.height + DRS_TABLE_LEAD) / DRS_EPOCH;
-        if epoch * DRS_EPOCH + DRS_EPOCH >= DRS_FROM_HEIGHT && drs_meta(db, &drs_sum_key(epoch)).is_none() {
-            let table = drs_table_in(db, block.timestamp, block.height.saturating_sub(1));
-            let total = table.iter().fold(0u64, |a, (_, w)| a.saturating_add(*w));
-            let mut sum = u64_le(total).to_vec();
-            sum.extend_from_slice(&u64_le(table.len() as u64));
-            for (addr, w) in &table {
-                puts.push((drs_weight_key(epoch, addr), u64_le(*w).to_vec()));
-            }
-            puts.push((drs_sum_key(epoch), sum));
-            if let Some(cut) = epoch.checked_sub(DRS_KEEP_EPOCHS) {
-                prune.push((drs_weight_prefix(0), drs_weight_prefix(cut)));
-                prune.push((drs_sum_key(0), drs_sum_key(cut)));
-                prune.push((drs_rota_key(0), drs_rota_key(cut)));
-            }
-        }
-    }
-    if block.height % DRS_EPOCH == 0 {
-        let epoch = block.height / DRS_EPOCH;
-        if epoch * DRS_EPOCH + DRS_EPOCH >= DRS_FROM_HEIGHT && drs_meta(db, &drs_rota_key(epoch)).is_none() {
-            let table = drs_epoch_table_in(db, epoch);
-            let rota = build_rota(&table, |a| drs_served_in(db, a), epoch, &rota_seed_in(db, block));
-            if let Ok(v) = serde_json::to_vec(&rota) {
-                puts.push((drs_rota_key(epoch), v));
-            }
-        }
-    }
-    (puts, prune)
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -10158,18 +9909,14 @@ impl CommitCert {
     }
 }
 
-fn live_coverage_witnesses_in(db: &DB, tx: &LedgerTx, at: i64) -> u64 {
+fn live_coverage_witnesses(ov: &crate::drs::Ov, tx: &LedgerTx, at: i64) -> u64 {
     let Ok(body) = crate::coverage_proof::parse_body(&tx.call_args) else { return 0 };
-    let mut counted: std::collections::BTreeSet<&str> = Default::default();
-    for w in &body.witnesses {
-        if w.address == tx.from || !is_registered_in(db, &w.address) {
-            continue;
-        }
-        let (count, last) = uptime_streak_in(db, &w.address);
-        if count >= SEAT_MIN_UPTIME_STREAK && at.saturating_sub(last) <= UPTIME_STREAK_GAP_SECS {
-            counted.insert(w.address.as_str());
-        }
-    }
+    let counted: std::collections::BTreeSet<&str> = body
+        .witnesses
+        .iter()
+        .filter(|w| w.address != tx.from && crate::drs::is_live(ov, &w.address, at))
+        .map(|w| w.address.as_str())
+        .collect();
     counted.len() as u64
 }
 
@@ -10182,11 +9929,6 @@ fn verify_block_certificate_in(db: &DB, block: &LedgerBlock) -> Result<(), Strin
     let committee = committee_for_height_in(db, block.height, block.timestamp)
         .ok_or_else(|| format!("no committee known for block #{}", block.height))?;
     cert.verify(block, &committee)
-}
-
-pub fn verify_block_certificate(block: &LedgerBlock) -> Result<(), String> {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    verify_block_certificate_in(&db, block)
 }
 
 fn drs_block_rules_in(db: &DB, block: &LedgerBlock, txs: &[LedgerTx], is_proposal: bool) -> Result<(), String> {
@@ -10232,6 +9974,7 @@ pub const STATE_CHECKPOINTS: &[(u64, &str)] = &[];
 const LOCAL_META_KEYS: &[&[u8]] = &[
     b"bls_reg_backfilled",
     b"drs_index_v1",
+    b"n2migrated",
     b"finalized_height",
     b"chain_graduated",
     b"known_validators_v1",
@@ -10448,6 +10191,25 @@ pub(crate) fn migrate_drs_index(db: &DB) {
     let _ = db.write(batch);
 }
 
+pub(crate) fn migrate_drs_v2(db: &DB) {
+    if drs_meta(db, b"n2migrated").is_some() {
+        return;
+    }
+    let Some(cf_txs) = db.cf_handle(CF_TXS) else { return };
+    let mut regs: Vec<(u64, String, String)> = Vec::new();
+    let mut iter = db.raw_iterator_cf(cf_txs);
+    iter.seek_to_first();
+    while iter.valid() {
+        if let Some(tx) = iter.value().and_then(decode::<LedgerTx>) {
+            if let Some((addr, _)) = parse_validator_registration(&tx) {
+                regs.push((tx.block_height.unwrap_or(0), tx.hash.clone(), addr));
+            }
+        }
+        iter.next();
+    }
+    crate::drs::migrate(db, regs);
+}
+
 pub(crate) fn rules_need_resync(db: &DB) -> bool {
     let Some(cf) = db.cf_handle(CF_META) else { return false };
     let stamp = db.get_cf(cf, META_RULES_VERSION).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
@@ -10566,47 +10328,6 @@ mod commit_cert_tests {
     }
 
     #[test]
-    fn the_committee_draw_is_weighted_ordered_and_repeatable() {
-        let table: Vec<(String, u64)> = (0..10).map(|i| (format!("n{i}"), if i == 0 { 1_000 } else { 1 })).collect();
-        let a = draw_committee(&table, "seed", 0, 4);
-        assert_eq!(a, draw_committee(&table, "seed", 0, 4));
-        assert_eq!(a.len(), 4);
-        let mut uniq = a.clone();
-        uniq.sort();
-        uniq.dedup();
-        assert_eq!(uniq.len(), 4);
-        assert_ne!(a, draw_committee(&table, "seed", 1, 4));
-        let heavy = (0..200).filter(|i| draw_committee(&table, &format!("s{i}"), 0, 1)[0] == "n0").count();
-        assert!(heavy > 150, "a node with far more DRS is drawn far more often ({heavy}/200)");
-        assert!(draw_committee(&[], "seed", 0, 4).is_empty());
-        let zero = vec![("z".to_string(), 0u64)];
-        assert!(draw_committee(&zero, "seed", 0, 4).is_empty());
-        assert_eq!(draw_committee(&table, "seed", 0, 50).len(), 10);
-    }
-
-    #[test]
-    fn equal_nodes_take_turns_and_nobody_sits_twice_running() {
-        let table: Vec<(String, u64)> = (0..16).map(|i| (format!("n{i:02}"), 120)).collect();
-        let mut served: std::collections::HashMap<String, u64> = Default::default();
-        let mut seats: std::collections::HashMap<String, u32> = Default::default();
-        let mut last: Vec<String> = Vec::new();
-        for epoch in 1..=40u64 {
-            let rota = build_rota(&table, |a| served.get(a).copied(), epoch, &format!("mix{epoch}"));
-            assert_eq!(rota.len(), 16);
-            let seated: Vec<String> = rota[..DRS_COMMITTEE_SIZE].to_vec();
-            for a in &seated {
-                assert!(!last.contains(a), "{a} sat in two epochs running");
-                served.insert(a.clone(), epoch);
-                *seats.entry(a.clone()).or_default() += 1;
-            }
-            last = seated;
-        }
-        for (a, _) in &table {
-            assert!(seats.get(a).copied().unwrap_or(0) >= 5, "{a} only sat {:?} times in 40 epochs", seats.get(a));
-        }
-    }
-
-    #[test]
     fn a_stuck_committee_hands_over_after_the_redraw_time_with_guard_bands() {
         let p = 1_000;
         assert_eq!(committee_attempt(p, p), 0);
@@ -10641,33 +10362,22 @@ mod commit_cert_tests {
     }
 
     #[test]
-    fn checkins_are_paid_from_the_epoch_budget_by_weight() {
-        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-        let cf = db.cf_handle(CF_META).unwrap();
-        let epoch = 900_001u64;
-        let h = epoch * DRS_EPOCH + 7;
-        let (a, b, c) = ("egot1drspaytesta", "egot1drspaytestb", "egot1drspaytestc");
-        for addr in [a, b, c] {
-            db.put_cf(cf, val_seated_key(addr), u64_le(1)).unwrap();
-        }
-        db.put_cf(cf, drs_weight_key(epoch, a), u64_le(300)).unwrap();
-        db.put_cf(cf, drs_weight_key(epoch, b), u64_le(100)).unwrap();
-        let mut sum = u64_le(400).to_vec();
-        sum.extend_from_slice(&u64_le(2));
-        db.put_cf(cf, drs_sum_key(epoch), sum).unwrap();
-        let ci = |from: &str, hash: &str| LedgerTx {
-            hash: hash.into(), from: from.into(), to: from.into(), tx_type: TX_UPTIME.into(), ..LedgerTx::default()
+    fn system_payouts_survive_the_sync_signature_filter() {
+        let fee = LedgerTx {
+            hash: "0xfee".into(),
+            from: String::new(),
+            to: NODE_POOL_ADDR.into(),
+            amount: 400,
+            tx_type: "fee_distribution".into(),
+            signature: "coinbase".into(),
+            ..LedgerTx::default()
         };
-        let txs = vec![ci(a, "0xd1"), ci(b, "0xd2"), ci(c, "0xd3")];
-        let paid = expected_uptime_rewards_in(&db, &txs, h, 1_900_000_000);
-        let per = NODE_REWARD_PER_DAY_UEGOC as u128 * UPTIME_INTERVAL_SECS as u128 / 86_400;
-        assert_eq!(paid.len(), 2);
-        assert_eq!(paid[0].to, a);
-        assert_eq!(paid[0].amount as u128, per * 3 / 4);
-        assert_eq!(paid[1].to, b);
-        assert_eq!(paid[1].amount as u128, per / 4);
-        assert!(paid.iter().all(|t| t.from == NODE_POOL_ADDR && t.tx_type == TX_UPTIME_REWARD));
-        assert!(expected_uptime_rewards_in(&db, &txs, DRS_FROM_HEIGHT - 1, 1_900_000_000).is_empty());
+        assert!(crate::ledger::verify_confirmed_tx_sig(&fee).is_ok());
+        let batch = crate::drs::batch_tx(crate::drs::TX_CHECKIN_BATCH, 32_100, 0, "{}".into());
+        assert!(crate::ledger::verify_confirmed_tx_sig(&batch).is_ok());
+        let mut forged = batch.clone();
+        forged.amount = 5;
+        assert!(crate::ledger::verify_confirmed_tx_sig(&forged).is_err());
     }
 
     #[test]

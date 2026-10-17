@@ -1958,6 +1958,10 @@ async fn build_live_candidate() -> Option<(crate::ledger::LedgerBlock, Vec<Ledge
         let mut seen = std::collections::HashSet::new();
         all_txs.retain(|tx| !tx.hash.is_empty() && seen.insert(tx.hash.clone()));
     }
+    let batch_height = crate::chain_db::latest_block_info().0 + 1;
+    let batches = tokio::task::spawn_blocking(move || drs_batches_for(batch_height, crate::clock::now()))
+        .await
+        .unwrap_or_default();
 
     let poc_slot = crate::poc::current_slot();
     let combined_ticket = {
@@ -1969,6 +1973,7 @@ async fn build_live_candidate() -> Option<(crate::ledger::LedgerBlock, Vec<Ledge
     };
 
     let drained = all_txs.clone();
+    all_txs.extend(batches);
     let (mut block, txs) = tokio::task::spawn_blocking(move || {
         crate::chain_db::build_block_proposal(&all_txs, &miner, &combined_ticket, poc_slot)
     }).await.ok()?;
@@ -3500,6 +3505,30 @@ pub enum P2PMessage {
     ChainSyncResponse {
         blocks:       Vec<LedgerBlock>,
         transactions: Vec<LedgerTx>,
+    },
+    DrsCheckin {
+        idx: u64,
+        anchor: u64,
+        sig: String,
+    },
+    DrsReady {
+        epoch: u64,
+        pos: u64,
+        sig: String,
+    },
+    DrsBeacon {
+        prover: String,
+        challenge: u64,
+        reply_to: String,
+    },
+    DrsWitness {
+        prover: String,
+        challenge: u64,
+        witness: u64,
+        sig: String,
+    },
+    DrsCoverage {
+        proof: crate::drs::CoverageProof,
     },
     SnapshotRequest {
         requester_endpoint: String,
@@ -5040,10 +5069,12 @@ pub async fn broadcast_poc_beacon() -> Option<String> {
         transport,
         signature,
     };
-    let data = serde_json::to_vec(&msg).ok()?;
     crate::poc::start_beacon(&beacon_id, now);
     crate::poc::set_beacon_challenge(challenge.map(|(h, _)| h));
-    publish_gossip("ego-poc-v1", data).await;
+    let peers = crate::app::global_app_state().get_active_peers(600);
+    for p in peers.into_iter().filter(|p| !p.endpoint.is_empty()).take(DRS_BEACON_PEERS) {
+        let _ = send_message(&p.endpoint, &msg).await;
+    }
     eprintln!("[PoC] beacon {} published (epoch {})", &beacon_id[..12], epoch);
     Some(beacon_id)
 }
@@ -5087,6 +5118,7 @@ async fn handle_poc_beacon(
         &beacon_id, &address, &my_addr, &my_machine, &witness_cell, latency_ms, rssi_dbm, now,
     );
     let Some(wsig) = crate::poc::sign_with_node_key(&wbytes) else { return; };
+    let reply_ep = get_relay_endpoint(&address).await;
     let receipt = P2PMessage::PocWitnessReceipt {
         beacon_id,
         beaconer: address,
@@ -5098,8 +5130,8 @@ async fn handle_poc_beacon(
         timestamp: now,
         signature: wsig,
     };
-    if let Ok(data) = serde_json::to_vec(&receipt) {
-        publish_gossip("ego-poc-v1", data).await;
+    if let Some(ep) = reply_ep {
+        let _ = send_message(&ep, &receipt).await;
     }
 }
 
@@ -6637,6 +6669,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let gateways_topic = gossipsub::IdentTopic::new(crate::gateway::GOSSIP_TOPIC);
     swarm.behaviour_mut().gossipsub.subscribe(&gateways_topic).ok();
 
+    let drs_topic = gossipsub::IdentTopic::new(DRS_TOPIC);
+    swarm.behaviour_mut().gossipsub.subscribe(&drs_topic).ok();
+
     let _ = swarm.behaviour_mut().kad.bootstrap();
 
     let (gossip_unbounded_tx, mut gossip_rx) =
@@ -7952,6 +7987,13 @@ async fn handle_event(
             } else if topic == crate::gateway::GOSSIP_TOPIC {
                 let data = message.data.clone();
                 tokio::spawn(crate::gateway::receive_gossip(data));
+            } else if topic == DRS_TOPIC {
+                if let Ok(msg @ (P2PMessage::DrsCheckin { .. } | P2PMessage::DrsReady { .. } | P2PMessage::DrsCoverage { .. })) =
+                    serde_json::from_slice::<P2PMessage>(&message.data)
+                {
+                    let app2 = app.cloned();
+                    tokio::spawn(async move { handle_incoming(msg, app2.as_ref()).await; });
+                }
             } else if topic == V2_TOPIC {
                 // Consensus-v2 messages → handle_incoming. The BftV2* arms feed the live
                 // engine that drives the chain by default (inline only with LEGACY=1).
@@ -8793,6 +8835,22 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         // inner message here. Keeping the unseal out of this function is what
         // stops handle_incoming from having to call itself.
         P2PMessage::SealedDm { .. } => {}
+
+        P2PMessage::DrsCheckin { idx, anchor, sig } => {
+            receive_drs_checkin(idx, anchor, sig).await;
+        }
+        P2PMessage::DrsReady { epoch, pos, sig } => {
+            receive_drs_ready(epoch, pos, sig).await;
+        }
+        P2PMessage::DrsBeacon { prover, challenge, reply_to } => {
+            answer_drs_beacon(prover, challenge, reply_to).await;
+        }
+        P2PMessage::DrsWitness { prover, challenge, witness, sig } => {
+            receive_drs_witness(prover, challenge, witness, sig).await;
+        }
+        P2PMessage::DrsCoverage { proof } => {
+            receive_drs_coverage(proof).await;
+        }
 
         P2PMessage::MarketChat { trade_id, from, kind, body, ts, id, pubkey, sig } => {
             crate::commands::market::receive_chat(
@@ -11795,15 +11853,12 @@ pub fn maybe_emit_validator_registration() {
     let bind_sig_hex = hex::encode(sk.sign(&bls_pk_bytes).to_bytes());
     let memo = format!("valreg:{}:{}", bls_pk_hex, bind_sig_hex);
 
-    // Skip if we already registered this exact BLS key on-chain.
-    let already = crate::chain_db::get_tx_history_for_addr(&addr)
-        .into_iter()
-        .any(|tx| tx.tx_type == "validator_register"
-            && tx.memo.as_deref() == Some(memo.as_str()));
-    if already { return; }
+    let proven = crate::chain_db::drs_node(&addr).map_or(false, |r| r.pop_key == bls_pk_hex);
+    if proven { return; }
+    let pop_args = serde_json::json!({ "bls_pop": hex::encode(crate::bls_agg::pop_sign(bls_sk)) }).to_string();
 
     if let Some(pending) = crate::mempool::get_mempool().peek_all().into_iter().find(|t| {
-        t.from == addr && t.tx_type == "validator_register" && t.memo.as_deref() == Some(memo.as_str())
+        t.from == addr && t.tx_type == "validator_register" && t.memo.as_deref() == Some(memo.as_str()) && t.call_args == pop_args
     }) {
         tauri::async_runtime::spawn(async move { broadcast_pending_tx(pending).await; });
         return;
@@ -11824,6 +11879,7 @@ pub fn maybe_emit_validator_registration() {
         tx_type: "validator_register".into(),
         tx_version: crate::ledger::signing_tx_version(),
         chain_id: 1,
+        call_args: pop_args,
         ..crate::ledger::LedgerTx::default()
     };
     let sign_bytes = crate::ledger::tx_signing_bytes_for(&tx);
@@ -11849,50 +11905,300 @@ pub fn maybe_emit_validator_registration() {
 /// Sends this node's uptime check-in once it is due. Only a staked node checks in, at most
 /// once per payout interval, and a pending check-in is re-sent rather than replaced.
 pub fn maybe_send_uptime_checkin() {
+    static LAST_CHECKIN: AtomicI64 = AtomicI64::new(0);
+    static LAST_READY: AtomicI64 = AtomicI64::new(0);
     if is_observer() { return; }
     let tip = crate::chain_db::local_chain_height();
-    if tip.saturating_add(1) < crate::chain_db::UPTIME_FROM_HEIGHT { return; }
-    let ledger = crate::ledger::Ledger::load();
-    let addr = ledger.address.clone();
+    if tip.saturating_add(1) < crate::chain_db::CHECKIN_FROM_HEIGHT.saturating_sub(crate::drs::EPOCH) { return; }
+    let addr = crate::ledger::Ledger::load().address;
     if addr.is_empty() { return; }
+    let Some(sk) = BLS_SECRET_KEY.get() else { return };
+    let my_key = hex::encode(crate::bls_agg::bls_pubkey(sk));
+    let Some(rec) = crate::chain_db::drs_node(&addr).filter(|r| r.pop_key == my_key) else {
+        maybe_emit_validator_registration();
+        return;
+    };
+    prune_drs_pools(tip);
+    if tip.saturating_add(1) < crate::chain_db::CHECKIN_FROM_HEIGHT { return; }
     let now = crate::clock::now();
-    if !crate::chain_db::checkin_due(&addr, now) { return; }
-    let pending = crate::mempool::get_mempool().peek_all().into_iter().find(|t| {
-        t.from == addr
-            && crate::chain_db::is_uptime_checkin(t)
-            && crate::chain_db::uptime_checkin_fresh(t, tip, crate::chain_db::get_block_hash_at).is_ok()
-    });
-    if let Some(pending) = pending {
-        tauri::async_runtime::spawn(async move { broadcast_pending_tx(pending).await; });
+    tick_drs_coverage(&addr, &rec, tip, now);
+    if crate::drs::checkin_due(&rec, now) && now - LAST_CHECKIN.load(Ordering::Relaxed) >= 600 {
+        let anchor = tip / crate::drs::EPOCH * crate::drs::EPOCH;
+        if let Some(hash) = (anchor > 0).then(|| crate::chain_db::get_block_hash_at(anchor)).flatten() {
+            let sig = crate::bls_agg::sign_shared(sk, &crate::drs::checkin_message(anchor, &hash));
+            checkin_pool().insert((rec.idx, anchor), (sig.clone(), my_key.clone()));
+            LAST_CHECKIN.store(now, Ordering::Relaxed);
+            let msg = P2PMessage::DrsCheckin { idx: rec.idx, anchor, sig: hex::encode(sig) };
+            tauri::async_runtime::spawn(async move { send_drs_message(msg).await; });
+            eprintln!("[DRS] check-in signed at anchor {anchor}");
+        }
+    }
+    let next_height = tip.saturating_add(1);
+    let epoch = crate::drs::epoch_of(next_height);
+    if next_height - epoch * crate::drs::EPOCH <= crate::drs::READY_DEADLINE
+        && now - LAST_READY.load(Ordering::Relaxed) >= 120
+    {
+        if let Some((pos, seed, false)) = crate::chain_db::drs_rota_position(epoch + 1, &addr) {
+            let sig = crate::bls_agg::sign_shared(sk, &crate::drs::ready_message(epoch + 1, &seed));
+            ready_pool().insert((epoch + 1, pos as u64), (sig.clone(), my_key.clone()));
+            LAST_READY.store(now, Ordering::Relaxed);
+            let msg = P2PMessage::DrsReady { epoch: epoch + 1, pos: pos as u64, sig: hex::encode(sig) };
+            tauri::async_runtime::spawn(async move { send_drs_message(msg).await; });
+            eprintln!("[DRS] drawn for epoch {} (seat {pos}) — said ready", epoch + 1);
+        }
+    }
+}
+
+const DRS_TOPIC: &str = "ego-drs-v1";
+pub const DRS_GOSSIP_MAX_NODES: u64 = 5_000;
+const DRS_POOL_MAX: usize = 500_000;
+
+type SigPool = std::collections::BTreeMap<(u64, u64), (Vec<u8>, String)>;
+static CHECKIN_POOL: std::sync::OnceLock<std::sync::Mutex<SigPool>> = std::sync::OnceLock::new();
+static READY_POOL: std::sync::OnceLock<std::sync::Mutex<SigPool>> = std::sync::OnceLock::new();
+
+fn checkin_pool() -> std::sync::MutexGuard<'static, SigPool> {
+    CHECKIN_POOL.get_or_init(|| std::sync::Mutex::new(Default::default())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn ready_pool() -> std::sync::MutexGuard<'static, SigPool> {
+    READY_POOL.get_or_init(|| std::sync::Mutex::new(Default::default())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn prune_drs_pools(tip: u64) {
+    checkin_pool().retain(|(_, anchor), _| tip.saturating_sub(*anchor) <= crate::drs::ANCHOR_MAX_AGE);
+    coverage_pool().retain(|_, p| tip.saturating_sub(p.challenge) <= crate::drs::ANCHOR_MAX_AGE);
+    let epoch = crate::drs::epoch_of(tip.saturating_add(1));
+    ready_pool().retain(|(e, _), _| *e > epoch);
+}
+
+fn pooled(pool: &SigPool) -> Vec<crate::chain_db::PooledSig> {
+    pool.iter()
+        .map(|(k, (sig, signer))| crate::chain_db::PooledSig { key: *k, sig: sig.clone(), signer: signer.clone() })
+        .collect()
+}
+
+pub fn drs_batches_for(height: u64, now: i64) -> Vec<LedgerTx> {
+    let checkins = pooled(&checkin_pool());
+    let readies = pooled(&ready_pool());
+    let coverage: Vec<crate::drs::CoverageProof> = coverage_pool().values().cloned().collect();
+    crate::chain_db::drs_build_batches(height, now, checkins, readies, coverage)
+}
+
+static COVERAGE_POOL: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<u64, crate::drs::CoverageProof>>> =
+    std::sync::OnceLock::new();
+
+fn coverage_pool() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, crate::drs::CoverageProof>> {
+    COVERAGE_POOL.get_or_init(|| std::sync::Mutex::new(Default::default())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct CoverageRound {
+    challenge: u64,
+    started: i64,
+    witnesses: std::collections::BTreeMap<u64, Vec<u8>>,
+}
+
+static COVERAGE_ROUND: std::sync::Mutex<Option<CoverageRound>> = std::sync::Mutex::new(None);
+static WITNESSED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, i64>>> = std::sync::OnceLock::new();
+const DRS_BEACON_PEERS: usize = 64;
+const DRS_WITNESS_REPEAT_SECS: i64 = 6 * 3600;
+
+fn tick_drs_coverage(addr: &str, rec: &crate::drs::NodeRec, tip: u64, now: i64) {
+    static LAST_START: AtomicI64 = AtomicI64::new(0);
+    let finished = {
+        let mut round = COVERAGE_ROUND.lock().unwrap_or_else(|e| e.into_inner());
+        match round.as_ref() {
+            Some(r) if now - r.started >= 60 => round.take(),
+            _ => None,
+        }
+    };
+    if let Some(r) = finished {
+        if !r.witnesses.is_empty() {
+            let ids: Vec<u64> = r.witnesses.keys().copied().collect();
+            let sigs: Vec<Vec<u8>> = r.witnesses.into_values().collect();
+            if let Some(agg) = crate::bls_agg::aggregate_shared(&sigs) {
+                let proof = crate::drs::CoverageProof {
+                    prover: rec.idx,
+                    challenge: r.challenge,
+                    witnesses: crate::drs::encode_members(&ids),
+                    sig: hex::encode(agg),
+                };
+                coverage_pool().insert(rec.idx, proof.clone());
+                eprintln!("[DRS] coverage proven by {} witness(es)", ids.len());
+                tauri::async_runtime::spawn(async move { send_drs_message(P2PMessage::DrsCoverage { proof }).await; });
+            }
+        }
         return;
     }
-    let Some(block_hash) = crate::chain_db::get_block_hash_at(tip) else { return };
-    let Some(seed) = get_ed25519_seed() else { return };
-    let Ok(kp) = ego_core::KeyPair::from_bytes(&seed) else { return };
-    let nonce = crate::ledger::next_nonce_for(&addr, ledger.nonce);
-    let mut tx = crate::ledger::LedgerTx {
-        from: addr.clone(),
-        to: addr.clone(),
-        amount: 0,
-        fee_uegoc: 0,
-        memo: Some(crate::chain_db::uptime_checkin_memo(tip, &block_hash)),
-        timestamp: now,
-        status: "Pending".into(),
-        nonce,
-        tx_type: crate::chain_db::TX_UPTIME.into(),
-        chain_id: 1,
-        ..crate::ledger::LedgerTx::default()
-    };
-    crate::ledger::seal_tx(&mut tx, &kp, false);
-    match crate::mempool::get_mempool().push(tx.clone()) {
-        Ok(()) => {
-            let mut l = crate::ledger::Ledger::load();
-            l.nonce = nonce;
-            let _ = l.save();
-            tauri::async_runtime::spawn(async move { broadcast_pending_tx(tx).await; });
-            eprintln!("[Uptime] check-in sent at block {tip}");
+    let due = rec.coverage_at == 0 || now.saturating_sub(rec.coverage_at) >= crate::drs::COVERAGE_MIN_SPACING_SECS;
+    if !due || now - LAST_START.load(Ordering::Relaxed) < 1_800 || tip < 2 {
+        return;
+    }
+    let challenge = tip - 1;
+    if crate::chain_db::get_block_hash_at(challenge).is_none() {
+        return;
+    }
+    LAST_START.store(now, Ordering::Relaxed);
+    *COVERAGE_ROUND.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(CoverageRound { challenge, started: now, witnesses: Default::default() });
+    let prover = addr.to_string();
+    tauri::async_runtime::spawn(async move {
+        let reply_to = get_public_endpoint().await;
+        if reply_to.is_empty() {
+            return;
         }
-        Err(e) => eprintln!("[Uptime] check-in not sent: {e}"),
+        let peers = crate::app::global_app_state().get_active_peers(600);
+        let msg = P2PMessage::DrsBeacon { prover, challenge, reply_to };
+        for p in peers.into_iter().filter(|p| !p.endpoint.is_empty()).take(DRS_BEACON_PEERS) {
+            let _ = send_message(&p.endpoint, &msg).await;
+        }
+    });
+}
+
+async fn answer_drs_beacon(prover: String, challenge: u64, reply_to: String) {
+    let me = crate::ledger::Ledger::load().address;
+    if me.is_empty() || me == prover || reply_to.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    {
+        let mut seen = WITNESSED.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        if seen.get(&prover).map_or(false, |t| now - t < DRS_WITNESS_REPEAT_SECS) {
+            return;
+        }
+        if seen.len() > 100_000 {
+            seen.retain(|_, t| now - *t < DRS_WITNESS_REPEAT_SECS);
+        }
+        seen.insert(prover.clone(), now);
+    }
+    let Some(sk) = BLS_SECRET_KEY.get() else { return };
+    let tip = crate::chain_db::local_chain_height();
+    if challenge == 0 || challenge > tip || tip - challenge > crate::drs::ANCHOR_MAX_AGE {
+        return;
+    }
+    let Some(hash) = crate::chain_db::get_block_hash_at(challenge) else { return };
+    let my_key = hex::encode(crate::bls_agg::bls_pubkey(sk));
+    let Some(rec) = crate::chain_db::drs_node(&me).filter(|r| r.pop_key == my_key) else { return };
+    let beacon = crate::coverage_proof::beacon_id_for(&hash, &prover);
+    let sig = crate::bls_agg::sign_shared(sk, &crate::drs::witness_message(&beacon));
+    let msg = P2PMessage::DrsWitness { prover, challenge, witness: rec.idx, sig: hex::encode(sig) };
+    let _ = send_message(&reply_to, &msg).await;
+}
+
+async fn receive_drs_witness(prover: String, challenge: u64, witness: u64, sig_hex: String) {
+    let me = crate::ledger::Ledger::load().address;
+    if prover != me {
+        return;
+    }
+    let Ok(sig) = hex::decode(&sig_hex) else { return };
+    {
+        let round = COVERAGE_ROUND.lock().unwrap_or_else(|e| e.into_inner());
+        match round.as_ref() {
+            Some(r) if r.challenge == challenge && r.witnesses.len() < crate::drs::MAX_WITNESSES && !r.witnesses.contains_key(&witness) => {}
+            _ => return,
+        }
+    }
+    let s = sig.clone();
+    let ok = tokio::task::spawn_blocking(move || crate::chain_db::drs_witness_verify(witness, &prover, challenge, &s))
+        .await
+        .unwrap_or(false);
+    if ok {
+        if let Some(r) = COVERAGE_ROUND.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if r.challenge == challenge && r.witnesses.len() < crate::drs::MAX_WITNESSES {
+                r.witnesses.insert(witness, sig);
+            }
+        }
+    }
+}
+
+async fn receive_drs_coverage(proof: crate::drs::CoverageProof) {
+    if coverage_pool().get(&proof.prover) == Some(&proof) {
+        return;
+    }
+    let p = proof.clone();
+    let ok = tokio::task::spawn_blocking(move || crate::chain_db::drs_coverage_verify(&p)).await.unwrap_or(false);
+    if ok {
+        let mut pool = coverage_pool();
+        if pool.len() < DRS_POOL_MAX {
+            pool.insert(proof.prover, proof);
+        }
+    }
+}
+
+async fn send_drs_message(msg: P2PMessage) {
+    let small = tokio::task::spawn_blocking(crate::chain_db::drs_registered_count)
+        .await
+        .map(|n| n < DRS_GOSSIP_MAX_NODES)
+        .unwrap_or(true);
+    if small {
+        if let Ok(data) = serde_json::to_vec(&msg) {
+            publish_gossip(DRS_TOPIC, data).await;
+        }
+        return;
+    }
+    let next = crate::chain_db::local_chain_height().saturating_add(1);
+    let members: Vec<String> = tokio::task::spawn_blocking(move || {
+        crate::chain_db::committee_for_height(next, crate::clock::now())
+            .map(|c| c.into_iter().map(|(a, _)| a).collect())
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    let me = crate::ledger::Ledger::load().address;
+    let mut ranked: Vec<(String, String)> = members
+        .into_iter()
+        .filter(|a| a != &me)
+        .map(|a| (blake3::hash(format!("{me}:{a}:{next}").as_bytes()).to_hex().to_string(), a))
+        .collect();
+    ranked.sort();
+    let mut sent = 0;
+    for (_, member) in ranked {
+        if sent >= 3 {
+            break;
+        }
+        if let Some(ep) = get_relay_endpoint(&member).await {
+            if send_message(&ep, &msg).await.is_ok() {
+                sent += 1;
+            }
+        }
+    }
+    if sent == 0 {
+        if let Ok(data) = serde_json::to_vec(&msg) {
+            publish_gossip(DRS_TOPIC, data).await;
+        }
+    }
+}
+
+async fn receive_drs_checkin(idx: u64, anchor: u64, sig_hex: String) {
+    let Ok(sig) = hex::decode(&sig_hex) else { return };
+    if checkin_pool().contains_key(&(idx, anchor)) {
+        return;
+    }
+    let s = sig.clone();
+    let signer = tokio::task::spawn_blocking(move || crate::chain_db::drs_checkin_verify(idx, anchor, &s))
+        .await
+        .ok()
+        .flatten();
+    if let Some(signer) = signer {
+        let mut pool = checkin_pool();
+        if pool.len() < DRS_POOL_MAX {
+            pool.insert((idx, anchor), (sig, signer));
+        }
+    }
+}
+
+async fn receive_drs_ready(epoch: u64, pos: u64, sig_hex: String) {
+    let Ok(sig) = hex::decode(&sig_hex) else { return };
+    if ready_pool().contains_key(&(epoch, pos)) {
+        return;
+    }
+    let s = sig.clone();
+    let signer = tokio::task::spawn_blocking(move || crate::chain_db::drs_ready_verify(epoch, pos, &s))
+        .await
+        .ok()
+        .flatten();
+    if let Some(signer) = signer {
+        ready_pool().insert((epoch, pos), (sig, signer));
     }
 }
 
@@ -12122,7 +12428,7 @@ async fn handle_block_proposal(
     for tx in &transactions {
         // Skip coinbase (system reward tx) — its amount is validated below.
         if Some(&tx.hash) == block.coinbase_tx.as_ref() { continue; }
-        if crate::ledger::is_protocol_system_tx(tx) { continue; }
+        if crate::ledger::is_protocol_system_tx(tx) || crate::drs::is_batch_tx(tx) || crate::chain_db::is_contributor_fee_tx(tx) { continue; }
         if let Err(reason) = crate::ledger::verify_incoming_tx_with_miner(tx, &proposer) {
             eprintln!("[TX] {:.12} Rejected — {} (in proposal #{} from {:.16})",
                 tx.hash, reason, block.height, proposer);

@@ -267,32 +267,20 @@ pub async fn submit_poc_event(
         public_key: &pubkey_hex,
     };
 
-    // 1. Gossip the event robustly across the P2P mesh
-    let msg = crate::p2p::P2PMessage::PocEventBroadcast {
-        address:   address.clone(),
-        quality:   quality.clone(),
-        peers,
-        timestamp,
-        signature: signature_hex.clone(),
-    };
-    if let Ok(data) = serde_json::to_vec(&msg) {
-        crate::p2p::publish_gossip("ego-poc-v1", data).await;
+    static LAST_POST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    if timestamp - LAST_POST.load(std::sync::atomic::Ordering::Relaxed) >= 6 * 3600 {
+        LAST_POST.store(timestamp, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(body) = serde_json::to_value(&payload) {
+            tokio::spawn(async move {
+                crate::p2p::oracle_post_pub(&client, "/poc/event", &body).await;
+            });
+        }
     }
-
-    // 2. Dispatch HTTP fallback asynchronously across multiple oracle nodes
-    if let Ok(body) = serde_json::to_value(&payload) {
-        tokio::spawn(async move {
-            crate::p2p::oracle_post_pub(&client, "/poc/event", &body).await;
-        });
-    }
-
-    // Calculate expected reward natively (since we don't wait for synchronous HTTP response)
-    let expected_reward = 11_111 + (peers as u64 * 1_500).min(33_333);
 
     Ok(PocEventResult {
         success:      true,
-        message:      "PoC event gossiped to network".to_string(),
-        reward_uegoc: expected_reward,
+        message:      "Coverage noted. It is paid through your node's DRS, not per event".to_string(),
+        reward_uegoc: 0,
         drs_score:    None,
     })
 }
