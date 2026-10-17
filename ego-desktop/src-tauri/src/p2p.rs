@@ -3530,6 +3530,40 @@ pub enum P2PMessage {
     DrsCoverage {
         proof: crate::drs::CoverageProof,
     },
+    DrsStateVote {
+        body: crate::state_cert::CertBody,
+        signer: String,
+        sig: String,
+    },
+    StateCertsRequest {
+        from: u64,
+        reply_to: String,
+    },
+    StateCertsResponse {
+        certs: Vec<crate::state_cert::StateCert>,
+        server: String,
+    },
+    StateChunkRequest {
+        nonce: String,
+        height: u64,
+        part: u8,
+        index: u64,
+        reply_to: String,
+    },
+    StateChunkResponse {
+        nonce: String,
+        data: String,
+        path: Vec<String>,
+    },
+    StateTipRequest {
+        nonce: String,
+        height: u64,
+        reply_to: String,
+    },
+    StateTipResponse {
+        nonce: String,
+        blocks: Vec<LedgerBlock>,
+    },
     HistoryProbe {
         nonce: String,
         heights: Vec<u64>,
@@ -8010,7 +8044,7 @@ async fn handle_event(
                 let data = message.data.clone();
                 tokio::spawn(crate::gateway::receive_gossip(data));
             } else if topic == DRS_TOPIC {
-                if let Ok(msg @ (P2PMessage::DrsCheckin { .. } | P2PMessage::DrsReady { .. } | P2PMessage::DrsCoverage { .. })) =
+                if let Ok(msg @ (P2PMessage::DrsCheckin { .. } | P2PMessage::DrsReady { .. } | P2PMessage::DrsCoverage { .. } | P2PMessage::DrsStateVote { .. })) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     let app2 = app.cloned();
@@ -8876,6 +8910,27 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         P2PMessage::DrsCoverage { proof } => {
             receive_drs_coverage(proof).await;
         }
+        P2PMessage::DrsStateVote { body, signer, sig } => {
+            receive_state_vote(body, signer, sig).await;
+        }
+        P2PMessage::StateCertsRequest { from, reply_to } => {
+            serve_state_certs(from, reply_to).await;
+        }
+        P2PMessage::StateCertsResponse { certs, server } => {
+            receive_state_certs(certs, server).await;
+        }
+        P2PMessage::StateChunkRequest { nonce, height, part, index, reply_to } => {
+            serve_state_chunk(nonce, height, part, index, reply_to).await;
+        }
+        P2PMessage::StateChunkResponse { nonce, data, path } => {
+            receive_state_chunk(nonce, data, path).await;
+        }
+        P2PMessage::StateTipRequest { nonce, height, reply_to } => {
+            serve_state_tip(nonce, height, reply_to).await;
+        }
+        P2PMessage::StateTipResponse { nonce, blocks } => {
+            receive_state_tip(nonce, blocks).await;
+        }
         P2PMessage::HistoryProbe { nonce, heights, reply_to } => {
             answer_history_probe(nonce, heights, reply_to).await;
         }
@@ -9669,6 +9724,13 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
             };
             if checkpointed {
                 eprintln!("[P2PSnapshot] snapshot at height {} matches the state checkpoint this release ships", snapshot.height);
+            } else if snapshot.height >= crate::state_cert::STATE_CERT_FROM_HEIGHT {
+                eprintln!(
+                    "[P2PSnapshot] refused a snapshot at height {}: from block {} only state certified by a committee is installed",
+                    snapshot.height,
+                    crate::state_cert::STATE_CERT_FROM_HEIGHT
+                );
+                return;
             } else if let Err(e) = snapshot.verify() {
                 eprintln!("[P2PSnapshot] refused a snapshot at height {}: {e}", snapshot.height);
                 return;
@@ -10979,6 +11041,7 @@ async fn serve_state_checkpoint(requester_endpoint: String, height: u64) {
 
 async fn ask_peers_for_snapshot(have_height: u64, stuck: bool) {
     SNAPSHOT_ASKED_AT.store(Utc::now().timestamp(), Ordering::Relaxed);
+    request_state_certs().await;
     let my_endpoint = get_public_endpoint().await;
     if my_endpoint.is_empty() { return; }
     let latest = crate::chain_db::latest_state_checkpoint_height();
@@ -12019,7 +12082,11 @@ pub fn drs_batches_for(height: u64, now: i64) -> Vec<LedgerTx> {
     let checkins = pooled(&checkin_pool());
     let readies = pooled(&ready_pool());
     let coverage: Vec<crate::drs::CoverageProof> = coverage_pool().values().cloned().collect();
-    crate::chain_db::drs_build_batches(height, now, checkins, readies, coverage)
+    let mut out = crate::chain_db::drs_build_batches(height, now, checkins, readies, coverage);
+    if let Some(tx) = crate::chain_db::state_cert_tx_for(height, now, state_cert_votes_for_block()) {
+        out.push(tx);
+    }
+    out
 }
 
 static COVERAGE_POOL: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<u64, crate::drs::CoverageProof>>> =
@@ -12264,7 +12331,11 @@ fn history_nonce() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
 
-fn history_archive_mode(me: &str) -> bool {
+pub fn my_bls_pubkey() -> Option<String> {
+    BLS_SECRET_KEY.get().map(|sk| hex::encode(crate::bls_agg::bls_pubkey(sk)))
+}
+
+pub fn history_archive_mode(me: &str) -> bool {
     std::env::var("EGO_ARCHIVE").map_or(false, |v| v == "1") || crate::genesis::is_member(me)
 }
 
@@ -12638,6 +12709,450 @@ async fn receive_history_pieces(nonce: String, pieces: Vec<crate::history::Histo
         return;
     }
     tokio::spawn(history_backfill_next());
+}
+
+const STATE_SYNC_INFLIGHT: usize = 8;
+const STATE_SYNC_TIMEOUT_SECS: i64 = 60;
+const STATE_SYNC_MIN_LEAD: u64 = 100;
+const STATE_CERTS_PER_REPLY: usize = 64;
+const STATE_SERVE_PER_MINUTE: u32 = 120;
+const STATE_SERVE_PER_PEER_MINUTE: u32 = 60;
+const STATE_VOTE_RESEND_SECS: i64 = 600;
+
+type VotePool = HashMap<[u8; 32], (crate::state_cert::CertBody, Vec<(String, String)>, i64)>;
+static STATE_VOTES: OnceLock<Mutex<VotePool>> = OnceLock::new();
+
+fn state_votes() -> std::sync::MutexGuard<'static, VotePool> {
+    STATE_VOTES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn pool_state_vote(body: crate::state_cert::CertBody, signer: String, sig: String, now: i64) {
+    let mut pool = state_votes();
+    if pool.len() >= 64 && !pool.contains_key(&body.id()) {
+        if let Some(oldest) = pool.iter().min_by_key(|(_, (_, _, t))| *t).map(|(k, _)| *k) {
+            pool.remove(&oldest);
+        }
+    }
+    let entry = pool.entry(body.id()).or_insert_with(|| (body, Vec::new(), now));
+    if !entry.1.iter().any(|(s, _)| s == &signer) && entry.1.len() < 4 * crate::state_cert::CERT_COMMITTEE {
+        entry.1.push((signer, sig));
+    }
+    entry.2 = now;
+}
+
+fn state_cert_votes_for_block() -> Vec<(crate::state_cert::CertBody, Vec<(String, String)>)> {
+    state_votes().values().map(|(b, v, _)| (b.clone(), v.clone())).collect()
+}
+
+pub fn maybe_send_state_vote() {
+    static SENT: Mutex<Option<([u8; 32], i64)>> = Mutex::new(None);
+    if crate::chain_db::local_chain_height() < crate::state_cert::STATE_CERT_FROM_HEIGHT {
+        return;
+    }
+    let Some((open, signers)) = crate::chain_db::state_cert_open() else { return };
+    {
+        let mut pool = state_votes();
+        pool.retain(|_, (b, _, _)| b.index >= open.index);
+    }
+    let Some((chain, contracts)) = crate::state_sync::digests(open.height) else { return };
+    let body = crate::state_cert::CertBody {
+        index: open.index,
+        height: open.height,
+        block_hash: open.block_hash.clone(),
+        state_root: chain.digest.root.clone(),
+        state_chunks: chain.digest.chunks.len() as u64,
+        contract_root: contracts.digest.root.clone(),
+        contract_chunks: contracts.digest.chunks.len() as u64,
+        next: open.next.clone(),
+    };
+    let (signer, sig) = match &signers {
+        crate::state_cert::Signers::Founders(founders) => {
+            use ed25519_dalek::Signer;
+            let me = crate::ledger::Ledger::load().address;
+            if !founders.contains(&me) {
+                return;
+            }
+            let Some(seed) = get_ed25519_seed() else { return };
+            let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+            if crate::state_cert::ed25519_address(key.verifying_key().as_bytes()).as_deref() != Some(me.as_str()) {
+                return;
+            }
+            (hex::encode(key.verifying_key().as_bytes()), hex::encode(key.sign(&body.message()).to_bytes()))
+        }
+        crate::state_cert::Signers::Committee(keys) => {
+            let Some(sk) = BLS_SECRET_KEY.get() else { return };
+            let pk = hex::encode(crate::bls_agg::bls_pubkey(sk));
+            if !keys.contains(&pk) {
+                return;
+            }
+            (pk, hex::encode(crate::bls_agg::sign_shared(sk, &body.message())))
+        }
+    };
+    let now = Utc::now().timestamp();
+    {
+        let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*sent, Some((id, at)) if id == body.id() && now - at < STATE_VOTE_RESEND_SECS) {
+            return;
+        }
+        *sent = Some((body.id(), now));
+    }
+    pool_state_vote(body.clone(), signer.clone(), sig.clone(), now);
+    eprintln!(
+        "[StateCert] signed checkpoint {} at block {}: state {:.16}, {} chunks",
+        body.index, body.height, body.state_root, body.state_chunks
+    );
+    let msg = P2PMessage::DrsStateVote { body, signer, sig };
+    tauri::async_runtime::spawn(async move { send_drs_message(msg).await; });
+}
+
+async fn receive_state_vote(body: crate::state_cert::CertBody, signer: String, sig: String) {
+    if signer.len() > 200 || sig.len() > 400 || body.next.len() > crate::state_cert::CERT_COMMITTEE {
+        return;
+    }
+    let b2 = body.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        let (open, signers) = crate::chain_db::state_cert_open()?;
+        let matches = open.index == b2.index && open.height == b2.height && open.block_hash == b2.block_hash && open.next == b2.next;
+        (matches && crate::state_cert::vote_ok(&b2, &signer, &sig, &signers)).then_some((signer, sig))
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some((signer, sig)) = checked {
+        pool_state_vote(body, signer, sig, Utc::now().timestamp());
+    }
+}
+
+fn state_serve_allowed(endpoint: &str) -> bool {
+    type Window = (i64, u32, HashMap<String, u32>);
+    static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
+    let minute = Utc::now().timestamp() / 60;
+    let mut guard = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    let w = guard.get_or_insert_with(|| (minute, 0, HashMap::new()));
+    if w.0 != minute {
+        *w = (minute, 0, HashMap::new());
+    }
+    if w.1 >= STATE_SERVE_PER_MINUTE {
+        return false;
+    }
+    let per = w.2.entry(endpoint.to_string()).or_insert(0);
+    if *per >= STATE_SERVE_PER_PEER_MINUTE {
+        return false;
+    }
+    *per += 1;
+    w.1 += 1;
+    true
+}
+
+fn live_endpoints(limit: usize) -> Vec<String> {
+    let cutoff = Utc::now().timestamp() - PEER_LIVENESS_SECS;
+    let mut eps: Vec<String> = load_peer_cache()
+        .into_iter()
+        .filter(|p| p.last_seen >= cutoff && !p.endpoint.trim().is_empty())
+        .map(|p| p.endpoint)
+        .collect();
+    eps.sort();
+    eps.dedup();
+    let start = if eps.is_empty() { 0 } else { rand::random::<usize>() % eps.len() };
+    eps.rotate_left(start);
+    eps.truncate(limit);
+    eps
+}
+
+async fn serve_state_certs(from: u64, reply_to: String) {
+    if reply_to.is_empty() || !state_serve_allowed(&reply_to) {
+        return;
+    }
+    let certs = tokio::task::spawn_blocking(move || crate::chain_db::state_certs_from(from, STATE_CERTS_PER_REPLY))
+        .await
+        .unwrap_or_default();
+    if certs.is_empty() {
+        return;
+    }
+    let server = get_public_endpoint().await;
+    let _ = send_message(&reply_to, &P2PMessage::StateCertsResponse { certs, server }).await;
+}
+
+async fn serve_state_chunk(nonce: String, height: u64, part: u8, index: u64, reply_to: String) {
+    use base64::Engine as _;
+    if nonce.is_empty() || nonce.len() > 64 || reply_to.is_empty() || !state_serve_allowed(&reply_to) {
+        return;
+    }
+    let Some((entries, path)) = tokio::task::spawn_blocking(move || crate::state_sync::serve_chunk(height, part, index))
+        .await
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let data = base64::engine::general_purpose::STANDARD.encode(crate::state_sync::encode_entries(&entries));
+    let path = path.iter().map(hex::encode).collect();
+    let _ = send_message(&reply_to, &P2PMessage::StateChunkResponse { nonce, data, path }).await;
+}
+
+async fn serve_state_tip(nonce: String, height: u64, reply_to: String) {
+    if nonce.is_empty() || nonce.len() > 64 || reply_to.is_empty() || !state_serve_allowed(&reply_to) {
+        return;
+    }
+    let blocks: Vec<LedgerBlock> = tokio::task::spawn_blocking(move || crate::chain_db::state_tip_blocks(height, crate::state_sync::TIP_BLOCKS))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut b| {
+            b.commit_cert.clear();
+            b
+        })
+        .collect();
+    if blocks.is_empty() {
+        return;
+    }
+    let _ = send_message(&reply_to, &P2PMessage::StateTipResponse { nonce, blocks }).await;
+}
+
+struct StateSyncJob {
+    cert: crate::state_cert::StateCert,
+    servers: Vec<String>,
+    queue: std::collections::VecDeque<(u8, u64)>,
+    inflight: HashMap<String, (u8, u64, i64)>,
+    done: u64,
+    total: u64,
+    tips: Option<Vec<LedgerBlock>>,
+    tip_nonce: String,
+    tip_asked: i64,
+    turn: usize,
+}
+
+static STATE_SYNC: Mutex<Option<StateSyncJob>> = Mutex::new(None);
+static STATE_CERT_CHAIN: Mutex<Vec<crate::state_cert::StateCert>> = Mutex::new(Vec::new());
+
+pub async fn request_state_certs() {
+    let reply_to = get_public_endpoint().await;
+    if reply_to.is_empty() {
+        return;
+    }
+    let from = STATE_CERT_CHAIN.lock().unwrap_or_else(|e| e.into_inner()).len() as u64 + 1;
+    for ep in live_endpoints(3) {
+        let _ = send_message(&ep, &P2PMessage::StateCertsRequest { from, reply_to: reply_to.clone() }).await;
+    }
+}
+
+async fn receive_state_certs(certs: Vec<crate::state_cert::StateCert>, server: String) {
+    if certs.is_empty() || certs.len() > STATE_CERTS_PER_REPLY {
+        return;
+    }
+    let known = STATE_CERT_CHAIN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if certs[0].body.index != known.len() as u64 + 1 {
+        return;
+    }
+    let full_page = certs.len() == STATE_CERTS_PER_REPLY;
+    let mut candidate = known;
+    candidate.extend(certs);
+    let verified = tokio::task::spawn_blocking(move || {
+        crate::state_cert::verify_chain(&candidate, &crate::genesis::addresses()).map(|last| (candidate, last))
+    })
+    .await;
+    let (chain, last) = match verified {
+        Ok(Ok((chain, Some(last)))) => (chain, last),
+        Ok(Err(e)) => {
+            eprintln!("[StateCert] refused certificates from {server}: {e}");
+            return;
+        }
+        _ => return,
+    };
+    *STATE_CERT_CHAIN.lock().unwrap_or_else(|e| e.into_inner()) = chain;
+    if full_page && !server.is_empty() {
+        let reply_to = get_public_endpoint().await;
+        let from = last.body.index + 1;
+        let _ = send_message(&server, &P2PMessage::StateCertsRequest { from, reply_to }).await;
+        return;
+    }
+    let tip = crate::chain_db::local_chain_height();
+    if last.body.height < tip.saturating_add(STATE_SYNC_MIN_LEAD) {
+        return;
+    }
+    start_state_sync(last, server).await;
+}
+
+async fn start_state_sync(cert: crate::state_cert::StateCert, server: String) {
+    {
+        let mut job = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+        if job.as_ref().map_or(false, |j| j.cert.body.index >= cert.body.index) {
+            return;
+        }
+        let dir = crate::state_sync::staging_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let mut queue = std::collections::VecDeque::new();
+        for i in 0..cert.body.state_chunks {
+            queue.push_back((crate::state_sync::PART_CHAIN, i));
+        }
+        for i in 0..cert.body.contract_chunks {
+            queue.push_back((crate::state_sync::PART_CONTRACTS, i));
+        }
+        let mut servers = vec![server];
+        servers.extend(live_endpoints(16));
+        servers.retain(|s| !s.is_empty());
+        servers.dedup();
+        eprintln!(
+            "[StateCert] joining from the state certified at block {} (certificate {}): {} chunks to fetch from {} peers",
+            cert.body.height, cert.body.index, queue.len(), servers.len()
+        );
+        *job = Some(StateSyncJob {
+            total: queue.len() as u64,
+            cert,
+            servers,
+            queue,
+            inflight: HashMap::new(),
+            done: 0,
+            tips: None,
+            tip_nonce: String::new(),
+            tip_asked: 0,
+            turn: 0,
+        });
+    }
+    pump_state_sync().await;
+}
+
+async fn pump_state_sync() {
+    let now = Utc::now().timestamp();
+    let mut sends: Vec<(String, P2PMessage)> = Vec::new();
+    let reply_to = get_public_endpoint().await;
+    if reply_to.is_empty() {
+        return;
+    }
+    {
+        let mut guard = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(job) = guard.as_mut() else { return };
+        if job.servers.is_empty() {
+            return;
+        }
+        let stale: Vec<String> = job.inflight.iter().filter(|(_, (_, _, t))| now - *t > STATE_SYNC_TIMEOUT_SECS).map(|(n, _)| n.clone()).collect();
+        for n in stale {
+            if let Some((part, index, _)) = job.inflight.remove(&n) {
+                job.queue.push_back((part, index));
+            }
+        }
+        while job.inflight.len() < STATE_SYNC_INFLIGHT {
+            let Some((part, index)) = job.queue.pop_front() else { break };
+            let server = job.servers[job.turn % job.servers.len()].clone();
+            job.turn += 1;
+            let nonce = history_nonce();
+            job.inflight.insert(nonce.clone(), (part, index, now));
+            let height = job.cert.body.height;
+            sends.push((server, P2PMessage::StateChunkRequest { nonce, height, part, index, reply_to: reply_to.clone() }));
+        }
+        if job.tips.is_none() && now - job.tip_asked > STATE_SYNC_TIMEOUT_SECS {
+            job.tip_asked = now;
+            job.tip_nonce = history_nonce();
+            let server = job.servers[job.turn % job.servers.len()].clone();
+            job.turn += 1;
+            sends.push((server, P2PMessage::StateTipRequest { nonce: job.tip_nonce.clone(), height: job.cert.body.height, reply_to: reply_to.clone() }));
+        }
+    }
+    for (ep, msg) in sends {
+        let _ = send_message(&ep, &msg).await;
+    }
+}
+
+async fn receive_state_chunk(nonce: String, data: String, path: Vec<String>) {
+    use base64::Engine as _;
+    let (part, index, cert) = {
+        let guard = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(job) = guard.as_ref() else { return };
+        let Some((part, index, _)) = job.inflight.get(&nonce) else { return };
+        (*part, *index, job.cert.clone())
+    };
+    let checked = tokio::task::spawn_blocking(move || {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+        let entries = crate::state_sync::decode_entries(&bytes)?;
+        let path: Vec<[u8; 32]> = path.iter().map(|p| crate::state_cert::hex32(p)).collect::<Option<_>>()?;
+        let (root, count) = if part == crate::state_sync::PART_CHAIN {
+            (cert.body.state_root.as_str(), cert.body.state_chunks)
+        } else {
+            (cert.body.contract_root.as_str(), cert.body.contract_chunks)
+        };
+        let root = crate::state_cert::hex32(root)?;
+        crate::state_cert::chunk_ok(&entries, index, count, &path, &root).then_some(())?;
+        std::fs::write(crate::state_sync::staged_path(part, index), bytes).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+    .is_some();
+    let finished = {
+        let mut guard = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(job) = guard.as_mut() else { return };
+        if job.inflight.remove(&nonce).is_none() {
+            return;
+        }
+        if checked {
+            job.done += 1;
+        } else {
+            job.queue.push_back((part, index));
+        }
+        job.done == job.total && job.tips.is_some()
+    };
+    if finished {
+        finish_state_sync().await;
+    } else {
+        pump_state_sync().await;
+    }
+}
+
+async fn receive_state_tip(nonce: String, blocks: Vec<LedgerBlock>) {
+    let cert = {
+        let guard = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(job) = guard.as_ref() else { return };
+        if job.tip_nonce != nonce || job.tips.is_some() {
+            return;
+        }
+        job.cert.clone()
+    };
+    let b2 = blocks.clone();
+    let ok = tokio::task::spawn_blocking(move || crate::chain_db::tip_blocks_ok(&cert, &b2)).await.unwrap_or(false);
+    if !ok {
+        return;
+    }
+    let finished = {
+        let mut guard = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(job) = guard.as_mut() else { return };
+        job.tips = Some(blocks);
+        job.done == job.total
+    };
+    if finished {
+        finish_state_sync().await;
+    }
+}
+
+async fn finish_state_sync() {
+    let job = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(job) = job else { return };
+    let Some(tips) = job.tips.clone() else { return };
+    if crate::chain_db::local_chain_height() >= job.cert.body.height {
+        eprintln!("[StateCert] this node reached block {} by itself while fetching; the certified state is not needed", job.cert.body.height);
+        let _ = std::fs::remove_dir_all(crate::state_sync::staging_dir());
+        return;
+    }
+    let cert = job.cert.clone();
+    let result = tokio::task::spawn_blocking(move || crate::chain_db::install_certified_state(&cert, &tips)).await;
+    match result {
+        Ok(Ok(())) => {
+            let _ = std::fs::remove_dir_all(crate::state_sync::staging_dir());
+            eprintln!("[StateCert] this node now holds the state certified at block {}; syncing on from there", job.cert.body.height);
+            crate::contract_exec::wake();
+        }
+        Ok(Err(e)) => eprintln!("[StateCert] could not install the certified state: {e}"),
+        Err(_) => {}
+    }
+}
+
+pub async fn state_sync_tick() {
+    let active = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    if active {
+        pump_state_sync().await;
+    }
 }
 
 async fn receive_drs_checkin(idx: u64, anchor: u64, sig_hex: String) {

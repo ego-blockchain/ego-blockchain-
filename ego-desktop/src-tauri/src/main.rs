@@ -27,6 +27,8 @@ mod ecvrf;
 mod chain_db;
 mod drs;
 mod history;
+mod state_cert;
+mod state_sync;
 mod storage_pay;
 mod contract_exec;
 mod dao_chat;
@@ -515,6 +517,8 @@ fn headless_main() {
             loop {
                 tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
                 tokio::task::spawn_blocking(crate::p2p::maybe_send_uptime_checkin).await.ok();
+                tokio::task::spawn_blocking(crate::p2p::maybe_send_state_vote).await.ok();
+                crate::p2p::state_sync_tick().await;
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             }
         });
@@ -1495,6 +1499,8 @@ fn main() {
                     loop {
                         tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
                         tokio::task::spawn_blocking(crate::p2p::maybe_send_uptime_checkin).await.ok();
+                        tokio::task::spawn_blocking(crate::p2p::maybe_send_state_vote).await.ok();
+                        crate::p2p::state_sync_tick().await;
                         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                     }
                 });

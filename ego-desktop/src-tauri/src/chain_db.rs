@@ -28,7 +28,7 @@ const CF_COMPUTE_OFFERS:       &str = "compute_offers";
 const CF_COMPUTE_RESERVATIONS: &str = "compute_reservations";
 const CF_STORAGE_DEALS:        &str = "storage_deals";
 const CF_CLUSTER_BOOKINGS:     &str = "cluster_bookings";
-const CF_CONTRACT_STATE:       &str = "contract_state";
+pub(crate) const CF_CONTRACT_STATE: &str = "contract_state";
 const CF_L2_CHANNELS:          &str = "cf_l2_channels";
 const CF_L2_BATCHES:           &str = "cf_l2_batches";
 const CF_L2_STATE:             &str = "cf_l2_state";
@@ -112,6 +112,10 @@ impl DbWrapper {
     pub fn expect(&self, _msg: &str) -> &'static DB { self.0 }
 }
 
+pub(crate) fn global_db() -> &'static DB {
+    get_db().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn get_db() -> DbWrapper {
     DbWrapper(CHAIN_DB.get_or_init(|| {
         let db_path = base_data_dir().join("chain_rocksdb");
@@ -121,6 +125,14 @@ pub fn get_db() -> DbWrapper {
         let db = open_chain_db(&db_path);
         let db = if rules_need_resync(&db) {
             eprintln!("[ChainDB] This chain copy was applied under older rules past block {RULES_DERIVED_FROM_HEIGHT} — downloading it again from the network");
+            drop(db);
+            wipe_local_chain(&db_path);
+            open_chain_db(&db_path)
+        } else {
+            db
+        };
+        let db = if drs_meta(&db, STATE_INSTALL_PENDING).is_some() {
+            eprintln!("[ChainDB] a certified state was being installed when the node stopped — downloading it again");
             drop(db);
             wipe_local_chain(&db_path);
             open_chain_db(&db_path)
@@ -2604,6 +2616,24 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     crate::shielded_chain::apply_block(db, &mut batch, block.height, &fresh_txs);
     crate::market_chain::apply_plan(db, &mut batch, block.height, &market_plan);
 
+    if block.height >= CHECKIN_FROM_HEIGHT {
+        for (key, amount) in escrow_release_updates(&fresh_txs) {
+            let cur = drs_ov.get(&key).map(|v| read_u64_le(&v)).unwrap_or(0);
+            drs_ov.put(key, u64_le(cur.saturating_add(amount)).to_vec());
+        }
+        let (deltas, released) = credit_updates(&fresh_txs);
+        for (addr, delta) in deltas {
+            let key = credits_key(&addr);
+            let cur = drs_ov.get(&key).map(|v| read_u64_le(&v)).unwrap_or(0);
+            drs_ov.put(key, u64_le((cur as i128 + delta).clamp(0, u64::MAX as i128) as u64).to_vec());
+        }
+        for ((deal_id, recipient), credits) in released {
+            let key = escrow_credits_released_key(&deal_id, &recipient);
+            let cur = drs_ov.get(&key).map(|v| read_u64_le(&v)).unwrap_or(0);
+            drs_ov.put(key, u64_le(cur.saturating_add(credits)).to_vec());
+        }
+    }
+    let opened_checkpoint = crate::state_cert::apply_block(&mut drs_ov, block, &confirmed_txs, &rota_seed_in(db, block));
     crate::history::push(&mut drs_ov, block.height, &block.hash);
     batch.put_cf(cf_meta, crate::history::undo_key(block.height), drs_ov.undo_record());
     if block.height > crate::history::UNDO_KEEP {
@@ -2708,8 +2738,10 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             }
         }
     }
-    record_escrow_releases(db, &confirmed_txs);
-    apply_credit_txs(db, &confirmed_txs);
+    if block.height < CHECKIN_FROM_HEIGHT {
+        record_escrow_releases(db, &confirmed_txs);
+        apply_credit_txs(db, &confirmed_txs);
+    }
 
     // BFT finality is immediate: a block persisted with a quorum of votes is
     // irreversible the moment it lands — no pipelining, no depth. Advance the
@@ -2726,6 +2758,9 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         }
     }
 
+    if opened_checkpoint {
+        crate::state_sync::on_checkpoint(db, block.height);
+    }
     notify_wallet_activity(&my_addr, block, &confirmed_txs);
     crate::contract_exec::wake();
     true
@@ -5173,6 +5208,7 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
             return Err(format!("storage_reward {} refused: hosts are paid when their proofs land", tx.hash));
         }
         crate::drs::validate_batches(&crate::drs::Ov::new(db), block, txs, |h| block_hash_at_in(db, h))?;
+        crate::state_cert::validate(&crate::drs::Ov::new(db), block, txs, &crate::genesis::addresses())?;
         if block.height >= CHECKIN_FROM_HEIGHT {
             if let Some(tx) = txs.iter().find(|t| t.tx_type == crate::coverage_proof::POC_PROOF_TX) {
                 return Err(format!("coverage proof {} refused: coverage is proven in coverage batches now", tx.hash));
@@ -7391,10 +7427,14 @@ pub fn validate_credits_tx(tx: &crate::ledger::LedgerTx) -> Result<(), String> {
     }
 }
 
-fn apply_credit_txs(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
-    let Some(cf) = db.cf_handle(CF_META) else { return };
-    let mut deltas: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
-    let mut rel_index: std::collections::HashMap<(String, String), u64> = std::collections::HashMap::new();
+type CreditUpdates = (
+    std::collections::BTreeMap<String, i128>,
+    std::collections::BTreeMap<(String, String), u64>,
+);
+
+fn credit_updates(txs: &[&crate::ledger::LedgerTx]) -> CreditUpdates {
+    let mut deltas: std::collections::BTreeMap<String, i128> = Default::default();
+    let mut rel_index: std::collections::BTreeMap<(String, String), u64> = Default::default();
     for tx in txs {
         match tx.tx_type.as_str() {
             "credits_mint" => {
@@ -7425,6 +7465,12 @@ fn apply_credit_txs(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
             _ => {}
         }
     }
+    (deltas, rel_index)
+}
+
+fn apply_credit_txs(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
+    let Some(cf) = db.cf_handle(CF_META) else { return };
+    let (deltas, rel_index) = credit_updates(txs);
     if deltas.is_empty() && rel_index.is_empty() { return; }
     let mut batch = rocksdb::WriteBatch::default();
     for (addr, delta) in deltas {
@@ -7564,7 +7610,7 @@ fn escrow_deal_id_from_memo(memo: &Option<String>) -> Option<(String, String)> {
 /// Record confirmed escrow releases in the cumulative per-deal/per-recipient
 /// index. Runs inside the block-apply path (db lock already held) so every
 /// validator derives the same accounting from the same committed blocks.
-fn record_escrow_releases(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
+fn escrow_release_updates(txs: &[&crate::ledger::LedgerTx]) -> Vec<(Vec<u8>, u64)> {
     let mut updates: Vec<(Vec<u8>, u64)> = Vec::new();
     for tx in txs {
         if !is_escrow_source(&tx.from) || tx.amount == 0 { continue; }
@@ -7572,6 +7618,11 @@ fn record_escrow_releases(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
         updates.push((escrow_released_key(&deal_id, &tx.to), tx.amount));
         updates.push((escrow_released_key(&deal_id, "*"), tx.amount));
     }
+    updates
+}
+
+fn record_escrow_releases(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
+    let updates = escrow_release_updates(txs);
     if updates.is_empty() { return; }
     let Some(cf) = db.cf_handle(CF_META) else { return };
     let mut batch = rocksdb::WriteBatch::default();
@@ -8170,7 +8221,9 @@ pub fn commit_contract_block(
         batch.delete_cf(cf, crate::contract_exec::undo_key(old));
     }
     batch.put_cf(cf_meta, crate::contract_exec::WATERMARK_KEY, u64_le(height));
-    db.write(batch).map_err(|e| e.to_string())
+    db.write(batch).map_err(|e| e.to_string())?;
+    crate::state_sync::on_contract_commit(height);
+    Ok(())
 }
 
 pub fn unwind_contract_block(height: u64, prev: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<(), String> {
@@ -10016,6 +10069,7 @@ const LOCAL_META_KEYS: &[&[u8]] = &[
     b"ftotal_v1",
     b"bhx_v1",
     b"derived_rebuilt_v3",
+    b"state_install_pending",
     b"finalized_height",
     b"chain_graduated",
     b"known_validators_v1",
@@ -10026,7 +10080,7 @@ const LOCAL_META_KEYS: &[&[u8]] = &[
     b"rules_version",
     b"slashed_validators",
 ];
-const LOCAL_META_PREFIXES: &[&[u8]] = &[b"pvotes:", b"validator_bls:", b"hu:", b"hpr:"];
+const LOCAL_META_PREFIXES: &[&[u8]] = &[b"pvotes:", b"validator_bls:", b"hu:", b"hpr:", b"scp:"];
 
 fn is_local_meta(key: &[u8]) -> bool {
     LOCAL_META_KEYS.iter().any(|k| *k == key) || LOCAL_META_PREFIXES.iter().any(|p| key.starts_with(p))
@@ -10280,6 +10334,175 @@ fn apply_undo_records(db: &DB, batch: &mut WriteBatch, records: &[Vec<u8>]) {
 }
 
 const DERIVED_PREFIXES: &[&[u8]] = &[b"n2", b"bhr:", b"ftotal:"];
+const STATE_INSTALL_PENDING: &[u8] = b"state_install_pending";
+
+pub fn state_cert_open() -> Option<(crate::state_cert::OpenCheckpoint, crate::state_cert::Signers)> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let open = crate::state_cert::load_open(&ov)?;
+    let signers = crate::state_cert::signers_of(&ov, open.index, &crate::genesis::addresses());
+    Some((open, signers))
+}
+
+pub fn state_cert_tx_for(
+    height: u64,
+    now: i64,
+    pool: Vec<(crate::state_cert::CertBody, Vec<(String, String)>)>,
+) -> Option<LedgerTx> {
+    if height < crate::state_cert::STATE_CERT_FROM_HEIGHT {
+        return None;
+    }
+    let (open, signers) = state_cert_open()?;
+    let needed = crate::state_cert::quorum(match &signers {
+        crate::state_cert::Signers::Founders(f) => f.len(),
+        crate::state_cert::Signers::Committee(k) => k.len(),
+    });
+    pool.into_iter()
+        .filter(|(b, v)| v.len() >= needed && b.index == open.index && b.height == open.height && b.block_hash == open.block_hash && b.next == open.next)
+        .find_map(|(body, votes)| crate::state_cert::assemble(&body, &votes, &signers))
+        .and_then(|cert| serde_json::to_string(&cert).ok())
+        .map(|args| crate::drs::batch_tx(crate::state_cert::TX_STATE_CERT, height, now, args))
+}
+
+pub fn state_cert_last_height() -> Option<u64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    crate::state_cert::load_cert(&ov, crate::state_cert::last_index(&ov)).map(|c| c.body.height)
+}
+
+pub fn state_certs_from(from: u64, limit: usize) -> Vec<crate::state_cert::StateCert> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let last = crate::state_cert::last_index(&ov);
+    (from.max(1)..=last).take(limit).filter_map(|i| crate::state_cert::load_cert(&ov, i)).collect()
+}
+
+pub fn state_tip_blocks(height: u64, count: u64) -> Vec<LedgerBlock> {
+    state_tip_blocks_in(get_db().lock().unwrap_or_else(|e| e.into_inner()), height, count)
+}
+
+fn state_tip_blocks_in(db: &DB, height: u64, count: u64) -> Vec<LedgerBlock> {
+    let Some(cf) = db.cf_handle(CF_BLOCKS) else { return Vec::new() };
+    (height.saturating_sub(count.saturating_sub(1)).max(1)..=height)
+        .rev()
+        .map_while(|h| db.get_cf(cf, height_key(h)).ok().flatten().and_then(|v| decode::<LedgerBlock>(&v)))
+        .collect()
+}
+
+pub fn tip_blocks_ok(cert: &crate::state_cert::StateCert, blocks: &[LedgerBlock]) -> bool {
+    let Some(first) = blocks.first() else { return false };
+    if first.height != cert.body.height || first.hash != cert.body.block_hash {
+        return false;
+    }
+    blocks.iter().all(|b| verify_block_hash(b, &[]))
+        && blocks.windows(2).all(|w| w[1].height + 1 == w[0].height && w[1].hash == w[0].prev_hash)
+}
+
+pub fn install_certified_state(cert: &crate::state_cert::StateCert, tips: &[LedgerBlock]) -> Result<(), String> {
+    let _contracts_paused = crate::contract_exec::exclusive();
+    let _commit_guard = block_commit_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    install_certified_state_in(db, cert, tips, &crate::state_sync::staging_dir())?;
+    drop(_commit_guard);
+    drop(_contracts_paused);
+    restore_in_memory_state_from_db();
+    tracing::info!(
+        "[StateCert] installed the state certified at block {} (certificate {}, {} + {} chunks)",
+        cert.body.height, cert.body.index, cert.body.state_chunks, cert.body.contract_chunks
+    );
+    Ok(())
+}
+
+fn install_certified_state_in(
+    db: &DB,
+    cert: &crate::state_cert::StateCert,
+    tips: &[LedgerBlock],
+    staging: &std::path::Path,
+) -> Result<(), String> {
+    use crate::state_cert::{is_state_meta, TAG_BALANCE, TAG_CONTRACT, TAG_META};
+    use crate::state_sync::{decode_entries, staged_path_in, PART_CHAIN, PART_CONTRACTS};
+    if !tip_blocks_ok(cert, tips) {
+        return Err("the recent blocks do not lead to the certified block".into());
+    }
+    let read_part = |part: u8, count: u64| -> Result<Vec<Vec<(u8, Vec<u8>, Vec<u8>)>>, String> {
+        (0..count)
+            .map(|i| {
+                let bytes = std::fs::read(staged_path_in(staging, part, i)).map_err(|e| format!("staged chunk {part}/{i}: {e}"))?;
+                decode_entries(&bytes).ok_or_else(|| format!("staged chunk {part}/{i} is unreadable"))
+            })
+            .collect()
+    };
+    let chain = read_part(PART_CHAIN, cert.body.state_chunks)?;
+    let contracts = read_part(PART_CONTRACTS, cert.body.contract_chunks)?;
+    let root_of = |parts: &[Vec<(u8, Vec<u8>, Vec<u8>)>]| {
+        let mut b = crate::state_cert::RootBuilder::default();
+        for (t, k, v) in parts.iter().flatten() {
+            b.add(*t, k, v);
+        }
+        b.finish().root
+    };
+    if root_of(&chain) != cert.body.state_root || root_of(&contracts) != cert.body.contract_root {
+        return Err("the staged state does not match the certificate".into());
+    }
+    let wrong_tag = chain.iter().flatten().any(|(t, k, _)| !(*t == TAG_BALANCE || (*t == TAG_META && is_state_meta(k))))
+        || contracts.iter().flatten().any(|(t, k, _)| *t != TAG_CONTRACT || !crate::state_cert::is_state_contract(k));
+    if wrong_tag {
+        return Err("the certified state holds an entry outside the shared state".into());
+    }
+
+    let (Some(cf_bal), Some(cf_meta), Some(cf_con), Some(cf_blocks), Some(cf_hdrs)) = (
+        db.cf_handle(CF_BALANCES),
+        db.cf_handle(CF_META),
+        db.cf_handle(CF_CONTRACT_STATE),
+        db.cf_handle(CF_BLOCKS),
+        db.cf_handle(CF_HEADERS),
+    ) else {
+        return Err("a column is missing".into());
+    };
+    db.put_cf(cf_meta, STATE_INSTALL_PENDING, b"1").map_err(|e| e.to_string())?;
+    let mut batch = WriteBatch::default();
+    for item in db.iterator_cf(cf_bal, rocksdb::IteratorMode::Start) {
+        let Ok((k, _)) = item else { break };
+        batch.delete_cf(cf_bal, &k);
+    }
+    for item in db.iterator_cf(cf_meta, rocksdb::IteratorMode::Start) {
+        let Ok((k, _)) = item else { break };
+        if is_state_meta(&k) || k.starts_with(b"hu:") || k.starts_with(b"hpr:") {
+            batch.delete_cf(cf_meta, &k);
+        }
+    }
+    for item in db.iterator_cf(cf_con, rocksdb::IteratorMode::Start) {
+        let Ok((k, _)) = item else { break };
+        batch.delete_cf(cf_con, &k);
+    }
+    for item in db.iterator_cf(cf_blocks, rocksdb::IteratorMode::From(&height_key(cert.body.height + 1), rocksdb::Direction::Forward)) {
+        let Ok((k, _)) = item else { break };
+        batch.delete_cf(cf_blocks, &k);
+    }
+    db.write(batch).map_err(|e| e.to_string())?;
+    for part in chain.iter().chain(contracts.iter()) {
+        let mut batch = WriteBatch::default();
+        for (t, k, v) in part {
+            let cf = match *t {
+                TAG_BALANCE => cf_bal,
+                TAG_META => cf_meta,
+                _ => cf_con,
+            };
+            batch.put_cf(cf, k, v);
+        }
+        db.write(batch).map_err(|e| e.to_string())?;
+    }
+    let mut batch = WriteBatch::default();
+    for b in tips {
+        batch.put_cf(cf_blocks, height_key(b.height), encode(b));
+        batch.put_cf(cf_hdrs, height_key(b.height), encode(&LightBlockHeader::from(b)));
+    }
+    batch.put_cf(cf_meta, META_PRUNE_BELOW, u64_le(cert.body.height + 1));
+    batch.put_cf(cf_meta, META_FINALIZED, u64_le(cert.body.height));
+    batch.put_cf(cf_meta, crate::contract_exec::WATERMARK_KEY, u64_le(cert.body.height));
+    batch.delete_cf(cf_meta, STATE_INSTALL_PENDING);
+    db.write(batch).map_err(|e| e.to_string())
+}
 const DERIVED_KEYS: &[&[u8]] = &[b"bhf", b"bhx_v1", b"ftotal_v1"];
 
 pub(crate) fn rebuild_derived_state(db: &DB) -> bool {
@@ -10674,6 +10897,110 @@ mod history_tests {
         };
         block.hash = block_hash_for(&block.prev_hash, height, &block.miner, block.timestamp, &block.tx_merkle_root, &block.poc_ticket);
         assert!(write_block_batch(db, &block, &txs), "block {height} commits");
+    }
+
+    fn commit_linked(db: &DB, height: u64, prev: &str, ts: i64, txs: &[LedgerTx]) -> String {
+        let txs: Vec<LedgerTx> = txs
+            .iter()
+            .cloned()
+            .map(|mut t| {
+                t.block_height = Some(height);
+                t.timestamp = ts;
+                t
+            })
+            .collect();
+        let mut hashes: Vec<&str> = txs.iter().map(|t| t.hash.as_str()).collect();
+        hashes.sort_unstable();
+        let mut block = LedgerBlock {
+            height,
+            prev_hash: prev.to_string(),
+            miner: "egot1miner".into(),
+            timestamp: ts,
+            tx_count: txs.len() as u32,
+            tx_merkle_root: compute_merkle_root(&hashes),
+            ..LedgerBlock::default()
+        };
+        block.hash = block_hash_for(&block.prev_hash, height, &block.miner, block.timestamp, &block.tx_merkle_root, &block.poc_ticket);
+        assert!(write_block_batch(db, &block, &txs), "block {height} commits");
+        block.hash
+    }
+
+    fn fingerprint(db: &DB, dir: &std::path::Path) -> (crate::state_sync::StoredDigest, crate::state_sync::StoredDigest) {
+        let chain = crate::state_sync::write_part(db, db, dir, crate::state_sync::PART_CHAIN).unwrap();
+        let contracts = crate::state_sync::write_part(db, db, dir, crate::state_sync::PART_CONTRACTS).unwrap();
+        (chain, contracts)
+    }
+
+    #[test]
+    fn a_new_node_installs_only_what_the_certificate_covers_and_then_keeps_step() {
+        let (a, adir) = scratch_db("cert-a");
+        let (b, bdir) = scratch_db("cert-b");
+        let from = crate::state_cert::STATE_CERT_FROM_HEIGHT;
+        let day = crate::state_cert::DAY_SECS;
+        let mut prev = "11".repeat(32);
+        for (i, h) in (from - 5..=from).enumerate() {
+            let txs = if i == 2 { vec![registration(7)] } else { vec![] };
+            prev = commit_linked(&a, h, &prev, 10 * day + i as i64, &txs);
+        }
+        let open = crate::state_cert::load_open(&crate::drs::Ov::new(&a)).expect("the first block under the rules opens a checkpoint");
+        assert_eq!(open.height, from);
+        let fp_dir = adir.join("fp");
+        let (chain, contracts) = fingerprint(&a, &fp_dir);
+        let cert = crate::state_cert::StateCert {
+            body: crate::state_cert::CertBody {
+                index: open.index,
+                height: open.height,
+                block_hash: open.block_hash.clone(),
+                state_root: chain.digest.root.clone(),
+                state_chunks: chain.digest.chunks.len() as u64,
+                contract_root: contracts.digest.root.clone(),
+                contract_chunks: contracts.digest.chunks.len() as u64,
+                next: open.next.clone(),
+            },
+            ..Default::default()
+        };
+
+        let staging = bdir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        for (part, count, root) in [
+            (crate::state_sync::PART_CHAIN, cert.body.state_chunks, &cert.body.state_root),
+            (crate::state_sync::PART_CONTRACTS, cert.body.contract_chunks, &cert.body.contract_root),
+        ] {
+            for i in 0..count {
+                let (entries, path) = crate::state_sync::serve_chunk_in(&fp_dir, part, i).unwrap();
+                assert!(crate::state_cert::chunk_ok(&entries, i, count, &path, &crate::state_cert::hex32(root).unwrap()));
+                std::fs::write(crate::state_sync::staged_path_in(&staging, part, i), crate::state_sync::encode_entries(&entries)).unwrap();
+            }
+        }
+        let tips = state_tip_blocks_in(&a, from, crate::state_sync::TIP_BLOCKS);
+        assert_eq!(tips.len(), 6);
+        assert!(tip_blocks_ok(&cert, &tips));
+        let mut broken = tips.clone();
+        broken[2].miner = "egot1other".into();
+        assert!(!tip_blocks_ok(&cert, &broken), "a recent block that was changed is refused");
+
+        let mut wrong = cert.clone();
+        wrong.body.state_root = "00".repeat(32);
+        assert!(install_certified_state_in(&b, &wrong, &tips, &staging).is_err(), "state that does not match the certificate is never installed");
+
+        install_certified_state_in(&b, &cert, &tips, &staging).unwrap();
+        let (b_chain, b_contracts) = fingerprint(&b, &bdir.join("fp"));
+        assert_eq!(b_chain.digest.root, chain.digest.root, "the new node holds exactly the certified state");
+        assert_eq!(b_contracts.digest.root, contracts.digest.root);
+        assert_eq!(local_chain_height_in(&b), from);
+        assert_eq!(crate::drs::load_rec(&crate::drs::Ov::new(&b), &registration(7).from).map(|r| r.idx), Some(0));
+
+        let next_a = commit_linked(&a, from + 1, &prev, 11 * day, &[registration(8)]);
+        let next_b = commit_linked(&b, from + 1, &prev, 11 * day, &[registration(8)]);
+        assert_eq!(next_a, next_b);
+        let (a2, _) = fingerprint(&a, &adir.join("fp2"));
+        let (b2, _) = fingerprint(&b, &bdir.join("fp2"));
+        assert_eq!(a2.digest.root, b2.digest.root, "after the next block both nodes still agree");
+        assert_ne!(a2.digest.root, chain.digest.root);
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
     }
 
     #[test]
