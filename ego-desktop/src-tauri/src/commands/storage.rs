@@ -707,7 +707,7 @@ pub async fn store_file(
             if let Ok(mfd_bytes) = serde_json::to_vec(&manifest2) {
                 if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
                     let key = format!("ego-manifest:{}", cid2);
-                    let _ = tx.send(crate::p2p::DhtCommand::PutPeer { key, value: mfd_bytes });
+                    let _ = tx.try_send(crate::p2p::DhtCommand::PutPeer { key, value: mfd_bytes });
                     eprintln!("[Blocks] Manifest {} published to DHT ({} blocks)", &cid2[..16], manifest2.blocks.len());
                 }
             }
@@ -716,7 +716,7 @@ pub async fn store_file(
                 if let Ok(enc_bytes) = crate::blocks::load_block(&entry.block_cid) {
                     if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
                         let key = format!("ego-block:{}", entry.block_cid);
-                        let _ = tx.send(crate::p2p::DhtCommand::PutPeer { key, value: enc_bytes });
+                        let _ = tx.try_send(crate::p2p::DhtCommand::PutPeer { key, value: enc_bytes });
                     }
                 }
             }

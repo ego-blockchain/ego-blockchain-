@@ -403,6 +403,48 @@ pub struct PoolRepair {
     pub changed: bool,
 }
 
+pub fn verify_from_state() -> Result<u64, String> {
+    let (st, leaves, on_chain) = {
+        let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let st = read_state(&db);
+        let Some(cf) = db.cf_handle(CF_META) else { return Err("no state column".into()) };
+        let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(st.next_index as usize);
+        for item in db.iterator_cf(cf, IteratorMode::From(KEY_LEAF, Direction::Forward)) {
+            let Ok((k, v)) = item else { break };
+            if !k.starts_with(KEY_LEAF) {
+                break;
+            }
+            if k.as_ref() != leaf_key(leaves.len() as u64).as_slice() {
+                return Err(format!("leaf {} is missing from the pool", leaves.len()));
+            }
+            let leaf = <[u8; 32]>::try_from(v.as_ref()).map_err(|_| format!("leaf {} is malformed", leaves.len()))?;
+            leaves.push(leaf);
+        }
+        (st, leaves, pool_address_balance(&db))
+    };
+    if leaves.len() as u64 != st.next_index {
+        return Err(format!("the pool records {} leaves but holds {}", st.next_index, leaves.len()));
+    }
+    let mut t = IncrementalTree::new(st.depth as usize);
+    for l in &leaves {
+        t.insert(to_digest(l)?)?;
+    }
+    if from_digest(&t.root()) != st.root {
+        return Err("the pool's leaves do not rebuild its root".into());
+    }
+    let frontier: Vec<[u8; 32]> = t.frontier().iter().map(from_digest).collect();
+    if frontier != st.frontier {
+        return Err("the pool's leaves do not rebuild its frontier".into());
+    }
+    if st.accounted_uegoc() != on_chain {
+        return Err(format!("the pool accounts for {} uEGOC but its address holds {on_chain}", st.accounted_uegoc()));
+    }
+    if st.counted_uegoc() != st.balance_uegoc as u128 {
+        return Err(format!("unspent notes are worth {} uEGOC but the pool holds {}", st.counted_uegoc(), st.balance_uegoc));
+    }
+    Ok(st.next_index)
+}
+
 pub fn repair_pool_state() -> Option<PoolRepair> {
     let before = state();
     match rebuild_from_chain() {
@@ -424,6 +466,24 @@ pub fn repair_pool_state() -> Option<PoolRepair> {
                 changed,
             })
         }
+        Err(e) if e.contains("holds no blocks below") || e.contains("is not on this node") => match verify_from_state() {
+            Ok(leaves) => {
+                tracing::info!(
+                    "[Shielded] this node keeps only part of the history ({e}), so the pool was checked from state: {leaves} leaves rebuild its root and its address balance matches"
+                );
+                Some(PoolRepair { leaves_before: before.next_index, leaves_after: before.next_index, changed: false })
+            }
+            Err(why) => {
+                tracing::error!("[Shielded] the pool state does not check out on its own ({why}); asking a peer for the pool state");
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async {
+                        let tip = chain_db::local_chain_height();
+                        crate::p2p::request_snapshot_from_peers(crate::p2p::snapshot_request_height(tip)).await;
+                    });
+                }
+                None
+            }
+        },
         Err(e) => {
             // A node that fast-synced has no history below its snapshot and never will. That
             // is how fast sync works, not a fault, and saying ERROR every time a reorg asks
@@ -1591,7 +1651,12 @@ mod tests {
         }
         let err = rebuild_from_chain().unwrap_err();
         assert!(err.contains("28874"), "the refusal names the floor: {err}");
-        assert!(repair_pool_state().is_none(), "a refused rebuild is not a repair");
+        if verify_from_state().is_ok() {
+            let repair = repair_pool_state().expect("a pool that checks out from state is verified");
+            assert!(!repair.changed, "checking from state never rewrites the pool");
+        } else {
+            assert!(repair_pool_state().is_none(), "a pool that fails its own check is not repaired from blocks it lacks");
+        }
         assert_eq!(state(), before, "a node that cannot rebuild must not overwrite the pool");
         {
             let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());

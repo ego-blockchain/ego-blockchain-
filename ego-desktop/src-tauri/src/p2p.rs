@@ -3530,6 +3530,28 @@ pub enum P2PMessage {
     DrsCoverage {
         proof: crate::drs::CoverageProof,
     },
+    HistoryProbe {
+        nonce: String,
+        heights: Vec<u64>,
+        reply_to: String,
+    },
+    HistoryProof {
+        nonce: String,
+        holder: String,
+        answers: Vec<String>,
+        sig: String,
+    },
+    HistoryFetch {
+        nonce: String,
+        from: u64,
+        count: u64,
+        reply_to: String,
+    },
+    HistoryPieces {
+        nonce: String,
+        holder: String,
+        pieces: Vec<crate::history::HistoryPiece>,
+    },
     SnapshotRequest {
         requester_endpoint: String,
         #[serde(default)]
@@ -7138,7 +7160,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                     for (_, block_cids) in missing {
                         if let Some(tx) = DHT_CMD_TX.get() {
                             for block_cid in block_cids {
-                                let _ = tx.send(DhtCommand::GetPeers {
+                                let _ = tx.try_send(DhtCommand::GetPeers {
                                     key: format!("ego-block:{}", block_cid),
                                 });
                             }
@@ -7874,7 +7896,7 @@ async fn handle_event(
                     let value    = relay_ma.as_bytes().to_vec();
                     save_dht_record_to_cache(&dht_key, &value);
                     if let Some(tx) = DHT_CMD_TX.get() {
-                        let _ = tx.send(DhtCommand::PutPeer { key: dht_key, value });
+                        let _ = tx.try_send(DhtCommand::PutPeer { key: dht_key, value });
                     }
                     eprintln!("[Relay] Advertised as community relay: {}", relay_ma);
                 }
@@ -8270,7 +8292,7 @@ async fn handle_event(
                         for addr_str in to_dial {
                             if !known.contains(&addr_str) {
                                 if let Some(tx) = DHT_CMD_TX.get() {
-                                    let _ = tx.send(DhtCommand::DialPeer { addr: addr_str });
+                                    let _ = tx.try_send(DhtCommand::DialPeer { addr: addr_str });
                                 }
                             }
                         }
@@ -8772,7 +8794,7 @@ async fn handle_event(
                             }
                             eprintln!("[Relay] Discovered community relay via DHT: {}", relay_ma);
                             if let Some(tx) = DHT_CMD_TX.get() {
-                                let _ = tx.send(DhtCommand::DialPeer { addr: relay_ma });
+                                let _ = tx.try_send(DhtCommand::DialPeer { addr: relay_ma });
                             }
                         }
                     } else if key_str.starts_with("ego-inbox:") {
@@ -8785,7 +8807,7 @@ async fn handle_event(
                                 tokio::spawn(async move { handle_incoming(msg, app2.as_ref()).await; });
 
                                 if let Some(tx) = DHT_CMD_TX.get() {
-                                    let _ = tx.send(DhtCommand::PutPeer {
+                                    let _ = tx.try_send(DhtCommand::PutPeer {
                                         key:   key_str,
                                         value: vec![],
                                     });
@@ -8796,6 +8818,9 @@ async fn handle_event(
                         if let Ok(peer_info) = serde_json::from_slice::<serde_json::Value>(&rec.record.value) {
                             let endpoint = peer_info["endpoint"].as_str().unwrap_or("");
                             if !endpoint.is_empty() {
+                                if let Some(owner) = key_str.strip_prefix("ego-peer:") {
+                                    remember_dht_endpoint(owner, endpoint);
+                                }
                                 if let Ok(addr) = endpoint.parse::<Multiaddr>() {
                                     let _ = swarm.dial(addr);
                                     eprintln!("[DHT] Discovered peer via DHT: {}", endpoint);
@@ -8850,6 +8875,18 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         }
         P2PMessage::DrsCoverage { proof } => {
             receive_drs_coverage(proof).await;
+        }
+        P2PMessage::HistoryProbe { nonce, heights, reply_to } => {
+            answer_history_probe(nonce, heights, reply_to).await;
+        }
+        P2PMessage::HistoryProof { nonce, holder, answers, sig } => {
+            receive_history_proof(nonce, holder, answers, sig).await;
+        }
+        P2PMessage::HistoryFetch { nonce, from, count, reply_to } => {
+            serve_history_fetch(nonce, from, count, reply_to).await;
+        }
+        P2PMessage::HistoryPieces { nonce, pieces, .. } => {
+            receive_history_pieces(nonce, pieces).await;
         }
 
         P2PMessage::MarketChat { trade_id, from, kind, body, ts, id, pubkey, sig } => {
@@ -10089,7 +10126,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
 
                         if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
                             let dht_key = format!("ego-block:{}", block_cid);
-                            let _ = tx.send(crate::p2p::DhtCommand::GetPeers { key: dht_key });
+                            let _ = tx.try_send(crate::p2p::DhtCommand::GetPeers { key: dht_key });
                         }
 
                         if !sender_ep.is_empty() {
@@ -10580,7 +10617,7 @@ async fn process_received_manifest(manifest_cid: &str, app: Option<&tauri::AppHa
     
     for block_cid in crate::blocks::missing_blocks(&manifest) {
         if let Some(tx) = DHT_CMD_TX.get() {
-            let _ = tx.send(DhtCommand::GetPeers { key: format!("ego-block:{}", block_cid) });
+            let _ = tx.try_send(DhtCommand::GetPeers { key: format!("ego-block:{}", block_cid) });
         }
 
         if !sender_addr.is_empty() {
@@ -12167,6 +12204,440 @@ async fn send_drs_message(msg: P2PMessage) {
             publish_gossip(DRS_TOPIC, data).await;
         }
     }
+}
+
+const HISTORY_TICK_SECS: i64 = 300;
+const HISTORY_PROBES_PER_MINUTE: u32 = 600;
+const HISTORY_PROBES_PER_PEER_MINUTE: u32 = 30;
+const HISTORY_FETCHES_PER_MINUTE: u32 = 60;
+const HISTORY_FETCHES_PER_PEER_MINUTE: u32 = 12;
+const HISTORY_BACKFILL_STALE_SECS: i64 = 600;
+
+struct HistoryProbeSent {
+    holder: String,
+    chunk: u64,
+    expected: Vec<String>,
+    at: i64,
+}
+
+struct HistoryBackfill {
+    chunk: u64,
+    shards: u64,
+    at: i64,
+    me: String,
+    from: u64,
+    asked: HashMap<String, (String, String)>,
+    got: Vec<(String, String, Vec<crate::history::HistoryPiece>)>,
+    tried: Vec<String>,
+    touched: i64,
+}
+
+static HISTORY_PROBES: OnceLock<Mutex<HashMap<String, HistoryProbeSent>>> = OnceLock::new();
+static HISTORY_VERIFIED: OnceLock<Mutex<HashMap<u64, Vec<(String, i64)>>>> = OnceLock::new();
+static HISTORY_BACKFILL: Mutex<Option<HistoryBackfill>> = Mutex::new(None);
+static DHT_ENDPOINTS: OnceLock<Mutex<HashMap<String, (String, i64)>>> = OnceLock::new();
+
+fn remember_dht_endpoint(address: &str, endpoint: &str) {
+    let now = Utc::now().timestamp();
+    let mut map = DHT_ENDPOINTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= 50_000 {
+        map.retain(|_, (_, t)| now - *t < 3_600);
+    }
+    if map.len() < 50_000 {
+        map.insert(address.to_string(), (endpoint.to_string(), now));
+    }
+}
+
+fn dht_endpoint(address: &str) -> Option<String> {
+    let now = Utc::now().timestamp();
+    let map = DHT_ENDPOINTS.get()?.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(address).filter(|(_, t)| now - *t < 3_600).map(|(e, _)| e.clone())
+}
+
+fn lookup_dht_endpoint(address: &str) {
+    if let Some(tx) = DHT_CMD_TX.get() {
+        let _ = tx.try_send(DhtCommand::GetPeers { key: format!("ego-peer:{address}") });
+    }
+}
+
+fn history_nonce() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
+
+fn history_archive_mode(me: &str) -> bool {
+    std::env::var("EGO_ARCHIVE").map_or(false, |v| v == "1") || crate::genesis::is_member(me)
+}
+
+fn own_addresses() -> std::collections::HashSet<String> {
+    let mut set: std::collections::HashSet<String> = crate::ledger::load_registry()
+        .wallets
+        .into_iter()
+        .map(|w| w.address)
+        .filter(|a| !a.is_empty())
+        .collect();
+    let me = crate::ledger::Ledger::load().address;
+    if !me.is_empty() {
+        set.insert(me);
+    }
+    set
+}
+
+fn history_serve_allowed(endpoint: &str, fetch: bool) -> bool {
+    type Window = (i64, u32, HashMap<String, u32>);
+    static PROBES: Mutex<Option<Window>> = Mutex::new(None);
+    static FETCHES: Mutex<Option<Window>> = Mutex::new(None);
+    let (lock, total_cap, peer_cap) = if fetch {
+        (&FETCHES, HISTORY_FETCHES_PER_MINUTE, HISTORY_FETCHES_PER_PEER_MINUTE)
+    } else {
+        (&PROBES, HISTORY_PROBES_PER_MINUTE, HISTORY_PROBES_PER_PEER_MINUTE)
+    };
+    let minute = Utc::now().timestamp() / 60;
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let w = guard.get_or_insert_with(|| (minute, 0, HashMap::new()));
+    if w.0 != minute {
+        *w = (minute, 0, HashMap::new());
+    }
+    if w.1 >= total_cap {
+        return false;
+    }
+    let per = w.2.entry(endpoint.to_string()).or_insert(0);
+    if *per >= peer_cap {
+        return false;
+    }
+    *per += 1;
+    w.1 += 1;
+    true
+}
+
+fn history_verified(chunk: u64, now: i64) -> Vec<String> {
+    let map = HISTORY_VERIFIED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&chunk)
+        .map(|v| {
+            v.iter()
+                .filter(|(_, t)| now - *t < crate::history::VERIFIED_FOR_SECS)
+                .map(|(h, _)| h.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub async fn history_tick() {
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now = Utc::now().timestamp();
+    if now - LAST.load(Ordering::Relaxed) < HISTORY_TICK_SECS {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let me = crate::ledger::Ledger::load().address;
+    if me.is_empty() {
+        return;
+    }
+    let archive = history_archive_mode(&me);
+    let me2 = me.clone();
+    let Ok(plan) = tokio::task::spawn_blocking(move || {
+        let contracts = crate::chain_db::contract_exec_height();
+        crate::chain_db::history_plan(&me2, archive, contracts)
+    })
+    .await
+    else {
+        return;
+    };
+    if !plan.prune.is_empty() {
+        let keep = tokio::task::spawn_blocking(own_addresses).await.unwrap_or_default();
+        for chunk in plan.prune.iter().copied() {
+            let verified = history_verified(chunk, now);
+            if verified.len() >= crate::history::HOLDERS_NEEDED {
+                let keep = keep.clone();
+                let removed = tokio::task::spawn_blocking(move || crate::chain_db::history_prune_chunk(chunk, &keep))
+                    .await
+                    .unwrap_or(0);
+                HISTORY_VERIFIED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner()).remove(&chunk);
+                let range = crate::history::chunk_heights(chunk);
+                eprintln!(
+                    "[History] dropped blocks {}..{} here after {} nodes proved they keep them ({removed} transactions removed, your own kept)",
+                    range.start, range.end - 1, verified.len()
+                );
+                continue;
+            }
+            let mut skip = verified;
+            skip.push(me.clone());
+            let shard = crate::history::shard_of_chunk(chunk, plan.shards);
+            let (shards, at) = (plan.shards, plan.at);
+            let rotate = rand::random::<u64>();
+            let holders = tokio::task::spawn_blocking(move || {
+                crate::chain_db::history_holders(shard, shards, at, rotate, crate::history::PROBE_CANDIDATES, skip)
+            })
+            .await
+            .unwrap_or_default();
+            for holder in holders {
+                send_history_probe(holder, chunk).await;
+            }
+        }
+    }
+    if let Some(chunk) = plan.backfill {
+        start_history_backfill(chunk, plan.shards, plan.at, me).await;
+    }
+}
+
+async fn send_history_probe(holder: String, chunk: u64) {
+    let Some(ep) = get_relay_endpoint(&holder).await else {
+        lookup_dht_endpoint(&holder);
+        return;
+    };
+    let nonce = history_nonce();
+    let heights = crate::history::probe_heights(&nonce, chunk, crate::history::PROBE_HEIGHTS);
+    let (n2, h2, hs) = (nonce.clone(), holder.clone(), heights.clone());
+    let expected = tokio::task::spawn_blocking(move || crate::chain_db::history_probe_answers(&n2, &h2, &hs))
+        .await
+        .unwrap_or_default();
+    if expected.len() != heights.len() || expected.iter().any(|e| e.is_empty()) {
+        return;
+    }
+    {
+        let now = Utc::now().timestamp();
+        let mut map = HISTORY_PROBES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, p| now - p.at < 600);
+        if map.len() >= 10_000 {
+            return;
+        }
+        map.insert(nonce.clone(), HistoryProbeSent { holder, chunk, expected, at: now });
+    }
+    let reply_to = get_public_endpoint().await;
+    if reply_to.is_empty() {
+        return;
+    }
+    let _ = send_message(&ep, &P2PMessage::HistoryProbe { nonce, heights, reply_to }).await;
+}
+
+async fn answer_history_probe(nonce: String, heights: Vec<u64>, reply_to: String) {
+    if nonce.is_empty() || nonce.len() > 64 || heights.is_empty() || heights.len() > crate::history::MAX_PROBE_HEIGHTS || reply_to.is_empty() {
+        return;
+    }
+    if !history_serve_allowed(&reply_to, false) {
+        return;
+    }
+    let Some(sk) = BLS_SECRET_KEY.get() else { return };
+    let me = crate::ledger::Ledger::load().address;
+    if me.is_empty() {
+        return;
+    }
+    let my_key = hex::encode(crate::bls_agg::bls_pubkey(sk));
+    let me2 = me.clone();
+    let registered = tokio::task::spawn_blocking(move || crate::chain_db::drs_node(&me2).map_or(false, |r| r.pop_key == my_key))
+        .await
+        .unwrap_or(false);
+    if !registered {
+        return;
+    }
+    let (n2, m2) = (nonce.clone(), me.clone());
+    let answers = tokio::task::spawn_blocking(move || crate::chain_db::history_probe_answers(&n2, &m2, &heights))
+        .await
+        .unwrap_or_default();
+    if answers.iter().all(|a| a.is_empty()) {
+        return;
+    }
+    let sig = crate::bls_agg::sign_shared(sk, &crate::history::proof_message(&nonce, &me, &answers));
+    let msg = P2PMessage::HistoryProof { nonce, holder: me, answers, sig: hex::encode(sig) };
+    let _ = send_message(&reply_to, &msg).await;
+}
+
+async fn receive_history_proof(nonce: String, holder: String, answers: Vec<String>, sig: String) {
+    let sent = HISTORY_PROBES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&nonce);
+    let Some(sent) = sent else { return };
+    if sent.holder != holder || sent.expected != answers {
+        return;
+    }
+    let h2 = holder.clone();
+    let Some(rec) = tokio::task::spawn_blocking(move || crate::chain_db::drs_node(&h2)).await.ok().flatten() else { return };
+    let (Ok(pk), Ok(sig)) = (hex::decode(&rec.pop_key), hex::decode(&sig)) else { return };
+    if pk.is_empty() || !crate::bls_agg::verify_shared(&sig, &pk, &crate::history::proof_message(&nonce, &holder, &answers)) {
+        return;
+    }
+    let now = Utc::now().timestamp();
+    let mut map = HISTORY_VERIFIED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > 10_000 {
+        map.retain(|_, v| v.iter().any(|(_, t)| now - *t < crate::history::VERIFIED_FOR_SECS));
+    }
+    let list = map.entry(sent.chunk).or_default();
+    list.retain(|(h, t)| h != &holder && now - *t < crate::history::VERIFIED_FOR_SECS);
+    list.push((holder, now));
+}
+
+async fn start_history_backfill(chunk: u64, shards: u64, at: i64, me: String) {
+    {
+        let now = Utc::now().timestamp();
+        let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = st.as_ref() {
+            if b.chunk == chunk && now - b.touched < HISTORY_BACKFILL_STALE_SECS {
+                return;
+            }
+        }
+        *st = Some(HistoryBackfill {
+            chunk,
+            shards,
+            at,
+            me,
+            from: crate::history::chunk_heights(chunk).start,
+            asked: HashMap::new(),
+            got: Vec::new(),
+            tried: Vec::new(),
+            touched: now,
+        });
+    }
+    history_backfill_next().await;
+}
+
+async fn history_backfill_next() {
+    let (chunk, shards, at, from, me, tried) = {
+        let st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(b) = st.as_ref() else { return };
+        (b.chunk, b.shards, b.at, b.from, b.me.clone(), b.tried.clone())
+    };
+    let next = tokio::task::spawn_blocking(move || crate::chain_db::history_first_missing(chunk, from)).await.ok().flatten();
+    let Some(next) = next else {
+        let _ = tokio::task::spawn_blocking(move || crate::chain_db::history_mark_held(chunk)).await;
+        *HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let range = crate::history::chunk_heights(chunk);
+        eprintln!("[History] this node now keeps blocks {}..{} for the network", range.start, range.end - 1);
+        return;
+    };
+    let mut skip = tried;
+    skip.push(me);
+    let shard = crate::history::shard_of_chunk(chunk, shards);
+    let rotate = rand::random::<u64>();
+    let holders = tokio::task::spawn_blocking(move || {
+        crate::chain_db::history_holders(shard, shards, at, rotate, crate::history::PROBE_CANDIDATES, skip)
+    })
+    .await
+    .unwrap_or_default();
+    let mut asks: Vec<(String, String, String)> = Vec::new();
+    for holder in holders {
+        if asks.len() >= 2 {
+            break;
+        }
+        match get_relay_endpoint(&holder).await {
+            Some(ep) if !asks.iter().any(|(_, _, e)| e == &ep) => asks.push((history_nonce(), holder, ep)),
+            Some(_) => {}
+            None => lookup_dht_endpoint(&holder),
+        }
+    }
+    if asks.len() < 2 {
+        return;
+    }
+    let reply_to = get_public_endpoint().await;
+    if reply_to.is_empty() {
+        return;
+    }
+    {
+        let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(b) = st.as_mut() else { return };
+        b.from = next;
+        b.asked = asks.iter().map(|(n, h, e)| (n.clone(), (h.clone(), e.clone()))).collect();
+        b.got.clear();
+        b.touched = Utc::now().timestamp();
+    }
+    for (nonce, _, ep) in asks {
+        let msg = P2PMessage::HistoryFetch { nonce, from: next, count: crate::history::FETCH_BATCH, reply_to: reply_to.clone() };
+        let _ = send_message(&ep, &msg).await;
+    }
+}
+
+async fn serve_history_fetch(nonce: String, from: u64, count: u64, reply_to: String) {
+    if nonce.is_empty() || nonce.len() > 64 || count == 0 || reply_to.is_empty() {
+        return;
+    }
+    if !history_serve_allowed(&reply_to, true) {
+        return;
+    }
+    let me = crate::ledger::Ledger::load().address;
+    let pieces = tokio::task::spawn_blocking(move || crate::chain_db::history_serve(from, count)).await.unwrap_or_default();
+    if pieces.is_empty() {
+        return;
+    }
+    let _ = send_message(&reply_to, &P2PMessage::HistoryPieces { nonce, holder: me, pieces }).await;
+}
+
+fn history_backfill_reject(holder: &str) {
+    let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(b) = st.as_mut() {
+        if !b.tried.iter().any(|t| t == holder) {
+            b.tried.push(holder.to_string());
+        }
+    }
+}
+
+async fn receive_history_pieces(nonce: String, pieces: Vec<crate::history::HistoryPiece>) {
+    let (chunk, from, holder) = {
+        let st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(b) = st.as_ref() else { return };
+        let Some((holder, _)) = b.asked.get(&nonce) else { return };
+        (b.chunk, b.from, holder.clone())
+    };
+    let end = from.saturating_add(crate::history::FETCH_BATCH);
+    if pieces.is_empty()
+        || pieces.len() as u64 > crate::history::FETCH_BATCH
+        || pieces.iter().any(|p| p.height < from || p.height >= end || crate::history::chunk_of(p.height) != chunk)
+    {
+        history_backfill_reject(&holder);
+        return;
+    }
+    let Some(root) = tokio::task::spawn_blocking(move || crate::chain_db::history_root(chunk)).await.ok().flatten() else { return };
+    let checked = tokio::task::spawn_blocking(move || {
+        for p in &pieces {
+            crate::history::verify_piece(p, &root)?;
+        }
+        Ok::<_, String>(pieces)
+    })
+    .await;
+    let pieces = match checked {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            eprintln!("[History] {:.16} served history that does not check out: {e}", holder);
+            history_backfill_reject(&holder);
+            return;
+        }
+        Err(_) => return,
+    };
+    let ready = {
+        let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(b) = st.as_mut() else { return };
+        let Some((h, ep)) = b.asked.remove(&nonce) else { return };
+        b.got.push((h, ep, pieces));
+        b.touched = Utc::now().timestamp();
+        if b.got.len() < 2 { None } else { Some(std::mem::take(&mut b.got)) }
+    };
+    let Some(got) = ready else { return };
+    let theirs: HashMap<u64, [u8; 32]> = got[1]
+        .2
+        .iter()
+        .map(|p| (p.height, crate::history::piece_digest(&p.block, &p.txs)))
+        .collect();
+    let agreed: Vec<crate::history::HistoryPiece> = got[0]
+        .2
+        .iter()
+        .filter(|p| theirs.get(&p.height) == Some(&crate::history::piece_digest(&p.block, &p.txs)))
+        .cloned()
+        .collect();
+    let stored = if agreed.is_empty() {
+        0
+    } else {
+        tokio::task::spawn_blocking(move || crate::chain_db::history_store(&agreed)).await.unwrap_or(0)
+    };
+    let progressed = tokio::task::spawn_blocking(move || crate::chain_db::history_first_missing(chunk, from))
+        .await
+        .ok()
+        .flatten()
+        .map_or(true, |next| next > from);
+    if stored == 0 && !progressed {
+        history_backfill_reject(&got[0].0);
+        history_backfill_reject(&got[1].0);
+        return;
+    }
+    tokio::spawn(history_backfill_next());
 }
 
 async fn receive_drs_checkin(idx: u64, anchor: u64, sig_hex: String) {
@@ -14460,7 +14931,7 @@ pub async fn dht_register_cid(cid: &str, holder_addr: &str, endpoint: &str) {
     let key = format!("ego-cid:{}", cid);
     if let Ok(v) = serde_json::to_vec(&record) {
         if let Some(tx) = DHT_CMD_TX.get() {
-            let _ = tx.send(DhtCommand::PutPeer { key, value: v });
+            let _ = tx.try_send(DhtCommand::PutPeer { key, value: v });
         }
     }
 }
@@ -14468,7 +14939,7 @@ pub async fn dht_register_cid(cid: &str, holder_addr: &str, endpoint: &str) {
 pub async fn dht_find_cid(cid: &str) {
     let key = format!("ego-cid:{}", cid);
     if let Some(tx) = DHT_CMD_TX.get() {
-        let _ = tx.send(DhtCommand::GetPeers { key });
+        let _ = tx.try_send(DhtCommand::GetPeers { key });
     }
 }
 
@@ -14522,7 +14993,7 @@ pub async fn restore_dht_cache() {
     for (key, val) in &map {
         if let Some(b64) = val.as_str() {
             if let Ok(value) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                let _ = tx.send(DhtCommand::PutPeer { key: key.clone(), value });
+                let _ = tx.try_send(DhtCommand::PutPeer { key: key.clone(), value });
                 count += 1;
             }
         }
@@ -14548,14 +15019,14 @@ pub async fn dht_publish_self(address: &str, endpoint: &str, name: &str) {
 
     save_dht_record_to_cache(&key, &value);
     if let Some(tx) = DHT_CMD_TX.get() {
-        let _ = tx.send(DhtCommand::PutPeer { key, value });
+        let _ = tx.try_send(DhtCommand::PutPeer { key, value });
     }
 }
 
 pub async fn dht_discover_peers() {
     let key = "ego-peers-v1".to_string();
     if let Some(tx) = DHT_CMD_TX.get() {
-        let _ = tx.send(DhtCommand::GetPeers { key });
+        let _ = tx.try_send(DhtCommand::GetPeers { key });
     }
 }
 
@@ -14566,7 +15037,7 @@ pub async fn dht_discover_relays() {
     if let Ok(data) = std::fs::read(&cache_path) {
         if let Ok(map) = serde_json::from_slice::<std::collections::HashMap<String, String>>(&data) {
             for key in map.keys().filter(|k| k.starts_with("ego-relay:")) {
-                let _ = tx.send(DhtCommand::GetPeers { key: key.clone() });
+                let _ = tx.try_send(DhtCommand::GetPeers { key: key.clone() });
             }
         }
     }
@@ -14600,7 +15071,7 @@ pub async fn dht_inbox_deposit(from_addr: &str, to_addr: &str, msg: &P2PMessage)
     };
     save_dht_record_to_cache(&key, &value);
     if let Some(tx) = DHT_CMD_TX.get() {
-        let _ = tx.send(DhtCommand::PutPeer { key, value });
+        let _ = tx.try_send(DhtCommand::PutPeer { key, value });
         eprintln!("[DHT-Inbox] Deposited message for {} in DHT", &to_addr[..12.min(to_addr.len())]);
     }
 }
@@ -14618,12 +15089,12 @@ pub async fn dht_inbox_poll(my_addr: &str) {
 
     let Some(tx) = DHT_CMD_TX.get() else { return };
 
-    let _ = tx.send(DhtCommand::GetPeers { key: doorbell_key(my_addr) });
+    let _ = tx.try_send(DhtCommand::GetPeers { key: doorbell_key(my_addr) });
 
     let mut queried = 0;
     for key in map.keys() {
         if key.starts_with(&my_prefix) {
-            let _ = tx.send(DhtCommand::GetPeers { key: key.clone() });
+            let _ = tx.try_send(DhtCommand::GetPeers { key: key.clone() });
             queried += 1;
         }
     }
@@ -14896,7 +15367,7 @@ pub async fn dht_publish_shard_assignments(address: &str, endpoint: &str) {
         });
         if let Ok(v) = serde_json::to_vec(&value) {
             if let Some(tx) = DHT_CMD_TX.get() {
-                let _ = tx.send(DhtCommand::PutPeer { key, value: v });
+                let _ = tx.try_send(DhtCommand::PutPeer { key, value: v });
             }
         }
     }
@@ -14905,7 +15376,7 @@ pub async fn dht_publish_shard_assignments(address: &str, endpoint: &str) {
 pub async fn dht_query_shard_holders(shard_id: u32) {
     let key = format!("ego-shard:{}", shard_id);
     if let Some(tx) = DHT_CMD_TX.get() {
-        let _ = tx.send(DhtCommand::GetPeers { key });
+        let _ = tx.try_send(DhtCommand::GetPeers { key });
     }
 }
 
@@ -14980,7 +15451,7 @@ pub async fn get_relay_endpoint(address: &str) -> Option<String> {
         }
     }
 
-    None
+    dht_endpoint(address)
 }
 
 #[cfg(target_os = "windows")]

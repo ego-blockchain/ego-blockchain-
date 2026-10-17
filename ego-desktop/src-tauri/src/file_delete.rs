@@ -223,7 +223,7 @@ pub async fn broadcast(notice: &DeleteNotice) {
         crate::p2p::publish_gossip("ego-shards-v1", data).await;
     }
     if let (Some(tx), Ok(value)) = (crate::p2p::DHT_CMD_TX.get(), serde_json::to_vec(notice)) {
-        let _ = tx.send(crate::p2p::DhtCommand::PutPeer { key: dht_key(&notice.owner, &notice.cid), value });
+        let _ = tx.try_send(crate::p2p::DhtCommand::PutPeer { key: dht_key(&notice.owner, &notice.cid), value });
     }
     // Directly to every peer we know: replicas may not be in the gossip mesh yet.
     let peers = tokio::task::spawn_blocking(crate::p2p::load_peer_cache).await.unwrap_or_default();
@@ -287,7 +287,7 @@ pub fn may_promote(owner: &str, cid: &str, now: i64) -> bool {
         None => {
             asked.insert(k, now);
             if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
-                let _ = tx.send(crate::p2p::DhtCommand::GetPeers { key: dht_key(owner, cid) });
+                let _ = tx.try_send(crate::p2p::DhtCommand::GetPeers { key: dht_key(owner, cid) });
             }
             false
         }

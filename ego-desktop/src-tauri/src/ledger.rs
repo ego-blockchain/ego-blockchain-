@@ -2086,6 +2086,10 @@ pub fn tx_signing_bytes_v3(tx: &LedgerTx) -> Vec<u8> {
 }
 
 pub fn seal_tx(tx: &mut LedgerTx, kp: &ego_core::KeyPair, with_dilithium: bool) {
+    let network_now = crate::clock::now();
+    if (tx.timestamp - network_now).abs() > 300 {
+        tx.timestamp = network_now;
+    }
     if tx.tx_version == 0 {
         tx.tx_version = signing_tx_version();
     }

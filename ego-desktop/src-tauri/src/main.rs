@@ -26,6 +26,7 @@ mod blocks;
 mod ecvrf;
 mod chain_db;
 mod drs;
+mod history;
 mod storage_pay;
 mod contract_exec;
 mod dao_chat;
@@ -1643,7 +1644,7 @@ fn main() {
                     let ep3 = crate::p2p::get_public_endpoint().await;
                     bounded!(15, crate::p2p::dht_publish_shard_assignments(&ledger_addr, &ep3));
                     bounded!(15, crate::p2p::broadcast_vacancy_notices());
-                    crate::sharding::prune_observer_shards(&ledger_addr);
+                    bounded!(120, crate::p2p::history_tick());
                 }
             });
 

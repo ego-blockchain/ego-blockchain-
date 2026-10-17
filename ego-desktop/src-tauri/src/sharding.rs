@@ -382,30 +382,6 @@ pub fn should_volunteer_for_shard(shard_id: u32, my_address: &str, map: &ShardMa
     my_count <= avg
 }
 
-pub fn prune_observer_shards(my_address: &str) {
-    let map = load_shard_map();
-    if map.shard_count <= 1 { return; }
-
-    let now = chrono::Utc::now().timestamp();
-    let all_nodes: Vec<String> = map.assignments.iter()
-        .map(|a| a.node_address.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter().collect();
-
-    let my_shard_ids: Vec<u32> = my_shards(my_address, &map, &all_nodes)
-        .into_iter().map(|(id, _)| id).collect();
-
-    for shard_id in 0..map.shard_count {
-        if my_shard_ids.contains(&shard_id) { continue; }
-        let live_holders = map.assignments.iter()
-            .filter(|a| a.shard_id == shard_id && now - a.last_seen < 300)
-            .count() as u32;
-        if live_holders >= REPLICATION_FACTOR {
-            crate::chain_db::delete_full_blocks_for_shard(shard_id, map.shard_count);
-        }
-    }
-}
-
 pub fn get_shard_master(shard_id: u32) -> Option<String> {
     let map = load_shard_map();
     if map.shard_count <= 1 {

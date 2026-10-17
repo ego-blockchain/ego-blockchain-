@@ -172,6 +172,10 @@ impl<'a> Ov<'a> {
         if let Some(v) = self.map.get(key) {
             return v.clone();
         }
+        self.committed(key)
+    }
+
+    fn committed(&self, key: &[u8]) -> Option<Vec<u8>> {
         match self.db {
             Some(db) => {
                 let cf = db.cf_handle(CF_META)?;
@@ -179,6 +183,23 @@ impl<'a> Ov<'a> {
             }
             None => self.base.get(key).cloned(),
         }
+    }
+
+    pub fn undo_record(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for key in self.map.keys() {
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            out.extend_from_slice(key);
+            match self.committed(key) {
+                Some(v) => {
+                    out.push(1);
+                    out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&v);
+                }
+                None => out.push(0),
+            }
+        }
+        out
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
@@ -215,6 +236,20 @@ impl<'a> Ov<'a> {
     }
 
     #[cfg(test)]
+    pub fn restore_memory(&mut self, undo: &[u8]) {
+        for (k, v) in read_undo(undo).expect("a well-formed undo record") {
+            match v {
+                Some(v) => {
+                    self.base.insert(k, v);
+                }
+                None => {
+                    self.base.remove(&k);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub fn commit_memory(&mut self) {
         for (k, v) in std::mem::take(&mut self.map) {
             match v {
@@ -238,6 +273,30 @@ impl<'a> Ov<'a> {
             }
         }
     }
+}
+
+pub fn read_undo(bytes: &[u8]) -> Option<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    fn take<'b>(bytes: &'b [u8], i: &mut usize, n: usize) -> Option<&'b [u8]> {
+        let s = bytes.get(*i..i.checked_add(n)?)?;
+        *i += n;
+        Some(s)
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let kl = u32::from_le_bytes(take(bytes, &mut i, 4)?.try_into().ok()?) as usize;
+        let k = take(bytes, &mut i, kl)?.to_vec();
+        let v = match take(bytes, &mut i, 1)?[0] {
+            1 => {
+                let vl = u32::from_le_bytes(take(bytes, &mut i, 4)?.try_into().ok()?) as usize;
+                Some(take(bytes, &mut i, vl)?.to_vec())
+            }
+            0 => None,
+            _ => return None,
+        };
+        out.push((k, v));
+    }
+    Some(out)
 }
 
 impl NodeRec {
@@ -934,39 +993,47 @@ pub fn rota_position(ov: &Ov, epoch: u64, addr: &str) -> Option<(usize, String)>
     Some((pos, rota.seed))
 }
 
-pub fn migrate(db: &DB, registrations: Vec<(u64, String, String)>) {
+pub fn migrate(db: &DB, mut blocks: Vec<(u64, i64, Vec<LedgerTx>)>) {
     let mut ov = Ov::new(db);
     if ov.get(KEY_MIGRATED).is_some() {
         return;
     }
-    let mut first: BTreeMap<String, (u64, String)> = BTreeMap::new();
-    for (height, hash, addr) in registrations {
-        let e = first.entry(addr).or_insert((height, hash.clone()));
-        if (height, &hash) < (e.0, &e.1) {
-            *e = (height, hash);
-        }
-    }
-    let mut ordered: Vec<(u64, String, String)> = first.into_iter().map(|(a, (h, x))| (h, x, a)).collect();
-    ordered.sort();
-    for (_, _, addr) in ordered {
-        if load_rec(&ov, &addr).is_some() {
-            continue;
-        }
-        let idx = node_count(&ov);
-        ov.put(KEY_COUNT.to_vec(), u64_le(idx + 1).to_vec());
-        ov.put(addr_key(idx), addr.as_bytes().to_vec());
-        let rec = NodeRec { idx, ..NodeRec::default() };
-        save_rec(&mut ov, &addr, &rec);
-    }
+    replay_registrations(&mut ov, &mut blocks);
     ov.put(KEY_MIGRATED.to_vec(), b"1".to_vec());
     let mut batch = WriteBatch::default();
     ov.flush(&mut batch);
     let _ = db.write(batch);
 }
 
+fn replay_registrations(ov: &mut Ov, blocks: &mut [(u64, i64, Vec<LedgerTx>)]) {
+    blocks.sort_by_key(|(h, _, _)| *h);
+    for (height, at, txs) in blocks.iter() {
+        let refs: Vec<&LedgerTx> = txs.iter().collect();
+        apply_registrations(ov, &refs, *at, period_of(*height));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_undo_record_puts_every_touched_key_back() {
+        let mut ov = Ov::memory();
+        ov.put(b"n2a".to_vec(), b"1".to_vec());
+        ov.put(b"n2b".to_vec(), b"2".to_vec());
+        ov.commit_memory();
+        ov.put(b"n2a".to_vec(), b"9".to_vec());
+        ov.del(b"n2b".to_vec());
+        ov.put(b"n2c".to_vec(), b"3".to_vec());
+        let undo = ov.undo_record();
+        ov.commit_memory();
+        ov.restore_memory(&undo);
+        assert_eq!(ov.get(b"n2a"), Some(b"1".to_vec()));
+        assert_eq!(ov.get(b"n2b"), Some(b"2".to_vec()));
+        assert_eq!(ov.get(b"n2c"), None);
+        assert!(read_undo(&undo[..undo.len() - 1]).is_none(), "a cut-off record is refused");
+    }
 
     #[test]
     fn a_weight_set_in_one_period_only_counts_from_the_next() {

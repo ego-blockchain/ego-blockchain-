@@ -98,7 +98,7 @@ fn block_cid_of(sealed: &[u8]) -> String {
 
 fn publish(key: String, value: Vec<u8>) {
     if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
-        let _ = tx.send(crate::p2p::DhtCommand::PutPeer { key, value });
+        let _ = tx.try_send(crate::p2p::DhtCommand::PutPeer { key, value });
     }
 }
 
@@ -257,7 +257,7 @@ async fn get_block(params: &Value) -> RpcResult {
         Some(sealed) => Ok(json!({ "data": base64::engine::general_purpose::STANDARD.encode(sealed) })),
         None => {
             if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
-                let _ = tx.send(crate::p2p::DhtCommand::GetPeers { key: format!("ego-block:{cid}") });
+                let _ = tx.try_send(crate::p2p::DhtCommand::GetPeers { key: format!("ego-block:{cid}") });
             }
             Ok(json!({ "pending": true }))
         }
@@ -281,7 +281,7 @@ async fn get_manifest(params: &Value) -> RpcResult {
         })),
         _ => {
             if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
-                let _ = tx.send(crate::p2p::DhtCommand::GetPeers { key: format!("ego-manifest:{cid}") });
+                let _ = tx.try_send(crate::p2p::DhtCommand::GetPeers { key: format!("ego-manifest:{cid}") });
             }
             Ok(json!({ "pending": true }))
         }

@@ -127,9 +127,20 @@ pub fn get_db() -> DbWrapper {
         } else {
             db
         };
+        let db = if derived_state_needs_resync(&db) {
+            eprintln!("[ChainDB] this node joined from a snapshot, so its node records cannot be checked against its own history — downloading the chain again");
+            drop(db);
+            wipe_local_chain(&db_path);
+            open_chain_db(&db_path)
+        } else {
+            db
+        };
         stamp_rules_version(&db);
         migrate_drs_index(&db);
         migrate_drs_v2(&db);
+        migrate_faucet_totals(&db);
+        rebuild_derived_state_once(&db);
+        migrate_history_index(&db);
         db
     }))
 }
@@ -1321,7 +1332,15 @@ pub fn admitted_joiners(registrations: &[(String, u64)], boundary: u64, epoch: u
     admitted
 }
 
+fn faucet_total_key(address: &str) -> Vec<u8> {
+    format!("ftotal:{address}").into_bytes()
+}
+
 fn faucet_total_to_in(db: &DB, address: &str) -> u64 {
+    drs_meta(db, &faucet_total_key(address)).map(|v| read_u64_le(&v)).unwrap_or(0)
+}
+
+fn faucet_total_from_history_in(db: &DB, address: &str) -> u64 {
     let (Some(cf_addr), Some(cf_txs)) = (db.cf_handle(CF_ADDR_TXS), db.cf_handle(CF_TXS)) else { return 0 };
     let mut prefix = address.as_bytes().to_vec();
     prefix.push(b':');
@@ -2532,6 +2551,20 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             batch.put_cf(cf_meta, faucet_mark_key(addr), u64_le(*mark));
         }
     }
+    {
+        let mut totals: std::collections::BTreeMap<String, u64> = Default::default();
+        for tx in &fresh_txs {
+            if tx.tx_type == "faucet" && tx.from == NODE_POOL_ADDR {
+                let base = *totals.entry(tx.to.clone()).or_insert_with(|| {
+                    drs_ov.get(&faucet_total_key(&tx.to)).map(|v| read_u64_le(&v)).unwrap_or(0)
+                });
+                totals.insert(tx.to.clone(), base.saturating_add(tx.amount));
+            }
+        }
+        for (addr, total) in totals {
+            drs_ov.put(faucet_total_key(&addr), u64_le(total).to_vec());
+        }
+    }
 
     // Persist validator stakes to CF_META so they survive restarts without O(N) scan
     for (addr, amount) in &stake_sim {
@@ -2571,6 +2604,11 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     crate::shielded_chain::apply_block(db, &mut batch, block.height, &fresh_txs);
     crate::market_chain::apply_plan(db, &mut batch, block.height, &market_plan);
 
+    crate::history::push(&mut drs_ov, block.height, &block.hash);
+    batch.put_cf(cf_meta, crate::history::undo_key(block.height), drs_ov.undo_record());
+    if block.height > crate::history::UNDO_KEEP {
+        batch.delete_cf(cf_meta, crate::history::undo_key(block.height - crate::history::UNDO_KEEP));
+    }
     drs_ov.flush(&mut batch);
     tracing::debug!("[ChainDB] db.write(batch) starting — block #{}", block.height);
     if let Err(e) = db.write(batch) {
@@ -3122,11 +3160,47 @@ pub const FAUCET_CAP_UEGOC: u64 = 5_000 * 1_000_000;
 
 /// Sum of all *confirmed* faucet grants ever received by `address`.
 pub fn get_faucet_total_uegoc(address: &str) -> u64 {
-    get_tx_history_for_addr(address)
-        .into_iter()
-        .filter(|tx| tx.tx_type == "faucet")
-        .map(|tx| tx.amount)
-        .sum()
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    faucet_total_to_in(&db, address)
+}
+
+pub(crate) fn migrate_faucet_totals(db: &DB) {
+    const FLAG: &[u8] = b"ftotal_v1";
+    if drs_meta(db, FLAG).is_some() {
+        return;
+    }
+    let Some(cf_txs) = db.cf_handle(CF_TXS) else { return };
+    let Some(cf_meta) = db.cf_handle(CF_META) else { return };
+    let mut receivers: std::collections::BTreeSet<String> = Default::default();
+    let mut iter = db.raw_iterator_cf(cf_txs);
+    iter.seek_to_first();
+    while iter.valid() {
+        if let Some(tx) = iter.value().and_then(decode::<LedgerTx>) {
+            if tx.tx_type == "faucet" && tx.from == NODE_POOL_ADDR {
+                receivers.insert(tx.to.clone());
+            }
+        }
+        iter.next();
+    }
+    let mut batch = WriteBatch::default();
+    for addr in receivers {
+        batch.put_cf(cf_meta, faucet_total_key(&addr), u64_le(faucet_total_from_history_in(db, &addr)));
+    }
+    batch.put_cf(cf_meta, FLAG, b"1");
+    let _ = db.write(batch);
+}
+
+pub const TX_MAX_AGE_SECS: i64 = 7 * 86_400;
+pub const TX_MAX_AHEAD_SECS: i64 = 86_400;
+
+pub fn generated_with_block(tx: &LedgerTx) -> bool {
+    tx.signature == "coinbase" && crate::ledger::is_reserved_system_source(&tx.from)
+}
+
+pub fn tx_age_ok(tx: &LedgerTx, block_ts: i64) -> bool {
+    generated_with_block(tx)
+        || (tx.timestamp >= block_ts.saturating_sub(TX_MAX_AGE_SECS)
+            && tx.timestamp <= block_ts.saturating_add(TX_MAX_AHEAD_SECS))
 }
 
 /// Amount from a faucet grant to `address` still sitting unconfirmed in the mempool.
@@ -4240,6 +4314,10 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         if crate::drs::is_batch_tx(tx) {
             return height >= CHECKIN_FROM_HEIGHT && tx.block_height == Some(height);
         }
+        if height >= CHECKIN_FROM_HEIGHT && !tx_age_ok(tx, timestamp) {
+            eprintln!("[TX] {:.12} Rejected — dated outside the {}-day window", tx.hash, TX_MAX_AGE_SECS / 86_400);
+            return false;
+        }
         if height >= CHECKIN_FROM_HEIGHT && is_free_housekeeping(tx) {
             if free_count >= MAX_FREE_TXS_PER_BLOCK {
                 held_back.push((*tx).clone());
@@ -4736,23 +4814,6 @@ fn is_system_emission_type(tx_type: &str) -> bool {
     ) || tx_type.contains("escrow")
 }
 
-/// Minimum spacing between operational reward credits to the same address
-/// (matches the honest client's hourly credit). Enforced in consensus so a
-/// modified validator can't self-issue a capped reward every block — bounding
-/// the M2 self-sizing drain to at most one cap per hour per validator.
-const OPERATIONAL_REWARD_MIN_INTERVAL_SECS: i64 = 3600;
-
-fn operational_reward_rate_ok(to: &str, ts: i64) -> bool {
-    let last = get_tx_history_for_addr(to).into_iter()
-        .filter(|t| t.tx_type == "reward" && t.from == NODE_POOL_ADDR && t.signature != "coinbase")
-        .map(|t| t.timestamp)
-        .max();
-    match last {
-        Some(prev) => ts - prev >= OPERATIONAL_REWARD_MIN_INTERVAL_SECS,
-        None => true,
-    }
-}
-
 fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), String> {
     if block.height > 0 && block.tx_count as usize != txs.len() {
         return Err(format!(
@@ -4896,11 +4957,6 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                 // block miner (no paying arbitrary addresses) and is bounded. This
                 // blocks the free-mint vector where any peer gossips a "reward" tx
                 // from the node pool to itself for an arbitrary amount.
-                let is_reward = tx.tx_type == "reward"
-                    && !block.miner.is_empty()
-                    && tx.to == block.miner
-                    && tx.amount <= crate::tokenomics::REWARD_CAP_PER_TX_UEGOC
-                    && operational_reward_rate_ok(&tx.to, tx.timestamp);
                 let is_unshield = tx.tx_type == crate::shielded_chain::TX_UNSHIELD
                     && tx.from == crate::shielded_chain::SHIELDED_POOL_ADDR;
                 let is_settle = tx.tx_type == crate::market_chain::TX_SETTLE
@@ -4911,7 +4967,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                 // recipient the rules check. Accepting any "emission type" bounded only by
                 // the pool's balance let a block producer pay itself the whole staking or
                 // node pool by naming the payment an escrow release.
-                if !is_reward && !is_unshield && !is_settle && !is_contributor_fee && !is_drs_batch {
+                if !is_unshield && !is_settle && !is_contributor_fee && !is_drs_batch {
                     return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
                 }
         } else {
@@ -5092,6 +5148,14 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
             validate_credits_tx(tx)?;
         } else if tx.tx_type == "credits_escrow" {
             validate_credits_escrow_tx(tx, block.timestamp)?;
+        }
+    }
+    if block.height >= CHECKIN_FROM_HEIGHT {
+        if let Some(tx) = txs.iter().find(|t| !tx_age_ok(t, block.timestamp)) {
+            return Err(format!(
+                "tx {} is dated {}, outside the {}-day window around its block",
+                tx.hash, tx.timestamp, TX_MAX_AGE_SECS / 86_400
+            ));
         }
     }
     if let Some(tx) = txs.iter().find(|t| t.tx_type == TX_UPTIME || t.tx_type == TX_UPTIME_REWARD) {
@@ -5370,49 +5434,6 @@ pub fn append_trusted_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     write_block_batch(&db, block, txs)
 }
 
-pub fn delete_full_blocks_for_shard(shard_id: u32, shard_count: u32) {
-    if shard_count <= 1 { return; }
-    // A validator has to be able to replay its own chain: block validation, the shielded
-    // pool rebuild and the transaction count all read history this would delete. Keeping a
-    // fraction of the blocks is for a node serving storage, not for one deciding what the
-    // chain says.
-    if crate::p2p::is_seated_validator() {
-        return;
-    }
-    // A node holding shielded state needs the blocks that state was built from. The rebuild
-    // that checks the pool against the chain refuses to run on a history with holes, and it
-    // is right to: replaying a pruned history silently undercounts the pool. But refusing
-    // leaves the pool unverifiable for ever, its withdrawals never validate, and the coins
-    // look sent while reaching nobody. Storage sharding is for nodes serving files, not for
-    // one that is also a shielded wallet.
-    if crate::shielded_chain::state().next_index > 0 {
-        return;
-    }
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf_blocks    = db.cf_handle(CF_BLOCKS).unwrap();
-    let cf_block_txs = db.cf_handle(CF_BLOCK_TXS).unwrap();
-    let cf_meta      = db.cf_handle(CF_META).unwrap();
-    let latest = db.get_cf(cf_meta, META_LATEST_HEIGHT)
-        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-
-    let mut heights_to_delete: Vec<u64> = Vec::new();
-    for h in 1..=latest {
-        if crate::sharding::shard_for_height(h, shard_count) == shard_id {
-            heights_to_delete.push(h);
-        }
-    }
-
-    if heights_to_delete.is_empty() { return; }
-
-    let mut batch = WriteBatch::default();
-    for h in &heights_to_delete {
-        batch.delete_cf(cf_blocks,    height_key(*h));
-        batch.delete_cf(cf_block_txs, height_key(*h));
-    }
-    let _ = db.write(batch);
-    tracing::info!("Pruned {} full blocks for shard {} (keeping light headers)", heights_to_delete.len(), shard_id);
-}
-
 fn reorg_reverse_balance_delta(tx: &LedgerTx, out: &mut std::collections::HashMap<String, i128>) {
     if tx.tx_type == "equivocation_proof" { return; }
     if crate::shielded_chain::reverse_balance_delta(tx, out) { return; }
@@ -5478,6 +5499,14 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
         eprintln!(
             "[Checkpoint] REJECTED reorg to height {} — at/below finality floor {} (long-range attack protection)",
             height, floor
+        );
+        return vec![];
+    }
+    let undo_records = undo_records_in(&db, height, tip);
+    let undo_missing = undo_records.is_none();
+    if undo_missing && tip >= CHECKIN_FROM_HEIGHT {
+        eprintln!(
+            "[Reorg] REJECTED reorg to height {height}: this node holds no record of how blocks {height}..={tip} changed node state, so it cannot rewind them. Resync from Settings instead."
         );
         return vec![];
     }
@@ -5607,7 +5636,16 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
         nonce_updates.push((addr.clone(), max_nonce));
     }
 
+    if let Some(records) = &undo_records {
+        apply_undo_records(&db, &mut batch, records);
+    }
+    for h in height..=tip {
+        batch.delete_cf(cf_meta, crate::history::undo_key(h));
+    }
     db.write(batch).expect("truncate write");
+    if undo_missing && !rebuild_derived_state(&db) {
+        eprintln!("[Reorg] node records could not be rebuilt after the rewind to {height}: this node's history is incomplete");
+    }
 
     for (addr, max_nonce) in nonce_updates {
         crate::ledger::set_confirmed_nonce(&addr, max_nonce);
@@ -9975,6 +10013,9 @@ const LOCAL_META_KEYS: &[&[u8]] = &[
     b"bls_reg_backfilled",
     b"drs_index_v1",
     b"n2migrated",
+    b"ftotal_v1",
+    b"bhx_v1",
+    b"derived_rebuilt_v3",
     b"finalized_height",
     b"chain_graduated",
     b"known_validators_v1",
@@ -9985,7 +10026,7 @@ const LOCAL_META_KEYS: &[&[u8]] = &[
     b"rules_version",
     b"slashed_validators",
 ];
-const LOCAL_META_PREFIXES: &[&[u8]] = &[b"pvotes:", b"validator_bls:"];
+const LOCAL_META_PREFIXES: &[&[u8]] = &[b"pvotes:", b"validator_bls:", b"hu:", b"hpr:"];
 
 fn is_local_meta(key: &[u8]) -> bool {
     LOCAL_META_KEYS.iter().any(|k| *k == key) || LOCAL_META_PREFIXES.iter().any(|p| key.starts_with(p))
@@ -10195,19 +10236,357 @@ pub(crate) fn migrate_drs_v2(db: &DB) {
     if drs_meta(db, b"n2migrated").is_some() {
         return;
     }
-    let Some(cf_txs) = db.cf_handle(CF_TXS) else { return };
-    let mut regs: Vec<(u64, String, String)> = Vec::new();
-    let mut iter = db.raw_iterator_cf(cf_txs);
-    iter.seek_to_first();
-    while iter.valid() {
-        if let Some(tx) = iter.value().and_then(decode::<LedgerTx>) {
-            if let Some((addr, _)) = parse_validator_registration(&tx) {
-                regs.push((tx.block_height.unwrap_or(0), tx.hash.clone(), addr));
+    let tip = local_chain_height_in(db);
+    let mut blocks: Vec<(u64, i64, Vec<LedgerTx>)> = Vec::new();
+    for h in 1..=tip {
+        let regs: Vec<LedgerTx> = txs_for_block_in(db, h)
+            .into_iter()
+            .filter(|t| parse_validator_registration(t).is_some())
+            .collect();
+        if !regs.is_empty() {
+            blocks.push((h, block_ts_at_in(db, h).unwrap_or(0), regs));
+        }
+    }
+    crate::drs::migrate(db, blocks);
+}
+
+fn history_complete_in(db: &DB, tip: u64) -> bool {
+    let floor = db
+        .cf_handle(CF_META)
+        .and_then(|m| db.get_cf(m, META_PRUNE_BELOW).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(1);
+    floor <= 1 && (1..=tip).all(|h| history_piece_in(db, h).is_some())
+}
+
+fn undo_records_in(db: &DB, height: u64, tip: u64) -> Option<Vec<Vec<u8>>> {
+    let cf = db.cf_handle(CF_META)?;
+    (height..=tip)
+        .rev()
+        .map(|h| db.get_cf(cf, crate::history::undo_key(h)).ok().flatten().map(|u| u.to_vec()))
+        .collect()
+}
+
+fn apply_undo_records(db: &DB, batch: &mut WriteBatch, records: &[Vec<u8>]) {
+    let Some(cf) = db.cf_handle(CF_META) else { return };
+    for record in records {
+        for (k, v) in crate::drs::read_undo(record).unwrap_or_default() {
+            match v {
+                Some(v) => batch.put_cf(cf, &k, &v),
+                None => batch.delete_cf(cf, &k),
             }
         }
-        iter.next();
     }
-    crate::drs::migrate(db, regs);
+}
+
+const DERIVED_PREFIXES: &[&[u8]] = &[b"n2", b"bhr:", b"ftotal:"];
+const DERIVED_KEYS: &[&[u8]] = &[b"bhf", b"bhx_v1", b"ftotal_v1"];
+
+pub(crate) fn rebuild_derived_state(db: &DB) -> bool {
+    let tip = local_chain_height_in(db);
+    if tip >= CHECKIN_FROM_HEIGHT || !history_complete_in(db, tip) {
+        return false;
+    }
+    let Some(cf_meta) = db.cf_handle(CF_META) else { return false };
+    let mut batch = WriteBatch::default();
+    for prefix in DERIVED_PREFIXES {
+        for item in db.prefix_iterator_cf(cf_meta, prefix) {
+            let Ok((k, _)) = item else { break };
+            if !k.starts_with(prefix) {
+                break;
+            }
+            batch.delete_cf(cf_meta, &k);
+        }
+    }
+    for key in DERIVED_KEYS {
+        batch.delete_cf(cf_meta, key);
+    }
+    if db.write(batch).is_err() {
+        return false;
+    }
+    migrate_drs_v2(db);
+    migrate_faucet_totals(db);
+    migrate_history_index(db);
+    true
+}
+
+const DERIVED_REBUILT_FLAG: &[u8] = b"derived_rebuilt_v3";
+
+fn derived_state_needs_resync(db: &DB) -> bool {
+    if drs_meta(db, DERIVED_REBUILT_FLAG).is_some() {
+        return false;
+    }
+    let tip = local_chain_height_in(db);
+    tip > 0 && tip < CHECKIN_FROM_HEIGHT && !history_complete_in(db, tip)
+}
+
+fn rebuild_derived_state_once(db: &DB) {
+    const FLAG: &[u8] = DERIVED_REBUILT_FLAG;
+    if drs_meta(db, FLAG).is_some() {
+        return;
+    }
+    if rebuild_derived_state(db) {
+        eprintln!("[ChainDB] node records, faucet totals and the block index were rebuilt from this node's history");
+    }
+    if let Some(cf) = db.cf_handle(CF_META) {
+        let _ = db.put_cf(cf, FLAG, b"1");
+    }
+}
+
+pub(crate) fn migrate_history_index(db: &DB) {
+    const FLAG: &[u8] = b"bhx_v1";
+    if drs_meta(db, FLAG).is_some() {
+        return;
+    }
+    let Some(cf_meta) = db.cf_handle(CF_META) else { return };
+    let tip = local_chain_height_in(db);
+    let mut ov = crate::drs::Ov::new(db);
+    crate::history::push(&mut ov, 0, GENESIS_HASH);
+    for h in 1..=tip {
+        if let Some(hash) = block_hash_at_in(db, h) {
+            crate::history::push(&mut ov, h, &hash);
+        }
+    }
+    let mut batch = WriteBatch::default();
+    ov.flush(&mut batch);
+    batch.put_cf(cf_meta, FLAG, b"1");
+    let _ = db.write(batch);
+}
+
+fn history_piece_in(db: &DB, height: u64) -> Option<(LedgerBlock, Vec<LedgerTx>)> {
+    let cf = db.cf_handle(CF_BLOCKS)?;
+    let block = db.get_cf(cf, height_key(height)).ok().flatten().and_then(|v| decode::<LedgerBlock>(&v))?;
+    let txs = txs_for_block_in(db, height);
+    (txs.len() as u64 == block.tx_count as u64).then_some((block, txs))
+}
+
+fn history_chunk_present_in(db: &DB, chunk: u64) -> bool {
+    let range = crate::history::chunk_heights(chunk);
+    history_piece_in(db, range.start.max(1)).is_some() && history_piece_in(db, range.end - 1).is_some()
+}
+
+pub fn history_probe_answers(nonce: &str, holder: &str, heights: &[u64]) -> Vec<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    heights
+        .iter()
+        .map(|h| {
+            history_piece_in(&db, *h)
+                .map(|(b, t)| crate::history::probe_answer(nonce, holder, &crate::history::piece_digest(&b, &t)))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn history_chunk_hashes_in(db: &DB, chunk: u64) -> Option<Vec<String>> {
+    static CACHE: std::sync::Mutex<Vec<(u64, Vec<String>)>> = std::sync::Mutex::new(Vec::new());
+    if let Some((_, h)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(c, _)| *c == chunk) {
+        return Some(h.clone());
+    }
+    let cf_hdrs = db.cf_handle(CF_HEADERS)?;
+    let hashes: Option<Vec<String>> = crate::history::chunk_heights(chunk)
+        .map(|h| {
+            if h == 0 {
+                return Some(GENESIS_HASH.to_string());
+            }
+            db.get_cf(cf_hdrs, height_key(h))
+                .ok()
+                .flatten()
+                .and_then(|v| decode::<LightBlockHeader>(&v))
+                .map(|x| x.hash)
+                .or_else(|| block_hash_at_in(db, h))
+        })
+        .collect();
+    let hashes = hashes?;
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 4 {
+        cache.remove(0);
+    }
+    cache.push((chunk, hashes.clone()));
+    Some(hashes)
+}
+
+pub fn history_serve(from: u64, count: u64) -> Vec<crate::history::HistoryPiece> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    history_serve_in(&db, from, count)
+}
+
+fn history_serve_in(db: &DB, from: u64, count: u64) -> Vec<crate::history::HistoryPiece> {
+    let chunk = crate::history::chunk_of(from);
+    let end = from
+        .saturating_add(count.min(crate::history::FETCH_BATCH))
+        .min(crate::history::chunk_heights(chunk).end);
+    let Some(hashes) = history_chunk_hashes_in(db, chunk) else { return Vec::new() };
+    (from.max(1)..end)
+        .filter_map(|h| {
+            let (block, txs) = history_piece_in(db, h)?;
+            let path = crate::history::path_for(&hashes, h % crate::history::CHUNK)?;
+            Some(crate::history::HistoryPiece { height: h, block, txs, path })
+        })
+        .collect()
+}
+
+pub fn history_root(chunk: u64) -> Option<[u8; 32]> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::history::chunk_root(&crate::drs::Ov::new(&db), chunk)
+}
+
+pub fn history_holders(shard: u64, shards: u64, at: i64, rotate: u64, limit: usize, skip: Vec<String>) -> Vec<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::history::holders(&crate::drs::Ov::new(&db), shard, shards, at, rotate, limit, &skip)
+}
+
+pub fn history_first_missing(chunk: u64, from: u64) -> Option<u64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let range = crate::history::chunk_heights(chunk);
+    (from.max(range.start).max(1)..range.end).find(|h| history_piece_in(&db, *h).is_none())
+}
+
+pub fn history_store(pieces: &[crate::history::HistoryPiece]) -> usize {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    history_store_in(&db, pieces)
+}
+
+fn history_store_in(db: &DB, pieces: &[crate::history::HistoryPiece]) -> usize {
+    let (Some(cf_blocks), Some(cf_hdrs), Some(cf_txs), Some(cf_block_txs)) = (
+        db.cf_handle(CF_BLOCKS),
+        db.cf_handle(CF_HEADERS),
+        db.cf_handle(CF_TXS),
+        db.cf_handle(CF_BLOCK_TXS),
+    ) else {
+        return 0;
+    };
+    let mut batch = WriteBatch::default();
+    let mut stored = 0usize;
+    for p in pieces {
+        if p.height == 0 || history_piece_in(db, p.height).is_some() {
+            continue;
+        }
+        batch.put_cf(cf_blocks, height_key(p.height), encode(&p.block));
+        batch.put_cf(cf_hdrs, height_key(p.height), encode(&LightBlockHeader::from(&p.block)));
+        for (i, tx) in p.txs.iter().enumerate() {
+            if db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_none() {
+                let mut t = tx.clone();
+                t.status = "Confirmed".to_string();
+                t.block_height = Some(p.height);
+                batch.put_cf(cf_txs, tx.hash.as_bytes(), encode(&t));
+            }
+            batch.put_cf(cf_block_txs, block_txs_key(p.height, &tx.hash), (i as u32).to_be_bytes());
+        }
+        stored += 1;
+    }
+    if db.write(batch).is_err() {
+        return 0;
+    }
+    stored
+}
+
+pub fn history_mark_held(chunk: u64) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cf) = db.cf_handle(CF_META) {
+        let _ = db.delete_cf(cf, crate::history::pruned_key(chunk));
+    }
+}
+
+pub fn history_prune_chunk(chunk: u64, keep: &std::collections::HashSet<String>) -> usize {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    history_prune_chunk_in(&db, chunk, keep)
+}
+
+fn history_prune_chunk_in(db: &DB, chunk: u64, keep: &std::collections::HashSet<String>) -> usize {
+    let (Some(cf_blocks), Some(cf_hdrs), Some(cf_txs), Some(cf_block_txs), Some(cf_addr_txs), Some(cf_recent), Some(cf_meta)) = (
+        db.cf_handle(CF_BLOCKS),
+        db.cf_handle(CF_HEADERS),
+        db.cf_handle(CF_TXS),
+        db.cf_handle(CF_BLOCK_TXS),
+        db.cf_handle(CF_ADDR_TXS),
+        db.cf_handle(CF_RECENT_TXS),
+        db.cf_handle(CF_META),
+    ) else {
+        return 0;
+    };
+    let mut batch = WriteBatch::default();
+    let mut removed = 0usize;
+    for h in crate::history::chunk_heights(chunk) {
+        if h == 0 {
+            continue;
+        }
+        let prefix = height_key(h);
+        for item in db.prefix_iterator_cf(cf_block_txs, prefix) {
+            let Ok((k, _)) = item else { break };
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            batch.delete_cf(cf_block_txs, &k);
+            let Some(hash) = k.get(8..).and_then(|b| std::str::from_utf8(b).ok()).filter(|s| !s.is_empty()) else { continue };
+            let Some(tx) = db.get_cf(cf_txs, hash.as_bytes()).ok().flatten().and_then(|v| decode::<LedgerTx>(&v)) else { continue };
+            if keep.contains(&tx.from) || keep.contains(&tx.to) {
+                continue;
+            }
+            batch.delete_cf(cf_txs, hash.as_bytes());
+            let mut owners = vec![tx.to.as_str(), tx.from.as_str()];
+            if is_unstake_tx(&tx) || tx.tx_type == "equivocation_proof" {
+                owners.push(STAKING_ADDR);
+            }
+            for owner in owners.into_iter().filter(|a| !a.is_empty()) {
+                batch.delete_cf(cf_addr_txs, addr_txs_key(owner, tx.timestamp, hash));
+                batch.delete_cf(cf_addr_txs, old_addr_txs_key(owner, tx.timestamp, hash));
+            }
+            batch.delete_cf(cf_recent, recent_txs_key(tx.timestamp, hash));
+            removed += 1;
+        }
+        batch.delete_cf(cf_blocks, height_key(h));
+        batch.delete_cf(cf_hdrs, height_key(h));
+    }
+    batch.put_cf(cf_meta, crate::history::pruned_key(chunk), b"1");
+    if db.write(batch).is_err() {
+        return 0;
+    }
+    removed
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HistoryPlan {
+    pub shards: u64,
+    pub floor: u64,
+    pub at: i64,
+    pub prune: Vec<u64>,
+    pub backfill: Option<u64>,
+}
+
+pub fn history_plan(me: &str, archive: bool, contract_height: Option<u64>) -> HistoryPlan {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf_meta) = db.cf_handle(CF_META) else { return HistoryPlan::default() };
+    let tip = local_chain_height_in(&db);
+    let at = block_ts_at_in(&db, tip).unwrap_or(0);
+    let ov = crate::drs::Ov::new(&db);
+    let shards = crate::history::shard_count(crate::drs::eligible_count(&ov, crate::drs::period_of(tip + 1)));
+    let floor = crate::history::recent_floor(tip, at, |h| block_ts_at_in(&db, h), contract_height);
+    let home = crate::drs::load_rec(&ov, me).map(|r| crate::history::home_shard(r.idx, shards));
+    let mut plan = HistoryPlan { shards, floor, at, ..HistoryPlan::default() };
+    let mut absent = WriteBatch::default();
+    for chunk in 0..floor / crate::history::CHUNK {
+        if !crate::history::prunable(chunk, floor) {
+            break;
+        }
+        let pruned = db.get_cf(cf_meta, crate::history::pruned_key(chunk)).ok().flatten().is_some();
+        let mine = archive || home == Some(crate::history::shard_of_chunk(chunk, shards));
+        if mine {
+            if plan.backfill.is_none()
+                && (pruned || !history_chunk_present_in(&db, chunk))
+                && crate::history::chunk_root(&ov, chunk).is_some()
+            {
+                plan.backfill = Some(chunk);
+            }
+        } else if shards > 1 && !pruned {
+            if !history_chunk_present_in(&db, chunk) {
+                absent.put_cf(cf_meta, crate::history::pruned_key(chunk), b"1");
+            } else if plan.prune.len() < 2 {
+                plan.prune.push(chunk);
+            }
+        }
+    }
+    let _ = db.write(absent);
+    plan
 }
 
 pub(crate) fn rules_need_resync(db: &DB) -> bool {
@@ -10226,6 +10605,164 @@ pub(crate) fn rules_need_resync(db: &DB) -> bool {
 pub(crate) fn stamp_rules_version(db: &DB) {
     if let Some(cf) = db.cf_handle(CF_META) {
         let _ = db.put_cf(cf, META_RULES_VERSION, u64_le(RULES_VERSION));
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn scratch_db(tag: &str) -> (DB, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ego-history-{tag}-{}-{}", std::process::id(), rand::random::<u32>()));
+        let db = open_chain_db(&dir);
+        migrate_history_index(&db);
+        migrate_drs_v2(&db);
+        (db, dir)
+    }
+
+    fn derived(db: &DB) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let cf = db.cf_handle(CF_META).unwrap();
+        db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .filter_map(|r| r.ok())
+            .filter(|(k, _)| DERIVED_PREFIXES.iter().any(|p| k.starts_with(p)) || k.as_ref() == b"bhf")
+            .filter(|(k, _)| k.as_ref() != b"n2migrated")
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect()
+    }
+
+    fn registration(seed: u8) -> LedgerTx {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let pk = sk.verifying_key();
+        let from = ego_core::EgoAddress::from_public_key_bytes(pk.as_bytes(), 1, ego_core::AddressType::EOA)
+            .to_bech32("egot")
+            .unwrap();
+        let bls = crate::bls_agg::derive_bls_key(&[seed; 32]);
+        let bls_pk = crate::bls_agg::bls_pubkey(&bls);
+        let bind = sk.sign(&bls_pk);
+        LedgerTx {
+            hash: format!("0x{:064x}", seed),
+            from,
+            tx_type: "validator_register".into(),
+            chain_id: 1,
+            public_key_ed25519: hex::encode(pk.as_bytes()),
+            memo: Some(format!("valreg:{}:{}", hex::encode(&bls_pk), hex::encode(bind.to_bytes()))),
+            call_args: serde_json::json!({ "bls_pop": hex::encode(crate::bls_agg::pop_sign(&bls)) }).to_string(),
+            ..LedgerTx::default()
+        }
+    }
+
+    fn commit(db: &DB, height: u64, txs: &[LedgerTx]) {
+        let txs: Vec<LedgerTx> = txs
+            .iter()
+            .cloned()
+            .map(|mut t| {
+                t.block_height = Some(height);
+                t.timestamp = 1_700_000_000 + height as i64 * 1_200;
+                t
+            })
+            .collect();
+        let hashes: Vec<&str> = txs.iter().map(|t| t.hash.as_str()).collect();
+        let mut block = LedgerBlock {
+            height,
+            prev_hash: format!("{:064x}", height + 999),
+            miner: "egot1miner".into(),
+            timestamp: 1_700_000_000 + height as i64 * 1_200,
+            tx_count: txs.len() as u32,
+            tx_merkle_root: compute_merkle_root(&hashes),
+            ..LedgerBlock::default()
+        };
+        block.hash = block_hash_for(&block.prev_hash, height, &block.miner, block.timestamp, &block.tx_merkle_root, &block.poc_ticket);
+        assert!(write_block_batch(db, &block, &txs), "block {height} commits");
+    }
+
+    #[test]
+    fn a_rewind_puts_node_records_and_the_block_index_back() {
+        let (db, dir) = scratch_db("rewind");
+        commit(&db, 1, &[]);
+        let after_one = derived(&db);
+        let reg = registration(7);
+        commit(&db, 2, &[reg.clone()]);
+        commit(&db, 3, &[]);
+        assert_ne!(derived(&db), after_one, "the later blocks changed node state");
+        assert!(crate::drs::load_rec(&crate::drs::Ov::new(&db), &reg.from).is_some());
+        let records = undo_records_in(&db, 2, 3).expect("every committed block leaves its undo record");
+        let mut batch = WriteBatch::default();
+        apply_undo_records(&db, &mut batch, &records);
+        db.write(batch).unwrap();
+        assert_eq!(derived(&db), after_one, "rewinding two blocks restores the state after block 1 exactly");
+        assert!(crate::drs::load_rec(&crate::drs::Ov::new(&db), &reg.from).is_none());
+        assert!(undo_records_in(&db, 2, 5).is_none(), "a height with no record cannot be rewound");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebuilding_from_history_gives_the_state_live_blocks_built() {
+        let (db, dir) = scratch_db("rebuild");
+        commit(&db, 1, &[]);
+        commit(&db, 2, &[registration(7)]);
+        commit(&db, 3, &[registration(8), registration(9)]);
+        commit(&db, 4, &[]);
+        let live = derived(&db);
+        let rec = crate::drs::load_rec(&crate::drs::Ov::new(&db), &registration(8).from).unwrap();
+        assert!(!rec.pop_key.is_empty(), "a registration with a proof of possession carries its key");
+        assert!(rebuild_derived_state(&db), "a complete history before check-ins can be rebuilt");
+        assert_eq!(derived(&db), live, "replaying the history gives exactly what the live blocks built");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_dropped_chunk_comes_back_whole_from_what_a_holder_serves() {
+        let (db, dir) = scratch_db("roundtrip");
+        let reg = registration(7);
+        for h in 1..=crate::history::CHUNK {
+            let txs = if h == 5 { vec![reg.clone()] } else { vec![] };
+            commit(&db, h, &txs);
+        }
+        let root = crate::history::chunk_root(&crate::drs::Ov::new(&db), 0).expect("a complete chunk has a root");
+        let mut served = Vec::new();
+        let mut from = 1;
+        while from < crate::history::CHUNK {
+            served.extend(history_serve_in(&db, from, crate::history::FETCH_BATCH));
+            from += crate::history::FETCH_BATCH;
+        }
+        assert_eq!(served.len() as u64, crate::history::CHUNK - 1);
+        for p in &served {
+            crate::history::verify_piece(p, &root).unwrap();
+        }
+        let mut wrong_block = served[4].clone();
+        wrong_block.block.miner = "egot1someoneelse".into();
+        assert!(crate::history::verify_piece(&wrong_block, &root).is_err(), "a block altered after the fact is refused");
+        let mut wrong_height = served[4].clone();
+        wrong_height.height += 1;
+        wrong_height.block.height += 1;
+        assert!(crate::history::verify_piece(&wrong_height, &root).is_err(), "a block cannot pose as another height");
+        let mut dropped_tx = served[4].clone();
+        dropped_tx.txs.clear();
+        assert!(crate::history::verify_piece(&dropped_tx, &root).is_err(), "a block served short is refused");
+
+        let before = history_piece_in(&db, 5).unwrap();
+        let keep: std::collections::HashSet<String> = [reg.from.clone()].into_iter().collect();
+        assert_eq!(history_prune_chunk_in(&db, 0, &keep), 0, "the node's own transaction is kept");
+        assert!(history_piece_in(&db, 5).is_none(), "the block itself is gone");
+        let cf_txs = db.cf_handle(CF_TXS).unwrap();
+        assert!(db.get_cf(cf_txs, reg.hash.as_bytes()).unwrap().is_some(), "the wallet's own history survives");
+        assert!(history_piece_in(&db, crate::history::CHUNK).is_some(), "the next chunk is untouched");
+        let cf_meta = db.cf_handle(CF_META).unwrap();
+        assert!(db.get_cf(cf_meta, crate::history::pruned_key(0)).unwrap().is_some());
+
+        assert_eq!(history_store_in(&db, &served), served.len());
+        let after = history_piece_in(&db, 5).unwrap();
+        assert_eq!(
+            crate::history::piece_digest(&before.0, &before.1),
+            crate::history::piece_digest(&after.0, &after.1),
+            "the restored block is the one that was dropped"
+        );
+        assert_eq!(history_store_in(&db, &served), 0, "storing again changes nothing");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
