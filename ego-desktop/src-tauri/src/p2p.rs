@@ -7849,9 +7849,9 @@ async fn handle_event(
                         && sync_reply_allowed(&requester_endpoint)
                     {
                         tokio::spawn(async move {
-                            let snap = match tokio::task::spawn_blocking(crate::chain_db::export_state_snapshot).await {
-                                Ok(s) => s,
-                                Err(_) => return,
+                            let snap = match tokio::task::spawn_blocking(signed_state_snapshot).await {
+                                Ok(Some(s)) => s,
+                                _ => return,
                             };
                             if snap.height <= have_height { return; }
                             let resp = P2PMessage::SnapshotResponse { snapshot: snap };
@@ -9249,9 +9249,9 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
                 && sync_reply_allowed(&requester_endpoint)
             {
                 tokio::spawn(async move {
-                    let snap = match tokio::task::spawn_blocking(crate::chain_db::export_state_snapshot).await {
-                        Ok(s) => s,
-                        Err(_) => return,
+                    let snap = match tokio::task::spawn_blocking(signed_state_snapshot).await {
+                        Ok(Some(s)) => s,
+                        _ => return,
                     };
                     if snap.height <= have_height { return; }
                     let resp = P2PMessage::SnapshotResponse { snapshot: snap };
@@ -9261,6 +9261,15 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
         }
 
         P2PMessage::SnapshotResponse { snapshot } => {
+            let asked_at = SNAPSHOT_ASKED_AT.load(Ordering::Relaxed);
+            if asked_at == 0 || Utc::now().timestamp() - asked_at > SNAPSHOT_ANSWER_WINDOW_SECS {
+                eprintln!("[P2PSnapshot] refused a snapshot at height {} that this node didn't ask for", snapshot.height);
+                return;
+            }
+            if let Err(e) = snapshot.verify() {
+                eprintln!("[P2PSnapshot] refused a snapshot at height {}: {e}", snapshot.height);
+                return;
+            }
             if !snapshot_is_from_our_network(&snapshot) {
                 eprintln!(
                     "[P2PSnapshot] refused a snapshot at height {} — none of its recent blocks were produced by this network's starting committee",
@@ -10536,7 +10545,26 @@ pub async fn request_snapshot_because_stuck(have_height: u64) {
     ask_peers_for_snapshot(have_height, true).await;
 }
 
+/// When this node last asked for a snapshot. A snapshot nobody asked for is refused, so a
+/// peer can't push state onto a node that is following the chain fine.
+static SNAPSHOT_ASKED_AT: AtomicI64 = AtomicI64::new(0);
+const SNAPSHOT_ANSWER_WINDOW_SECS: i64 = 300;
+
+/// This node's snapshot, signed, or nothing if this node isn't in the starting committee:
+/// only those snapshots are installed by anyone, so others needn't send theirs.
+fn signed_state_snapshot() -> Option<crate::chain_db::StateSnapshot> {
+    let me = crate::ledger::Ledger::load().address;
+    if !crate::genesis::addresses().iter().any(|a| a == &me) {
+        return None;
+    }
+    let seed = get_ed25519_seed()?;
+    let mut snap = crate::chain_db::export_state_snapshot();
+    snap.sign(&me, &seed);
+    Some(snap)
+}
+
 async fn ask_peers_for_snapshot(have_height: u64, stuck: bool) {
+    SNAPSHOT_ASKED_AT.store(Utc::now().timestamp(), Ordering::Relaxed);
     let my_endpoint = get_public_endpoint().await;
     if my_endpoint.is_empty() { return; }
     let msg = P2PMessage::SnapshotRequest { requester_endpoint: my_endpoint, have_height, stuck };
@@ -10849,6 +10877,21 @@ fn merge_remote_chain_blocking(
             .map(|b| b.height);
 
         if let Some(dh) = diverge_height {
+            // Under the live engine every block this node holds was finalized by a quorum
+            // of its committee. A peer offering different blocks at those heights is on a
+            // fork or lying; deleting finalized blocks because it says so would let anyone
+            // with a longer list of unchecked blocks erase a node's chain.
+            if consensus_v2_live_enabled() {
+                static LAST_FORK_LOG: AtomicI64 = AtomicI64::new(0);
+                let now = Utc::now().timestamp();
+                if now - LAST_FORK_LOG.swap(now, Ordering::Relaxed) > 60 {
+                    tracing::warn!(
+                        "[Sync] a peer offered blocks that differ from this node's finalized chain at height {} — ignored",
+                        dh
+                    );
+                }
+                return (false, false);
+            }
             let remote_has_quorum = blocks.iter().any(|b| b.height >= dh && b.vote_count >= 2);
             let is_remote_longer = remote_tip > local_tip;
 
@@ -11144,6 +11187,13 @@ async fn merge_remote_chain_inner(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
     trusted: bool,
 ) {
+    // "Trusted" blocks come from the old engine's finalization message, whose votes are
+    // counted from any key this node has heard of rather than from the committee on chain,
+    // and which are written without checking their signatures or transactions. The live
+    // engine never sends it; while it runs, those blocks are not accepted.
+    if trusted && consensus_v2_live_enabled() {
+        return;
+    }
     if !blocks_are_from_our_network(&blocks) {
         static LAST_FOREIGN_LOG: AtomicI64 = AtomicI64::new(0);
         let now = Utc::now().timestamp();

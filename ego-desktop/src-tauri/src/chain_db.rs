@@ -3830,6 +3830,68 @@ pub struct StateSnapshot {
     pub contracts:  Vec<(String, String)>,
     #[serde(default)]
     pub contract_txs: Vec<(u64, LedgerTx)>,
+    /// A snapshot's balances can't be checked against the chain (a block's state_root
+    /// commits to that block's changes, not to the whole state), so installing one means
+    /// trusting whoever made it. Only a snapshot signed by a starting-committee member is
+    /// installed.
+    #[serde(default)]
+    pub signer: String,
+    #[serde(default)]
+    pub signer_pubkey: String,
+    #[serde(default)]
+    pub signature: String,
+}
+
+impl StateSnapshot {
+    pub fn digest(&self) -> [u8; 32] {
+        let body = serde_json::to_vec(&(
+            self.height,
+            &self.tip_hash,
+            &self.state_root,
+            &self.balances,
+            &self.meta,
+            self.blocks.iter().map(|b| b.hash.as_str()).collect::<Vec<_>>(),
+            self.contract_height,
+            &self.contracts,
+            &self.contract_txs,
+        ))
+        .unwrap_or_default();
+        let mut h = blake3::Hasher::new();
+        h.update(b"ego/snapshot/v1:");
+        h.update(&body);
+        *h.finalize().as_bytes()
+    }
+
+    pub fn sign(&mut self, signer: &str, seed: &[u8; 32]) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(seed);
+        self.signer = signer.to_string();
+        self.signer_pubkey = hex::encode(key.verifying_key().as_bytes());
+        self.signature = hex::encode(key.sign(&self.digest()).to_bytes());
+    }
+
+    /// Signed by a starting-committee member, and its tip block carries a valid producer
+    /// signature.
+    pub fn verify(&self) -> Result<(), String> {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if !crate::genesis::addresses().iter().any(|a| a == &self.signer) {
+            return Err(format!("snapshot is signed by {}, not by the starting committee", self.signer));
+        }
+        let pk: [u8; 32] = hex::decode(&self.signer_pubkey).ok().and_then(|b| b.try_into().ok()).ok_or("bad signer key")?;
+        let derived = ego_core::EgoAddress::from_public_key_bytes(&pk, crate::tokenomics::CHAIN_ID as u32, ego_core::AddressType::EOA)
+            .to_bech32(hrp_for_chain())
+            .map_err(|e| e.to_string())?;
+        if derived != self.signer {
+            return Err("snapshot signer key does not match its address".into());
+        }
+        let sig: [u8; 64] = hex::decode(&self.signature).ok().and_then(|b| b.try_into().ok()).ok_or("bad snapshot signature")?;
+        VerifyingKey::from_bytes(&pk)
+            .map_err(|e| e.to_string())?
+            .verify(&self.digest(), &Signature::from_bytes(&sig))
+            .map_err(|_| "snapshot signature does not verify".to_string())?;
+        let tip = self.blocks.iter().find(|b| b.height == self.height && b.hash == self.tip_hash).ok_or("snapshot has no tip block")?;
+        verify_block_producer(tip)
+    }
 }
 
 /// How many recent block headers to ship in a snapshot.
@@ -3868,6 +3930,7 @@ pub fn export_state_snapshot() -> StateSnapshot {
     StateSnapshot {
         height, tip_hash, state_root, balances: dump(CF_BALANCES), meta: dump(CF_META), blocks,
         contract_height, contracts, contract_txs,
+        signer: String::new(), signer_pubkey: String::new(), signature: String::new(),
     }
 }
 
@@ -4888,9 +4951,11 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                     && tx.from == crate::shielded_chain::SHIELDED_POOL_ADDR;
                 let is_settle = tx.tx_type == crate::market_chain::TX_SETTLE
                     && tx.from == crate::market_chain::MARKET_ESCROW_ADDR;
-                // H3: every other system-source tx must carry a recognized emission
-                // type (no magic-string signatures).
-                if !is_reward && !is_unshield && !is_settle && !is_system_emission_type(&tx.tx_type) {
+                // A system pool pays out only through a kind of payment whose amount and
+                // recipient the rules check. Accepting any "emission type" bounded only by
+                // the pool's balance let a block producer pay itself the whole staking or
+                // node pool by naming the payment an escrow release.
+                if !is_reward && !is_unshield && !is_settle {
                     return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
                 }
         } else {

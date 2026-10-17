@@ -81,6 +81,12 @@ const EarningsPage: React.FC = () => {
   const [computeStatus,   setComputeStatus]   = useState<ComputeStatus | null>(null);
 
   const [sessionEarned, setSessionEarned] = useState(0);
+  const [egocUsd, setEgocUsd] = useState(0);
+  useEffect(() => {
+    invoke<{ price_usd: number; source: string }>('get_egoc_price_usd')
+      .then(p => setEgocUsd(p.price_usd))
+      .catch(() => {});
+  }, []);
 
   const [uptime, setUptime]               = useState(0);
   const tickRef    = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -183,18 +189,10 @@ const EarningsPage: React.FC = () => {
   const COVERAGE_USD_PER_DAY   = 0.15;
   const RETRIEVAL_USD_PER_GB   = 0.003;
 
-  // Derive implied EGOC price from backend reward (storage is clearest proxy when allocated > 0)
-  // If we can't derive it, we fall back to showing only EGOC amounts
-  const impliedEgocPrice: number | null = (() => {
-    if (!bd || allocatedGb <= 0 || bd.storage_rewards <= 0) return null;
-    const usdTarget = STORAGE_USD_PER_GB_DAY * allocatedGb;
-    return usdTarget / (bd.storage_rewards / 1_000_000);
-  })();
+  const impliedEgocPrice: number | null = egocUsd > 0 ? egocUsd : null;
 
   const priceStr = impliedEgocPrice !== null
-    ? `~$${impliedEgocPrice < 0.01
-        ? impliedEgocPrice.toExponential(2)
-        : impliedEgocPrice.toFixed(4)}/EGOC`
+    ? `~$${impliedEgocPrice.toFixed(impliedEgocPrice < 0.01 ? 5 : 4)}/EGOC`
     : 'live price';
 
   const buckets = bd ? [
