@@ -11050,6 +11050,15 @@ async fn ask_peers_for_snapshot(have_height: u64, stuck: bool) {
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-snapshot-v1", data).await;
     }
+    let me = crate::ledger::Ledger::load().address;
+    for founder in crate::genesis::addresses().into_iter().filter(|a| a != &me) {
+        match get_relay_endpoint(&founder).await {
+            Some(ep) => {
+                let _ = send_message(&ep, &msg).await;
+            }
+            None => lookup_dht_endpoint(&founder),
+        }
+    }
 }
 
 /// Append a synced block, or record that nobody could serve it whole.

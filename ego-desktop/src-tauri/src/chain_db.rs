@@ -139,14 +139,6 @@ pub fn get_db() -> DbWrapper {
         } else {
             db
         };
-        let db = if derived_state_needs_resync(&db) {
-            eprintln!("[ChainDB] this node joined from a snapshot, so its node records cannot be checked against its own history — downloading the chain again");
-            drop(db);
-            wipe_local_chain(&db_path);
-            open_chain_db(&db_path)
-        } else {
-            db
-        };
         stamp_rules_version(&db);
         migrate_drs_index(&db);
         migrate_drs_v2(&db);
@@ -10534,14 +10526,6 @@ pub(crate) fn rebuild_derived_state(db: &DB) -> bool {
 }
 
 const DERIVED_REBUILT_FLAG: &[u8] = b"derived_rebuilt_v3";
-
-fn derived_state_needs_resync(db: &DB) -> bool {
-    if drs_meta(db, DERIVED_REBUILT_FLAG).is_some() {
-        return false;
-    }
-    let tip = local_chain_height_in(db);
-    tip > 0 && tip < CHECKIN_FROM_HEIGHT && !history_complete_in(db, tip)
-}
 
 fn rebuild_derived_state_once(db: &DB) {
     const FLAG: &[u8] = DERIVED_REBUILT_FLAG;
