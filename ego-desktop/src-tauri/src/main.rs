@@ -861,6 +861,10 @@ fn main() {
         .add_native_item(SystemTrayMenuItem::Separator)
         .add_item(quit);
     let tray = SystemTray::new().with_menu(tray_menu);
+    // The menu bar draws a template icon from its alpha alone, so the opaque app
+    // icon showed as a white square. tray.png is the EGO glyph on transparency.
+    #[cfg(target_os = "macos")]
+    let tray = tray.with_icon(tauri::Icon::Raw(include_bytes!("../icons/tray.png").to_vec()));
 
     let submenu = Submenu::new(
         "Ego Desktop",
