@@ -192,6 +192,9 @@ async fn submit_coverage_proof(challenge_height: u64, cell: String, records: Vec
         return;
     }
     let tip = crate::chain_db::local_chain_height();
+    if tip.saturating_add(1) >= crate::chain_db::CHECKIN_FROM_HEIGHT {
+        return;
+    }
     if tip.saturating_sub(challenge_height) > crate::coverage_proof::CHALLENGE_MAX_AGE * 4 / 5 {
         eprintln!("[PoC] coverage proof not sent: its beacon is already {} blocks old", tip.saturating_sub(challenge_height));
         return;

@@ -3217,6 +3217,12 @@ pub(crate) fn migrate_faucet_totals(db: &DB) {
     let _ = db.write(batch);
 }
 
+pub fn tx_retired(tx: &LedgerTx, height: u64) -> bool {
+    tx.tx_type == TX_UPTIME
+        || tx.tx_type == TX_UPTIME_REWARD
+        || (tx.tx_type == crate::coverage_proof::POC_PROOF_TX && height >= CHECKIN_FROM_HEIGHT)
+}
+
 pub const TX_MAX_AGE_SECS: i64 = 7 * 86_400;
 pub const TX_MAX_AHEAD_SECS: i64 = 86_400;
 
@@ -4332,10 +4338,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             eprintln!("[TX] {:.12} Rejected — {e}", tx.hash);
             return false;
         }
-        if tx.tx_type == TX_UPTIME
-            || tx.tx_type == TX_UPTIME_REWARD
-            || (tx.tx_type == crate::coverage_proof::POC_PROOF_TX && height >= CHECKIN_FROM_HEIGHT)
-        {
+        if tx_retired(tx, height) {
             return false;
         }
         if crate::drs::is_batch_tx(tx) {

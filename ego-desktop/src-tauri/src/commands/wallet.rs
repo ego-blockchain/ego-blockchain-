@@ -577,8 +577,20 @@ pub async fn get_transaction_history(
         let now = chrono::Utc::now().timestamp();
         let pool_txs = crate::mempool::get_mempool().pending_txs_for_address(&my_addr);
         let file_txs = crate::commands::tx_pending::get_all();
+        let next_height = crate::chain_db::local_chain_height().saturating_add(1);
+        let (retired, pending): (Vec<LedgerTx>, Vec<LedgerTx>) = pool_txs
+            .into_iter()
+            .chain(file_txs.into_iter())
+            .partition(|tx| crate::chain_db::tx_retired(tx, next_height));
+        if !retired.is_empty() {
+            let hashes: Vec<String> = retired.iter().map(|t| t.hash.clone()).collect();
+            for h in &hashes {
+                crate::commands::tx_pending::remove(h);
+            }
+            crate::mempool::get_mempool().remove_txs(&hashes);
+        }
 
-        for mut tx in pool_txs.into_iter().chain(file_txs.into_iter()) {
+        for mut tx in pending.into_iter() {
             if (tx.from == my_addr || tx.to == my_addr) && !confirmed_hashes.contains(&tx.hash) {
                 let is_receiver = tx.to == my_addr && tx.from != my_addr;
                 

@@ -74,6 +74,13 @@ pub fn restore_to_mempool() {
             continue;
         }
 
+        if crate::chain_db::tx_retired(tx, crate::chain_db::local_chain_height().saturating_add(1)) {
+            remove(&tx.hash);
+            pool.remove_txs(std::slice::from_ref(&tx.hash));
+            pruned += 1;
+            continue;
+        }
+
         let balance = crate::chain_db::balance_of(&tx.from);
         let amount_plus_fee = tx.amount + tx.fee_uegoc;
         if balance < amount_plus_fee {
