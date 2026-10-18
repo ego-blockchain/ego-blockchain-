@@ -17,6 +17,8 @@ fn registry_io_mutex() -> &'static std::sync::Mutex<()> {
 pub fn base_data_dir() -> PathBuf {
     let dir = if let Ok(v) = std::env::var("EGO_DATA_DIR") {
         PathBuf::from(v)
+    } else if cfg!(test) {
+        std::env::temp_dir().join(format!("ego-test-data-{}", std::process::id()))
     } else {
         dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -132,6 +134,141 @@ fn decrypt_seed_wrapped_blob(seed: &[u8], encoded: &str) -> Option<Vec<u8>> {
     cipher.decrypt(Nonce::from_slice(nonce_bytes), ciphertext).ok()
 }
 
+#[cfg_attr(windows, allow(dead_code))]
+fn read_seed_from_keyring(entry: &keyring::Entry) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+
+    let pw = match entry.get_password().map_err(|e| e.to_string()) {
+        Ok(p) => p,
+        Err(e) if cfg!(target_os = "linux") && (
+            e.contains("zbus") || e.contains("D-Bus") || e.contains("DBus")
+            || e.contains("NoReply") || e.contains("message bus")
+            || e.contains("NoSuchObject") || e.contains("ServiceUnknown")
+        ) => {
+            // Secret Service (gnome-keyring / kwallet) isn't reachable over D-Bus in
+            // this session. This is an environment/session problem, not data loss —
+            // the seed is still safely stored once the Secret Service is reachable
+            // again. DO NOT delete the sentinel file: that would silently generate a
+            // brand-new wallet on next launch and orphan the real one.
+            return Err(format!(
+                "Ego Desktop couldn't reach your Linux Secret Service (gnome-keyring or \
+                 kwallet) over D-Bus, which is needed to unlock your wallet seed: {}\n\n\
+                 Your wallet is safe — nothing was lost. This usually means the keyring \
+                 daemon isn't running in this session.\n\n\
+                 FIX: log out and back in (so the desktop session starts the keyring \
+                 daemon), or install/start one manually, e.g. `sudo apt install \
+                 gnome-keyring` then restart Ego Desktop.",
+                e
+            ));
+        }
+        Err(e) if e.contains("No such item") || e.contains("not found") || e.contains("Access control") => {
+            // Inconsistent state or Access Denied due to signature change.
+            // DO NOT delete the sentinel file. Deleting it causes a new wallet
+            // to be generated, losing the user's identity.
+            return Err(format!(
+                "macOS Keychain Access Error: {}. If you are developing, ensure your app is signed or check Keychain Access.app.",
+                e
+            ));
+        }
+        Err(e) => {
+            if e.contains("User canceled") || e.contains("Access control") {
+                return Err(format!(
+                    "macOS Keychain Access Denied: {}. This happens because the app signature changed or is not notarized.\n\n\
+                    FIX: Open 'Keychain Access.app', search for 'ego-desktop', delete the entry, then run 'rm -rf ~/Library/Application\\ Support/EgoDesktop' and restart.",
+                    e
+                ));
+            }
+            return Err(format!("Keyring read error: {}", e));
+        }
+    };
+
+    // Attempt to decode the retrieved value.
+    // Try base64 (standard for new wallets), then hex, then raw bytes.
+    let mut bytes = base64::engine::general_purpose::STANDARD.decode(&pw).unwrap_or_default();
+    if bytes.len() != 32 {
+        if let Ok(h) = hex::decode(&pw) {
+            if h.len() == 32 { bytes = h; }
+        }
+    }
+    if bytes.len() != 32 && pw.as_bytes().len() == 32 {
+        bytes = pw.as_bytes().to_vec();
+    }
+
+    if bytes.len() != 32 {
+        // Keychain returned something that isn't a 32-byte seed.
+        // Do NOT delete the sentinel — that would cause a brand-new wallet to be
+        // silently generated on next launch, losing the user's identity.
+        if libp2p::identity::Keypair::from_protobuf_encoding(&bytes).is_ok() {
+            // The pre-fix os_protect wrote the node's P2P identity into the
+            // wallet-seed Keychain slot, overwriting the seed (the
+            // "invalid seed data (68 bytes)" bug). The seed itself is not
+            // recoverable from this device.
+            return Err(
+                "A bug in an earlier version overwrote the wallet seed in your macOS \
+                 Keychain with the node's P2P identity (this version fixes the cause).\n\n\
+                 To recover your wallet: open Keychain Access.app, search for \
+                 'ego-desktop', delete the 'wallet-seed' entry, restart Ego Desktop \
+                 and re-import your 24-word recovery phrase.".to_string()
+            );
+        }
+        return Err(format!(
+            "macOS Keychain returned invalid seed data ({} bytes). \
+             Your wallet seed is still protected in Keychain but could not be read.\n\n\
+             To fix: open Keychain Access.app, search for 'ego-desktop', \
+             delete the entry, then re-import your 24-word recovery phrase.",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+const SEED_KEYRING_V2: &str = "ego-keyring-seed-v2:";
+
+const SEED_REPLACED: &str = "This wallet's seed in your system keychain was replaced by another Ego wallet's seed on \
+    this computer, because earlier versions kept every wallet's seed in one keychain slot. This version keeps \
+    each wallet separate.\n\nYour funds are safe on the chain. To open this wallet again, re-import its 24-word \
+    recovery phrase.";
+
+pub(crate) fn keyring_account_in(raw: &[u8]) -> Option<String> {
+    let account = std::str::from_utf8(raw).ok()?.strip_prefix(SEED_KEYRING_V2)?;
+    (account.len() == 32 && account.chars().all(|c| c.is_ascii_hexdigit())).then(|| account.to_string())
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn new_keyring_account() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn wallet_keyring_entry(account: &str) -> Result<keyring::Entry, keyring::Error> {
+    keyring::Entry::new("ego-desktop", &format!("wallet-seed-{account}"))
+}
+
+pub(crate) fn seed_belongs_to(seed: &[u8], address: &str) -> bool {
+    if address.is_empty() {
+        return true;
+    }
+    let hrp = if crate::tokenomics::CHAIN_ID == 1 { "egot" } else { "ego" };
+    <[u8; 32]>::try_from(seed)
+        .ok()
+        .and_then(|s| ego_core::KeyPair::from_bytes(&s).ok())
+        .and_then(|kp| kp.derive_bech32_address(crate::tokenomics::CHAIN_ID as u32, ego_core::AddressType::EOA, hrp).ok())
+        .map_or(false, |a| a == address)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn move_seed_to_own_slot(path: &std::path::Path, seed: &[u8]) {
+    use base64::Engine as _;
+    let account = new_keyring_account();
+    let stored = wallet_keyring_entry(&account)
+        .ok()
+        .and_then(|e| e.set_password(&base64::engine::general_purpose::STANDARD.encode(seed)).ok())
+        .is_some();
+    if stored {
+        let _ = crate::utils::atomic_write(path, format!("{SEED_KEYRING_V2}{account}").as_bytes());
+    }
+}
+
 /// Load the wallet seed, decrypting it with OS DPAPI if it was previously protected.
 pub fn load_seed() -> Result<Option<Vec<u8>>, String> {
     let path = seed_path();
@@ -142,91 +279,17 @@ pub fn load_seed() -> Result<Option<Vec<u8>>, String> {
     #[cfg(not(windows))]
     {
         let raw = fs::read(&path).map_err(|e| format!("Failed to read seed file: {}", e))?;
+        if let Some(account) = keyring_account_in(&raw) {
+            let entry = wallet_keyring_entry(&account).map_err(|e| format!("Keyring init error: {}", e))?;
+            return read_seed_from_keyring(&entry).map(Some);
+        }
         if raw == SEED_KEYRING_SENTINEL || raw == b"ego-keyring-protected" {
-            use base64::Engine as _;
-
             let entry = seed_keyring_entry().map_err(|e| format!("Keyring init error: {}", e))?;
-            let pw = match entry.get_password().map_err(|e| e.to_string()) {
-                Ok(p) => p,
-                Err(e) if cfg!(target_os = "linux") && (
-                    e.contains("zbus") || e.contains("D-Bus") || e.contains("DBus")
-                    || e.contains("NoReply") || e.contains("message bus")
-                    || e.contains("NoSuchObject") || e.contains("ServiceUnknown")
-                ) => {
-                    // Secret Service (gnome-keyring / kwallet) isn't reachable over D-Bus in
-                    // this session. This is an environment/session problem, not data loss —
-                    // the seed is still safely stored once the Secret Service is reachable
-                    // again. DO NOT delete the sentinel file: that would silently generate a
-                    // brand-new wallet on next launch and orphan the real one.
-                    return Err(format!(
-                        "Ego Desktop couldn't reach your Linux Secret Service (gnome-keyring or \
-                         kwallet) over D-Bus, which is needed to unlock your wallet seed: {}\n\n\
-                         Your wallet is safe — nothing was lost. This usually means the keyring \
-                         daemon isn't running in this session.\n\n\
-                         FIX: log out and back in (so the desktop session starts the keyring \
-                         daemon), or install/start one manually, e.g. `sudo apt install \
-                         gnome-keyring` then restart Ego Desktop.",
-                        e
-                    ));
-                }
-                Err(e) if e.contains("No such item") || e.contains("not found") || e.contains("Access control") => {
-                    // Inconsistent state or Access Denied due to signature change.
-                    // DO NOT delete the sentinel file. Deleting it causes a new wallet
-                    // to be generated, losing the user's identity.
-                    return Err(format!(
-                        "macOS Keychain Access Error: {}. If you are developing, ensure your app is signed or check Keychain Access.app.",
-                        e
-                    ));
-                }
-                Err(e) => {
-                    if e.contains("User canceled") || e.contains("Access control") {
-                        return Err(format!(
-                            "macOS Keychain Access Denied: {}. This happens because the app signature changed or is not notarized.\n\n\
-                            FIX: Open 'Keychain Access.app', search for 'ego-desktop', delete the entry, then run 'rm -rf ~/Library/Application\\ Support/EgoDesktop' and restart.",
-                            e
-                        ));
-                    }
-                    return Err(format!("Keyring read error: {}", e));
-                }
-            };
-
-            // Attempt to decode the retrieved value.
-            // Try base64 (standard for new wallets), then hex, then raw bytes.
-            let mut bytes = base64::engine::general_purpose::STANDARD.decode(&pw).unwrap_or_default();
-            if bytes.len() != 32 {
-                if let Ok(h) = hex::decode(&pw) {
-                    if h.len() == 32 { bytes = h; }
-                }
+            let bytes = read_seed_from_keyring(&entry)?;
+            if !seed_belongs_to(&bytes, &Ledger::load().address) {
+                return Err(SEED_REPLACED.to_string());
             }
-            if bytes.len() != 32 && pw.as_bytes().len() == 32 {
-                bytes = pw.as_bytes().to_vec();
-            }
-
-            if bytes.len() != 32 {
-                // Keychain returned something that isn't a 32-byte seed.
-                // Do NOT delete the sentinel — that would cause a brand-new wallet to be
-                // silently generated on next launch, losing the user's identity.
-                if libp2p::identity::Keypair::from_protobuf_encoding(&bytes).is_ok() {
-                    // The pre-fix os_protect wrote the node's P2P identity into the
-                    // wallet-seed Keychain slot, overwriting the seed (the
-                    // "invalid seed data (68 bytes)" bug). The seed itself is not
-                    // recoverable from this device.
-                    return Err(
-                        "A bug in an earlier version overwrote the wallet seed in your macOS \
-                         Keychain with the node's P2P identity (this version fixes the cause).\n\n\
-                         To recover your wallet: open Keychain Access.app, search for \
-                         'ego-desktop', delete the 'wallet-seed' entry, restart Ego Desktop \
-                         and re-import your 24-word recovery phrase.".to_string()
-                    );
-                }
-                return Err(format!(
-                    "macOS Keychain returned invalid seed data ({} bytes). \
-                     Your wallet seed is still protected in Keychain but could not be read.\n\n\
-                     To fix: open Keychain Access.app, search for 'ego-desktop', \
-                     delete the entry, then re-import your 24-word recovery phrase.",
-                    bytes.len()
-                ));
-            }
+            move_seed_to_own_slot(&path, &bytes);
             return Ok(Some(bytes));
         }
         if raw.len() != 32 {
@@ -274,7 +337,14 @@ pub fn save_seed(seed: &[u8]) -> std::io::Result<()> {
     {
         use base64::Engine as _;
 
-        let keyring_ok = seed_keyring_entry()
+        if cfg!(test) {
+            return crate::utils::atomic_write(&seed_path(), seed);
+        }
+        let account = fs::read(seed_path())
+            .ok()
+            .and_then(|raw| keyring_account_in(&raw))
+            .unwrap_or_else(new_keyring_account);
+        let keyring_ok = wallet_keyring_entry(&account)
             .ok()
             .and_then(|entry| {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(seed);
@@ -283,7 +353,7 @@ pub fn save_seed(seed: &[u8]) -> std::io::Result<()> {
             .is_some();
 
         if keyring_ok {
-            return crate::utils::atomic_write(&seed_path(), SEED_KEYRING_SENTINEL);
+            return crate::utils::atomic_write(&seed_path(), format!("{SEED_KEYRING_V2}{account}").as_bytes());
         }
 
         // Keychain unavailable (unsigned build, sandboxing restriction, etc.).
@@ -2356,5 +2426,40 @@ mod tx_v3_tests {
         let fits = LedgerTx { tx_version: 3, memo: Some("é".repeat(MAX_MEMO_BYTES / 2)), ..LedgerTx::default() };
         assert!(check_tx_version_at(&fits, TX_V3_FROM_HEIGHT).is_ok());
         assert!(tx_signing_bytes_for(&fits).ends_with("é".repeat(MAX_MEMO_BYTES / 2).as_bytes()));
+    }
+}
+
+#[cfg(test)]
+mod seed_slot_tests {
+    use super::*;
+
+    #[test]
+    fn each_wallet_names_its_own_keychain_slot() {
+        let a = new_keyring_account();
+        let b = new_keyring_account();
+        assert_ne!(a, b);
+        assert_eq!(keyring_account_in(format!("{SEED_KEYRING_V2}{a}").as_bytes()), Some(a));
+        assert_eq!(keyring_account_in(b"ego-keyring-seed-v1"), None, "the old shared sentinel is not a slot name");
+        assert_eq!(keyring_account_in(&[7u8; 32]), None, "a raw seed is not a slot name");
+        assert_eq!(keyring_account_in(format!("{SEED_KEYRING_V2}xyz").as_bytes()), None);
+    }
+
+    #[test]
+    fn a_seed_is_only_used_for_the_wallet_it_belongs_to() {
+        let seed = [9u8; 32];
+        let kp = ego_core::KeyPair::from_bytes(&seed).unwrap();
+        let hrp = if crate::tokenomics::CHAIN_ID == 1 { "egot" } else { "ego" };
+        let addr = kp.derive_bech32_address(crate::tokenomics::CHAIN_ID as u32, ego_core::AddressType::EOA, hrp).unwrap();
+        assert!(seed_belongs_to(&seed, &addr));
+        assert!(!seed_belongs_to(&[8u8; 32], &addr), "another wallet's seed is refused");
+        assert!(seed_belongs_to(&[8u8; 32], ""), "a wallet with no address yet takes the seed it was given");
+        assert!(!seed_belongs_to(&[1u8; 5], &addr));
+    }
+
+    #[test]
+    fn tests_never_touch_the_real_data_folder() {
+        if std::env::var("EGO_DATA_DIR").is_err() {
+            assert!(base_data_dir().starts_with(std::env::temp_dir()));
+        }
     }
 }

@@ -225,6 +225,33 @@ fn retire_stale_instances() -> usize {
     ended
 }
 
+static APP_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn hide_main(window: &tauri::Window) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window.app_handle().hide();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window.hide();
+    }
+    APP_HIDDEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::commands::auth::invalidate_pin_cache();
+    let _ = window.emit("ego://app-locked", ());
+}
+
+fn show_main(window: &tauri::Window) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window.app_handle().show();
+    }
+    APP_HIDDEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
 fn acquire_single_instance_lock() -> bool {
     let port: u16 = std::env::var("EGO_LOCK_PORT")
         .ok().and_then(|v| v.parse().ok())
@@ -879,13 +906,12 @@ fn main() {
         .on_window_event(|event| {
             match event.event() {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
-                    event.window().hide().unwrap();
-                    crate::commands::auth::invalidate_pin_cache();
-                    let _ = event.window().emit("ego://app-locked", ());
+                    hide_main(event.window());
                     api.prevent_close();
                 }
                 tauri::WindowEvent::Focused(true) => {
                     use tauri::Manager;
+                    APP_HIDDEN.store(false, std::sync::atomic::Ordering::Relaxed);
                     let win = event.window();
                     let app_handle = win.app_handle();
                     let state = app_handle.state::<app::AppState>();
@@ -917,16 +943,13 @@ fn main() {
                 // A minimized window still reports itself visible, so checking only
                 // is_visible hid a minimized app instead of bringing it back, and the
                 // next click showed it without restoring it: nothing appeared at all.
-                let on_screen = window.is_visible().unwrap_or(false)
+                let on_screen = !APP_HIDDEN.load(std::sync::atomic::Ordering::Relaxed)
+                    && window.is_visible().unwrap_or(false)
                     && !window.is_minimized().unwrap_or(false);
                 if on_screen {
-                    let _ = window.hide();
-                    crate::commands::auth::invalidate_pin_cache();
-                    let _ = window.emit("ego://app-locked", ());
+                    hide_main(&window);
                 } else {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
+                    show_main(&window);
                 }
             }
             SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
@@ -940,16 +963,10 @@ fn main() {
                     std::process::exit(0);
                 }
                 "hide" => {
-                    let w = app.get_window("main").unwrap();
-                    w.hide().unwrap();
-                    crate::commands::auth::invalidate_pin_cache();
-                    let _ = w.emit("ego://app-locked", ());
+                    hide_main(&app.get_window("main").unwrap());
                 }
                 "show" => {
-                    let w = app.get_window("main").unwrap();
-                    let _ = w.show();
-                    let _ = w.unminimize();
-                    let _ = w.set_focus();
+                    show_main(&app.get_window("main").unwrap());
                 }
                 _ => {}
             },
@@ -1413,9 +1430,7 @@ fn main() {
                                 const NOTIFICATION_KEEP_SECS: i64 = 30 * 60;
                                 let pending = crate::app::global_app_state()
                                     .pending_chat_address.lock().unwrap().take();
-                                let _ = win.show();
-                                let _ = win.unminimize();
-                                let _ = win.set_focus();
+                                show_main(&win);
                                 if let Some((addr, set_at)) = pending {
                                     if chrono::Utc::now().timestamp() - set_at <= NOTIFICATION_KEEP_SECS {
                                         let _ = win.emit("ego://open-chat", serde_json::json!({ "address": addr }));
