@@ -11936,6 +11936,7 @@ pub fn is_observer() -> bool {
 
 pub fn maybe_emit_validator_registration() {
     if is_observer() { return; }
+    if crate::commands::coverage::earning_block_reason().is_some() { return; }
     let seed = match get_ed25519_seed() { Some(s) => s, None => return };
     let bls_sk = match BLS_SECRET_KEY.get() { Some(s) => s, None => return };
     let ledger = crate::ledger::Ledger::load();
@@ -12017,6 +12018,14 @@ pub fn maybe_send_uptime_checkin() {
     static LAST_CHECKIN: AtomicI64 = AtomicI64::new(0);
     static LAST_READY: AtomicI64 = AtomicI64::new(0);
     if is_observer() { return; }
+    if let Some(reason) = crate::commands::coverage::earning_block_reason() {
+        static LAST_SAID: AtomicI64 = AtomicI64::new(0);
+        let now = Utc::now().timestamp();
+        if now - LAST_SAID.swap(now, Ordering::Relaxed) > 3600 {
+            eprintln!("[DRS] not checking in: {reason}. Turn off any VPN or proxy to run your node and earn.");
+        }
+        return;
+    }
     let tip = crate::chain_db::local_chain_height();
     if tip.saturating_add(1) < crate::chain_db::CHECKIN_FROM_HEIGHT.saturating_sub(crate::drs::EPOCH) { return; }
     let addr = crate::ledger::Ledger::load().address;
@@ -12169,6 +12178,9 @@ fn tick_drs_coverage(addr: &str, rec: &crate::drs::NodeRec, tip: u64, now: i64) 
 }
 
 async fn answer_drs_beacon(prover: String, challenge: u64, reply_to: String) {
+    if tokio::task::spawn_blocking(crate::commands::coverage::earning_block_reason).await.ok().flatten().is_some() {
+        return;
+    }
     let me = crate::ledger::Ledger::load().address;
     if me.is_empty() || me == prover || reply_to.is_empty() {
         return;
@@ -12756,6 +12768,9 @@ fn state_cert_votes_for_block() -> Vec<(crate::state_cert::CertBody, Vec<(String
 pub fn maybe_send_state_vote() {
     static SENT: Mutex<Option<([u8; 32], i64)>> = Mutex::new(None);
     if crate::chain_db::local_chain_height() < crate::state_cert::STATE_CERT_FROM_HEIGHT {
+        return;
+    }
+    if crate::commands::coverage::earning_block_reason().is_some() {
         return;
     }
     let Some((open, signers)) = crate::chain_db::state_cert_open() else { return };

@@ -96,6 +96,9 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
     if prover_addr.is_empty() {
         return Ok(empty("No wallet yet".into()));
     }
+    if let Some(reason) = tokio::task::spawn_blocking(crate::commands::coverage::earning_block_reason).await.ok().flatten() {
+        return Ok(empty(format!("Storage proofs are paused: {reason}. Turn off any VPN or proxy to earn.")));
+    }
     if !crate::chain_db::is_registered_node(&prover_addr) {
         return Ok(empty("This node registers itself on the network first; proofs start once it has".into()));
     }

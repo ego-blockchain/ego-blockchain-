@@ -165,7 +165,7 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - Beacon fires every ~4 minutes when coverage is online. Records location via IP geolocation + H3 cell (resolution 8).
 - Quality tiers: Excellent (5+ peers), Good (1-4 peers), Fair (0 peers, self-attested), Poor (failed/VPN).
 - Reward per event: base 0.011 EGOC + (witnessed_peers × 0.0015 EGOC).
-- VPN/proxy/datacenter IPs are blocked — only real residential or business IPs qualify.
+- A node on a VPN, proxy or datacenter connection earns nothing and does not take part (no check-ins, coverage, storage proofs or committee seats). Its wallet still works. A node also has to pass a connection check at least once a day; if the check cannot run, the node is treated as unchecked, not clean.
 - Coverage page shows: event log, network quality, location, witness count, beacon settings, DRS score.
 
 ## Proof-of-Storage (PoST)
@@ -1012,7 +1012,7 @@ Ask me about **earning**, **smart contracts**, **consensus**, **tokenomics**, or
 Share your spare disk space in the **Storage** tab. You earn for every GB used by the network (target: **$0.002 / GB / day**). To keep earning, pass Proof-of-Storage (**PoST**) challenges automatically by keeping the app open.
 
 ### 2. Proof-of-Coverage (PoC)
-Help map the network's global reach. Simply keep your node online and reachable (no VPN). A 'beacon' fires every 4 minutes, earning you EGOC based on network quality and witnesses (target: **$0.15 / day**).
+Help map the network's global reach. Keep your node online and reachable, with no VPN or proxy: a node on a VPN, proxy or datacenter connection earns nothing. A 'beacon' fires every 4 minutes, earning you EGOC based on network quality and witnesses (target: **$0.15 / day**).
 
 ### 3. Staking & Consensus
 Stake at least **1,000 EGOC** in the **Staking** tab to become a validator. You'll earn block rewards (base **0.0832 EGOC**) plus a share of transaction fees. Staking currently offers up to **20%+ APR**.

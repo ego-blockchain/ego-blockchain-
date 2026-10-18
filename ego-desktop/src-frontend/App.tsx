@@ -25,6 +25,7 @@ import P2PPage from './pages/P2PPage';
 import TradeRoom from './pages/p2p/TradeRoom';
 import RegistrationFlow from './components/RegistrationFlow';
 import SyncBanner from './components/SyncBanner';
+import VpnBanner from './components/VpnBanner';
 import { GlobalLockScreen } from './components/GlobalLockScreen';
 
 type Theme = 'dark' | 'light';
@@ -359,6 +360,7 @@ function App() {
           <Router>
             <div data-theme={theme} className="App min-h-screen bg-gray-900 text-white">
               <SyncBanner />
+              <VpnBanner />
               <Routes>
                 <Route path="/welcome" element={<WelcomeScreen />} />
                 <Route path="/" element={<Layout />}>

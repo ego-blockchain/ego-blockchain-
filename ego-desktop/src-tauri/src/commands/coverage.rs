@@ -62,6 +62,39 @@ fn detect_vpn(resp: &IpApiResponse) -> Option<String> {
     vpn_keyword_match(resp)
 }
 
+pub const NET_VERIFIED_FOR_SECS: i64 = 24 * 3600;
+
+struct NetCheck {
+    blocked: bool,
+    reason: String,
+    verified_at: i64,
+}
+
+static NET_CHECK: std::sync::Mutex<NetCheck> =
+    std::sync::Mutex::new(NetCheck { blocked: false, reason: String::new(), verified_at: 0 });
+
+fn record_net_check(blocked: bool, reason: &str) {
+    let mut s = NET_CHECK.lock().unwrap_or_else(|e| e.into_inner());
+    s.blocked = blocked;
+    s.reason = reason.to_string();
+    s.verified_at = chrono::Utc::now().timestamp();
+}
+
+fn net_block_reason(blocked: bool, reason: &str, verified_at: i64, now: i64) -> Option<String> {
+    if verified_at == 0 || now - verified_at > NET_VERIFIED_FOR_SECS {
+        return Some("Ego could not check your internet connection".to_string());
+    }
+    blocked.then(|| if reason.is_empty() { "VPN, proxy or datacenter connection".to_string() } else { reason.to_string() })
+}
+
+pub fn earning_block_reason() -> Option<String> {
+    if crate::genesis::is_member(&crate::ledger::Ledger::load().address) {
+        return None;
+    }
+    let s = NET_CHECK.lock().unwrap_or_else(|e| e.into_inner());
+    net_block_reason(s.blocked, &s.reason, s.verified_at, chrono::Utc::now().timestamp())
+}
+
 fn get_machine_id() -> String {
     #[cfg(target_os = "windows")]
     {
@@ -293,7 +326,10 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
     // Initial IP/VPN fetch.
-    let (init_loc, init_vpn, init_reason, init_ip) = fetch_ip_data().await;
+    let (init_loc, _, _, init_ip) = fetch_ip_data().await;
+    let init_gate = tokio::task::spawn_blocking(earning_block_reason).await.unwrap_or(None);
+    let init_vpn = init_gate.is_some();
+    let init_reason = init_gate.unwrap_or_default();
     let mut location     = init_loc;
     let mut vpn_detected = init_vpn;
     let mut vpn_reason   = init_reason;
@@ -324,7 +360,10 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
     loop {
         let recheck = tick > 0;
         if recheck {
-            let (new_loc, new_vpn, new_reason, new_ip) = fetch_ip_data().await;
+            let (new_loc, _, _, new_ip) = fetch_ip_data().await;
+            let gate = tokio::task::spawn_blocking(earning_block_reason).await.unwrap_or(None);
+            let new_vpn = gate.is_some();
+            let new_reason = gate.unwrap_or_default();
 
             let ip_changed  = !new_ip.is_empty() && new_ip != last_ip;
             let vpn_changed = new_vpn != vpn_detected;
@@ -551,6 +590,7 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
                     else if data.hosting.unwrap_or(false) { "Datacenter/Hosting IP".to_string() }
                     else { String::new() }
                 });
+                record_net_check(is_vpn, &reason_str);
                 return (Some(loc), is_vpn, reason_str, data.query.unwrap_or_default());
             }
         }
@@ -558,4 +598,19 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
 
     let public_ip = crate::p2p::get_public_endpoint().await;
     (None, false, String::new(), public_ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_node_earns_only_after_a_clean_recent_connection_check() {
+        let now = 1_900_000_000;
+        assert!(net_block_reason(false, "", 0, now).is_some(), "never checked is not clean");
+        assert!(net_block_reason(false, "", now - NET_VERIFIED_FOR_SECS - 1, now).is_some(), "a check older than a day has expired");
+        assert_eq!(net_block_reason(false, "", now - 60, now), None, "a clean check from a minute ago passes");
+        assert_eq!(net_block_reason(true, "Proxy detected", now - 60, now).as_deref(), Some("Proxy detected"));
+        assert!(net_block_reason(true, "", now - 60, now).is_some());
+    }
 }
