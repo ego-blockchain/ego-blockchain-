@@ -729,7 +729,7 @@ pub async fn get_chain_drs() -> Result<ChainDrs, EgoDesktopError> {
             registered: rec.is_some(),
             key_proven: rec.as_ref().map_or(false, |r| !r.pop_key.is_empty()),
             uptime_streak: rec.as_ref().map_or(0, |r| r.streak),
-            streak_needed: crate::drs::MIN_STREAK,
+            streak_needed: crate::drs::min_streak(crate::drs::period_of(next)),
             checkin_every_hours: (crate::drs::CHECKIN_INTERVAL_SECS / 3600) as u32,
             my_weight,
             total_weight,

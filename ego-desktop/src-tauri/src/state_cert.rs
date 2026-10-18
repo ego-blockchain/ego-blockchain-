@@ -3,7 +3,7 @@ use crate::ledger::{LedgerBlock, LedgerTx};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const STATE_CERT_FROM_HEIGHT: u64 = crate::drs::DRS_FROM_HEIGHT;
+pub const STATE_CERT_FROM_HEIGHT: u64 = 34_001;
 pub const CERT_COMMITTEE: usize = 128;
 pub const CHUNK_ENTRIES: usize = 4096;
 pub const DAY_SECS: i64 = 86_400;

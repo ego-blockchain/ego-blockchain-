@@ -5,7 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const CHECKIN_FROM_HEIGHT: u64 = 32_000;
-pub const DRS_FROM_HEIGHT: u64 = 34_001;
+pub const DRS_FROM_HEIGHT: u64 = 32_601;
+pub const FAST_START_HEIGHT: u64 = 32_350;
+const FAST_START_RECOUNT_MAX: u64 = 100_000;
+
+pub fn min_streak(period: u64) -> u32 {
+    if period >= period_of(FAST_START_HEIGHT) { 1 } else { MIN_STREAK }
+}
 pub const EPOCH: u64 = 100;
 pub const WEIGHT_LEAD: u64 = 50;
 pub const COMMITTEE_SIZE: usize = 32;
@@ -413,8 +419,8 @@ fn has_consensus_key(ov: &Ov, addr: &str) -> bool {
         || ov.get(&crate::chain_db::val_dil_key(addr)).map(|k| !k.is_empty()).unwrap_or(false)
 }
 
-pub fn weight_of(rec: &NodeRec, at: i64, keys_ok: bool) -> u64 {
-    if !keys_ok || rec.pop_key.is_empty() || rec.streak < MIN_STREAK || at.saturating_sub(rec.last_checkin) > STREAK_GAP_SECS {
+pub fn weight_of(rec: &NodeRec, at: i64, keys_ok: bool, period: u64) -> u64 {
+    if !keys_ok || rec.pop_key.is_empty() || rec.streak < min_streak(period) || at.saturating_sub(rec.last_checkin) > STREAK_GAP_SECS {
         return 0;
     }
     let uptime = (rec.streak as u64).min(UPTIME_CAP);
@@ -447,7 +453,7 @@ fn next_drop(rec: &NodeRec, at: i64) -> Option<i64> {
 
 fn refresh(ov: &mut Ov, addr: &str, rec: &mut NodeRec, at: i64, period: u64) {
     let keys_ok = has_consensus_key(ov, addr);
-    let new_w = weight_of(rec, at, keys_ok);
+    let new_w = weight_of(rec, at, keys_ok, period);
     let old_w = rec.weight.next;
     if new_w != old_w {
         rec.weight.set(period, new_w);
@@ -844,6 +850,9 @@ pub fn apply_block(
         process_expiries(ov, at, period);
     }
     apply_registrations(ov, txs, at, period);
+    if block.height == FAST_START_HEIGHT {
+        recount_all(ov, at, period);
+    }
     if block.height < CHECKIN_FROM_HEIGHT {
         return Applied { credits };
     }
@@ -901,7 +910,7 @@ pub fn apply_block(
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|w| *w != p.prover)
-                    .filter(|w| addr_at(ov, *w).map_or(false, |a| is_live(ov, &a, at)))
+                    .filter(|w| addr_at(ov, *w).map_or(false, |a| is_live_in(ov, &a, at, period)))
                     .collect();
                 record_coverage(ov, &prover, live.len() as u64, at, block.height);
             }
@@ -958,6 +967,23 @@ pub fn coverage_spacing_ok(ov: &Ov, addr: &str, at: i64) -> bool {
 
 pub fn is_live(ov: &Ov, addr: &str, at: i64) -> bool {
     load_rec(ov, addr).map_or(false, |rec| rec.streak >= MIN_STREAK && at.saturating_sub(rec.last_checkin) <= STREAK_GAP_SECS)
+}
+
+pub fn is_live_in(ov: &Ov, addr: &str, at: i64, period: u64) -> bool {
+    load_rec(ov, addr).map_or(false, |rec| rec.streak >= min_streak(period) && at.saturating_sub(rec.last_checkin) <= STREAK_GAP_SECS)
+}
+
+fn recount_all(ov: &mut Ov, at: i64, period: u64) {
+    let count = node_count(ov);
+    if count > FAST_START_RECOUNT_MAX {
+        return;
+    }
+    for idx in 0..count {
+        let Some(addr) = addr_at(ov, idx) else { continue };
+        let Some(mut rec) = load_rec(ov, &addr) else { continue };
+        refresh(ov, &addr, &mut rec, at, period);
+        save_rec(ov, &addr, &rec);
+    }
 }
 
 pub fn committee(ov: &Ov, height: u64, attempt: i64, founders_with_keys: &[String]) -> Vec<String> {
@@ -1123,6 +1149,24 @@ mod tests {
     }
 
     #[test]
+    fn from_the_fast_start_one_check_in_is_enough_and_the_first_draw_sees_it() {
+        let (mut ov, _) = network(6);
+        let all: Vec<u64> = (0..6).collect();
+        let t0 = 1_900_000_000i64;
+        run(&mut ov, CHECKIN_FROM_HEIGHT, t0, &all);
+        assert_eq!(total_weight(&ov, period_of(FAST_START_HEIGHT)), 0, "one check-in earns nothing before the fast start");
+        apply_block(&mut ov, &block(FAST_START_HEIGHT, t0 + 3_600), &[], u64::MAX, "seed");
+        ov.commit_memory();
+        assert_eq!(total_weight(&ov, period_of(FAST_START_HEIGHT) + 1), 6, "the fast start counts everyone who checked in");
+        let draw_height = (first_drs_epoch() - 1) * EPOCH;
+        assert!(FAST_START_HEIGHT < draw_height && draw_height < DRS_FROM_HEIGHT);
+        apply_block(&mut ov, &block(draw_height, t0 + 7_200), &[], u64::MAX, "seed");
+        ov.commit_memory();
+        let rota = load_rota(&ov, first_drs_epoch()).expect("the first open group is drawn");
+        assert_eq!(rota.members.len(), 6, "every node that checked in is in the first draw");
+    }
+
+    #[test]
     fn nodes_earn_weight_after_two_days_and_lose_it_when_they_stop() {
         let (mut ov, addrs) = network(40);
         let all: Vec<u64> = (0..40).collect();
@@ -1272,17 +1316,17 @@ mod tests {
     #[test]
     fn weight_needs_a_proven_key_a_streak_and_a_recent_checkin() {
         let mut rec = NodeRec { idx: 0, pop_key: "ab".into(), streak: MIN_STREAK, last_checkin: 1_000, ..NodeRec::default() };
-        assert_eq!(weight_of(&rec, 1_000, true), MIN_STREAK as u64);
-        assert_eq!(weight_of(&rec, 1_000, false), 0);
-        assert_eq!(weight_of(&rec, 1_000 + STREAK_GAP_SECS + 1, true), 0);
+        assert_eq!(weight_of(&rec, 1_000, true, 0), MIN_STREAK as u64);
+        assert_eq!(weight_of(&rec, 1_000, false, 0), 0);
+        assert_eq!(weight_of(&rec, 1_000 + STREAK_GAP_SECS + 1, true, 0), 0);
         rec.streak = 500;
         rec.storage_bytes = 3 * GB;
         rec.storage_until = 2_000;
         rec.coverage = 50;
         rec.coverage_at = 1_000;
-        assert_eq!(weight_of(&rec, 1_500, true), UPTIME_CAP + 30 + COVERAGE_CAP_WITNESSES * 2);
-        assert_eq!(weight_of(&rec, 2_001, true), UPTIME_CAP + COVERAGE_CAP_WITNESSES * 2);
+        assert_eq!(weight_of(&rec, 1_500, true, 0), UPTIME_CAP + 30 + COVERAGE_CAP_WITNESSES * 2);
+        assert_eq!(weight_of(&rec, 2_001, true, 0), UPTIME_CAP + COVERAGE_CAP_WITNESSES * 2);
         rec.pop_key.clear();
-        assert_eq!(weight_of(&rec, 1_500, true), 0);
+        assert_eq!(weight_of(&rec, 1_500, true, 0), 0);
     }
 }
