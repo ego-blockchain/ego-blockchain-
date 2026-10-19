@@ -37,6 +37,13 @@ pub const MAX_WITNESSES: usize = 32;
 pub const MAX_COVERAGE_PROOFS_PER_BLOCK: usize = 512;
 pub const TX_COVERAGE_BATCH: &str = "coverage_batch";
 pub const NODE_REWARD_PER_DAY_UEGOC: u64 = 50_000 * 1_000_000;
+pub const CHECKIN_HALVING_START_TS: i64 = 1_792_382_606;
+pub const CHECKIN_HALVING_SECS: i64 = 1_461 * 86_400;
+
+pub fn node_reward_per_day_at(at: i64) -> u64 {
+    let era = at.saturating_sub(CHECKIN_HALVING_START_TS).max(0) / CHECKIN_HALVING_SECS;
+    if era >= 64 { 0 } else { NODE_REWARD_PER_DAY_UEGOC >> era }
+}
 pub const MAX_CHECKINS_PER_BLOCK: usize = 2_048;
 pub const MAX_EXPIRIES_PER_BLOCK: usize = 20_000;
 pub const ANCHOR_MAX_AGE: u64 = 300;
@@ -906,7 +913,7 @@ pub fn apply_block(
     if let Some(tx) = txs.iter().find(|t| t.tx_type == TX_CHECKIN_BATCH) {
         if let Ok(batch) = serde_json::from_str::<CheckinBatch>(&tx.call_args) {
             let total_w = total_weight(ov, period) as u128;
-            let per_checkin = NODE_REWARD_PER_DAY_UEGOC as u128 * CHECKIN_INTERVAL_SECS as u128 / 86_400;
+            let per_checkin = node_reward_per_day_at(at) as u128 * CHECKIN_INTERVAL_SECS as u128 / 86_400;
             let mut members: Vec<u64> = batch.groups.iter().filter_map(|g| decode_members(&g.members)).flatten().collect();
             members.sort_unstable();
             members.dedup();
@@ -1268,7 +1275,7 @@ mod tests {
         assert_eq!(total_weight(&ov, period), 40 * MIN_STREAK as u64);
 
         let paid = run(&mut ov, later, t0 + MIN_STREAK as i64 * CHECKIN_INTERVAL_SECS, &all);
-        let per_checkin = (NODE_REWARD_PER_DAY_UEGOC as u128 * CHECKIN_INTERVAL_SECS as u128 / 86_400) as u64;
+        let per_checkin = (node_reward_per_day_at(t0 + MIN_STREAK as i64 * CHECKIN_INTERVAL_SECS) as u128 * CHECKIN_INTERVAL_SECS as u128 / 86_400) as u64;
         let sum: u64 = paid.iter().map(|(_, p)| *p).sum();
         assert_eq!(paid.len(), 40);
         assert!(sum <= per_checkin && sum + 40 >= per_checkin, "{sum} vs budget {per_checkin}");
@@ -1402,6 +1409,20 @@ mod tests {
         ov.commit_memory();
         assert_eq!(committee(&ov, new_h, 7), vec![members[3].clone(), members[40].clone(), members[90].clone()], "three ready nodes are enough");
         assert!(committee(&Ov::memory(), new_h, 0).is_empty(), "no founders are added when nobody was drawn");
+    }
+
+    #[test]
+    fn check_in_pay_halves_every_four_years_and_never_drains_the_pool() {
+        let start = CHECKIN_HALVING_START_TS;
+        assert_eq!(node_reward_per_day_at(start - 86_400), NODE_REWARD_PER_DAY_UEGOC, "before the clock starts the full pool is paid");
+        assert_eq!(node_reward_per_day_at(start), NODE_REWARD_PER_DAY_UEGOC);
+        assert_eq!(node_reward_per_day_at(start + CHECKIN_HALVING_SECS - 1), NODE_REWARD_PER_DAY_UEGOC, "the first four years pay what nodes are paid today");
+        assert_eq!(node_reward_per_day_at(start + CHECKIN_HALVING_SECS), NODE_REWARD_PER_DAY_UEGOC / 2);
+        assert_eq!(node_reward_per_day_at(start + 2 * CHECKIN_HALVING_SECS), NODE_REWARD_PER_DAY_UEGOC / 4);
+        assert_eq!(node_reward_per_day_at(start + 70 * CHECKIN_HALVING_SECS), 0);
+        let total: u128 = (0..64).map(|e| node_reward_per_day_at(start + e * CHECKIN_HALVING_SECS) as u128 * 1_461).sum();
+        assert!(total < crate::tokenomics::NODE_POOL_UEGOC as u128 / 2 + NODE_REWARD_PER_DAY_UEGOC as u128 * 1_461, "{} EGOC over all time", total / 1_000_000);
+        assert!(total < crate::tokenomics::NODE_POOL_UEGOC as u128, "check-in pay alone never empties the node pool");
     }
 
     #[test]
