@@ -2134,6 +2134,8 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     }
 
     let mut balance_delta: std::collections::HashMap<String, i128> = Default::default();
+    let mine = local_addresses();
+    let mut reward_events: Vec<(String, &'static str, u64, String)> = Vec::new();
     let mut supply = crate::invariants::SupplyLedger::new();
     let mut new_tx_count: u64 = 0;
     let mut stake_sim: std::collections::HashMap<String, u64> = Default::default();
@@ -2223,6 +2225,9 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             if reward > 0 {
                 *balance_delta.entry(tx.from.clone()).or_insert(0) += reward as i128;
                 *balance_delta.entry(STAKING_POOL_ADDR.to_string()).or_insert(0) -= reward as i128;
+                if mine.contains(&tx.from) {
+                    reward_events.push((tx.from.clone(), REWARD_STAKING, reward, tx.hash.clone()));
+                }
             }
             let stake = stake_sim
                 .entry(tx.from.clone())
@@ -2282,14 +2287,20 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         let applied = crate::drs::apply_block(&mut drs_ov, block, &confirmed_txs, pool_now.max(0) as u64, &seed);
         let mut pool_left = pool_now.max(0) as u128;
         let mut credits = applied.credits;
-        for (_, pay) in &credits {
+        for (addr, pay) in &credits {
             pool_left = pool_left.saturating_sub(*pay as u128);
+            if mine.contains(addr) {
+                reward_events.push((addr.clone(), REWARD_NODE, *pay, String::new()));
+            }
         }
         if block.height >= STORAGE_PAY_FROM_HEIGHT {
             for (host, pay) in storage_pay_in(db, &mut drs_ov, block, &confirmed_txs) {
                 let pay = (pay as u128).min(pool_left) as u64;
                 pool_left -= pay as u128;
                 if pay > 0 {
+                    if mine.contains(&host) {
+                        reward_events.push((host.clone(), REWARD_STORAGE, pay, String::new()));
+                    }
                     credits.push((host, pay));
                 }
             }
@@ -2321,6 +2332,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
 
     // Block record.
     batch.put_cf(cf_blocks, height_k, encode(block));
+    for (seq, (addr, kind, amount, tx_hash)) in reward_events.into_iter().enumerate() {
+        let entry = RewardEntry { kind: kind.to_string(), amount_uegoc: amount, height: block.height, timestamp: block.timestamp, tx_hash };
+        if let Ok(v) = serde_json::to_vec(&entry) {
+            batch.put_cf(cf_meta, reward_key(&addr, block.height, kind, seq), v);
+        }
+    }
 
     if drs_active(block.height) {
         if let Some(mix) = randao_mix_write_in(&db, block) {
@@ -3677,6 +3694,79 @@ pub fn recent_tx_history_for_addr(
         if out.len() >= max { break; }
     }
     out
+}
+
+pub const REWARD_NODE: &str = "node";
+pub const REWARD_STORAGE: &str = "storage";
+pub const REWARD_STAKING: &str = "staking";
+const REWARD_PREFIX: &[u8] = b"rwd:";
+const LOCAL_ADDRESSES_TTL_SECS: i64 = 30;
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RewardEntry {
+    pub kind: String,
+    pub amount_uegoc: u64,
+    pub height: u64,
+    pub timestamp: i64,
+    #[serde(default)]
+    pub tx_hash: String,
+}
+
+fn reward_key(addr: &str, height: u64, kind: &str, seq: usize) -> Vec<u8> {
+    format!("rwd:{addr}:{height:012}:{kind}:{seq}").into_bytes()
+}
+
+fn reward_key_height(key: &[u8]) -> Option<u64> {
+    std::str::from_utf8(key).ok()?.split(':').nth(2)?.parse().ok()
+}
+
+fn local_addresses() -> Vec<String> {
+    static CACHE: std::sync::Mutex<(i64, Vec<String>)> = std::sync::Mutex::new((i64::MIN, Vec::new()));
+    let now = chrono::Utc::now().timestamp();
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if now.saturating_sub(g.0) < LOCAL_ADDRESSES_TTL_SECS {
+        return g.1.clone();
+    }
+    let mut all: Vec<String> = crate::ledger::load_registry().wallets.into_iter().map(|w| w.address).collect();
+    all.push(crate::ledger::Ledger::load().address);
+    all.retain(|a| !a.is_empty());
+    all.sort();
+    all.dedup();
+    *g = (now, all.clone());
+    all
+}
+
+fn drop_rewards_from(db: &DB, batch: &mut WriteBatch, height: u64) {
+    let Some(cf) = db.cf_handle(CF_META) else { return };
+    for item in db.prefix_iterator_cf(cf, REWARD_PREFIX) {
+        let Ok((k, _)) = item else { break };
+        if !k.starts_with(REWARD_PREFIX) {
+            break;
+        }
+        if reward_key_height(&k).map_or(false, |h| h >= height) {
+            batch.delete_cf(cf, &k);
+        }
+    }
+}
+
+pub fn reward_entries_for(addr: &str) -> Vec<RewardEntry> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    reward_entries_in(&db, addr)
+}
+
+fn reward_entries_in(db: &DB, addr: &str) -> Vec<RewardEntry> {
+    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new() };
+    let prefix = format!("rwd:{addr}:").into_bytes();
+    db.prefix_iterator_cf(cf, &prefix)
+        .filter_map(|item| item.ok())
+        .take_while(|(k, _)| k.starts_with(&prefix))
+        .filter_map(|(_, v)| serde_json::from_slice::<RewardEntry>(&v).ok())
+        .collect()
+}
+
+pub fn drs_earned_total(addr: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::drs::load_rec(&crate::drs::Ov::new(db), addr).map_or(0, |r| r.earned)
 }
 
 pub fn get_tx_history_for_addr(address: &str) -> Vec<LedgerTx> {
@@ -5554,6 +5644,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
     let mut pool_txs: Vec<crate::ledger::LedgerTx> = Vec::new();
     let mut removed_hashes: std::collections::HashSet<String> = Default::default();
     let mut batch = WriteBatch::default();
+    drop_rewards_from(&db, &mut batch, height);
     let market_rejected = crate::market_chain::rejected_since(&db, height);
 
     for h in height..=tip {
@@ -9468,6 +9559,8 @@ pub const LEGACY_CHECKIN_FROM_HEIGHT: u64 = 31_000;
 pub const DRS_EPOCH: u64 = crate::drs::EPOCH;
 pub const COMMITTEE_REDRAW_SECS: i64 = 300;
 pub const COMMITTEE_GUARD_SECS: i64 = 30;
+pub const COMMITTEE_REDRAW_V2_SECS: i64 = 90;
+pub const COMMITTEE_GUARD_V2_SECS: i64 = 10;
 pub const MAX_COMMITTEE_ATTEMPT: i64 = 10_000;
 pub const MAX_FREE_TXS_PER_BLOCK: usize = 256;
 pub const RULES_VERSION: u64 = 2;
@@ -9734,24 +9827,33 @@ pub fn storage_file_memo(call_args: &str, delete: bool) -> String {
     if delete { format!("storage_file:delete:{h}") } else { format!("storage_file:{h}") }
 }
 
-pub fn committee_attempt(parent_ts: i64, stamp: i64) -> i64 {
-    (stamp.saturating_sub(parent_ts).max(0) / COMMITTEE_REDRAW_SECS).min(MAX_COMMITTEE_ATTEMPT)
+fn committee_timing(height: u64) -> (i64, i64) {
+    if height >= crate::drs::DRAW_V2_FROM_HEIGHT {
+        (COMMITTEE_REDRAW_V2_SECS, COMMITTEE_GUARD_V2_SECS)
+    } else {
+        (COMMITTEE_REDRAW_SECS, COMMITTEE_GUARD_SECS)
+    }
 }
 
-pub fn proposal_window_open(parent_ts: i64, stamp: i64) -> bool {
-    let attempt = committee_attempt(parent_ts, stamp);
+pub fn committee_attempt(height: u64, parent_ts: i64, stamp: i64) -> i64 {
+    let (redraw, _) = committee_timing(height);
+    (stamp.saturating_sub(parent_ts).max(0) / redraw).min(MAX_COMMITTEE_ATTEMPT)
+}
+
+pub fn proposal_window_open(height: u64, parent_ts: i64, stamp: i64) -> bool {
+    let (redraw, guard) = committee_timing(height);
+    let attempt = committee_attempt(height, parent_ts, stamp);
     if attempt >= MAX_COMMITTEE_ATTEMPT {
         return true;
     }
-    let start = parent_ts.saturating_add(attempt * COMMITTEE_REDRAW_SECS);
-    let end = start.saturating_add(COMMITTEE_REDRAW_SECS);
-    (attempt == 0 || stamp >= start.saturating_add(COMMITTEE_GUARD_SECS))
-        && stamp < end.saturating_sub(COMMITTEE_GUARD_SECS)
+    let start = parent_ts.saturating_add(attempt * redraw);
+    let end = start.saturating_add(redraw);
+    (attempt == 0 || stamp >= start.saturating_add(guard)) && stamp < end.saturating_sub(guard)
 }
 
 fn committee_for_height_in(db: &DB, height: u64, stamp: i64) -> Option<Vec<(String, Vec<u8>)>> {
     let parent_ts = block_ts_at_in(db, height.checked_sub(1)?)?;
-    let attempt = committee_attempt(parent_ts, stamp);
+    let attempt = committee_attempt(height, parent_ts, stamp);
     let ov = crate::drs::Ov::new(db);
     let members = crate::drs::committee(&ov, height, attempt);
     let out: Vec<(String, Vec<u8>)> = members
@@ -9784,13 +9886,13 @@ pub fn rota_members(height: u64) -> Option<Vec<String>> {
 pub fn committee_window(height: u64, now: i64) -> Option<(i64, bool)> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let parent_ts = block_ts_at_in(&db, height.checked_sub(1)?)?;
-    Some((committee_attempt(parent_ts, now), proposal_window_open(parent_ts, now)))
+    Some((committee_attempt(height, parent_ts, now), proposal_window_open(height, parent_ts, now)))
 }
 
 pub fn block_attempt(block: &LedgerBlock) -> Option<i64> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let parent_ts = block_ts_at_in(&db, block.height.checked_sub(1)?)?;
-    Some(committee_attempt(parent_ts, block.timestamp))
+    Some(committee_attempt(block.height, parent_ts, block.timestamp))
 }
 
 pub fn randao_message(height: u64) -> Vec<u8> {
@@ -10824,6 +10926,30 @@ mod history_tests {
         (db, dir)
     }
 
+    #[test]
+    fn a_rewind_drops_the_rewards_of_the_blocks_it_removes() {
+        let (db, _dir) = scratch_db("rewards");
+        let cf = db.cf_handle(CF_META).unwrap();
+        let me = "egot1me";
+        let put = |h: u64, kind: &str, seq: usize, amount: u64| {
+            let e = RewardEntry { kind: kind.into(), amount_uegoc: amount, height: h, timestamp: h as i64 * 20, tx_hash: String::new() };
+            db.put_cf(cf, reward_key(me, h, kind, seq), serde_json::to_vec(&e).unwrap()).unwrap();
+        };
+        put(100, REWARD_NODE, 0, 5);
+        put(101, REWARD_STORAGE, 0, 7);
+        put(102, REWARD_STAKING, 0, 9);
+        db.put_cf(cf, reward_key("egot1other", 102, REWARD_NODE, 0), b"{}").unwrap();
+        assert_eq!(reward_key_height(&reward_key(me, 101, REWARD_NODE, 3)), Some(101));
+        assert_eq!(reward_entries_in(&db, me).len(), 3);
+        let mut batch = WriteBatch::default();
+        drop_rewards_from(&db, &mut batch, 101);
+        db.write(batch).unwrap();
+        let left = reward_entries_in(&db, me);
+        assert_eq!(left.iter().map(|e| e.height).collect::<Vec<_>>(), vec![100], "rewards at and above the rewind height are gone");
+        assert!(db.get_cf(cf, reward_key("egot1other", 102, REWARD_NODE, 0)).unwrap().is_none());
+        assert!(reward_entries_in(&db, "egot1m").is_empty(), "an address that is a prefix of another sees nothing of it");
+    }
+
     fn derived(db: &DB) -> Vec<(Vec<u8>, Vec<u8>)> {
         let cf = db.cf_handle(CF_META).unwrap();
         db.iterator_cf(cf, rocksdb::IteratorMode::Start)
@@ -11174,19 +11300,32 @@ mod commit_cert_tests {
     #[test]
     fn a_stuck_committee_hands_over_after_the_redraw_time_with_guard_bands() {
         let p = 1_000;
-        assert_eq!(committee_attempt(p, p), 0);
-        assert_eq!(committee_attempt(p, p - 50), 0);
-        assert_eq!(committee_attempt(p, p + 299), 0);
-        assert_eq!(committee_attempt(p, p + 300), 1);
-        assert_eq!(committee_attempt(p, p + 901), 3);
-        assert!(proposal_window_open(p, p));
-        assert!(proposal_window_open(p, p + 269));
-        assert!(!proposal_window_open(p, p + 270));
-        assert!(!proposal_window_open(p, p + 300));
-        assert!(!proposal_window_open(p, p + 329));
-        assert!(proposal_window_open(p, p + 330));
-        assert!(proposal_window_open(p, p + 569));
-        assert!(!proposal_window_open(p, p + 570));
+        let old = crate::drs::DRAW_V2_FROM_HEIGHT - 1;
+        assert_eq!(committee_attempt(old, p, p), 0);
+        assert_eq!(committee_attempt(old, p, p - 50), 0);
+        assert_eq!(committee_attempt(old, p, p + 299), 0);
+        assert_eq!(committee_attempt(old, p, p + 300), 1);
+        assert_eq!(committee_attempt(old, p, p + 901), 3);
+        assert!(proposal_window_open(old, p, p));
+        assert!(proposal_window_open(old, p, p + 269));
+        assert!(!proposal_window_open(old, p, p + 270));
+        assert!(!proposal_window_open(old, p, p + 300));
+        assert!(!proposal_window_open(old, p, p + 329));
+        assert!(proposal_window_open(old, p, p + 330));
+        assert!(proposal_window_open(old, p, p + 569));
+        assert!(!proposal_window_open(old, p, p + 570));
+
+        let new = crate::drs::DRAW_V2_FROM_HEIGHT;
+        assert_eq!(committee_attempt(new, p, p + 89), 0);
+        assert_eq!(committee_attempt(new, p, p + 90), 1);
+        assert_eq!(committee_attempt(new, p, p + 300), 3);
+        let empty_block_due = p + crate::mempool::EMPTY_BLOCK_INTERVAL_S as i64;
+        assert!(proposal_window_open(new, p, empty_block_due + 5), "an empty block is due well inside the first attempt");
+        assert!(!proposal_window_open(new, p, p + 80));
+        assert!(!proposal_window_open(new, p, p + 99));
+        assert!(proposal_window_open(new, p, p + 100));
+        assert!(proposal_window_open(new, p, p + 169));
+        assert!(!proposal_window_open(new, p, p + 170));
     }
 
     #[test]

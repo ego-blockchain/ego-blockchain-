@@ -17,6 +17,8 @@ pub const WEIGHT_LEAD: u64 = 50;
 pub const COMMITTEE_SIZE: usize = 32;
 pub const MIN_COMMITTEE: usize = 3;
 pub const BLOCK_COMMITTEE: usize = 4;
+pub const DRAW_V2_FROM_HEIGHT: u64 = 32_640;
+pub const READY_V2_EPOCH: u64 = 328;
 pub const ROTA_LEN: usize = 128;
 pub const READY_DEADLINE: u64 = 90;
 pub const CHECKIN_INTERVAL_SECS: i64 = 12 * 3600;
@@ -534,7 +536,8 @@ pub fn checkin_message(anchor: u64, anchor_hash: &str) -> Vec<u8> {
 }
 
 pub fn ready_message(epoch: u64, seed: &str) -> Vec<u8> {
-    format!("ego/ready/v1:{epoch}:{seed}").into_bytes()
+    let version = if epoch >= READY_V2_EPOCH { 2 } else { 1 };
+    format!("ego/ready/v{version}:{epoch}:{seed}").into_bytes()
 }
 
 pub fn checkin_due(rec: &NodeRec, at: i64) -> bool {
@@ -1000,27 +1003,32 @@ pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
         .collect();
     let pool = if ready.len() >= MIN_COMMITTEE { ready } else { rota.members };
     let size = BLOCK_COMMITTEE.min(pool.len());
-    let members: Vec<String> = if pool.len() <= size {
-        pool
-    } else if attempt <= 0 {
-        pool[..size].to_vec()
-    } else {
-        let mut ranked: Vec<([u8; 32], String)> = pool
-            .into_iter()
-            .map(|a| {
-                let mut h = blake3::Hasher::new();
+    if pool.len() <= size {
+        return pool;
+    }
+    if height < DRAW_V2_FROM_HEIGHT && attempt <= 0 {
+        return pool[..size].to_vec();
+    }
+    let mut ranked: Vec<([u8; 32], String)> = pool
+        .into_iter()
+        .map(|a| {
+            let mut h = blake3::Hasher::new();
+            if height >= DRAW_V2_FROM_HEIGHT {
+                h.update(b"ego/committee-draw/v2:");
+                h.update(rota.seed.as_bytes());
+                h.update(&height.to_le_bytes());
+            } else {
                 h.update(b"ego/committee-redraw/v1:");
                 h.update(rota.seed.as_bytes());
                 h.update(&epoch.to_le_bytes());
-                h.update(&attempt.to_le_bytes());
-                h.update(a.as_bytes());
-                (*h.finalize().as_bytes(), a)
-            })
-            .collect();
-        ranked.sort();
-        ranked.into_iter().take(size).map(|(_, a)| a).collect()
-    };
-    members
+            }
+            h.update(&attempt.to_le_bytes());
+            h.update(a.as_bytes());
+            (*h.finalize().as_bytes(), a)
+        })
+        .collect();
+    ranked.sort();
+    ranked.into_iter().take(size).map(|(_, a)| a).collect()
 }
 
 pub fn rota_position(ov: &Ov, epoch: u64, addr: &str) -> Option<(usize, String)> {
@@ -1274,38 +1282,64 @@ mod tests {
 
     #[test]
     fn the_committee_is_the_ready_part_of_the_rota_and_rotates_on_redraw() {
+        let old_epoch = (DRAW_V2_FROM_HEIGHT - 1) / EPOCH - 1;
+        let new_epoch = DRAW_V2_FROM_HEIGHT / EPOCH + 1;
         let mut ov = Ov::memory();
         let members: Vec<String> = (0..ROTA_LEN).map(|i| format!("egot1seat{i:03}")).collect();
         let rota = Rota { seed: "s".into(), members: members.clone() };
-        ov.put(rota_key(400), serde_json::to_vec(&rota).unwrap());
+        for e in [old_epoch, new_epoch] {
+            ov.put(rota_key(e), serde_json::to_vec(&rota).unwrap());
+        }
         ov.commit_memory();
-        let h = 400 * EPOCH + 5;
-        assert_eq!(committee(&ov, h, 0), members[..BLOCK_COMMITTEE].to_vec(), "with nobody ready the first drawn make up the group");
+        let old_h = old_epoch * EPOCH + 5;
+        let new_h = new_epoch * EPOCH + 5;
+        assert!(old_h < DRAW_V2_FROM_HEIGHT && new_h >= DRAW_V2_FROM_HEIGHT);
+        assert_eq!(committee(&ov, old_h, 0), members[..BLOCK_COMMITTEE].to_vec(), "with nobody ready the first drawn make up the group");
         let mut bits = Vec::new();
         for i in (0..ROTA_LEN).filter(|i| i % 2 == 1) {
             set_bit(&mut bits, i);
         }
-        ov.put(ready_key(400), bits);
+        for e in [old_epoch, new_epoch] {
+            ov.put(ready_key(e), bits.clone());
+        }
         ov.commit_memory();
         let ready: Vec<String> = members.iter().enumerate().filter(|(i, _)| i % 2 == 1).map(|(_, a)| a.clone()).collect();
-        assert_eq!(committee(&ov, h, 0), ready[..BLOCK_COMMITTEE].to_vec());
+        assert_eq!(committee(&ov, old_h, 0), ready[..BLOCK_COMMITTEE].to_vec(), "before the new draw, the first attempt takes the first ready nodes");
+        assert_eq!(committee(&ov, old_h, 1), committee(&ov, old_h + 1, 1), "before the new draw, every height gets the same redraw");
+
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        for attempt in 1..60 {
-            let c = committee(&ov, h, attempt);
-            assert_eq!(c, committee(&ov, h, attempt), "every node draws the same group");
+        let mut firsts: BTreeSet<Vec<String>> = BTreeSet::new();
+        for k in 0..60u64 {
+            let h = new_h + k;
+            let c = committee(&ov, h, 0);
+            assert_eq!(c, committee(&ov, h, 0), "every node draws the same group");
             assert_eq!(c.len(), BLOCK_COMMITTEE);
             assert!(c.iter().all(|a| ready.contains(a)), "only ready nodes are drawn");
+            assert_ne!(c, committee(&ov, h, 1), "a redraw changes the group");
+            firsts.insert(c.clone());
             seen.extend(c);
         }
-        assert!(seen.len() > ready.len() / 2, "redraws rotate through the ready nodes ({} of {})", seen.len(), ready.len());
+        assert!(firsts.len() > 40, "the first group changes from block to block ({} different in 60)", firsts.len());
+        assert!(seen.len() > ready.len() * 3 / 4, "blocks rotate through the ready nodes ({} of {})", seen.len(), ready.len());
+
         let mut three = Vec::new();
         for i in [3usize, 40, 90] {
             set_bit(&mut three, i);
         }
-        ov.put(ready_key(400), three);
+        ov.put(ready_key(new_epoch), three);
         ov.commit_memory();
-        assert_eq!(committee(&ov, h, 7), vec![members[3].clone(), members[40].clone(), members[90].clone()], "three ready nodes are enough");
-        assert!(committee(&Ov::memory(), h, 0).is_empty(), "no founders are added when nobody was drawn");
+        assert_eq!(committee(&ov, new_h, 7), vec![members[3].clone(), members[40].clone(), members[90].clone()], "three ready nodes are enough");
+        assert!(committee(&Ov::memory(), new_h, 0).is_empty(), "no founders are added when nobody was drawn");
+    }
+
+    #[test]
+    fn readiness_is_signed_for_the_rules_the_node_runs() {
+        assert_eq!(ready_message(READY_V2_EPOCH - 1, "s"), b"ego/ready/v1:327:s".to_vec());
+        assert_eq!(ready_message(READY_V2_EPOCH, "s"), b"ego/ready/v2:328:s".to_vec());
+        let sk = crate::bls_agg::derive_bls_key(&[9u8; 32]);
+        let pk = crate::bls_agg::bls_pubkey(&sk);
+        let old = crate::bls_agg::sign_shared(&sk, b"ego/ready/v1:328:s");
+        assert!(!crate::bls_agg::verify_shared(&old, &pk, &ready_message(READY_V2_EPOCH, "s")), "a node still on the old rules is not counted ready");
     }
 
     #[test]

@@ -372,6 +372,40 @@ function isRewardTx(tx: LedgerTx): boolean {
   );
 }
 
+type RewardKind = 'all' | 'block' | 'staking' | 'node' | 'storage' | 'compute';
+
+interface RewardItem {
+  kind: string;
+  amount_uegoc: number;
+  height: number;
+  timestamp: number;
+  hash: string;
+  memo: string;
+}
+
+interface RewardHistory {
+  items: RewardItem[];
+  node_earned_total_uegoc: number;
+}
+
+const REWARD_KINDS: { key: RewardKind; label: string; row: string; icon: string }[] = [
+  { key: 'all',     label: 'All',      row: 'Reward',        icon: '⚡' },
+  { key: 'block',   label: 'Blocks',   row: 'Block reward',  icon: '⛏' },
+  { key: 'staking', label: 'Staking',  row: 'Staking reward', icon: '🔒' },
+  { key: 'node',    label: 'Earnings', row: 'Node earnings', icon: '📡' },
+  { key: 'storage', label: 'Storage',  row: 'Storage pay',   icon: '💾' },
+  { key: 'compute', label: 'Compute',  row: 'Compute pay',   icon: '🖥' },
+];
+
+function rewardKindInfo(kind: string) {
+  return REWARD_KINDS.find(k => k.key === kind) ?? REWARD_KINDS[0];
+}
+
+function formatEgocAmount(uegoc: number): string {
+  const egoc = uegoc / 1_000_000;
+  return `${egoc.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: egoc < 1 ? 6 : 2 })} EGOC`;
+}
+
 function formatAge(secs: number): string {
   if (secs < 3600) return `${Math.round(secs / 60)} minutes`;
   if (secs < 86400) return `${Math.round(secs / 3600)} hours`;
@@ -411,6 +445,8 @@ const WalletPage: React.FC = () => {
   useEffect(() => { cachedBalance  = balance;  }, [balance]);
   useEffect(() => { cachedTxs      = txs;      }, [txs]);
   const [tab, setTab]               = useState<'all' | 'sent' | 'received' | 'rewards'>('all');
+  const [rewards, setRewards]       = useState<RewardHistory | null>(null);
+  const [rewardKind, setRewardKind] = useState<RewardKind>('all');
   const [txPage, setTxPage]         = useState(1);
   const [txPageSize, setTxPageSize] = useState(25);
   const [clearingPending, setClearingPending] = useState(false);
@@ -1230,6 +1266,32 @@ const WalletPage: React.FC = () => {
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    if (tab !== 'rewards') return;
+    let alive = true;
+    const load = () => invoke<RewardHistory>('get_reward_history')
+      .then(r => { if (alive) setRewards(r); })
+      .catch(() => {});
+    load();
+    const timer = setInterval(load, 30_000);
+    const unsub = listen('wallet-balance-updated', load);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      unsub.then(f => f());
+    };
+  }, [tab, myAddress]);
+
+  const rewardItems = rewards?.items ?? [];
+  const rewardTotals = REWARD_KINDS.reduce<Record<string, number>>((acc, k) => {
+    acc[k.key] = rewardItems
+      .filter(r => k.key === 'all' || r.kind === k.key)
+      .reduce((sum, r) => sum + r.amount_uegoc, 0);
+    return acc;
+  }, {});
+  const shownRewards = rewardItems.filter(r => rewardKind === 'all' || r.kind === rewardKind);
+  const pagedRewards = shownRewards.slice((txPage - 1) * txPageSize, txPage * txPageSize);
+
   const filteredTxs = txs.filter(tx => {
     // Hide internal protocol txs (e.g. validator BLS-key registration) — they're
     // not user transfers and only confuse the wallet history.
@@ -1748,7 +1810,7 @@ const WalletPage: React.FC = () => {
               </button>
             )}
             <div className="flex gap-1">
-              {(['all', 'sent', 'received'] as const).map(t => (
+              {(['all', 'sent', 'received', 'rewards'] as const).map(t => (
                 <button
                   key={t}
                   onClick={() => { setTab(t); setTxPage(1); }}
@@ -1765,7 +1827,78 @@ const WalletPage: React.FC = () => {
           </div>
         </div>
 
-        {filteredTxs.length === 0 ? (
+        {tab === 'rewards' ? (
+          <>
+          <div className="px-5 pt-4 pb-3 border-b border-gray-700/50 space-y-3">
+            <div className="flex flex-wrap gap-2">
+              {REWARD_KINDS.map(k => (
+                <button
+                  key={k.key}
+                  onClick={() => { setRewardKind(k.key); setTxPage(1); }}
+                  className={`px-3 py-1.5 rounded-lg text-xs transition flex items-center gap-2 border ${
+                    rewardKind === k.key
+                      ? 'bg-yellow-500/15 border-yellow-500/40 text-yellow-300'
+                      : 'border-gray-700 text-gray-400 hover:bg-gray-700'
+                  }`}
+                >
+                  <span>{k.label}</span>
+                  <span className="tabular-nums text-[11px] opacity-80">{formatEgocAmount(rewardTotals[k.key] ?? 0)}</span>
+                </button>
+              ))}
+            </div>
+            <div className="text-xs text-gray-500">
+              Check-in, storage and staking pay is listed from when this version was installed.
+              {(rewards?.node_earned_total_uegoc ?? 0) > 0 && (
+                <> Lifetime check-in pay: <span className="text-gray-300 tabular-nums">{formatEgocAmount(rewards!.node_earned_total_uegoc)}</span>.</>
+              )}
+            </div>
+          </div>
+          {shownRewards.length === 0 ? (
+            <div className="py-12 text-center text-gray-500">
+              <div className="text-4xl mb-3">⚡</div>
+              <div className="text-sm">{rewards ? 'No rewards here yet' : 'Loading rewards…'}</div>
+              <div className="text-xs mt-1 text-gray-600">
+                Rewards appear when your node makes blocks, checks in, proves storage, or is paid for compute
+              </div>
+            </div>
+          ) : (
+            <>
+            <div className="divide-y divide-gray-700/50">
+              {pagedRewards.map((r, i) => {
+                const info = rewardKindInfo(r.kind);
+                return (
+                  <div key={`${r.kind}-${r.height}-${r.hash || i}`} className="w-full flex items-center justify-between px-5 py-4">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-xl flex items-center justify-center text-lg shrink-0 bg-yellow-500/15">
+                        {info.icon}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-sm text-gray-300 truncate">{info.row}</div>
+                        <div className="text-xs text-gray-500 truncate">
+                          {r.height > 0 ? `Block #${r.height.toLocaleString('en-US')}` : '—'}
+                          {r.memo && <span className="ml-2 text-gray-600">• {r.memo}</span>}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-right shrink-0 ml-3">
+                      <div className="text-sm font-semibold text-yellow-400 tabular-nums">+{formatEgocAmount(r.amount_uegoc)}</div>
+                      <div className="text-xs text-gray-500 mt-0.5">{formatAgo(r.timestamp)}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <Pagination
+              total={shownRewards.length}
+              page={txPage}
+              pageSize={txPageSize}
+              onPage={setTxPage}
+              onPageSize={ps => { setTxPageSize(ps); setTxPage(1); }}
+            />
+            </>
+          )}
+          </>
+        ) : filteredTxs.length === 0 ? (
           <div className="py-12 text-center text-gray-500">
             <div className="text-4xl mb-3">📋</div>
             <div className="text-sm">No transactions yet</div>

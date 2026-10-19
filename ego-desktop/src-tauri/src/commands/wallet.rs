@@ -489,6 +489,106 @@ pub async fn commit_transaction(
     })
 }
 
+pub const REWARD_BLOCK: &str = "block";
+pub const REWARD_COMPUTE: &str = "compute";
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RewardItem {
+    pub kind: String,
+    pub amount_uegoc: u64,
+    pub height: u64,
+    pub timestamp: i64,
+    pub hash: String,
+    pub memo: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RewardHistory {
+    pub items: Vec<RewardItem>,
+    pub node_earned_total_uegoc: u64,
+}
+
+fn refund_or_collateral(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
+    s.contains("refund") || s.contains("collateral")
+}
+
+pub fn reward_kind_of(tx: &LedgerTx, me: &str) -> Option<&'static str> {
+    use crate::chain_db as c;
+    if me.is_empty() || tx.to != me || tx.from == me || tx.amount == 0 || tx.tx_type == "faucet" {
+        return None;
+    }
+    if refund_or_collateral(&tx.tx_type) || tx.memo.as_deref().map_or(false, refund_or_collateral) {
+        return None;
+    }
+    match tx.tx_type.as_str() {
+        "reward" | "coinbase" | "fee_distribution" | "post_reward" => return Some(REWARD_BLOCK),
+        c::TX_UPTIME_REWARD => return Some(c::REWARD_NODE),
+        c::TX_STORAGE_REWARD => return Some(c::REWARD_STORAGE),
+        _ => {}
+    }
+    match tx.from.as_str() {
+        c::STAKING_POOL_ADDR => Some(c::REWARD_STAKING),
+        c::RESERVATION_ESCROW_ADDR | c::COMPUTE_ESCROW_ADDR | c::CLUSTER_ESCROW_ADDR => Some(REWARD_COMPUTE),
+        c::STORAGE_ESCROW_ADDR => Some(c::REWARD_STORAGE),
+        _ => None,
+    }
+}
+
+fn credited_memo(kind: &str) -> &'static str {
+    match kind {
+        crate::chain_db::REWARD_NODE => "Node check-in pay",
+        crate::chain_db::REWARD_STORAGE => "Storage proof pay",
+        crate::chain_db::REWARD_STAKING => "Staking reward",
+        _ => "Reward",
+    }
+}
+
+pub fn merge_rewards(me: &str, txs: &[LedgerTx], credited: Vec<crate::chain_db::RewardEntry>) -> Vec<RewardItem> {
+    let mut items: Vec<RewardItem> = txs
+        .iter()
+        .filter_map(|tx| {
+            let kind = reward_kind_of(tx, me)?;
+            Some(RewardItem {
+                kind: kind.to_string(),
+                amount_uegoc: tx.amount,
+                height: tx.block_height.unwrap_or(0),
+                timestamp: tx.timestamp,
+                hash: tx.hash.clone(),
+                memo: tx.memo.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+    items.extend(credited.into_iter().filter(|e| e.amount_uegoc > 0).map(|e| RewardItem {
+        memo: credited_memo(&e.kind).to_string(),
+        kind: e.kind,
+        amount_uegoc: e.amount_uegoc,
+        height: e.height,
+        timestamp: e.timestamp,
+        hash: e.tx_hash,
+    }));
+    items.sort_by(|a, b| (b.timestamp, b.height).cmp(&(a.timestamp, a.height)));
+    items
+}
+
+#[tauri::command]
+pub async fn get_reward_history() -> Result<RewardHistory, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let me = Ledger::load().address;
+        if me.is_empty() {
+            return RewardHistory { items: Vec::new(), node_earned_total_uegoc: 0 };
+        }
+        let txs = crate::chain_db::get_tx_history_for_addr(&me);
+        let credited = crate::chain_db::reward_entries_for(&me);
+        RewardHistory {
+            items: merge_rewards(&me, &txs, credited),
+            node_earned_total_uegoc: crate::chain_db::drs_earned_total(&me),
+        }
+    })
+    .await
+    .map_err(|e| EgoDesktopError::InvalidInput(format!("reward history task failed: {e}")))
+}
+
 #[tauri::command]
 pub async fn get_transaction_history(
     _state: State<'_, AppState>,
@@ -1932,4 +2032,61 @@ pub async fn presale_stripe_create_iou(
 
     serde_json::to_string_pretty(&iou)
         .map_err(|e| EgoDesktopError::WalletError(e.to_string()))
+}
+
+#[cfg(test)]
+mod reward_tests {
+    use super::*;
+    use crate::chain_db as c;
+
+    fn tx(from: &str, to: &str, kind: &str, amount: u64, memo: &str, ts: i64) -> LedgerTx {
+        LedgerTx {
+            hash: format!("0x{kind}{ts}"),
+            from: from.into(),
+            to: to.into(),
+            tx_type: kind.into(),
+            amount,
+            memo: (!memo.is_empty()).then(|| memo.to_string()),
+            timestamp: ts,
+            block_height: Some(ts as u64),
+            ..LedgerTx::default()
+        }
+    }
+
+    #[test]
+    fn every_kind_of_reward_is_sorted_into_its_place() {
+        let me = "egot1me";
+        let cases = [
+            (tx(c::NODE_POOL_ADDR, me, "reward", 5, "Block #9 reward", 1), Some(REWARD_BLOCK)),
+            (tx(c::NODE_POOL_ADDR, me, c::TX_UPTIME_REWARD, 5, "", 2), Some(c::REWARD_NODE)),
+            (tx(c::NODE_POOL_ADDR, me, c::TX_STORAGE_REWARD, 5, "", 3), Some(c::REWARD_STORAGE)),
+            (tx(c::STAKING_POOL_ADDR, me, "transfer", 5, "", 4), Some(c::REWARD_STAKING)),
+            (tx(c::RESERVATION_ESCROW_ADDR, me, "reservation_escrow", 5, "release:r1", 5), Some(REWARD_COMPUTE)),
+            (tx(c::RESERVATION_ESCROW_ADDR, me, "early_termination_penalty", 5, "early_termination_penalty:r1", 6), Some(REWARD_COMPUTE)),
+            (tx(c::STORAGE_ESCROW_ADDR, me, "storage_escrow", 5, "release:d1", 7), Some(c::REWARD_STORAGE)),
+            (tx(c::RESERVATION_ESCROW_ADDR, me, "early_termination_refund", 5, "early_termination_refund:r1", 8), None),
+            (tx(c::COMPUTE_ESCROW_ADDR, me, "unlock_collateral", 5, "", 9), None),
+            (tx(c::STAKING_ADDR, me, "unstake", 5, "", 10), None),
+            (tx("egot1faucet000000000000000000000000000000000", me, "faucet", 5, "", 11), None),
+            (tx("egot1friend", me, "transfer", 5, "", 12), None),
+            (tx(c::NODE_POOL_ADDR, "egot1other", "reward", 5, "", 13), None),
+            (tx(c::NODE_POOL_ADDR, me, "reward", 0, "", 14), None),
+        ];
+        for (t, want) in &cases {
+            assert_eq!(reward_kind_of(t, me), *want, "{} from {}", t.tx_type, t.from);
+        }
+    }
+
+    #[test]
+    fn credited_rewards_join_the_list_newest_first() {
+        let me = "egot1me";
+        let txs = vec![tx(c::NODE_POOL_ADDR, me, "reward", 3, "Block #10 reward", 10), tx("egot1friend", me, "transfer", 4, "", 30)];
+        let credited = vec![
+            c::RewardEntry { kind: c::REWARD_NODE.into(), amount_uegoc: 7, height: 20, timestamp: 20, tx_hash: String::new() },
+            c::RewardEntry { kind: c::REWARD_STORAGE.into(), amount_uegoc: 0, height: 25, timestamp: 25, tx_hash: String::new() },
+        ];
+        let items = merge_rewards(me, &txs, credited);
+        assert_eq!(items.iter().map(|i| (i.kind.as_str(), i.amount_uegoc)).collect::<Vec<_>>(), vec![(c::REWARD_NODE, 7), (REWARD_BLOCK, 3)]);
+        assert_eq!(items[0].memo, "Node check-in pay");
+    }
 }

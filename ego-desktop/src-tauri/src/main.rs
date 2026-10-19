@@ -1015,6 +1015,7 @@ fn main() {
             commands::wallet::get_reservation_connect_info,
             commands::wallet::terminate_reservation_early,
             commands::wallet::get_transaction_history,
+            commands::wallet::get_reward_history,
             commands::wallet::get_tx_fee,
             commands::wallet::clear_pending_transactions,
             commands::storage::store_file,
