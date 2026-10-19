@@ -2284,7 +2284,18 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             .unwrap_or(0) as i128
             + balance_delta.get(NODE_POOL_ADDR).copied().unwrap_or(0);
         let seed = rota_seed_in(db, block);
+        let skipped = if block.height >= crate::drs::MISS_RULE_FROM_HEIGHT {
+            committee_for_height_in(db, block.height, block.timestamp)
+                .map(|c| {
+                    let group: Vec<String> = c.into_iter().map(|(a, _)| a).collect();
+                    crate::drs::skipped_before(&group, block.height, &block.miner)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let applied = crate::drs::apply_block(&mut drs_ov, block, &confirmed_txs, pool_now.max(0) as u64, &seed);
+        crate::drs::record_turns(&mut drs_ov, block.height, &skipped, &block.miner);
         let mut pool_left = pool_now.max(0) as u128;
         let mut credits = applied.credits;
         for (addr, pay) in &credits {

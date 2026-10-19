@@ -19,6 +19,8 @@ pub const MIN_COMMITTEE: usize = 3;
 pub const BLOCK_COMMITTEE: usize = 4;
 pub const DRAW_V2_FROM_HEIGHT: u64 = 32_640;
 pub const READY_V2_EPOCH: u64 = 328;
+pub const MISS_RULE_FROM_HEIGHT: u64 = 32_750;
+pub const MISS_LIMIT: u32 = 2;
 pub const ROTA_LEN: usize = 128;
 pub const READY_DEADLINE: u64 = 90;
 pub const CHECKIN_INTERVAL_SECS: i64 = 12 * 3600;
@@ -62,6 +64,46 @@ pub fn first_drs_epoch() -> u64 {
 
 fn rec_key(addr: &str) -> Vec<u8> {
     format!("n2rec:{addr}").into_bytes()
+}
+
+fn miss_key(addr: &str) -> Vec<u8> {
+    format!("n2miss:{addr}").into_bytes()
+}
+
+pub fn missed_turns(ov: &Ov, addr: &str, epoch: u64) -> u32 {
+    ov.get(&miss_key(addr))
+        .filter(|v| v.len() == 12 && read_u64_le(&v[..8]) == epoch)
+        .map(|v| u32::from_le_bytes(v[8..12].try_into().unwrap_or([0; 4])))
+        .unwrap_or(0)
+}
+
+pub fn record_turns(ov: &mut Ov, height: u64, missed: &[String], miner: &str) {
+    if height < MISS_RULE_FROM_HEIGHT {
+        return;
+    }
+    let epoch = epoch_of(height);
+    for addr in missed.iter().filter(|a| a.as_str() != miner) {
+        let count = missed_turns(ov, addr, epoch).saturating_add(1);
+        let mut v = epoch.to_le_bytes().to_vec();
+        v.extend_from_slice(&count.to_le_bytes());
+        ov.put(miss_key(addr), v);
+    }
+    if !miner.is_empty() && ov.get(&miss_key(miner)).is_some() {
+        ov.del(miss_key(miner));
+    }
+}
+
+pub fn proposer_order(group: &[String], height: u64) -> Vec<String> {
+    let n = group.len();
+    (0..n).map(|r| group[(height.wrapping_add(r as u64) % n as u64) as usize].clone()).collect()
+}
+
+pub fn skipped_before(group: &[String], height: u64, miner: &str) -> Vec<String> {
+    let order = proposer_order(group, height);
+    match order.iter().position(|a| a == miner) {
+        Some(turn) => order[..turn].to_vec(),
+        None => Vec::new(),
+    }
 }
 
 fn addr_key(idx: u64) -> Vec<u8> {
@@ -1001,7 +1043,13 @@ pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
         .filter(|(i, _)| bit(&bits, *i))
         .map(|(_, a)| a.clone())
         .collect();
-    let pool = if ready.len() >= MIN_COMMITTEE { ready } else { rota.members };
+    let mut pool = if ready.len() >= MIN_COMMITTEE { ready } else { rota.members };
+    if height >= MISS_RULE_FROM_HEIGHT {
+        let answering: Vec<String> = pool.iter().filter(|a| missed_turns(ov, a, epoch) < MISS_LIMIT).cloned().collect();
+        if answering.len() >= MIN_COMMITTEE {
+            pool = answering;
+        }
+    }
     let size = BLOCK_COMMITTEE.min(pool.len());
     if pool.len() <= size {
         return pool;
@@ -1330,6 +1378,62 @@ mod tests {
         ov.commit_memory();
         assert_eq!(committee(&ov, new_h, 7), vec![members[3].clone(), members[40].clone(), members[90].clone()], "three ready nodes are enough");
         assert!(committee(&Ov::memory(), new_h, 0).is_empty(), "no founders are added when nobody was drawn");
+    }
+
+    #[test]
+    fn the_turns_skipped_before_a_block_s_maker_are_the_ones_that_count() {
+        let g: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(proposer_order(&g, 8), vec!["a", "b", "c", "d"], "height 8 starts the order at 8 % 4 = 0");
+        assert_eq!(proposer_order(&g, 9), vec!["b", "c", "d", "a"]);
+        assert!(skipped_before(&g, 9, "b").is_empty(), "the first in line made it, nobody skipped");
+        assert_eq!(skipped_before(&g, 9, "d"), vec!["b", "c"]);
+        assert!(skipped_before(&g, 9, "z").is_empty(), "a maker outside the group skips nobody");
+    }
+
+    #[test]
+    fn a_node_that_keeps_missing_its_turn_is_left_out_until_it_makes_a_block_or_the_epoch_turns() {
+        let e = epoch_of(MISS_RULE_FROM_HEIGHT) + 2;
+        let h = e * EPOCH + 5;
+        let mut ov = Ov::memory();
+        let members: Vec<String> = (0..6).map(|i| format!("egot1n{i}")).collect();
+        ov.put(rota_key(e), serde_json::to_vec(&Rota { seed: "s".into(), members: members.clone() }).unwrap());
+        let mut bits = Vec::new();
+        for i in 0..6 {
+            set_bit(&mut bits, i);
+        }
+        ov.put(ready_key(e), bits);
+        ov.commit_memory();
+        let silent = members[0].clone();
+        record_turns(&mut ov, h, &[silent.clone()], &members[1]);
+        ov.commit_memory();
+        assert_eq!(missed_turns(&ov, &silent, e), 1);
+        assert!((0..40).any(|k| committee(&ov, h + k, 0).contains(&silent)), "one miss is forgiven");
+        record_turns(&mut ov, h + 1, &[silent.clone()], &members[2]);
+        ov.commit_memory();
+        assert_eq!(missed_turns(&ov, &silent, e), 2);
+        for k in 0..60 {
+            for attempt in 0..3 {
+                assert!(!committee(&ov, h + k, attempt).contains(&silent), "two misses in an epoch leave it out of every draw");
+            }
+        }
+        assert_eq!(missed_turns(&ov, &silent, e + 1), 0, "a new epoch starts it fresh");
+        record_turns(&mut ov, h + 2, &[], &silent);
+        ov.commit_memory();
+        assert_eq!(missed_turns(&ov, &silent, e), 0, "making a block clears its misses");
+
+        for m in &members[..4] {
+            record_turns(&mut ov, h + 3, &[m.clone()], &members[5]);
+            record_turns(&mut ov, h + 4, &[m.clone()], &members[5]);
+        }
+        ov.commit_memory();
+        assert_eq!(committee(&ov, h + 5, 0).len(), BLOCK_COMMITTEE, "never fewer than three to draw from: with only two answering, everyone stays in");
+
+        let before = MISS_RULE_FROM_HEIGHT - 1;
+        let mut old = Ov::memory();
+        record_turns(&mut old, before, &[silent.clone()], &members[1]);
+        record_turns(&mut old, before, &[silent.clone()], &members[1]);
+        old.commit_memory();
+        assert_eq!(missed_turns(&old, &silent, epoch_of(before)), 0, "nothing is counted before the rule starts");
     }
 
     #[test]

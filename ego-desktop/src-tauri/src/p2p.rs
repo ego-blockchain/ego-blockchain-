@@ -1615,6 +1615,117 @@ async fn shadow_publish(msg: &P2PMessage) {
     }
 }
 
+const V2_RESEND_MS: i64 = 2_000;
+
+struct V2Outbox {
+    height: u64,
+    slots: [Option<P2PMessage>; 3],
+    last_sent_ms: i64,
+}
+
+static V2_OUTBOX: Mutex<Option<V2Outbox>> = Mutex::new(None);
+static V2_SENDS_IN_FLIGHT: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn v2_slot(msg: &P2PMessage) -> Option<usize> {
+    match msg {
+        P2PMessage::BftV2Proposal { .. } => Some(0),
+        P2PMessage::BftV2Vote { .. } => Some(1),
+        P2PMessage::BftV2ViewChange { .. } => Some(2),
+        _ => None,
+    }
+}
+
+fn outbox_put(outbox: &mut Option<V2Outbox>, height: u64, slot: usize, msg: P2PMessage, now_ms: i64) -> bool {
+    if slot >= 3 {
+        return false;
+    }
+    if outbox.as_ref().map_or(true, |o| o.height != height) {
+        if outbox.as_ref().map_or(false, |o| o.height > height) {
+            return false;
+        }
+        *outbox = Some(V2Outbox { height, slots: [None, None, None], last_sent_ms: 0 });
+    }
+    if let Some(o) = outbox.as_mut() {
+        o.slots[slot] = Some(msg);
+        o.last_sent_ms = now_ms;
+    }
+    true
+}
+
+fn outbox_due(outbox: &mut Option<V2Outbox>, engine_height: u64, now_ms: i64) -> Vec<P2PMessage> {
+    match outbox.as_mut() {
+        Some(o) if o.height < engine_height => {
+            *outbox = None;
+            Vec::new()
+        }
+        Some(o) if o.height == engine_height && now_ms - o.last_sent_ms >= V2_RESEND_MS => {
+            o.last_sent_ms = now_ms;
+            o.slots.iter().flatten().cloned().collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+async fn v2_send_own(height: u64, msg: P2PMessage) {
+    shadow_publish(&msg).await;
+    if !drs_running() {
+        return;
+    }
+    let Some(slot) = v2_slot(&msg) else { return };
+    let kept = {
+        let mut g = V2_OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+        outbox_put(&mut g, height, slot, msg.clone(), chrono::Utc::now().timestamp_millis())
+    };
+    if kept {
+        send_to_group(height, vec![msg]).await;
+    }
+}
+
+async fn v2_resend_due() {
+    if !drs_running() {
+        return;
+    }
+    let Some(cur) = v2_engine_height() else { return };
+    let due = {
+        let mut g = V2_OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+        outbox_due(&mut g, cur, chrono::Utc::now().timestamp_millis())
+    };
+    if !due.is_empty() {
+        send_to_group(cur, due).await;
+    }
+}
+
+async fn send_to_group(height: u64, msgs: Vec<P2PMessage>) {
+    let members: Vec<String> = tokio::task::spawn_blocking(move || {
+        let me = crate::ledger::Ledger::load().address;
+        crate::chain_db::committee_for_height(height, crate::clock::now())
+            .map(|c| c.into_iter().map(|(a, _)| a).filter(|a| *a != me).collect())
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    for member in members {
+        let Some(ep) = get_relay_endpoint(&member).await else { continue };
+        {
+            let mut g = V2_SENDS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            if !g.get_or_insert_with(Default::default).insert(ep.clone()) {
+                continue;
+            }
+        }
+        let msgs = msgs.clone();
+        tokio::spawn(async move {
+            for msg in &msgs {
+                if send_message(&ep, msg).await.is_err() {
+                    break;
+                }
+            }
+            if let Some(set) = V2_SENDS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                set.remove(&ep);
+            }
+        });
+    }
+}
+
 /// A v2 proposal arrived (or we just produced our own): in LIVE mode remember the
 /// LedgerBlock payload so we can persist it on QC; then vote, publish, and self-count.
 /// A proposal arrived from a view we are not in. The engine elects by
@@ -1736,7 +1847,7 @@ pub async fn shadow_on_proposal(
     if let Some(v) = vote {
         let tag = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
         eprintln!("[ConsensusV2/{}] voted h={} round={}", tag, header.height, v.round);
-        shadow_publish(&P2PMessage::BftV2Vote { vote: v.clone() }).await;
+        v2_send_own(v.height, P2PMessage::BftV2Vote { vote: v.clone() }).await;
         shadow_on_vote(v).await;
     }
 }
@@ -1847,6 +1958,7 @@ pub async fn shadow_v2_tick() {
     // Follow the live validator set: rebuild the committee when a node joins/drops (so a
     // dropped validator can't block quorum and a rejoiner is re-included).
     maybe_reconfigure_committee().await;
+    v2_resend_due().await;
 
     // If the chain advanced via block-sync while the engine lagged (e.g. we just restarted
     // and caught up from peers), pull the engine forward to the real tip so it proposes and
@@ -1948,7 +2060,7 @@ pub async fn shadow_v2_tick() {
                 let vc = { let g = shadow_host_lock(); g.as_ref().and_then(|h| h.trigger_view_change()) };
                 if let Some(vc) = vc {
                     eprintln!("[ConsensusV2/LIVE] view timeout (key={:#x}) — broadcasting view-change", key);
-                    shadow_publish(&P2PMessage::BftV2ViewChange { msg: vc.clone() }).await;
+                    v2_send_own(vc.height, P2PMessage::BftV2ViewChange { msg: vc.clone() }).await;
                     shadow_on_view_change(vc).await; // count our own toward quorum
                 }
                 V2_VIEW_ENTERED_MS.store(now_ms, Ordering::Relaxed); // re-arm; avoid a VC storm
@@ -2005,7 +2117,7 @@ async fn emit_v2_proposal() {
     let tag = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
     eprintln!("[ConsensusV2/{}] proposed h={} txs={}", tag, header.height, stamped.len());
     let round = { let g = shadow_host_lock(); g.as_ref().map_or(0, |h| h.current_round()) };
-    shadow_publish(&P2PMessage::BftV2Proposal {
+    v2_send_own(header.height, P2PMessage::BftV2Proposal {
         header: header.clone(), block: candidate.clone(), transactions: stamped.clone(), round,
     }).await;
     shadow_on_proposal(header, candidate, stamped, round).await; // our own self-vote
@@ -16848,6 +16960,24 @@ mod poison_tx_tests {
             blamed_in(reason, &txs).is_empty(),
             "a whole-block failure must not evict the transactions that happened to be in it",
         );
+    }
+
+    #[test]
+    fn a_node_keeps_resending_its_latest_messages_until_the_height_moves_on() {
+        use super::{outbox_due, outbox_put, P2PMessage, V2_RESEND_MS};
+        let vote = |h: u64| P2PMessage::StateCertsRequest { from: h, reply_to: String::new() };
+        let mut ob = None;
+        assert!(!outbox_put(&mut ob, 7, 3, vote(7), 0), "only the three consensus slots exist");
+        assert!(outbox_put(&mut ob, 7, 1, vote(7), 1_000));
+        assert!(outbox_due(&mut ob, 7, 1_000 + V2_RESEND_MS - 1).is_empty(), "not before the resend interval");
+        assert_eq!(outbox_due(&mut ob, 7, 1_000 + V2_RESEND_MS).len(), 1);
+        assert!(outbox_due(&mut ob, 7, 1_000 + V2_RESEND_MS + 1).is_empty(), "the interval restarts after a resend");
+        assert_eq!(outbox_due(&mut ob, 7, 1_000 + 3 * V2_RESEND_MS).len(), 1, "and it keeps going while the height is open");
+        assert!(outbox_put(&mut ob, 7, 1, vote(7), 50_000));
+        assert_eq!(ob.as_ref().unwrap().slots.iter().flatten().count(), 1, "a newer vote replaces the older one");
+        assert!(!outbox_put(&mut ob, 6, 1, vote(6), 60_000), "an older height never replaces a newer one");
+        assert!(outbox_due(&mut ob, 8, 90_000).is_empty());
+        assert!(ob.is_none(), "once the engine moves past the height there is nothing left to resend");
     }
 
     #[test]
