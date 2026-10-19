@@ -1516,9 +1516,19 @@ fn collect_drs_vote(vote: &ego_consensus_core::bft::Vote) {
     let mut votes = v2_collected_votes();
     votes.retain(|&h, _| h + 3 >= vote.height);
     let per_voter = votes.entry(vote.height).or_default().entry(vote.voter.clone()).or_default();
-    if per_voter.len() < 4 && !per_voter.iter().any(|v| v.block_hash == vote.block_hash && v.round == vote.round) {
-        per_voter.push(vote.clone());
+    keep_recent(per_voter, vote.clone(), DRS_VOTES_PER_VOTER, |a, b| a.block_hash == b.block_hash && a.round == b.round);
+}
+
+const DRS_VOTES_PER_VOTER: usize = 32;
+
+fn keep_recent<T>(list: &mut Vec<T>, item: T, cap: usize, same: impl Fn(&T, &T) -> bool) {
+    if list.iter().any(|x| same(x, &item)) {
+        return;
     }
+    if list.len() >= cap {
+        list.remove(0);
+    }
+    list.push(item);
 }
 
 fn build_commit_cert(
@@ -1612,8 +1622,21 @@ async fn shadow_publish(msg: &P2PMessage) {
 /// wrong proposer and both sides reject each other until they realign by chance. Nudge the
 /// committee toward the proposer's view through the ordinary quorum-gated view change
 /// rather than adopting an unsigned round on trust.
+fn drs_running() -> bool {
+    static ON: AtomicBool = AtomicBool::new(false);
+    if ON.load(Ordering::Relaxed) {
+        return true;
+    }
+    let on = crate::chain_db::drs_active(crate::chain_db::latest_block_info().0.saturating_add(1));
+    if on {
+        ON.store(true, Ordering::Relaxed);
+    }
+    on
+}
+
 async fn reconcile_proposal_round(peer_round: u32, proposer: &ego_core::Address) {
     if !consensus_v2_live_enabled() { return; }
+    if drs_running() { return; }
     let (mine, electing) = {
         let g = shadow_host_lock();
         match g.as_ref() {
@@ -1948,7 +1971,7 @@ pub async fn shadow_v2_tick() {
 }
 
 pub async fn force_v2_proposal_as_elected_leader() {
-    if !consensus_v2_live_enabled() {
+    if !consensus_v2_live_enabled() || drs_running() {
         return;
     }
     {
@@ -15070,6 +15093,7 @@ pub async fn run_view_change_monitor() {
         }
 
         if known_validators().is_empty() { continue; }
+        if consensus_v2_live_enabled() && drs_running() { continue; }
 
         // Fire immediately if the commit path requested pipelining; otherwise wait
         // for the proposal timeout.
@@ -16824,6 +16848,20 @@ mod poison_tx_tests {
             blamed_in(reason, &txs).is_empty(),
             "a whole-block failure must not evict the transactions that happened to be in it",
         );
+    }
+
+    #[test]
+    fn a_voter_s_latest_votes_are_kept_however_many_rounds_a_height_takes() {
+        let mut kept: Vec<(u32, u8)> = Vec::new();
+        let same = |a: &(u32, u8), b: &(u32, u8)| a == b;
+        for round in 0..40u32 {
+            super::keep_recent(&mut kept, (round, 1), super::DRS_VOTES_PER_VOTER, same);
+        }
+        assert_eq!(kept.len(), super::DRS_VOTES_PER_VOTER);
+        assert!(kept.contains(&(39, 1)), "the vote of the latest round is there to build the certificate from");
+        assert!(!kept.contains(&(0, 1)), "the oldest make way");
+        super::keep_recent(&mut kept, (39, 1), super::DRS_VOTES_PER_VOTER, same);
+        assert_eq!(kept.iter().filter(|v| **v == (39, 1)).count(), 1, "a repeated vote is stored once");
     }
 
     #[test]
