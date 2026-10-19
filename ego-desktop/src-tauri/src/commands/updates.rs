@@ -60,28 +60,7 @@ pub async fn check_for_update() -> Result<UpdateInfo, EgoDesktopError> {
         return Ok(fallback);
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return Ok(fallback),
-    };
-
-    let resp = match client.get(VERSION_MANIFEST_URL).send().await {
-        Ok(r) => r,
-        Err(_) => return Ok(fallback),
-    };
-    if !resp.status().is_success() {
-        return Ok(fallback);
-    }
-
-    // A missing version.json on an SPA host answers with index.html and a 200,
-    // so a failed JSON parse here is the expected shape of "not published yet".
-    let manifest: serde_json::Value = match resp.json().await {
-        Ok(j) => j,
-        Err(_) => return Ok(fallback),
-    };
+    let Some(manifest) = fetch_manifest().await else { return Ok(fallback) };
 
     let latest = manifest["version"].as_str().unwrap_or("").trim().to_string();
     if latest.is_empty() {
@@ -95,6 +74,47 @@ pub async fn check_for_update() -> Result<UpdateInfo, EgoDesktopError> {
         download_url: manifest["url"].as_str().unwrap_or(DOWNLOAD_PAGE_URL).to_string(),
         notes: manifest["notes"].as_str().unwrap_or("").to_string(),
     })
+}
+
+async fn fetch_manifest() -> Option<serde_json::Value> {
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(8)).build().ok()?;
+    let resp = client.get(VERSION_MANIFEST_URL).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    // A missing version.json on an SPA host answers with index.html and a 200,
+    // so a failed JSON parse here is the expected shape of "not published yet".
+    resp.json().await.ok()
+}
+
+const PUBLISHED_CERT_RECHECK_SECS: i64 = 600;
+static PUBLISHED_CERT: std::sync::Mutex<(i64, Option<(u64, String)>)> = std::sync::Mutex::new((0, None));
+
+fn published_cert_in(manifest: &serde_json::Value) -> Option<(u64, String)> {
+    let index = manifest["state_cert"]["index"].as_u64().filter(|i| *i > 0)?;
+    let hash = manifest["state_cert"]["hash"].as_str()?.trim().to_ascii_lowercase();
+    crate::state_cert::is_anchor_hash(&hash).then_some((index, hash))
+}
+
+pub fn published_state_cert() -> Option<(u64, String)> {
+    PUBLISHED_CERT.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
+}
+
+pub async fn refresh_published_state_cert() -> Option<(u64, String)> {
+    let now = chrono::Utc::now().timestamp();
+    {
+        let g = PUBLISHED_CERT.lock().unwrap_or_else(|e| e.into_inner());
+        if g.0 != 0 && now - g.0 < PUBLISHED_CERT_RECHECK_SECS {
+            return g.1.clone();
+        }
+    }
+    let fetched = if crate::p2p::offline_mode() { None } else { fetch_manifest().await.as_ref().and_then(published_cert_in) };
+    let mut g = PUBLISHED_CERT.lock().unwrap_or_else(|e| e.into_inner());
+    g.0 = now;
+    if fetched.is_some() {
+        g.1 = fetched;
+    }
+    g.1.clone()
 }
 
 const NOTIFY_MARKER: &str = ".update_notified";
@@ -159,6 +179,24 @@ mod tests {
     fn compares_numerically_not_alphabetically() {
         assert!(is_newer("0.3.10", "0.3.9"));
         assert!(!is_newer("0.3.9", "0.3.10"));
+    }
+
+    #[test]
+    fn the_published_certificate_is_read_only_when_well_formed() {
+        let h = "ab".repeat(32);
+        let ok = serde_json::json!({ "version": "0.3.627", "state_cert": { "index": 1, "hash": h } });
+        assert_eq!(published_cert_in(&ok), Some((1, h.clone())));
+        let upper = serde_json::json!({ "state_cert": { "index": 3, "hash": h.to_uppercase() } });
+        assert_eq!(published_cert_in(&upper), Some((3, h.clone())));
+        for bad in [
+            serde_json::json!({ "version": "0.3.627" }),
+            serde_json::json!({ "state_cert": { "index": 0, "hash": h } }),
+            serde_json::json!({ "state_cert": { "index": 1, "hash": "abc" } }),
+            serde_json::json!({ "state_cert": { "index": 1, "hash": "zz".repeat(32) } }),
+            serde_json::json!({ "state_cert": { "hash": h } }),
+        ] {
+            assert_eq!(published_cert_in(&bad), None, "{bad}");
+        }
     }
 
     /// A corrupt or HTML manifest must never appear newer than a real build.

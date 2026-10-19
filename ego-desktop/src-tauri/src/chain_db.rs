@@ -787,7 +787,7 @@ pub fn may_report_price(addr: &str) -> bool {
 }
 
 fn may_report_price_in(db: &DB, addr: &str, height: u64) -> bool {
-    crate::genesis::addresses().iter().any(|a| a == addr)
+    (height < crate::genesis::FOUNDERS_RETIRE_AT && crate::genesis::addresses().iter().any(|a| a == addr))
         || crate::drs::rota_position(&crate::drs::Ov::new(db), drs_epoch_of(height), addr).is_some()
 }
 
@@ -5203,7 +5203,7 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
             return Err(format!("storage_reward {} refused: hosts are paid when their proofs land", tx.hash));
         }
         crate::drs::validate_batches(&crate::drs::Ov::new(db), block, txs, |h| block_hash_at_in(db, h))?;
-        crate::state_cert::validate(&crate::drs::Ov::new(db), block, txs, &crate::genesis::addresses())?;
+        crate::state_cert::validate(&crate::drs::Ov::new(db), block, txs)?;
         if block.height >= CHECKIN_FROM_HEIGHT {
             if let Some(tx) = txs.iter().find(|t| t.tx_type == crate::coverage_proof::POC_PROOF_TX) {
                 return Err(format!("coverage proof {} refused: coverage is proven in coverage batches now", tx.hash));
@@ -9771,14 +9771,14 @@ pub fn committee_candidates(height: u64) -> (Vec<(String, Vec<u8>)>, bool) {
     let ov = crate::drs::Ov::new(db);
     let rota = crate::drs::load_rota(&ov, drs_epoch_of(height));
     let settled = rota.is_some();
-    let mut names = rota.map(|r| r.members).unwrap_or_default();
-    for g in crate::genesis::addresses() {
-        if !names.contains(&g) {
-            names.push(g);
-        }
-    }
+    let names = rota.map(|r| r.members).unwrap_or_default();
     let out = names.into_iter().filter_map(|a| dilithium_key_in(db, &a).map(|k| (a, k))).collect();
     (out, settled)
+}
+
+pub fn rota_members(height: u64) -> Option<Vec<String>> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::drs::load_rota(&crate::drs::Ov::new(db), drs_epoch_of(height)).map(|r| r.members)
 }
 
 pub fn committee_window(height: u64, now: i64) -> Option<(i64, bool)> {
@@ -10327,11 +10327,11 @@ fn apply_undo_records(db: &DB, batch: &mut WriteBatch, records: &[Vec<u8>]) {
 const DERIVED_PREFIXES: &[&[u8]] = &[b"n2", b"bhr:", b"ftotal:"];
 const STATE_INSTALL_PENDING: &[u8] = b"state_install_pending";
 
-pub fn state_cert_open() -> Option<(crate::state_cert::OpenCheckpoint, crate::state_cert::Signers)> {
+pub fn state_cert_open() -> Option<(crate::state_cert::OpenCheckpoint, Vec<String>)> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let ov = crate::drs::Ov::new(db);
     let open = crate::state_cert::load_open(&ov)?;
-    let signers = crate::state_cert::signers_of(&ov, open.index, &crate::genesis::addresses());
+    let signers = crate::state_cert::signers_of(&ov, open.index);
     Some((open, signers))
 }
 
@@ -10344,10 +10344,7 @@ pub fn state_cert_tx_for(
         return None;
     }
     let (open, signers) = state_cert_open()?;
-    let needed = crate::state_cert::quorum(match &signers {
-        crate::state_cert::Signers::Founders(f) => f.len(),
-        crate::state_cert::Signers::Committee(k) => k.len(),
-    });
+    let needed = crate::state_cert::quorum(signers.len());
     pool.into_iter()
         .filter(|(b, v)| v.len() >= needed && b.index == open.index && b.height == open.height && b.block_hash == open.block_hash && b.next == open.next)
         .find_map(|(body, votes)| crate::state_cert::assemble(&body, &votes, &signers))

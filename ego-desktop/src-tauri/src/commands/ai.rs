@@ -67,8 +67,9 @@ Formatting: use `###` for section/category headers in responses. Use `-` bullet 
 - The key must travel with the address because the engine identifies a validator by `blake3(dilithium_pubkey)`, which cannot be recovered from a bech32 address. A list of addresses alone would be incomplete until every member announced itself, and an offline member would stop the chain starting at all.
 - **Four seats, quorum of three** — tolerates one member offline or restarting. The four are deliberately split across separate machines: with every seat on one machine, that machine could finalize alone and any fault appearing only between machines would be invisible to consensus.
 - **It is a bootstrap, not an authority.** It buys exactly two things: a seat at block 1 without registering first, and exemption from the contribution floor for `GENESIS_GRACE_BLOCKS = 10,000` blocks. After that the founding members register and qualify like anyone else or lose their seats.
-- Founders' share dilutes by arithmetic as others join: 4 of 10 is 40% (can still block), 4 of 13 is 31% (cannot block anything). No vote or fork needed.
-- If asked "do the 4 stay in charge?" — no. They bootstrap the chain and then compete on the same terms.
+- From block 32,601 every block is made by 4 nodes drawn by DRS from the online nodes, and is final with 3 of their signatures. If a group stalls for 5 minutes a new group of 4 is drawn at random. Founders are never added to a group.
+- From block 32,650 founders have no role in consensus at all. The daily state checkpoint is signed by a committee drawn by DRS, and a brand-new node starts from the checkpoint that egoblockchain.com and each release publish, then checks every later checkpoint against the committee the one before it named. That is how anyone can confirm which chain is the real one.
+- If asked "do the 4 stay in charge?" — no. They bootstrapped the chain and now compete on the same terms as every other node.
 
 ## HotStuff BFT View-Change
 - `CURRENT_VIEW` atomic u64. `leader_for_view(v)` = sorted validators[v % n].

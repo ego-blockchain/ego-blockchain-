@@ -181,8 +181,7 @@ fn serves_state() -> bool {
         return true;
     }
     if let (Some(key), Some((open, signers))) = (crate::p2p::my_bls_pubkey(), crate::chain_db::state_cert_open()) {
-        let signs_now = matches!(&signers, crate::state_cert::Signers::Committee(k) if k.contains(&key));
-        if signs_now || open.next.contains(&key) {
+        if signers.contains(&key) || open.next.contains(&key) {
             return true;
         }
     }

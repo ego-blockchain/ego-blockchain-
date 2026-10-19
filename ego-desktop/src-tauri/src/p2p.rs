@@ -142,9 +142,47 @@ pub fn note_network_height(height: u64) {
 /// blocks beyond ours, and the sync path then rightly refuses its blocks — leaving the app
 /// reporting that it is catching up to something it will never reach.
 pub fn note_network_height_from(height: u64, claimant: &str) {
-    if crate::genesis::addresses().is_empty() || crate::genesis::is_member(claimant) {
+    if crate::genesis::addresses().is_empty() || vouches_for_height(claimant) {
         note_network_height(height);
     }
+}
+
+const RECHECK_TIP_SECS: i64 = 15;
+
+fn founders_retired() -> bool {
+    static RETIRED: AtomicBool = AtomicBool::new(false);
+    static CHECKED: AtomicI64 = AtomicI64::new(0);
+    if RETIRED.load(Ordering::Relaxed) {
+        return true;
+    }
+    let now = Utc::now().timestamp();
+    if now - CHECKED.load(Ordering::Relaxed) < RECHECK_TIP_SECS {
+        return false;
+    }
+    CHECKED.store(now, Ordering::Relaxed);
+    let retired = crate::chain_db::local_chain_height().saturating_add(1) >= crate::genesis::FOUNDERS_RETIRE_AT;
+    if retired {
+        RETIRED.store(true, Ordering::Relaxed);
+    }
+    retired
+}
+
+fn vouches_for_height(claimant: &str) -> bool {
+    if !founders_retired() {
+        return crate::genesis::is_member(claimant);
+    }
+    static ROTA: Mutex<(i64, Vec<String>)> = Mutex::new((0, Vec::new()));
+    let now = Utc::now().timestamp();
+    let mut g = ROTA.lock().unwrap_or_else(|e| e.into_inner());
+    if now - g.0 >= RECHECK_TIP_SECS {
+        let next = crate::chain_db::local_chain_height().saturating_add(1);
+        let mut names = crate::chain_db::rota_members(next).unwrap_or_default();
+        names.extend(crate::chain_db::rota_members(next.saturating_sub(crate::chain_db::DRS_EPOCH)).unwrap_or_default());
+        names.sort();
+        names.dedup();
+        *g = (now, names);
+    }
+    g.1.binary_search_by(|m| m.as_str().cmp(claimant)).is_ok()
 }
 
 fn note_network_height_from_blocks(blocks: &[LedgerBlock]) {
@@ -1603,7 +1641,12 @@ pub async fn shadow_on_proposal(
     peer_round: u32,
 ) {
     if !consensus_v2_active() { return; }
-    if crate::genesis::addresses().is_empty() || crate::genesis::is_engine_member(&header.proposer) {
+    let vouched = if founders_retired() {
+        drs_vote_candidates(header.height).contains(&header.proposer)
+    } else {
+        crate::genesis::addresses().is_empty() || crate::genesis::is_engine_member(&header.proposer)
+    };
+    if vouched {
         note_network_height(header.height);
     }
     if v2_engine_height() == Some(header.height) {
@@ -11018,6 +11061,9 @@ const SNAPSHOT_ANSWER_WINDOW_SECS: i64 = 300;
 /// This node's snapshot, signed, or nothing if this node isn't in the starting committee:
 /// only those snapshots are installed by anyone, so others needn't send theirs.
 fn signed_state_snapshot() -> Option<crate::chain_db::StateSnapshot> {
+    if founders_retired() {
+        return None;
+    }
     let me = crate::ledger::Ledger::load().address;
     if !crate::genesis::addresses().iter().any(|a| a == &me) {
         return None;
@@ -11049,6 +11095,9 @@ async fn ask_peers_for_snapshot(have_height: u64, stuck: bool) {
     let msg = P2PMessage::SnapshotRequest { requester_endpoint: my_endpoint, have_height, stuck, checkpoint };
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-snapshot-v1", data).await;
+    }
+    if network_tip() >= crate::genesis::FOUNDERS_RETIRE_AT {
+        return;
     }
     let me = crate::ledger::Ledger::load().address;
     for founder in crate::genesis::addresses().into_iter().filter(|a| a != &me) {
@@ -12789,29 +12838,12 @@ pub fn maybe_send_state_vote() {
         contract_chunks: contracts.digest.chunks.len() as u64,
         next: open.next.clone(),
     };
-    let (signer, sig) = match &signers {
-        crate::state_cert::Signers::Founders(founders) => {
-            use ed25519_dalek::Signer;
-            let me = crate::ledger::Ledger::load().address;
-            if !founders.contains(&me) {
-                return;
-            }
-            let Some(seed) = get_ed25519_seed() else { return };
-            let key = ed25519_dalek::SigningKey::from_bytes(&seed);
-            if crate::state_cert::ed25519_address(key.verifying_key().as_bytes()).as_deref() != Some(me.as_str()) {
-                return;
-            }
-            (hex::encode(key.verifying_key().as_bytes()), hex::encode(key.sign(&body.message()).to_bytes()))
-        }
-        crate::state_cert::Signers::Committee(keys) => {
-            let Some(sk) = BLS_SECRET_KEY.get() else { return };
-            let pk = hex::encode(crate::bls_agg::bls_pubkey(sk));
-            if !keys.contains(&pk) {
-                return;
-            }
-            (pk, hex::encode(crate::bls_agg::sign_shared(sk, &body.message())))
-        }
-    };
+    let Some(sk) = BLS_SECRET_KEY.get() else { return };
+    let signer = hex::encode(crate::bls_agg::bls_pubkey(sk));
+    if !signers.contains(&signer) {
+        return;
+    }
+    let sig = hex::encode(crate::bls_agg::sign_shared(sk, &body.message()));
     let now = Utc::now().timestamp();
     {
         let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
@@ -12949,12 +12981,27 @@ struct StateSyncJob {
 static STATE_SYNC: Mutex<Option<StateSyncJob>> = Mutex::new(None);
 static STATE_CERT_CHAIN: Mutex<Vec<crate::state_cert::StateCert>> = Mutex::new(Vec::new());
 
+fn known_cert_chain(anchors: &[(u64, String)]) -> Vec<crate::state_cert::StateCert> {
+    let chain = STATE_CERT_CHAIN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let start = anchors.first().map(|(i, _)| *i);
+    if chain.first().map(|c| c.body.index) == start { chain } else { Vec::new() }
+}
+
 pub async fn request_state_certs() {
     let reply_to = get_public_endpoint().await;
     if reply_to.is_empty() {
         return;
     }
-    let from = STATE_CERT_CHAIN.lock().unwrap_or_else(|e| e.into_inner()).len() as u64 + 1;
+    let anchors = crate::state_cert::anchors_with(crate::commands::updates::refresh_published_state_cert().await);
+    let Some((start, _)) = anchors.first().cloned() else {
+        static SAID: AtomicI64 = AtomicI64::new(0);
+        let now = Utc::now().timestamp();
+        if now - SAID.swap(now, Ordering::Relaxed) > 3600 {
+            eprintln!("[StateCert] no official certificate is known yet; egoblockchain.com names one once the first is final");
+        }
+        return;
+    };
+    let from = known_cert_chain(&anchors).last().map_or(start, |c| c.body.index + 1);
     for ep in live_endpoints(3) {
         let _ = send_message(&ep, &P2PMessage::StateCertsRequest { from, reply_to: reply_to.clone() }).await;
     }
@@ -12964,15 +13011,17 @@ async fn receive_state_certs(certs: Vec<crate::state_cert::StateCert>, server: S
     if certs.is_empty() || certs.len() > STATE_CERTS_PER_REPLY {
         return;
     }
-    let known = STATE_CERT_CHAIN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if certs[0].body.index != known.len() as u64 + 1 {
+    let anchors = crate::state_cert::anchors_with(crate::commands::updates::published_state_cert());
+    let Some((start, _)) = anchors.first().cloned() else { return };
+    let known = known_cert_chain(&anchors);
+    if certs[0].body.index != known.last().map_or(start, |c| c.body.index + 1) {
         return;
     }
     let full_page = certs.len() == STATE_CERTS_PER_REPLY;
     let mut candidate = known;
     candidate.extend(certs);
     let verified = tokio::task::spawn_blocking(move || {
-        crate::state_cert::verify_chain(&candidate, &crate::genesis::addresses()).map(|last| (candidate, last))
+        crate::state_cert::verify_chain(&candidate, &anchors).map(|last| (candidate, last))
     })
     .await;
     let (chain, last) = match verified {

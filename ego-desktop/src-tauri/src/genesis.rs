@@ -4,6 +4,7 @@ pub const GENESIS_FILE_ENV: &str = "EGO_GENESIS_VALIDATORS_FILE";
 pub const GENESIS_INLINE_ENV: &str = "EGO_GENESIS_VALIDATORS";
 
 const BAKED_IN: &str = include_str!("../genesis_validators.json");
+pub const FOUNDERS_RETIRE_AT: u64 = 32_650;
 
 /// One member of the committee the network starts with. Two nodes cannot agree on whose
 /// turn it is to propose unless they already agree on who is playing, and that agreement

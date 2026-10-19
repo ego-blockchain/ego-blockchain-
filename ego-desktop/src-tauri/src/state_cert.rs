@@ -3,7 +3,7 @@ use crate::ledger::{LedgerBlock, LedgerTx};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const STATE_CERT_FROM_HEIGHT: u64 = 34_001;
+pub const STATE_CERT_FROM_HEIGHT: u64 = 32_650;
 pub const CERT_COMMITTEE: usize = 128;
 pub const CHUNK_ENTRIES: usize = 4096;
 pub const DAY_SECS: i64 = 86_400;
@@ -237,8 +237,6 @@ pub struct StateCert {
     pub signers: Vec<u32>,
     #[serde(default)]
     pub sig: String,
-    #[serde(default)]
-    pub founder_sigs: Vec<(String, String)>,
 }
 
 impl StateCert {
@@ -255,149 +253,99 @@ pub struct OpenCheckpoint {
     pub next: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Signers {
-    Founders(Vec<String>),
-    Committee(Vec<String>),
-}
-
 pub fn quorum(n: usize) -> usize {
     n * 2 / 3 + 1
 }
 
-pub fn signers_for(prev: Option<&StateCert>, founders: &[String]) -> Signers {
+pub fn signers_for(prev: Option<&StateCert>, drawn: &[String]) -> Vec<String> {
     match prev {
-        Some(c) if !c.body.next.is_empty() => Signers::Committee(c.body.next.clone()),
-        _ => Signers::Founders(founders.to_vec()),
+        Some(c) if !c.body.next.is_empty() => c.body.next.clone(),
+        _ => drawn.to_vec(),
     }
 }
 
-pub fn ed25519_address(pk: &[u8; 32]) -> Option<String> {
-    let hrp = if crate::tokenomics::CHAIN_ID == 1 { "egot" } else { "ego" };
-    ego_core::EgoAddress::from_public_key_bytes(pk, crate::tokenomics::CHAIN_ID as u32, ego_core::AddressType::EOA)
-        .to_bech32(hrp)
-        .ok()
+pub fn vote_ok(body: &CertBody, signer: &str, sig: &str, keys: &[String]) -> bool {
+    keys.iter().any(|k| k == signer)
+        && match (hex::decode(signer), hex::decode(sig)) {
+            (Ok(pk), Ok(s)) => crate::bls_agg::verify_shared(&s, &pk, &body.message()),
+            _ => false,
+        }
 }
 
-fn founder_sig_ok(pk_hex: &str, sig_hex: &str, msg: &[u8], founders: &[String]) -> Option<String> {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    let pk: [u8; 32] = hex::decode(pk_hex).ok()?.try_into().ok()?;
-    let sig: [u8; 64] = hex::decode(sig_hex).ok()?.try_into().ok()?;
-    let addr = ed25519_address(&pk)?;
-    if !founders.contains(&addr) {
-        return None;
+pub fn verify_cert(cert: &StateCert, keys: &[String]) -> Result<(), String> {
+    if keys.is_empty() {
+        return Err(format!("certificate {} has no committee that may sign it", cert.body.index));
     }
-    VerifyingKey::from_bytes(&pk).ok()?.verify(msg, &Signature::from_bytes(&sig)).ok()?;
-    Some(addr)
-}
-
-pub fn vote_ok(body: &CertBody, signer: &str, sig: &str, signers: &Signers) -> bool {
-    let msg = body.message();
-    match signers {
-        Signers::Founders(f) => founder_sig_ok(signer, sig, &msg, f).is_some(),
-        Signers::Committee(keys) => {
-            keys.iter().any(|k| k == signer)
-                && match (hex::decode(signer), hex::decode(sig)) {
-                    (Ok(pk), Ok(s)) => crate::bls_agg::verify_shared(&s, &pk, &msg),
-                    _ => false,
-                }
-        }
+    if cert.signers.windows(2).any(|w| w[0] >= w[1]) || cert.signers.iter().any(|p| *p as usize >= keys.len()) {
+        return Err(format!("certificate {} lists its signers out of order or out of range", cert.body.index));
     }
-}
-
-pub fn verify_cert(cert: &StateCert, signers: &Signers) -> Result<(), String> {
-    let msg = cert.body.message();
-    match signers {
-        Signers::Founders(founders) => {
-            if !cert.signers.is_empty() || !cert.sig.is_empty() {
-                return Err("a founders' certificate carries committee signatures".into());
-            }
-            let mut seen = BTreeSet::new();
-            for (pk, sig) in &cert.founder_sigs {
-                let addr = founder_sig_ok(pk, sig, &msg, founders)
-                    .ok_or_else(|| format!("certificate {} carries a founder signature that does not verify", cert.body.index))?;
-                if !seen.insert(addr) {
-                    return Err(format!("certificate {} counts a founder twice", cert.body.index));
-                }
-            }
-            if seen.len() < quorum(founders.len()) {
-                return Err(format!("certificate {} has {} of the {} founders it needs", cert.body.index, seen.len(), quorum(founders.len())));
-            }
-            Ok(())
-        }
-        Signers::Committee(keys) => {
-            if !cert.founder_sigs.is_empty() {
-                return Err("a committee certificate carries founder signatures".into());
-            }
-            if cert.signers.windows(2).any(|w| w[0] >= w[1]) || cert.signers.iter().any(|p| *p as usize >= keys.len()) {
-                return Err(format!("certificate {} lists its signers out of order or out of range", cert.body.index));
-            }
-            if cert.signers.len() < quorum(keys.len()) {
-                return Err(format!("certificate {} has {} of the {} signatures it needs", cert.body.index, cert.signers.len(), quorum(keys.len())));
-            }
-            let pks: Vec<Vec<u8>> = cert.signers.iter().filter_map(|p| hex::decode(&keys[*p as usize]).ok()).collect();
-            let sig = hex::decode(&cert.sig).map_err(|_| "certificate signature is not hex".to_string())?;
-            if pks.len() != cert.signers.len() || !crate::bls_agg::verify_shared_aggregate(&sig, &pks, &msg) {
-                return Err(format!("certificate {} signature does not verify", cert.body.index));
-            }
-            Ok(())
-        }
+    if cert.signers.len() < quorum(keys.len()) {
+        return Err(format!("certificate {} has {} of the {} signatures it needs", cert.body.index, cert.signers.len(), quorum(keys.len())));
     }
+    let pks: Vec<Vec<u8>> = cert.signers.iter().filter_map(|p| hex::decode(&keys[*p as usize]).ok()).collect();
+    let sig = hex::decode(&cert.sig).map_err(|_| "certificate signature is not hex".to_string())?;
+    if pks.len() != cert.signers.len() || !crate::bls_agg::verify_shared_aggregate(&sig, &pks, &cert.body.message()) {
+        return Err(format!("certificate {} signature does not verify", cert.body.index));
+    }
+    Ok(())
 }
 
-pub fn assemble(body: &CertBody, votes: &[(String, String)], signers: &Signers) -> Option<StateCert> {
-    let ok: Vec<&(String, String)> = votes.iter().filter(|(s, g)| vote_ok(body, s, g, signers)).collect();
-    let cert = match signers {
-        Signers::Founders(f) => {
-            let mut seen = BTreeSet::new();
-            let founder_sigs: Vec<(String, String)> = ok
-                .iter()
-                .filter(|(s, g)| founder_sig_ok(s, g, &body.message(), f).map_or(false, |a| seen.insert(a)))
-                .map(|(s, g)| (s.clone(), g.clone()))
-                .collect();
-            StateCert { body: body.clone(), founder_sigs, ..StateCert::default() }
-        }
-        Signers::Committee(keys) => {
-            let mut picked: Vec<(u32, Vec<u8>)> = keys
-                .iter()
-                .enumerate()
-                .filter_map(|(i, k)| {
-                    let (_, sig) = ok.iter().find(|(s, _)| s == k)?;
-                    Some((i as u32, hex::decode(sig).ok()?))
-                })
-                .collect();
-            picked.sort_by_key(|(i, _)| *i);
-            let sigs: Vec<Vec<u8>> = picked.iter().map(|(_, s)| s.clone()).collect();
-            let agg = crate::bls_agg::aggregate_shared(&sigs)?;
-            StateCert { body: body.clone(), signers: picked.iter().map(|(i, _)| *i).collect(), sig: hex::encode(agg), ..StateCert::default() }
-        }
+pub fn assemble(body: &CertBody, votes: &[(String, String)], keys: &[String]) -> Option<StateCert> {
+    let ok: Vec<&(String, String)> = votes.iter().filter(|(s, g)| vote_ok(body, s, g, keys)).collect();
+    let mut picked: Vec<(u32, Vec<u8>)> = keys
+        .iter()
+        .enumerate()
+        .filter_map(|(i, k)| {
+            let (_, sig) = ok.iter().find(|(s, _)| s == k)?;
+            Some((i as u32, hex::decode(sig).ok()?))
+        })
+        .collect();
+    picked.sort_by_key(|(i, _)| *i);
+    let sigs: Vec<Vec<u8>> = picked.iter().map(|(_, s)| s.clone()).collect();
+    let agg = crate::bls_agg::aggregate_shared(&sigs)?;
+    let cert = StateCert { body: body.clone(), signers: picked.iter().map(|(i, _)| *i).collect(), sig: hex::encode(agg) };
+    verify_cert(&cert, keys).ok().map(|_| cert)
+}
+
+pub fn is_anchor_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn anchors_with(published: Option<(u64, String)>) -> Vec<(u64, String)> {
+    let mut all: Vec<(u64, String)> = STATE_CERT_ANCHORS.iter().map(|(i, h)| (*i, h.to_string())).collect();
+    all.extend(published.filter(|(i, h)| *i > 0 && is_anchor_hash(h)));
+    all.sort();
+    all.dedup();
+    all
+}
+
+pub fn verify_chain(certs: &[StateCert], anchors: &[(u64, String)]) -> Result<Option<StateCert>, String> {
+    let Some(first) = certs.first() else { return Ok(None) };
+    let Some((start, _)) = anchors.first() else {
+        return Err("no official certificate is known yet; egoblockchain.com names one once the first is final".into());
     };
-    verify_cert(&cert, signers).ok().map(|_| cert)
-}
-
-pub fn verify_chain(certs: &[StateCert], founders: &[String]) -> Result<Option<StateCert>, String> {
+    if first.body.index != *start {
+        return Err(format!("the certificates offered start at {}, not at the official certificate {start}", first.body.index));
+    }
     let mut prev: Option<StateCert> = None;
     for cert in certs {
-        let expected = prev.as_ref().map_or(1, |p| p.body.index + 1);
-        if cert.body.index != expected {
-            return Err(format!("certificate {} follows {}", cert.body.index, expected - 1));
-        }
         if let Some(p) = &prev {
+            if cert.body.index != p.body.index + 1 {
+                return Err(format!("certificate {} follows {}", cert.body.index, p.body.index));
+            }
             if cert.body.height <= p.body.height {
                 return Err(format!("certificate {} does not move the chain forward", cert.body.index));
             }
+            verify_cert(cert, &p.body.next)?;
         }
-        verify_cert(cert, &signers_for(prev.as_ref(), founders))?;
-        if let Some((_, h)) = STATE_CERT_ANCHORS.iter().find(|(i, _)| *i == cert.body.index) {
-            if cert.hash() != *h {
-                return Err(format!("certificate {} is not the one this release was built against", cert.body.index));
-            }
+        if anchors.iter().any(|(i, h)| *i == cert.body.index && *h != cert.hash()) {
+            return Err(format!("certificate {} is not the official one", cert.body.index));
         }
         prev = Some(cert.clone());
     }
-    if let Some((i, _)) = STATE_CERT_ANCHORS.iter().max_by_key(|(i, _)| *i) {
+    if let Some((i, _)) = anchors.last() {
         if prev.as_ref().map_or(true, |p| p.body.index < *i) {
-            return Err(format!("the certificates offered stop before {i}, which this release already knows"));
+            return Err(format!("the certificates offered stop before {i}, which is already official"));
         }
     }
     Ok(prev)
@@ -415,9 +363,10 @@ pub fn last_index(ov: &Ov) -> u64 {
     ov.get(KEY_LAST).map(|v| u64_of(&v)).unwrap_or(0)
 }
 
-pub fn signers_of(ov: &Ov, index: u64, founders: &[String]) -> Signers {
+pub fn signers_of(ov: &Ov, index: u64) -> Vec<String> {
     let prev = if index > 1 { load_cert(ov, index - 1) } else { None };
-    signers_for(prev.as_ref(), founders)
+    let drawn = load_open(ov).filter(|o| o.index == index).map(|o| o.next).unwrap_or_default();
+    signers_for(prev.as_ref(), &drawn)
 }
 
 pub fn draw_next(ov: &Ov, period: u64, seed: &str) -> Vec<String> {
@@ -457,7 +406,7 @@ pub fn is_cert_tx(tx: &LedgerTx) -> bool {
         && tx.signature == "coinbase"
 }
 
-pub fn validate(ov: &Ov, block: &LedgerBlock, txs: &[LedgerTx], founders: &[String]) -> Result<(), String> {
+pub fn validate(ov: &Ov, block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), String> {
     let certs: Vec<&LedgerTx> = txs.iter().filter(|t| t.tx_type == TX_STATE_CERT).collect();
     let Some(tx) = certs.first() else { return Ok(()) };
     if certs.len() > 1 {
@@ -475,7 +424,7 @@ pub fn validate(ov: &Ov, block: &LedgerBlock, txs: &[LedgerTx], founders: &[Stri
     if b.index != open.index || b.height != open.height || b.block_hash != open.block_hash || b.next != open.next {
         return Err(format!("state certificate {} does not match the checkpoint at block {}", b.index, open.height));
     }
-    verify_cert(&cert, &signers_of(ov, open.index, founders))
+    verify_cert(&cert, &signers_of(ov, open.index))
 }
 
 pub fn apply_block(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx], seed: &str) -> bool {
@@ -499,12 +448,12 @@ pub fn apply_block(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx], seed: &s
         return false;
     }
     ov.put(KEY_DAY.to_vec(), day.to_le_bytes().to_vec());
-    let open = OpenCheckpoint {
-        index: last_index(ov) + 1,
-        height: block.height,
-        block_hash: block.hash.clone(),
-        next: draw_next(ov, crate::drs::period_of(block.height), seed),
-    };
+    let last = last_index(ov);
+    let mut next = draw_next(ov, crate::drs::period_of(block.height), seed);
+    if next.is_empty() {
+        next = load_cert(ov, last).map(|c| c.body.next).unwrap_or_default();
+    }
+    let open = OpenCheckpoint { index: last + 1, height: block.height, block_hash: block.hash.clone(), next };
     ov.put(KEY_OPEN.to_vec(), serde_json::to_vec(&open).unwrap_or_default());
     true
 }
@@ -512,7 +461,6 @@ pub fn apply_block(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx], seed: &s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
 
     fn entries(n: usize) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
         (0..n).map(|i| (TAG_BALANCE, format!("k{i:08}").into_bytes(), (i as u64).to_le_bytes().to_vec())).collect()
@@ -549,20 +497,8 @@ mod tests {
         }
     }
 
-    fn founder(seed: u8) -> (SigningKey, String) {
-        let sk = SigningKey::from_bytes(&[seed; 32]);
-        let addr = ed25519_address(sk.verifying_key().as_bytes()).unwrap();
-        (sk, addr)
-    }
-
     fn body(index: u64, next: Vec<String>) -> CertBody {
         CertBody { index, height: 100 * index, block_hash: format!("{index:064x}"), state_root: "aa".repeat(32), state_chunks: 3, next, ..CertBody::default() }
-    }
-
-    fn founder_votes(b: &CertBody, keys: &[SigningKey]) -> Vec<(String, String)> {
-        keys.iter()
-            .map(|k| (hex::encode(k.verifying_key().as_bytes()), hex::encode(k.sign(&b.message()).to_bytes())))
-            .collect()
     }
 
     fn bls(seed: u8) -> blst::min_pk::SecretKey {
@@ -575,84 +511,117 @@ mod tests {
             .collect()
     }
 
+    fn keys(s: &[blst::min_pk::SecretKey]) -> Vec<String> {
+        s.iter().map(|k| hex::encode(crate::bls_agg::bls_pubkey(k))).collect()
+    }
+
     #[test]
-    fn a_new_node_follows_the_certificates_from_the_founders_to_today() {
-        let fk: Vec<(SigningKey, String)> = (1..=4).map(founder).collect();
-        let founders: Vec<String> = fk.iter().map(|(_, a)| a.clone()).collect();
-        let fsk: Vec<SigningKey> = fk.iter().map(|(k, _)| k.clone()).collect();
+    fn a_new_node_follows_the_certificates_from_the_official_one_to_today() {
+        let c1: Vec<blst::min_pk::SecretKey> = (1..7).map(bls).collect();
         let c2: Vec<blst::min_pk::SecretKey> = (10..16).map(bls).collect();
         let c3: Vec<blst::min_pk::SecretKey> = (20..26).map(bls).collect();
-        let keys = |s: &[blst::min_pk::SecretKey]| s.iter().map(|k| hex::encode(crate::bls_agg::bls_pubkey(k))).collect::<Vec<_>>();
 
         let b1 = body(1, keys(&c2));
-        assert!(assemble(&b1, &founder_votes(&b1, &fsk[..2]), &Signers::Founders(founders.clone())).is_none(), "two of four founders are not enough");
-        let cert1 = assemble(&b1, &founder_votes(&b1, &fsk[..3]), &Signers::Founders(founders.clone())).unwrap();
+        let first = signers_for(None, &keys(&c1));
+        assert_eq!(first, keys(&c1), "the first certificate is signed by the committee drawn at its own checkpoint");
+        assert!(assemble(&b1, &bls_votes(&b1, &c1[..4]), &first).is_none(), "four of six is not two thirds");
+        let cert1 = assemble(&b1, &bls_votes(&b1, &c1[..5]), &first).unwrap();
 
         let b2 = body(2, keys(&c3));
-        let committee2 = signers_for(Some(&cert1), &founders);
-        assert!(assemble(&b2, &bls_votes(&b2, &c2[..4]), &committee2).is_none(), "four of six is not two thirds");
+        let committee2 = signers_for(Some(&cert1), &keys(&c1));
+        assert_eq!(committee2, keys(&c2), "after that, each certificate names who signs the next");
         let cert2 = assemble(&b2, &bls_votes(&b2, &c2[..5]), &committee2).unwrap();
         assert!(assemble(&b2, &bls_votes(&b2, &c3), &committee2).is_none(), "the next committee cannot sign early");
 
-        let b3 = body(3, vec![]);
-        let cert3 = assemble(&b3, &bls_votes(&b3, &c3), &signers_for(Some(&cert2), &founders)).unwrap();
-
+        let b3 = body(3, keys(&c3));
+        let cert3 = assemble(&b3, &bls_votes(&b3, &c3), &signers_for(Some(&cert2), &[])).unwrap();
         let chain = vec![cert1.clone(), cert2.clone(), cert3.clone()];
-        assert_eq!(verify_chain(&chain, &founders).unwrap().unwrap().body.index, 3);
+        let official = vec![(1, cert1.hash())];
+        assert_eq!(verify_chain(&chain, &official).unwrap().unwrap().body.index, 3);
+
+        assert!(verify_chain(&chain, &[]).is_err(), "with nothing official there is nothing to start from");
+        assert!(verify_chain(&chain, &[(1, "00".repeat(32))]).is_err(), "a first certificate that is not the official one is refused");
+        assert!(verify_chain(&[cert2.clone(), cert3.clone()], &official).is_err(), "the chain must start at the official certificate");
+
+        let attacker: Vec<blst::min_pk::SecretKey> = (40..46).map(bls).collect();
+        let mut fake_body = b1.clone();
+        fake_body.state_root = "bb".repeat(32);
+        fake_body.next = keys(&attacker);
+        let fake1 = assemble(&fake_body, &bls_votes(&fake_body, &attacker), &keys(&attacker)).unwrap();
+        let fake2 = assemble(&b2, &bls_votes(&b2, &attacker), &keys(&attacker)).unwrap();
+        assert!(verify_chain(&[fake1, fake2], &official).is_err(), "a made-up chain that signs itself is refused");
 
         let mut forged = cert2.clone();
         forged.body.state_root = "bb".repeat(32);
-        assert!(verify_chain(&[cert1.clone(), forged], &founders).is_err(), "a changed state root breaks the signature");
-        let stolen = assemble(&b2, &founder_votes(&b2, &fsk), &Signers::Founders(founders.clone()));
-        assert!(stolen.is_some());
-        assert!(verify_chain(&[cert1.clone(), stolen.unwrap()], &founders).is_err(), "founders cannot sign once a committee holds the chain");
-        assert!(verify_chain(&[cert2.clone()], &founders).is_err(), "the chain must start at the founders");
+        assert!(verify_chain(&[cert1.clone(), forged], &official).is_err(), "a changed state root breaks the signature");
+        let resigned = assemble(&b2, &bls_votes(&b2, &c1), &keys(&c1)).unwrap();
+        assert!(verify_chain(&[cert1.clone(), resigned], &official).is_err(), "an old committee cannot sign once it has handed over");
 
-        let b4 = body(4, vec![]);
-        let back_to_founders = signers_for(Some(&cert3), &founders);
-        assert_eq!(back_to_founders, Signers::Founders(founders.clone()), "with no committee drawn the founders sign again");
-        let cert4 = assemble(&b4, &founder_votes(&b4, &fsk[1..]), &back_to_founders).unwrap();
-        assert!(verify_chain(&[cert1, cert2, cert3, cert4], &founders).is_ok());
+        let later = vec![(2, cert2.hash())];
+        assert_eq!(verify_chain(&[cert2.clone(), cert3.clone()], &later).unwrap().unwrap().body.index, 3, "the website may name a newer certificate to start from");
+        let both = vec![(1, cert1.hash()), (2, cert2.hash())];
+        assert!(verify_chain(&chain, &both).is_ok());
+        assert!(verify_chain(&[cert1.clone()], &both).is_err(), "a chain that stops before an official certificate is refused");
+        let disagree = vec![(1, cert1.hash()), (2, cert3.hash())];
+        assert!(verify_chain(&chain, &disagree).is_err(), "every official certificate on the way must match");
+    }
+
+    #[test]
+    fn only_well_formed_published_certificates_are_used() {
+        let h = "ab".repeat(32);
+        assert_eq!(anchors_with(Some((4, h.clone()))), vec![(4, h.clone())]);
+        assert!(anchors_with(Some((0, h.clone()))).is_empty());
+        assert!(anchors_with(Some((4, "AB".repeat(32)))).is_empty());
+        assert!(anchors_with(Some((4, "ab".repeat(31)))).is_empty());
+        assert!(anchors_with(None).is_empty());
     }
 
     #[test]
     fn a_block_may_carry_only_the_certificate_the_open_checkpoint_asked_for() {
-        let fk: Vec<(SigningKey, String)> = (1..=4).map(founder).collect();
-        let founders: Vec<String> = fk.iter().map(|(_, a)| a.clone()).collect();
-        let fsk: Vec<SigningKey> = fk.iter().map(|(k, _)| k.clone()).collect();
+        let c1: Vec<blst::min_pk::SecretKey> = (1..5).map(bls).collect();
         let from = STATE_CERT_FROM_HEIGHT;
         let blk = |h: u64, ts: i64| LedgerBlock { height: h, timestamp: ts, hash: format!("{h:064x}"), ..LedgerBlock::default() };
         let mut ov = Ov::memory();
         apply_block(&mut ov, &blk(from, 10), &[], "s");
+        let mut open = load_open(&ov).unwrap();
+        open.next = keys(&c1);
+        ov.put(KEY_OPEN.to_vec(), serde_json::to_vec(&open).unwrap());
         ov.commit_memory();
-        let open = load_open(&ov).unwrap();
+        assert_eq!(signers_of(&ov, 1), keys(&c1));
         let body = CertBody { index: 1, height: open.height, block_hash: open.block_hash.clone(), state_root: "aa".repeat(32), state_chunks: 2, next: open.next.clone(), ..CertBody::default() };
-        let signed = |b: &CertBody| assemble(b, &founder_votes(b, &fsk[..3]), &Signers::Founders(founders.clone())).unwrap();
+        let signed = |b: &CertBody| assemble(b, &bls_votes(b, &c1), &keys(&c1)).unwrap();
         let tx_of = |c: &StateCert, h: u64| crate::drs::batch_tx(TX_STATE_CERT, h, 20, serde_json::to_string(c).unwrap());
         let cert = signed(&body);
         let next = blk(from + 1, 20);
-        assert!(validate(&ov, &next, &[tx_of(&cert, from + 1)], &founders).is_ok());
+        assert!(validate(&ov, &next, &[tx_of(&cert, from + 1)]).is_ok());
         let mut moved = body.clone();
         moved.height += 1;
-        assert!(validate(&ov, &next, &[tx_of(&signed(&moved), from + 1)], &founders).is_err(), "a certificate for another block is refused");
+        assert!(validate(&ov, &next, &[tx_of(&signed(&moved), from + 1)]).is_err(), "a certificate for another block is refused");
         let mut later = body.clone();
         later.index = 2;
-        assert!(validate(&ov, &next, &[tx_of(&signed(&later), from + 1)], &founders).is_err(), "a certificate out of turn is refused");
-        assert!(validate(&ov, &next, &[tx_of(&cert, from + 1), tx_of(&cert, from + 1)], &founders).is_err());
+        assert!(validate(&ov, &next, &[tx_of(&signed(&later), from + 1)]).is_err(), "a certificate out of turn is refused");
+        assert!(validate(&ov, &next, &[tx_of(&cert, from + 1), tx_of(&cert, from + 1)]).is_err());
         let mut tampered = tx_of(&cert, from + 1);
         tampered.hash = "0x00".into();
-        assert!(validate(&ov, &next, &[tampered], &founders).is_err());
-        let short = assemble(&body, &founder_votes(&body, &fsk[..2]), &Signers::Founders(founders.clone()));
-        assert!(short.is_none());
+        assert!(validate(&ov, &next, &[tampered]).is_err());
+        assert!(assemble(&body, &bls_votes(&body, &c1[..2]), &keys(&c1)).is_none(), "two of four is not enough");
+        let outsiders: Vec<blst::min_pk::SecretKey> = (30..34).map(bls).collect();
+        let by_outsiders = assemble(&body, &bls_votes(&body, &outsiders), &keys(&outsiders)).unwrap();
+        assert!(validate(&ov, &next, &[tx_of(&by_outsiders, from + 1)]).is_err(), "only the drawn committee can sign");
         let mut forged = cert.clone();
-        forged.founder_sigs.truncate(2);
-        assert!(validate(&ov, &next, &[tx_of(&forged, from + 1)], &founders).is_err(), "too few signatures is refused");
+        forged.signers.truncate(2);
+        assert!(validate(&ov, &next, &[tx_of(&forged, from + 1)]).is_err(), "too few signatures is refused");
         let early = blk(from - 1, 5);
-        assert!(validate(&Ov::memory(), &early, &[tx_of(&cert, from - 1)], &founders).is_err(), "no certificates before the rules start");
+        assert!(validate(&Ov::memory(), &early, &[tx_of(&cert, from - 1)]).is_err(), "no certificates before the rules start");
         let ctx = tx_of(&cert, from + 1);
         apply_block(&mut ov, &next, &[&ctx], "s");
         ov.commit_memory();
-        assert!(validate(&ov, &blk(from + 2, 30), &[tx_of(&cert, from + 2)], &founders).is_err(), "a certificate lands once");
+        assert!(validate(&ov, &blk(from + 2, 30), &[tx_of(&cert, from + 2)]).is_err(), "a certificate lands once");
+        apply_block(&mut ov, &blk(from + 3, DAY_SECS + 40), &[], "s");
+        ov.commit_memory();
+        let reopened = load_open(&ov).unwrap();
+        assert_eq!((reopened.index, reopened.next.clone()), (2, keys(&c1)), "with nobody to draw, the last committee carries on");
+        assert_eq!(signers_of(&ov, 2), keys(&c1));
     }
 
     #[test]
