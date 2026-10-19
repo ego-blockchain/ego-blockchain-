@@ -154,5 +154,6 @@ wat = "1.219"
 # build / CI picks it up automatically.
 [patch.crates-io]
 wry = { path = "patches/wry" }
+libp2p-upnp = { path = "patches/libp2p-upnp" }
 
 [workspace]

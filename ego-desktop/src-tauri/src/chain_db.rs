@@ -10442,9 +10442,10 @@ const STATE_INSTALL_PENDING: &[u8] = b"state_install_pending";
 
 pub fn state_cert_open() -> Option<(crate::state_cert::OpenCheckpoint, Vec<String>)> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let next = local_chain_height_in(&db).saturating_add(1);
     let ov = crate::drs::Ov::new(db);
     let open = crate::state_cert::load_open(&ov)?;
-    let signers = crate::state_cert::signers_of(&ov, open.index);
+    let signers = crate::state_cert::signers_of(&ov, open.index, next);
     Some((open, signers))
 }
 
@@ -10935,6 +10936,52 @@ mod history_tests {
         migrate_history_index(&db);
         migrate_drs_v2(&db);
         (db, dir)
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_a_node_database_read_only() {
+        let Ok(path) = std::env::var("EGO_INSPECT_DB") else { return };
+        let from: u64 = std::env::var("EGO_INSPECT_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let to: u64 = std::env::var("EGO_INSPECT_TO").ok().and_then(|v| v.parse().ok()).unwrap_or(from + 5);
+        let db = DB::open_cf_for_read_only(&Options::default(), &path, ALL_CFS.to_vec(), false).expect("open read-only");
+        eprintln!("tip {}", local_chain_height_in(&db));
+        if let Some(cf) = db.cf_handle(CF_GOVERNANCE) {
+            for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start).take(50) {
+                if let Ok((k, v)) = item {
+                    let p = decode::<GovernanceProposal>(&v);
+                    eprintln!("gov {} -> {:?}", String::from_utf8_lossy(&k), p.map(|p| (p.activated, p.activate_at)));
+                }
+            }
+        }
+        for h in from..=to {
+            let cf = db.cf_handle(CF_BLOCKS).unwrap();
+            match db.get_cf(cf, height_key(h)).ok().flatten().and_then(|v| decode::<LedgerBlock>(&v)) {
+                Some(b) => {
+                    let txs = txs_for_block_in(&db, h);
+                    let ticket = {
+                        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                        let mut parts = b.poc_ticket.splitn(2, ':');
+                        let (tk, sg) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                        let sig = hex::decode(sg).unwrap_or_default();
+                        let ticket_ok = hex::encode(blake3::hash(&sig).as_bytes()) == tk;
+                        let pk: Option<[u8; 32]> = hex::decode(&b.producer_pubkey).ok().and_then(|v| v.try_into().ok());
+                        let sig_ok = match (pk.and_then(|k| VerifyingKey::from_bytes(&k).ok()), <[u8; 64]>::try_from(sig.as_slice())) {
+                            (Some(vk), Ok(s)) => vk.verify(&crate::poc::slot_seed(&b.prev_hash, b.poc_slot), &Signature::from_bytes(&s)).is_ok(),
+                            _ => false,
+                        };
+                        format!("ticket_hash_ok {ticket_ok} ticket_sig_ok {sig_ok} slot {} empty {}", b.poc_slot, b.poc_ticket.is_empty())
+                    };
+                    eprintln!("#{h} {ticket}");
+                    eprintln!(
+                        "#{} hash {} prev {} miner {} ts {} tx_count {} stored_txs {} votes {} cert_len {} reward {} base {} hash_ok {} producer_ok {:?}",
+                        h, &b.hash[..16.min(b.hash.len())], &b.prev_hash[..16.min(b.prev_hash.len())], b.miner, b.timestamp,
+                        b.tx_count, txs.len(), b.vote_count, b.commit_cert.len(), b.reward, crate::tokenomics::block_reward_at(h), verify_block_hash(&b, &txs), check_block_producer(&b).err()
+                    );
+                }
+                None => eprintln!("#{h} missing"),
+            }
+        }
     }
 
     #[test]

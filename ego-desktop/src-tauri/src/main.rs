@@ -468,7 +468,11 @@ fn headless_main() {
         crate::sharding::load_agreed_shard_count_from_db();
 
         tokio::spawn(async {
-            crate::p2p::start_p2p_server(None).await;
+            use futures::FutureExt;
+            if std::panic::AssertUnwindSafe(crate::p2p::start_p2p_server(None)).catch_unwind().await.is_err() {
+                eprintln!("[P2P] networking stopped after an internal error; exiting so the service manager restarts the node");
+                std::process::exit(70);
+            }
         });
 
         tokio::spawn(async {
@@ -1454,7 +1458,13 @@ fn main() {
 
             let handle_p2p = app.handle();
             tauri::async_runtime::spawn(async move {
-                crate::p2p::start_p2p_server(Some(handle_p2p)).await;
+                use futures::FutureExt;
+                let restart = handle_p2p.clone();
+                let ran = std::panic::AssertUnwindSafe(crate::p2p::start_p2p_server(Some(handle_p2p))).catch_unwind().await;
+                if ran.is_err() {
+                    eprintln!("[P2P] networking stopped after an internal error; restarting Ego Desktop so the node reconnects");
+                    restart.restart();
+                }
             });
 
             let handle_startup = app.handle();

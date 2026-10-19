@@ -1032,7 +1032,24 @@ fn recount_all(ov: &mut Ov, at: i64, period: u64) {
     }
 }
 
-pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
+#[cfg(test)]
+pub fn seed_rota_for_tests(ov: &mut Ov, epoch: u64, members: &[String], ready: &[usize]) {
+    ov.put(rota_key(epoch), serde_json::to_vec(&Rota { seed: "s".into(), members: members.to_vec() }).unwrap());
+    let mut bits = Vec::new();
+    for i in ready {
+        set_bit(&mut bits, *i);
+    }
+    ov.put(ready_key(epoch), bits);
+}
+
+#[cfg(test)]
+pub fn seed_pop_key_for_tests(ov: &mut Ov, addr: &str, pop: &str) {
+    let mut rec = load_rec(ov, addr).unwrap_or_default();
+    rec.pop_key = pop.to_string();
+    save_rec(ov, addr, &rec);
+}
+
+pub fn draw_pool(ov: &Ov, height: u64) -> Vec<String> {
     let epoch = epoch_of(height);
     let rota = load_rota(ov, epoch).unwrap_or_default();
     let bits = ready_set(ov, epoch);
@@ -1050,6 +1067,13 @@ pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
             pool = answering;
         }
     }
+    pool
+}
+
+pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
+    let epoch = epoch_of(height);
+    let rota = load_rota(ov, epoch).unwrap_or_default();
+    let pool = draw_pool(ov, height);
     let size = BLOCK_COMMITTEE.min(pool.len());
     if pool.len() <= size {
         return pool;

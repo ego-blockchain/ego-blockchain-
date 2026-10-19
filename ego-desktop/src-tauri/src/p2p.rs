@@ -11392,6 +11392,17 @@ pub fn fork_walkback() -> u64 {
     FORK_WALKBACK.load(Ordering::Relaxed)
 }
 
+fn note_sync_refusal(height: u64, kind: &str, detail: &str) {
+    static LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    let now = Utc::now().timestamp();
+    let mut seen = LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if now - seen.get(kind).copied().unwrap_or(0) < 60 {
+        return;
+    }
+    seen.insert(kind.to_string(), now);
+    eprintln!("[Sync] block #{height} not taken: {kind}{}{detail}", if detail.is_empty() { "" } else { " — " });
+}
+
 fn merge_remote_chain_blocking(
     mut blocks: Vec<LedgerBlock>,
     transactions: Vec<LedgerTx>,
@@ -11666,10 +11677,7 @@ fn merge_remote_chain_blocking(
                 }
 
                 if block.prev_hash != expected_prev {
-                    tracing::debug!(
-                        "[P2P] Block #{} rejected: prev_hash mismatch. Forcing sync to resolve fork.",
-                        block.height
-                    );
+                    note_sync_refusal(block.height, "its parent is not the block this node holds at that height", "");
                     peer_ahead = true;
                     continue;
                 }
@@ -11684,19 +11692,20 @@ fn merge_remote_chain_blocking(
                 || block.reward == 0
                 || block.reward >= base_reward / 2;
             if !reward_ok {
-                tracing::debug!("[P2P] Block #{} rejected: reward {} below base {}",
-                    block.height, block.reward, base_reward);
+                note_sync_refusal(block.height, "reward below the floor", &format!("{} under half of {}", block.reward, base_reward));
                 continue;
             }
 
-            let mut parts = block.poc_ticket.splitn(2, ':');
-            let ticket_hex = parts.next().unwrap_or("");
-            let sig_hex    = parts.next().unwrap_or("");
-            if !crate::poc::verify_ticket(
-                ticket_hex, sig_hex, &block.miner, &block.prev_hash, block.poc_slot, block.height,
-            ) {
-                tracing::debug!("[P2P] Block #{} rejected: invalid PoC ticket", block.height);
-                continue;
+            if !consensus_v2_live_enabled() {
+                let mut parts = block.poc_ticket.splitn(2, ':');
+                let ticket_hex = parts.next().unwrap_or("");
+                let sig_hex    = parts.next().unwrap_or("");
+                if !crate::poc::verify_ticket(
+                    ticket_hex, sig_hex, &block.miner, &block.prev_hash, block.poc_slot, block.height,
+                ) {
+                    note_sync_refusal(block.height, "invalid PoC ticket", "");
+                    continue;
+                }
             }
 
             let mut block_txs: Vec<LedgerTx> = {
@@ -11737,6 +11746,7 @@ fn merge_remote_chain_blocking(
             // is the only place that knows the block actually landed, so it is the only
             // place that clears.
             if let Err(reason) = crate::chain_db::validate_peer_block(&block, &block_txs) {
+                note_sync_refusal(block.height, "it does not pass validation", &reason);
                 note_block_rejected(block.height, &reason);
                 let now = Utc::now().timestamp();
                 let key = (block.height, reason[..reason.len().min(40)].to_string());
@@ -11760,6 +11770,7 @@ fn merge_remote_chain_blocking(
                     .cloned()
                     .collect();
                 if !append_synced_block(&block, &block_txs_now) {
+                    note_sync_refusal(block.height, "it could not be written", &format!("{} of {} transactions verified", block_txs_now.len(), block.tx_count));
                     continue;
                 }
             }

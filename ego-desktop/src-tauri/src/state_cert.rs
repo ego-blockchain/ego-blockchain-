@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const STATE_CERT_FROM_HEIGHT: u64 = 32_650;
+pub const CERT_DRAW_V2_FROM_HEIGHT: u64 = 32_901;
+pub const CERT_RETRY_BLOCKS: u64 = 300;
+pub const CERT_FALLBACK_BLOCKS: u64 = 2_000;
 pub const CERT_COMMITTEE: usize = 128;
 pub const CHUNK_ENTRIES: usize = 4096;
 pub const DAY_SECS: i64 = 86_400;
@@ -251,6 +254,12 @@ pub struct OpenCheckpoint {
     pub height: u64,
     pub block_hash: String,
     pub next: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub first_height: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 pub fn quorum(n: usize) -> usize {
@@ -329,6 +338,10 @@ pub fn verify_chain(certs: &[StateCert], anchors: &[(u64, String)]) -> Result<Op
     }
     let mut prev: Option<StateCert> = None;
     for cert in certs {
+        if anchors.iter().any(|(i, h)| *i == cert.body.index && *h != cert.hash()) {
+            return Err(format!("certificate {} is not the official one", cert.body.index));
+        }
+        let official = anchors.iter().any(|(i, _)| *i == cert.body.index);
         if let Some(p) = &prev {
             if cert.body.index != p.body.index + 1 {
                 return Err(format!("certificate {} follows {}", cert.body.index, p.body.index));
@@ -336,10 +349,9 @@ pub fn verify_chain(certs: &[StateCert], anchors: &[(u64, String)]) -> Result<Op
             if cert.body.height <= p.body.height {
                 return Err(format!("certificate {} does not move the chain forward", cert.body.index));
             }
-            verify_cert(cert, &p.body.next)?;
-        }
-        if anchors.iter().any(|(i, h)| *i == cert.body.index && *h != cert.hash()) {
-            return Err(format!("certificate {} is not the official one", cert.body.index));
+            if !official {
+                verify_cert(cert, &p.body.next)?;
+            }
         }
         prev = Some(cert.clone());
     }
@@ -363,10 +375,31 @@ pub fn last_index(ov: &Ov) -> u64 {
     ov.get(KEY_LAST).map(|v| u64_of(&v)).unwrap_or(0)
 }
 
-pub fn signers_of(ov: &Ov, index: u64) -> Vec<String> {
+pub fn signers_of(ov: &Ov, index: u64, height: u64) -> Vec<String> {
     let prev = if index > 1 { load_cert(ov, index - 1) } else { None };
-    let drawn = load_open(ov).filter(|o| o.index == index).map(|o| o.next).unwrap_or_default();
+    let open = load_open(ov).filter(|o| o.index == index);
+    let drawn = open.as_ref().map(|o| o.next.clone()).unwrap_or_default();
+    let stuck = open.as_ref().map_or(false, |o| o.first_height > 0 && height >= o.first_height.saturating_add(CERT_FALLBACK_BLOCKS));
+    if stuck && !drawn.is_empty() {
+        return drawn;
+    }
     signers_for(prev.as_ref(), &drawn)
+}
+
+pub fn draw_answering(ov: &Ov, height: u64) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for addr in crate::drs::draw_pool(ov, height) {
+        if keys.len() >= CERT_COMMITTEE {
+            break;
+        }
+        if let Some(rec) = crate::drs::load_rec(ov, &addr) {
+            if !rec.pop_key.is_empty() && seen.insert(rec.pop_key.clone()) {
+                keys.push(rec.pop_key);
+            }
+        }
+    }
+    keys
 }
 
 pub fn draw_next(ov: &Ov, period: u64, seed: &str) -> Vec<String> {
@@ -424,7 +457,7 @@ pub fn validate(ov: &Ov, block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), St
     if b.index != open.index || b.height != open.height || b.block_hash != open.block_hash || b.next != open.next {
         return Err(format!("state certificate {} does not match the checkpoint at block {}", b.index, open.height));
     }
-    verify_cert(&cert, &signers_of(ov, open.index))
+    verify_cert(&cert, &signers_of(ov, open.index, block.height))
 }
 
 pub fn apply_block(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx], seed: &str) -> bool {
@@ -444,16 +477,33 @@ pub fn apply_block(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx], seed: &s
         }
     }
     let day = (block.timestamp.max(0) / DAY_SECS) as u64;
-    if ov.get(KEY_DAY).map_or(false, |v| day <= u64_of(&v)) {
+    let new_day = !ov.get(KEY_DAY).map_or(false, |v| day <= u64_of(&v));
+    let v2 = block.height >= CERT_DRAW_V2_FROM_HEIGHT;
+    let waiting = load_open(ov);
+    let retry = v2
+        && waiting.as_ref().map_or(false, |o| {
+            block.height == CERT_DRAW_V2_FROM_HEIGHT || block.height >= o.height.saturating_add(CERT_RETRY_BLOCKS)
+        });
+    if !new_day && !retry {
         return false;
     }
-    ov.put(KEY_DAY.to_vec(), day.to_le_bytes().to_vec());
+    if new_day {
+        ov.put(KEY_DAY.to_vec(), day.to_le_bytes().to_vec());
+    }
     let last = last_index(ov);
-    let mut next = draw_next(ov, crate::drs::period_of(block.height), seed);
+    let mut next = if v2 { draw_answering(ov, block.height) } else { draw_next(ov, crate::drs::period_of(block.height), seed) };
     if next.is_empty() {
         next = load_cert(ov, last).map(|c| c.body.next).unwrap_or_default();
     }
-    let open = OpenCheckpoint { index: last + 1, height: block.height, block_hash: block.hash.clone(), next };
+    let first_height = if v2 {
+        waiting
+            .filter(|o| o.index == last + 1)
+            .map(|o| if o.first_height > 0 { o.first_height } else { o.height })
+            .unwrap_or(block.height)
+    } else {
+        0
+    };
+    let open = OpenCheckpoint { index: last + 1, height: block.height, block_hash: block.hash.clone(), next, first_height };
     ov.put(KEY_OPEN.to_vec(), serde_json::to_vec(&open).unwrap_or_default());
     true
 }
@@ -587,7 +637,7 @@ mod tests {
         open.next = keys(&c1);
         ov.put(KEY_OPEN.to_vec(), serde_json::to_vec(&open).unwrap());
         ov.commit_memory();
-        assert_eq!(signers_of(&ov, 1), keys(&c1));
+        assert_eq!(signers_of(&ov, 1, from + 1), keys(&c1));
         let body = CertBody { index: 1, height: open.height, block_hash: open.block_hash.clone(), state_root: "aa".repeat(32), state_chunks: 2, next: open.next.clone(), ..CertBody::default() };
         let signed = |b: &CertBody| assemble(b, &bls_votes(b, &c1), &keys(&c1)).unwrap();
         let tx_of = |c: &StateCert, h: u64| crate::drs::batch_tx(TX_STATE_CERT, h, 20, serde_json::to_string(c).unwrap());
@@ -621,7 +671,78 @@ mod tests {
         ov.commit_memory();
         let reopened = load_open(&ov).unwrap();
         assert_eq!((reopened.index, reopened.next.clone()), (2, keys(&c1)), "with nobody to draw, the last committee carries on");
-        assert_eq!(signers_of(&ov, 2), keys(&c1));
+        assert_eq!(signers_of(&ov, 2, from + 4), keys(&c1));
+    }
+
+    fn answering_network(ov: &mut Ov, height: u64, ready: &[usize]) -> Vec<String> {
+        let epoch = crate::drs::epoch_of(height);
+        let members: Vec<String> = (0..6).map(|i| format!("egot1cert{i}")).collect();
+        crate::drs::seed_rota_for_tests(ov, epoch, &members, ready);
+        let mut pops = Vec::new();
+        for (i, m) in members.iter().enumerate() {
+            let pop = hex::encode(crate::bls_agg::bls_pubkey(&bls(60 + i as u8)));
+            crate::drs::seed_pop_key_for_tests(ov, m, &pop);
+            pops.push(pop);
+        }
+        ov.commit_memory();
+        ready.iter().map(|i| pops[*i].clone()).collect()
+    }
+
+    #[test]
+    fn an_unsigned_checkpoint_is_redrawn_from_the_nodes_that_answer() {
+        let blk = |h: u64, ts: i64| LedgerBlock { height: h, timestamp: ts, hash: format!("{h:064x}"), ..LedgerBlock::default() };
+        let mut ov = Ov::memory();
+        let before = CERT_DRAW_V2_FROM_HEIGHT - 50;
+        apply_block(&mut ov, &blk(before, 10), &[], "s");
+        ov.commit_memory();
+        let old = load_open(&ov).unwrap();
+        assert_eq!(old.first_height, 0, "before the new rules a checkpoint is written exactly as before");
+        assert!(!serde_json::to_string(&old).unwrap().contains("first_height"));
+
+        let answering = answering_network(&mut ov, CERT_DRAW_V2_FROM_HEIGHT, &[1, 2, 4]);
+        assert!(!apply_block(&mut ov, &blk(CERT_DRAW_V2_FROM_HEIGHT - 1, 20), &[], "s"), "same day, still the old rules: nothing moves");
+        assert!(apply_block(&mut ov, &blk(CERT_DRAW_V2_FROM_HEIGHT, 30), &[], "s"), "the new rules redraw a waiting checkpoint at once");
+        ov.commit_memory();
+        let redrawn = load_open(&ov).unwrap();
+        assert_eq!((redrawn.index, redrawn.height), (1, CERT_DRAW_V2_FROM_HEIGHT));
+        assert_eq!(redrawn.next, answering, "only nodes that are ready and answering are asked to sign");
+        assert_eq!(redrawn.first_height, before, "the checkpoint remembers when it first opened");
+        assert_eq!(signers_of(&ov, 1, CERT_DRAW_V2_FROM_HEIGHT + 1), answering);
+
+        assert!(!apply_block(&mut ov, &blk(CERT_DRAW_V2_FROM_HEIGHT + CERT_RETRY_BLOCKS - 1, 40), &[], "s"));
+        assert!(apply_block(&mut ov, &blk(CERT_DRAW_V2_FROM_HEIGHT + CERT_RETRY_BLOCKS, 50), &[], "s"), "still unsigned after the retry interval: draw again");
+        ov.commit_memory();
+        assert_eq!(load_open(&ov).unwrap().first_height, before);
+    }
+
+    #[test]
+    fn a_checkpoint_whose_signers_are_gone_can_be_signed_by_its_own_draw_after_a_long_wait() {
+        let mut ov = Ov::memory();
+        let gone: Vec<blst::min_pk::SecretKey> = (70..74).map(bls).collect();
+        let cert1 = StateCert { body: body(1, keys(&gone)), ..StateCert::default() };
+        ov.put(cert_key(1), serde_json::to_vec(&cert1).unwrap());
+        ov.put(KEY_LAST.to_vec(), 1u64.to_le_bytes().to_vec());
+        let here: Vec<blst::min_pk::SecretKey> = (80..84).map(bls).collect();
+        let first = CERT_DRAW_V2_FROM_HEIGHT + 10;
+        let open = OpenCheckpoint { index: 2, height: first + 600, block_hash: "ab".repeat(32), next: keys(&here), first_height: first };
+        ov.put(KEY_OPEN.to_vec(), serde_json::to_vec(&open).unwrap());
+        ov.commit_memory();
+        assert_eq!(signers_of(&ov, 2, first + CERT_FALLBACK_BLOCKS - 1), keys(&gone), "until the wait is over the named committee must sign");
+        assert_eq!(signers_of(&ov, 2, first + CERT_FALLBACK_BLOCKS), keys(&here), "after it, the checkpoint's own draw may");
+    }
+
+    #[test]
+    fn a_new_node_trusts_an_official_certificate_even_when_its_signers_changed() {
+        let c1: Vec<blst::min_pk::SecretKey> = (1..5).map(bls).collect();
+        let c2: Vec<blst::min_pk::SecretKey> = (10..14).map(bls).collect();
+        let fresh: Vec<blst::min_pk::SecretKey> = (20..24).map(bls).collect();
+        let b1 = body(1, keys(&c2));
+        let cert1 = assemble(&b1, &bls_votes(&b1, &c1), &keys(&c1)).unwrap();
+        let b2 = body(2, keys(&fresh));
+        let by_own_draw = assemble(&b2, &bls_votes(&b2, &fresh), &keys(&fresh)).unwrap();
+        assert!(verify_chain(&[cert1.clone(), by_own_draw.clone()], &[(1, cert1.hash())]).is_err(), "without the website naming it, a certificate signed by others is refused");
+        let both = vec![(1, cert1.hash()), (2, by_own_draw.hash())];
+        assert_eq!(verify_chain(&[cert1, by_own_draw], &both).unwrap().unwrap().body.index, 2, "once it is official it is taken on the website's word");
     }
 
     #[test]
