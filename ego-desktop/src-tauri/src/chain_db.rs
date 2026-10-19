@@ -9734,10 +9734,6 @@ pub fn storage_file_memo(call_args: &str, delete: bool) -> String {
     if delete { format!("storage_file:delete:{h}") } else { format!("storage_file:{h}") }
 }
 
-fn founders_with_keys_in(db: &DB) -> Vec<String> {
-    crate::genesis::addresses().into_iter().filter(|g| dilithium_key_in(db, g).is_some()).collect()
-}
-
 pub fn committee_attempt(parent_ts: i64, stamp: i64) -> i64 {
     (stamp.saturating_sub(parent_ts).max(0) / COMMITTEE_REDRAW_SECS).min(MAX_COMMITTEE_ATTEMPT)
 }
@@ -9757,7 +9753,7 @@ fn committee_for_height_in(db: &DB, height: u64, stamp: i64) -> Option<Vec<(Stri
     let parent_ts = block_ts_at_in(db, height.checked_sub(1)?)?;
     let attempt = committee_attempt(parent_ts, stamp);
     let ov = crate::drs::Ov::new(db);
-    let members = crate::drs::committee(&ov, height, attempt, &founders_with_keys_in(db));
+    let members = crate::drs::committee(&ov, height, attempt);
     let out: Vec<(String, Vec<u8>)> = members
         .into_iter()
         .filter_map(|a| dilithium_key_in(db, &a).map(|k| (a, k)))

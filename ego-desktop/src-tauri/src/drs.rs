@@ -15,7 +15,8 @@ pub fn min_streak(period: u64) -> u32 {
 pub const EPOCH: u64 = 100;
 pub const WEIGHT_LEAD: u64 = 50;
 pub const COMMITTEE_SIZE: usize = 32;
-pub const MIN_COMMITTEE: usize = 4;
+pub const MIN_COMMITTEE: usize = 3;
+pub const BLOCK_COMMITTEE: usize = 4;
 pub const ROTA_LEN: usize = 128;
 pub const READY_DEADLINE: u64 = 90;
 pub const CHECKIN_INTERVAL_SECS: i64 = 12 * 3600;
@@ -986,7 +987,7 @@ fn recount_all(ov: &mut Ov, at: i64, period: u64) {
     }
 }
 
-pub fn committee(ov: &Ov, height: u64, attempt: i64, founders_with_keys: &[String]) -> Vec<String> {
+pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
     let epoch = epoch_of(height);
     let rota = load_rota(ov, epoch).unwrap_or_default();
     let bits = ready_set(ov, epoch);
@@ -998,21 +999,27 @@ pub fn committee(ov: &Ov, height: u64, attempt: i64, founders_with_keys: &[Strin
         .map(|(_, a)| a.clone())
         .collect();
     let pool = if ready.len() >= MIN_COMMITTEE { ready } else { rota.members };
-    let size = COMMITTEE_SIZE.min(pool.len());
-    let mut members: Vec<String> = if pool.len() > size {
-        let start = (attempt.max(0) as usize).wrapping_mul(size) % pool.len();
-        (0..size).map(|j| pool[(start + j) % pool.len()].clone()).collect()
-    } else {
+    let size = BLOCK_COMMITTEE.min(pool.len());
+    let members: Vec<String> = if pool.len() <= size {
         pool
+    } else if attempt <= 0 {
+        pool[..size].to_vec()
+    } else {
+        let mut ranked: Vec<([u8; 32], String)> = pool
+            .into_iter()
+            .map(|a| {
+                let mut h = blake3::Hasher::new();
+                h.update(b"ego/committee-redraw/v1:");
+                h.update(rota.seed.as_bytes());
+                h.update(&epoch.to_le_bytes());
+                h.update(&attempt.to_le_bytes());
+                h.update(a.as_bytes());
+                (*h.finalize().as_bytes(), a)
+            })
+            .collect();
+        ranked.sort();
+        ranked.into_iter().take(size).map(|(_, a)| a).collect()
     };
-    for f in founders_with_keys {
-        if members.len() >= MIN_COMMITTEE {
-            break;
-        }
-        if !members.contains(f) {
-            members.push(f.clone());
-        }
-    }
     members
 }
 
@@ -1273,8 +1280,7 @@ mod tests {
         ov.put(rota_key(400), serde_json::to_vec(&rota).unwrap());
         ov.commit_memory();
         let h = 400 * EPOCH + 5;
-        let c0 = committee(&ov, h, 0, &[]);
-        assert_eq!(c0, members[..COMMITTEE_SIZE].to_vec());
+        assert_eq!(committee(&ov, h, 0), members[..BLOCK_COMMITTEE].to_vec(), "with nobody ready the first drawn make up the group");
         let mut bits = Vec::new();
         for i in (0..ROTA_LEN).filter(|i| i % 2 == 1) {
             set_bit(&mut bits, i);
@@ -1282,11 +1288,24 @@ mod tests {
         ov.put(ready_key(400), bits);
         ov.commit_memory();
         let ready: Vec<String> = members.iter().enumerate().filter(|(i, _)| i % 2 == 1).map(|(_, a)| a.clone()).collect();
-        assert_eq!(committee(&ov, h, 0, &[]), ready[..COMMITTEE_SIZE].to_vec());
-        assert_eq!(committee(&ov, h, 1, &[]), ready[COMMITTEE_SIZE..2 * COMMITTEE_SIZE].to_vec());
-        let empty = Ov::memory();
-        let founders = vec!["egot1founder1".to_string(), "egot1founder2".to_string()];
-        assert_eq!(committee(&empty, h, 0, &founders), founders);
+        assert_eq!(committee(&ov, h, 0), ready[..BLOCK_COMMITTEE].to_vec());
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for attempt in 1..60 {
+            let c = committee(&ov, h, attempt);
+            assert_eq!(c, committee(&ov, h, attempt), "every node draws the same group");
+            assert_eq!(c.len(), BLOCK_COMMITTEE);
+            assert!(c.iter().all(|a| ready.contains(a)), "only ready nodes are drawn");
+            seen.extend(c);
+        }
+        assert!(seen.len() > ready.len() / 2, "redraws rotate through the ready nodes ({} of {})", seen.len(), ready.len());
+        let mut three = Vec::new();
+        for i in [3usize, 40, 90] {
+            set_bit(&mut three, i);
+        }
+        ov.put(ready_key(400), three);
+        ov.commit_memory();
+        assert_eq!(committee(&ov, h, 7), vec![members[3].clone(), members[40].clone(), members[90].clone()], "three ready nodes are enough");
+        assert!(committee(&Ov::memory(), h, 0).is_empty(), "no founders are added when nobody was drawn");
     }
 
     #[test]
