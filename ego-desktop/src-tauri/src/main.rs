@@ -981,8 +981,6 @@ fn main() {
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
-            autostart::get_autostart_state,
-            autostart::set_autostart_enabled,
             commands::auth::init_wallet,
             commands::auth::generate_keypair,
             commands::auth::import_keypair,
@@ -1002,6 +1000,7 @@ fn main() {
             commands::auth::get_password_status,
             commands::auth::set_password,
             commands::auth::verify_password,
+            commands::auth::lock_app,
             commands::auth::password_cache_status,
             commands::auth::reset_password_with_recovery_phrase,
             commands::auth::get_recovery_info,
@@ -1415,6 +1414,7 @@ fn main() {
                 session_end::install(hwnd.0);
             }
 
+            crate::autostart::keep_enabled();
             let start_hidden = crate::autostart::launched_hidden();
             app.listen_global("frontend-ready", move |_| {
                 eprintln!("[Startup] frontend-ready received, showing window (hidden={start_hidden})");

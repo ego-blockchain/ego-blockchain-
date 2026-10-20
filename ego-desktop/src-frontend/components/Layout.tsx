@@ -5,7 +5,6 @@ import { listen } from '@tauri-apps/api/event';
 import { open as openUrl } from '@tauri-apps/api/shell';
 import { useWallet, useTheme } from '../App';
 import TitleBar from './TitleBar';
-import StartAtLoginBanner from './StartAtLoginBanner';
 import { useAppVersion, formatVersion } from '../lib/version';
 
 const NAV_ITEMS = [
@@ -528,7 +527,6 @@ const Layout: React.FC = () => {
       {}
       <main className="flex-1 overflow-auto min-w-0">
         <UpdateBanner />
-        <StartAtLoginBanner />
         <Outlet />
       </main>
       </div>

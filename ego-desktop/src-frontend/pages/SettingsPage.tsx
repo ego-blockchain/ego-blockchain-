@@ -37,8 +37,7 @@ const SettingsPage: React.FC = () => {
   const [avatarMsg, setAvatarMsg]             = useState('');
   const avatarInputRef                        = useRef<HTMLInputElement>(null);
 
-  const [startAtLogin, setStartAtLogin]       = useState<boolean | null>(null);
-  const [startAtLoginError, setStartAtLoginError] = useState('');
+  const [lockError, setLockError]             = useState('');
 
   const [hasPin, setHasPin]                   = useState(false);
   const [showSetPin, setShowSetPin]           = useState(false);
@@ -85,7 +84,6 @@ const SettingsPage: React.FC = () => {
       .then(n => { setDisplayName(n); setSavedName(n); })
       .catch(() => {});
     invoke<string>('get_my_avatar').then(setAvatar).catch(() => {});
-    invoke<{ enabled: boolean }>('get_autostart_state').then(s => setStartAtLogin(s.enabled)).catch(() => {});
   }, []);
 
   // Downscale to a 128px square here rather than shipping a multi-megabyte
@@ -151,15 +149,6 @@ const SettingsPage: React.FC = () => {
       setSavingName(false);
     }
   }
-
-  const Toggle: React.FC<{ value: boolean; onChange: (v: boolean) => void }> = ({ value, onChange }) => (
-    <button
-      onClick={() => onChange(!value)}
-      className={`w-11 h-6 rounded-full transition-colors relative ${value ? 'bg-blue-600' : 'bg-gray-600'}`}
-    >
-      <div className={`w-5 h-5 bg-white rounded-full shadow absolute top-0.5 transition-all ${value ? 'left-5' : 'left-0.5'}`} />
-    </button>
-  );
 
   async function handleSetPin() {
     if (pinInput.length < 8) { setPinMsg('Password must be at least 8 characters.'); return; }
@@ -256,12 +245,12 @@ const SettingsPage: React.FC = () => {
     finally { setLoadingRecovery(false); }
   }
 
-  async function changeStartAtLogin(enabled: boolean) {
-    setStartAtLoginError('');
+  async function lockNow() {
+    setLockError('');
     try {
-      setStartAtLogin(await invoke<boolean>('set_autostart_enabled', { enabled }));
+      await invoke('lock_app');
     } catch (e) {
-      setStartAtLoginError(String(e));
+      setLockError(String(e));
     }
   }
 
@@ -366,13 +355,27 @@ const SettingsPage: React.FC = () => {
       {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-700"><h3 className="font-semibold">General</h3></div>
-        <div className="flex items-center justify-between px-5 py-4">
+        <div className="flex items-center justify-between gap-4 px-5 py-4">
           <div>
-            <div className="text-sm font-medium">Start at login</div>
-            <div className="text-xs text-gray-400">Open Ego Desktop in the background when you log in, so your node keeps earning</div>
-            {startAtLoginError && <div className="text-xs text-red-400 mt-1">{startAtLoginError}</div>}
+            <div className="text-sm font-medium">Lock</div>
+            <div className="text-xs text-gray-400">
+              {hasPin
+                ? 'Lock Ego Desktop now. Your node keeps running and earning in the background.'
+                : 'Set a password under Security & Keys to be able to lock Ego Desktop.'}
+            </div>
+            {lockError && <div className="text-xs text-red-400 mt-1">{lockError}</div>}
           </div>
-          {startAtLogin !== null && <Toggle value={startAtLogin} onChange={changeStartAtLogin} />}
+          <button
+            type="button"
+            onClick={lockNow}
+            disabled={!hasPin}
+            className="shrink-0 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:hover:bg-gray-700 px-4 py-2 rounded-xl text-sm font-semibold transition-colors"
+          >
+            🔒 Lock
+          </button>
+        </div>
+        <div className="px-5 pb-4 -mt-1 text-xs text-gray-500">
+          Ego Desktop starts by itself when you log in to your computer, so your node never misses a check-in.
         </div>
       </div>
 

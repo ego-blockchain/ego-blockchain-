@@ -26,11 +26,6 @@ mod imp {
             .map_err(|e| format!("cannot open Run key: {e}"))
     }
 
-    pub fn is_enabled() -> bool {
-        open(false)
-            .and_then(|k| k.get_value::<String, _>(APP_KEY).map_err(|e| e.to_string()))
-            .is_ok()
-    }
 
     pub fn enable() -> Result<(), String> {
         let exe = exe_path()?;
@@ -40,13 +35,6 @@ mod imp {
             .map_err(|e| format!("cannot write Run key: {e}"))
     }
 
-    pub fn disable() -> Result<(), String> {
-        match open(true)?.delete_value(APP_KEY) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("cannot delete Run key: {e}")),
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -60,9 +48,6 @@ mod imp {
         Ok(home.join("Library/LaunchAgents").join(format!("{LABEL}.plist")))
     }
 
-    pub fn is_enabled() -> bool {
-        plist_path().map(|p| p.exists()).unwrap_or(false)
-    }
 
     pub fn enable() -> Result<(), String> {
         let exe = exe_path()?;
@@ -87,13 +72,6 @@ mod imp {
         std::fs::write(&path, plist).map_err(|e| format!("cannot write plist: {e}"))
     }
 
-    pub fn disable() -> Result<(), String> {
-        let path = plist_path()?;
-        if !path.exists() {
-            return Ok(());
-        }
-        std::fs::remove_file(&path).map_err(|e| format!("cannot remove plist: {e}"))
-    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -105,9 +83,6 @@ mod imp {
         Ok(cfg.join("autostart").join("ego-desktop.desktop"))
     }
 
-    pub fn is_enabled() -> bool {
-        desktop_path().map(|p| p.exists()).unwrap_or(false)
-    }
 
     pub fn enable() -> Result<(), String> {
         let exe = exe_path()?;
@@ -127,48 +102,13 @@ mod imp {
         std::fs::write(&path, entry).map_err(|e| format!("cannot write desktop entry: {e}"))
     }
 
-    pub fn disable() -> Result<(), String> {
-        let path = desktop_path()?;
-        if !path.exists() {
-            return Ok(());
-        }
-        std::fs::remove_file(&path).map_err(|e| format!("cannot remove desktop entry: {e}"))
+}
+
+pub fn keep_enabled() {
+    if cfg!(debug_assertions) || std::env::var_os("EGO_DATA_DIR").is_some() {
+        return;
     }
-}
-
-const ENABLED_BY_OLD_VERSION: &str = ".autostart_configured";
-const USER_CHOICE: &str = ".autostart_choice";
-
-fn marker(name: &str) -> PathBuf {
-    crate::ledger::base_data_dir().join(name)
-}
-
-#[derive(serde::Serialize)]
-pub struct AutostartState {
-    pub enabled: bool,
-    pub asked: bool,
-    pub enabled_without_asking: bool,
-}
-
-#[tauri::command]
-pub fn get_autostart_state() -> AutostartState {
-    let enabled = imp::is_enabled();
-    let asked = marker(USER_CHOICE).exists();
-    AutostartState {
-        enabled,
-        asked,
-        enabled_without_asking: enabled && !asked && marker(ENABLED_BY_OLD_VERSION).exists(),
+    if let Err(e) = imp::enable() {
+        eprintln!("[Autostart] could not set Ego Desktop to start at login: {e}");
     }
-}
-
-#[tauri::command]
-pub fn set_autostart_enabled(enabled: bool) -> Result<bool, String> {
-    if enabled {
-        imp::enable()?;
-    } else {
-        imp::disable()?;
-    }
-    let choice: &[u8] = if enabled { b"on" } else { b"off" };
-    std::fs::write(marker(USER_CHOICE), choice).map_err(|e| format!("cannot record the choice: {e}"))?;
-    Ok(imp::is_enabled())
 }

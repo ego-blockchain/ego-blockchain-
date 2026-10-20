@@ -984,6 +984,12 @@ pub(crate) fn refresh_pin_cache() {
     PIN_CACHE_TS.store(now_ts(), std::sync::atomic::Ordering::Relaxed);
 }
 
+#[tauri::command]
+pub fn lock_app(window: tauri::Window) {
+    invalidate_pin_cache();
+    let _ = window.emit("ego://app-locked", ());
+}
+
 pub(crate) fn invalidate_pin_cache() {
     PIN_CACHE_TS.store(0, std::sync::atomic::Ordering::Relaxed);
 }

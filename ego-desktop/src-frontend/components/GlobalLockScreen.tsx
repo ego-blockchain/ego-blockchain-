@@ -3,6 +3,28 @@ import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import { appWindow } from '@tauri-apps/api/window';
 
+function PasswordField({ className, ...props }: React.InputHTMLAttributes<HTMLInputElement>) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="relative">
+      <input {...props} type={visible ? 'text' : 'password'} className={`${className ?? ''} pr-11`} />
+      <button
+        type="button"
+        onClick={() => setVisible(v => !v)}
+        aria-label={visible ? 'Hide password' : 'Show password'}
+        title={visible ? 'Hide password' : 'Show password'}
+        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white focus:text-white focus:outline-none"
+      >
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" />
+          <circle cx="12" cy="12" r="3" />
+          {visible && <path d="M3 3l18 18" />}
+        </svg>
+      </button>
+    </div>
+  );
+}
+
 export function GlobalLockScreen({ children }: { children: React.ReactNode }) {
   const [isLocked, setIsLocked] = useState(true);
   const [password, setPassword] = useState('');
@@ -129,7 +151,9 @@ export function GlobalLockScreen({ children }: { children: React.ReactNode }) {
         <div className="w-16 h-16 bg-blue-500/20 text-blue-400 rounded-full flex items-center justify-center mx-auto mb-5 text-2xl">🔒</div>
         <h2 className="text-2xl font-bold text-white mb-2">Ego Desktop Locked</h2>
         <p className="text-sm text-gray-400 mb-6">Enter your password to continue.</p>
-        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" autoFocus className="w-full bg-gray-900 border border-gray-600 rounded-xl px-4 py-3 text-white mb-4 outline-none focus:border-blue-500 transition" />
+        <div className="mb-4">
+          <PasswordField value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" autoFocus className="w-full bg-gray-900 border border-gray-600 rounded-xl px-4 py-3 text-white outline-none focus:border-blue-500 transition" />
+        </div>
         {error && <div className="text-red-400 text-sm mb-4 font-semibold">{error}</div>}
         <button type="submit" disabled={loading || !password} className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3.5 rounded-xl transition disabled:opacity-50 mb-3">{loading ? 'Unlocking...' : 'Unlock'}</button>
         
@@ -167,8 +191,8 @@ export function GlobalLockScreen({ children }: { children: React.ReactNode }) {
             </div>
 
             <div className="space-y-3">
-              <input type="password" value={resetNewPwd} onChange={e => setResetNewPwd(e.target.value)} placeholder="New password (min 8 chars)" className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition text-white" />
-              <input type="password" value={resetNewPwd2} onChange={e => setResetNewPwd2(e.target.value)} onKeyDown={e => e.key === 'Enter' && !resetPwdBusy && handleResetPasswordWithRecovery()} placeholder="Confirm new password" className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition text-white" />
+              <PasswordField value={resetNewPwd} onChange={e => setResetNewPwd(e.target.value)} placeholder="New password (min 8 chars)" className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition text-white" />
+              <PasswordField value={resetNewPwd2} onChange={e => setResetNewPwd2(e.target.value)} onKeyDown={e => e.key === 'Enter' && !resetPwdBusy && handleResetPasswordWithRecovery()} placeholder="Confirm new password" className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition text-white" />
               
               {resetPwdError && (
                 <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{resetPwdError}</div>

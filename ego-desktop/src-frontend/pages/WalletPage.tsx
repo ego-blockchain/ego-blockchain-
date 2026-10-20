@@ -392,7 +392,7 @@ const REWARD_KINDS: { key: RewardKind; label: string; row: string; icon: string 
   { key: 'all',     label: 'All',      row: 'Reward',        icon: '⚡' },
   { key: 'block',   label: 'Blocks',   row: 'Block reward',  icon: '⛏' },
   { key: 'staking', label: 'Staking',  row: 'Staking reward', icon: '🔒' },
-  { key: 'node',    label: 'Earnings', row: 'Node earnings', icon: '📡' },
+  { key: 'node',    label: 'Check-ins', row: 'Daily check-in', icon: '✅' },
   { key: 'storage', label: 'Storage',  row: 'Storage pay',   icon: '💾' },
   { key: 'compute', label: 'Compute',  row: 'Compute pay',   icon: '🖥' },
 ];
