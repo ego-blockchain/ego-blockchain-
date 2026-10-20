@@ -10981,6 +10981,21 @@ mod history_tests {
         let to: u64 = std::env::var("EGO_INSPECT_TO").ok().and_then(|v| v.parse().ok()).unwrap_or(from + 5);
         let db = DB::open_cf_for_read_only(&Options::default(), &path, ALL_CFS.to_vec(), false).expect("open read-only");
         eprintln!("tip {}", local_chain_height_in(&db));
+        if std::env::var("EGO_INSPECT_CERTS").is_ok() {
+            let ov = crate::drs::Ov::new(&db);
+            let last = crate::state_cert::last_index(&ov);
+            for i in 1..=last {
+                if let Some(c) = crate::state_cert::load_cert(&ov, i) {
+                    eprintln!(
+                        "cert {i} height {} signers {} state_root {} hash {}",
+                        c.body.height, c.signers.len(), c.body.state_root, c.hash()
+                    );
+                }
+            }
+            if let Some(o) = crate::state_cert::load_open(&ov) {
+                eprintln!("open {} height {} next {} first_height {}", o.index, o.height, o.next.len(), o.first_height);
+            }
+        }
         if let Ok(h) = std::env::var("EGO_INSPECT_DRAW").map(|v| v.parse::<u64>().unwrap_or(0)) {
             let ov = crate::drs::Ov::new(&db);
             let epoch = crate::drs::epoch_of(h);

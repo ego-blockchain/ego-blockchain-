@@ -14,7 +14,7 @@ pub const TX_STATE_CERT: &str = "state_cert";
 pub const TAG_BALANCE: u8 = 1;
 pub const TAG_META: u8 = 2;
 pub const TAG_CONTRACT: u8 = 3;
-pub const STATE_CERT_ANCHORS: &[(u64, &str)] = &[];
+pub const STATE_CERT_ANCHORS: &[(u64, &str)] = &[(1, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c")];
 const KEY_DAY: &[u8] = b"sc:day";
 const KEY_OPEN: &[u8] = b"sc:open";
 const KEY_LAST: &[u8] = b"sc:last";
@@ -619,11 +619,14 @@ mod tests {
     #[test]
     fn only_well_formed_published_certificates_are_used() {
         let h = "ab".repeat(32);
-        assert_eq!(anchors_with(Some((4, h.clone()))), vec![(4, h.clone())]);
-        assert!(anchors_with(Some((0, h.clone()))).is_empty());
-        assert!(anchors_with(Some((4, "AB".repeat(32)))).is_empty());
-        assert!(anchors_with(Some((4, "ab".repeat(31)))).is_empty());
-        assert!(anchors_with(None).is_empty());
+        let built_in = vec![(1u64, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c".to_string())];
+        assert_eq!(anchors_with(None), built_in, "this release names checkpoint 1 itself");
+        assert_eq!(anchors_with(Some((4, h.clone()))), vec![built_in[0].clone(), (4, h.clone())]);
+        assert_eq!(anchors_with(Some((1, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c".into()))), built_in, "the website naming the same one adds nothing");
+        assert_eq!(anchors_with(Some((0, h.clone()))), built_in);
+        assert_eq!(anchors_with(Some((4, "AB".repeat(32)))), built_in);
+        assert_eq!(anchors_with(Some((4, "ab".repeat(31)))), built_in);
+        assert!(STATE_CERT_ANCHORS.iter().all(|(_, h)| is_anchor_hash(h)));
     }
 
     #[test]

@@ -55,6 +55,95 @@ fn chain_push_allowed(endpoint: &str) -> bool {
     }
 }
 
+const SYNC_REPLY_PROGRESS_MS: i64 = 500;
+const SYNC_REQUEST_PROGRESS_MS: i64 = 1_000;
+const GOSSIP_SYNC_ANSWERERS: u64 = 4;
+const GOSSIP_SYNC_REDRAW_SECS: i64 = 30;
+static BLOCK_SYNC_SERVED: OnceLock<Mutex<HashMap<String, (i64, u64)>>> = OnceLock::new();
+
+pub(crate) fn block_sync_reply_due(last: (i64, u64), from_height: u64, now_ms: i64) -> bool {
+    let (at, served) = last;
+    if from_height > served {
+        now_ms - at >= SYNC_REPLY_PROGRESS_MS
+    } else {
+        now_ms - at >= SYNC_REPLY_COOLDOWN_MS
+    }
+}
+
+fn block_sync_reply_allowed(endpoint: &str, from_height: u64) -> bool {
+    let now = Utc::now().timestamp_millis();
+    let mut map = BLOCK_SYNC_SERVED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > 4096 {
+        map.retain(|_, (at, _)| now - *at < SYNC_REPLY_COOLDOWN_MS);
+    }
+    let entry = map.entry(endpoint.to_string()).or_insert((0, 0));
+    if block_sync_reply_due(*entry, from_height, now) {
+        *entry = (now, from_height);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn sync_request_due(since_ms: i64, progressed: bool) -> bool {
+    since_ms >= if progressed { SYNC_REQUEST_PROGRESS_MS } else { SYNC_REQUEST_EVERY_MS }
+}
+
+pub(crate) fn answers_gossip_sync(requester: &str, from_height: u64, me: &str, live: usize, bucket: i64) -> bool {
+    let n = (live as u64).max(GOSSIP_SYNC_ANSWERERS);
+    let x = if me.is_empty() {
+        rand::random::<u64>()
+    } else {
+        let mut h = blake3::Hasher::new();
+        h.update(b"ego/sync-answer/v1:");
+        h.update(requester.as_bytes());
+        h.update(&from_height.to_le_bytes());
+        h.update(&bucket.to_le_bytes());
+        h.update(me.as_bytes());
+        u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap())
+    };
+    x % n < GOSSIP_SYNC_ANSWERERS
+}
+
+fn live_peer_count() -> usize {
+    static CACHE: Mutex<(i64, usize)> = Mutex::new((0, 0));
+    let now = Utc::now().timestamp();
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if now - c.0 >= 60 {
+        *c = (now, live_endpoints(usize::MAX).len());
+    }
+    c.1
+}
+
+async fn serve_block_range(requester: String, from_height: u64, gossip: bool) {
+    let me = if gossip { get_public_endpoint().await } else { String::new() };
+    let ep = requester.clone();
+    let (blocks, transactions) = tokio::task::spawn_blocking(move || {
+        let bucket = Utc::now().timestamp() / GOSSIP_SYNC_REDRAW_SECS;
+        if gossip && !answers_gossip_sync(&ep, from_height, &me, live_peer_count(), bucket) {
+            return (vec![], vec![]);
+        }
+        if !block_sync_reply_allowed(&ep, from_height) || crate::chain_db::block_count() == 0 {
+            return (vec![], vec![]);
+        }
+        let blocks = crate::chain_db::get_blocks_range(from_height.max(1), 500);
+        crate::chain_db::servable_blocks_with_txs(blocks)
+    })
+    .await
+    .unwrap_or_default();
+    if blocks.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "sync-v1: sending {} blocks ({} txs) from height {} to {}",
+        blocks.len(),
+        transactions.len(),
+        from_height.max(1),
+        blocks.last().map(|b| b.height).unwrap_or(from_height)
+    );
+    let _ = send_message(&requester, &P2PMessage::ChainSyncResponse { blocks, transactions }).await;
+}
+
 fn sync_reply_allowed(endpoint: &str) -> bool {
     let now = Utc::now().timestamp_millis();
     let mut map = SYNC_REPLY_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
@@ -5691,14 +5780,17 @@ pub async fn sync_chain_from_peers() {
     static LAST_FROM_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     static STUCK_ROUNDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static LAST_SYNC_GOSSIP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    static LAST_REQ_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = chrono::Utc::now().timestamp_millis();
-    let last = LAST_SYNC_REQ.load(std::sync::atomic::Ordering::Relaxed);
-    if now - last < SYNC_REQUEST_EVERY_MS { return; }
-    LAST_SYNC_REQ.store(now, std::sync::atomic::Ordering::Relaxed);
-
-    let my_endpoint = get_public_endpoint().await;
     let my_height = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
         .await.unwrap_or(0);
+    let last = LAST_SYNC_REQ.load(std::sync::atomic::Ordering::Relaxed);
+    let progressed = my_height > LAST_REQ_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    if !sync_request_due(now - last, progressed) { return; }
+    LAST_SYNC_REQ.store(now, std::sync::atomic::Ordering::Relaxed);
+    LAST_REQ_HEIGHT.store(my_height, std::sync::atomic::Ordering::Relaxed);
+
+    let my_endpoint = get_public_endpoint().await;
     let from_height = my_height
         .saturating_sub(1)
         .saturating_sub(fork_walkback())
@@ -8395,26 +8487,8 @@ async fn handle_event(
                 if let Ok(P2PMessage::ChainSyncRequest { requester_endpoint, from_height }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
-                    if !requester_endpoint.is_empty() && sync_reply_allowed(&requester_endpoint) {
-                        let ep = requester_endpoint.clone();
-                        tokio::spawn(async move {
-                            let (blocks, transactions) = tokio::task::spawn_blocking(move || {
-                                if crate::chain_db::block_count() == 0 { return (vec![], vec![]); }
-                                let start = from_height.max(1);
-                                let blocks = crate::chain_db::get_blocks_range(start, 500);
-                                crate::chain_db::servable_blocks_with_txs(blocks)
-                            }).await.unwrap_or_default();
-                            if blocks.is_empty() { return; }
-                            tracing::info!("sync-v1: sending {} blocks ({} txs) from height {} to {}",
-                                blocks.len(), transactions.len(), from_height.max(1),
-                                blocks.last().map(|b| b.height).unwrap_or(from_height));
-                            let response = P2PMessage::ChainSyncResponse { blocks, transactions };
-
-                            // Send response via gossip to bypass NAT dial-back issues
-                            if let Ok(data) = serde_json::to_vec(&response) {
-                                publish_gossip("ego-blocks-v1", data).await;
-                            }
-                        });
+                    if !requester_endpoint.is_empty() {
+                        tokio::spawn(serve_block_range(requester_endpoint, from_height, true));
                     }
                 }
             } else if topic == "ego-snapshot-v1" {
@@ -9881,20 +9955,8 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
         }
 
         P2PMessage::ChainSyncRequest { requester_endpoint, from_height } => {
-            if !requester_endpoint.is_empty() && sync_reply_allowed(&requester_endpoint) {
-                tokio::spawn(async move {
-                    let (blocks, transactions) = tokio::task::spawn_blocking(move || {
-                    let start = from_height.max(1);
-                    let blocks = crate::chain_db::get_blocks_range(start, 500);
-                        crate::chain_db::servable_blocks_with_txs(blocks)
-                    }).await.unwrap_or_default();
-                    tracing::debug!("[P2P] sync reply: {} blocks ({} txs) from height {}",
-                        blocks.len(), transactions.len(), from_height + 1);
-                    let response = P2PMessage::ChainSyncResponse { blocks, transactions };
-                    if let Ok(data) = serde_json::to_vec(&response) {
-                        publish_gossip("ego-blocks-v1", data).await;
-                    }
-                });
+            if !requester_endpoint.is_empty() {
+                tokio::spawn(serve_block_range(requester_endpoint, from_height, false));
             }
         }
 
@@ -16999,6 +17061,36 @@ mod poison_tx_tests {
             blamed_in(reason, &txs).is_empty(),
             "a whole-block failure must not evict the transactions that happened to be in it",
         );
+    }
+
+    #[test]
+    fn a_syncing_node_is_answered_at_once_while_it_moves_forward_and_slowly_when_it_repeats() {
+        let now = 100_000;
+        assert!(super::block_sync_reply_due((0, 0), 1, now), "a first request is answered");
+        assert!(super::block_sync_reply_due((now - 600, 500), 1000, now), "the next page is answered at once");
+        assert!(!super::block_sync_reply_due((now - 100, 500), 1000, now), "but not twice in the same half second");
+        assert!(!super::block_sync_reply_due((now - 7_000, 500), 500, now), "the same page again waits");
+        assert!(super::block_sync_reply_due((now - 8_000, 500), 500, now));
+        assert!(!super::block_sync_reply_due((now - 7_000, 500), 400, now), "going backwards is not progress");
+        assert!(super::sync_request_due(1_000, true));
+        assert!(!super::sync_request_due(1_000, false));
+        assert!(super::sync_request_due(8_000, false));
+    }
+
+    #[test]
+    fn only_a_few_nodes_answer_a_broadcast_sync_request() {
+        let me: Vec<String> = (0..1000).map(|i| format!("/ip4/10.0.{}.{}/tcp/4001/p2p/peer{i}", i / 250, i % 250)).collect();
+        let count = |req: &str, h: u64, bucket: i64| me.iter().filter(|m| super::answers_gossip_sync(req, h, m, me.len(), bucket)).count();
+        let per_request: Vec<usize> = (0..60).map(|r| count(&format!("/p2p/requester{r}"), 1_000 + r as u64, 7)).collect();
+        let total: usize = per_request.iter().sum();
+        assert!((150..=330).contains(&total), "about four of a thousand answer each request: {per_request:?}");
+        assert!(per_request.iter().all(|c| *c <= 16), "never a crowd: {per_request:?}");
+        for r in 0..20 {
+            let req = format!("/p2p/unlucky{r}");
+            assert!((0..6).map(|b| count(&req, 42, b)).sum::<usize>() > 0, "a request repeated over three minutes reaches someone");
+        }
+        assert!(me.iter().take(4).all(|m| super::answers_gossip_sync("/p2p/alice", 1, m, 4, 0)), "on a tiny network everyone answers");
+        assert_eq!(count("/p2p/alice", 1, 3), count("/p2p/alice", 1, 3), "the choice is the same within one window");
     }
 
     #[test]
