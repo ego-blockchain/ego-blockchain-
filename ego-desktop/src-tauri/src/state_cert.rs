@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const STATE_CERT_FROM_HEIGHT: u64 = 32_650;
-pub const CERT_DRAW_V2_FROM_HEIGHT: u64 = 32_901;
+pub const CERT_DRAW_V2_FROM_HEIGHT: u64 = 32_815;
 pub const CERT_RETRY_BLOCKS: u64 = 300;
 pub const CERT_FALLBACK_BLOCKS: u64 = 2_000;
 pub const CERT_COMMITTEE: usize = 128;
