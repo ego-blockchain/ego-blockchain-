@@ -20,6 +20,15 @@ pub const BLOCK_COMMITTEE: usize = 4;
 pub const DRAW_V2_FROM_HEIGHT: u64 = 32_640;
 pub const READY_V2_EPOCH: u64 = 328;
 pub const READY_V3_EPOCH: u64 = 329;
+pub const DRAW_V3_FROM_HEIGHT: u64 = 32_851;
+pub const LAST_MAKERS_KEEP: usize = 16;
+pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT];
+const KEY_LAST_MAKERS: &[u8] = b"n2last";
+
+pub fn ready_version(epoch: u64) -> u32 {
+    let first = epoch.saturating_mul(EPOCH).saturating_add(1);
+    1 + RULE_CHANGES.iter().filter(|h| **h <= first).count() as u32
+}
 pub const MISS_RULE_FROM_HEIGHT: u64 = 32_750;
 pub const MISS_LIMIT: u32 = 2;
 pub const MISS_RULE_UNTIL_HEIGHT: u64 = 32_766;
@@ -591,14 +600,7 @@ pub fn checkin_message(anchor: u64, anchor_hash: &str) -> Vec<u8> {
 }
 
 pub fn ready_message(epoch: u64, seed: &str) -> Vec<u8> {
-    let version = if epoch >= READY_V3_EPOCH {
-        3
-    } else if epoch >= READY_V2_EPOCH {
-        2
-    } else {
-        1
-    };
-    format!("ego/ready/v{version}:{epoch}:{seed}").into_bytes()
+    format!("ego/ready/v{}:{epoch}:{seed}", ready_version(epoch)).into_bytes()
 }
 
 pub fn checkin_due(rec: &NodeRec, at: i64) -> bool {
@@ -987,6 +989,7 @@ pub fn apply_block(
             rec.served = epoch_of(block.height) + 1;
             save_rec(ov, &block.miner, &rec);
         }
+        record_maker(ov, block.height, &block.miner);
     }
 
     if block.height % EPOCH == 0 {
@@ -1068,6 +1071,13 @@ pub fn seed_pop_key_for_tests(ov: &mut Ov, addr: &str, pop: &str) {
     save_rec(ov, addr, &rec);
 }
 
+#[cfg(test)]
+pub fn seed_weight_for_tests(ov: &mut Ov, addr: &str, weight: u64) {
+    let mut rec = load_rec(ov, addr).unwrap_or_default();
+    rec.weight.set(0, weight);
+    save_rec(ov, addr, &rec);
+}
+
 pub fn draw_pool(ov: &Ov, height: u64) -> Vec<String> {
     let epoch = epoch_of(height);
     let rota = load_rota(ov, epoch).unwrap_or_default();
@@ -1089,10 +1099,105 @@ pub fn draw_pool(ov: &Ov, height: u64) -> Vec<String> {
     pool
 }
 
+pub fn last_makers(ov: &Ov) -> Vec<String> {
+    ov.get(KEY_LAST_MAKERS).and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
+}
+
+pub fn record_maker(ov: &mut Ov, height: u64, miner: &str) {
+    if height < DRAW_V3_FROM_HEIGHT || miner.is_empty() {
+        return;
+    }
+    let mut list = last_makers(ov);
+    list.insert(0, miner.to_string());
+    list.truncate(LAST_MAKERS_KEEP);
+    if let Ok(v) = serde_json::to_vec(&list) {
+        ov.put(KEY_LAST_MAKERS.to_vec(), v);
+    }
+}
+
+pub fn maker_cooldown(pool_len: usize) -> usize {
+    (pool_len / 2).min(LAST_MAKERS_KEEP)
+}
+
+pub fn proposer_of(group: &[String], height: u64, round: u32) -> Option<&String> {
+    if group.is_empty() {
+        return None;
+    }
+    group.get((height.wrapping_add(round as u64) % group.len() as u64) as usize)
+}
+
+fn draw_hash(seed: &str, height: u64, attempt: i64, pick: usize) -> u128 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"ego/committee-draw/v3:");
+    h.update(seed.as_bytes());
+    h.update(&height.to_le_bytes());
+    h.update(&attempt.to_le_bytes());
+    h.update(&(pick as u64).to_le_bytes());
+    u128::from_le_bytes(h.finalize().as_bytes()[..16].try_into().unwrap())
+}
+
+fn weighted_pick(candidates: &[(String, u64)], r: u128) -> usize {
+    let total: u128 = candidates.iter().map(|(_, w)| *w as u128).sum();
+    let mut r = r % total.max(1);
+    for (i, (_, w)) in candidates.iter().enumerate() {
+        if r < *w as u128 {
+            return i;
+        }
+        r -= *w as u128;
+    }
+    candidates.len().saturating_sub(1)
+}
+
+fn weighted_committee(ov: &Ov, height: u64, attempt: i64, seed: &str, pool: Vec<String>) -> Vec<String> {
+    let period = period_of(height);
+    let size = BLOCK_COMMITTEE.min(pool.len());
+    let mut remaining: Vec<(String, u64)> = pool
+        .into_iter()
+        .map(|a| {
+            let w = load_rec(ov, &a).map_or(0, |r| r.weight.at(period));
+            (a, w.max(1))
+        })
+        .collect();
+    let recent: Vec<String> = last_makers(ov).into_iter().take(maker_cooldown(remaining.len())).collect();
+    let mut order: Vec<String> = Vec::with_capacity(size);
+    for pick in 0..size {
+        if remaining.is_empty() {
+            break;
+        }
+        let r = draw_hash(seed, height, attempt, pick);
+        let idx = if pick == 0 {
+            let rested: Vec<usize> = remaining
+                .iter()
+                .enumerate()
+                .filter(|(_, (a, _))| !recent.contains(a))
+                .map(|(i, _)| i)
+                .collect();
+            if rested.is_empty() {
+                weighted_pick(&remaining, r)
+            } else {
+                let cands: Vec<(String, u64)> = rested.iter().map(|i| remaining[*i].clone()).collect();
+                rested[weighted_pick(&cands, r)]
+            }
+        } else {
+            weighted_pick(&remaining, r)
+        };
+        order.push(remaining.remove(idx).0);
+    }
+    let n = order.len();
+    let mut rotated = vec![String::new(); n];
+    for (k, a) in order.into_iter().enumerate() {
+        rotated[(height as usize).wrapping_add(k) % n] = a;
+    }
+    rotated
+}
+
 pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
     let epoch = epoch_of(height);
     let rota = load_rota(ov, epoch).unwrap_or_default();
     let pool = draw_pool(ov, height);
+    if height >= DRAW_V3_FROM_HEIGHT {
+        return weighted_committee(ov, height, attempt, &rota.seed, pool);
+    }
     let size = BLOCK_COMMITTEE.min(pool.len());
     if pool.len() <= size {
         return pool;
@@ -1485,14 +1590,81 @@ mod tests {
         assert_eq!(missed_turns(&old, &silent, epoch_of(MISS_RULE_FROM_HEIGHT - 1)), 0, "nothing is counted before the rule starts");
     }
 
+    fn weighted_network(weights: &[u64]) -> (Ov<'static>, Vec<String>, u64) {
+        let e = epoch_of(DRAW_V3_FROM_HEIGHT) + 1;
+        let mut ov = Ov::memory();
+        let members: Vec<String> = (0..weights.len()).map(|i| format!("egot1w{i}")).collect();
+        let all: Vec<usize> = (0..weights.len()).collect();
+        seed_rota_for_tests(&mut ov, e, &members, &all);
+        for (m, w) in members.iter().zip(weights) {
+            seed_weight_for_tests(&mut ov, m, *w);
+        }
+        ov.commit_memory();
+        (ov, members, e * EPOCH + 1)
+    }
+
+    fn simulate(ov: &mut Ov, members: &[String], first: u64, blocks: u64) -> Vec<u64> {
+        let mut counts = vec![0u64; members.len()];
+        let mut recent: Vec<String> = Vec::new();
+        for h in first..first + blocks {
+            let group = committee(ov, h, 0);
+            assert_eq!(group, committee(ov, h, 0), "every node draws the same group");
+            assert_eq!(group.len(), BLOCK_COMMITTEE.min(members.len()));
+            let mut unique = group.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), group.len(), "a group holds distinct nodes");
+            let proposer = proposer_of(&group, h, 0).unwrap().clone();
+            assert!(!recent.contains(&proposer), "a node that just made a block waits its turn (h={h}, {proposer}, recent {recent:?})");
+            counts[members.iter().position(|m| *m == proposer).unwrap()] += 1;
+            recent.insert(0, proposer.clone());
+            recent.truncate(maker_cooldown(members.len()));
+            record_maker(ov, h, &proposer);
+            ov.commit_memory();
+        }
+        counts
+    }
+
+    #[test]
+    fn the_best_drs_makes_the_most_blocks_but_everyone_ready_gets_a_turn() {
+        let (mut ov, members, first) = weighted_network(&[1_000, 10, 10, 10, 10, 10]);
+        let counts = simulate(&mut ov, &members, first, 90);
+        assert!(counts[1..].iter().all(|c| counts[0] > *c), "the highest DRS makes the most blocks: {counts:?}");
+        assert!(counts.iter().all(|c| *c >= 3), "every ready node makes blocks: {counts:?}");
+        assert!(counts[0] <= 90 / (maker_cooldown(6) as u64 + 1) + 1, "the cooldown stops one node from taking every block: {counts:?}");
+        assert_eq!(last_makers(&ov).len(), LAST_MAKERS_KEEP);
+    }
+
+    #[test]
+    fn equal_drs_shares_the_blocks_evenly_and_a_redraw_changes_the_group() {
+        let (mut ov, members, first) = weighted_network(&[50, 50, 50, 50, 50, 50]);
+        let counts = simulate(&mut ov, &members, first, 99);
+        assert!(counts.iter().all(|c| *c >= 10), "equal scores share evenly: {counts:?}");
+        let h = first + 50;
+        let a0 = committee(&ov, h, 0);
+        let a1 = committee(&ov, h, 1);
+        assert_ne!(a0, a1, "a stalled attempt draws a different group");
+        assert_eq!(proposer_of(&a0, h, 1), Some(&a0[(h as usize + 1) % 4]), "the next round hands the block to the next drawn node");
+        let mut before = Ov::memory();
+        record_maker(&mut before, DRAW_V3_FROM_HEIGHT - 1, "egot1x");
+        before.commit_memory();
+        assert!(last_makers(&before).is_empty(), "nothing is recorded before the rule starts");
+    }
+
     #[test]
     fn readiness_is_signed_for_the_rules_the_node_runs() {
         assert_eq!(ready_message(READY_V2_EPOCH - 1, "s"), b"ego/ready/v1:327:s".to_vec());
         assert_eq!(ready_message(READY_V2_EPOCH, "s"), b"ego/ready/v2:328:s".to_vec());
-        assert_eq!(ready_message(READY_V3_EPOCH, "s"), b"ego/ready/v3:329:s".to_vec());
+        assert_eq!(ready_version(READY_V2_EPOCH - 1), 1);
+        assert_eq!(ready_version(READY_V2_EPOCH), 2);
+        assert_eq!(ready_version(READY_V3_EPOCH), 4, "two rule changes land before epoch 329 starts, so it takes two versions at once");
+        assert_eq!(ready_version(READY_V3_EPOCH + 50), 4);
+        assert_eq!(ready_message(READY_V3_EPOCH, "s"), b"ego/ready/v4:329:s".to_vec());
         let sk3 = crate::bls_agg::derive_bls_key(&[8u8; 32]);
-        let v2_sig = crate::bls_agg::sign_shared(&sk3, b"ego/ready/v2:329:s");
-        assert!(!crate::bls_agg::verify_shared(&v2_sig, &crate::bls_agg::bls_pubkey(&sk3), &ready_message(READY_V3_EPOCH, "s")), "a node that has not updated is not drawn from epoch 329");
+        for stale in [&b"ego/ready/v2:329:s"[..], b"ego/ready/v3:329:s"] {
+            let sig = crate::bls_agg::sign_shared(&sk3, stale);
+            assert!(!crate::bls_agg::verify_shared(&sig, &crate::bls_agg::bls_pubkey(&sk3), &ready_message(READY_V3_EPOCH, "s")), "a node without every rule change is not drawn from epoch 329");
+        }
         let sk = crate::bls_agg::derive_bls_key(&[9u8; 32]);
         let pk = crate::bls_agg::bls_pubkey(&sk);
         let old = crate::bls_agg::sign_shared(&sk, b"ego/ready/v1:328:s");

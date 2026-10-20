@@ -74,7 +74,7 @@ pub const TX_THRESHOLD: u64 = 50;
 
 pub const MAX_BLOCK_INTERVAL_S: u64 = 5;
 
-pub const EMPTY_BLOCK_INTERVAL_S: u64 = 60;
+pub const EMPTY_BLOCK_INTERVAL_S: u64 = 10;
 
 pub const MAX_MEMPOOL_SIZE: usize = 2_000_000;
 

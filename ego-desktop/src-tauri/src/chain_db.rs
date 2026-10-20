@@ -9572,6 +9572,8 @@ pub const COMMITTEE_REDRAW_SECS: i64 = 300;
 pub const COMMITTEE_GUARD_SECS: i64 = 30;
 pub const COMMITTEE_REDRAW_V2_SECS: i64 = 90;
 pub const COMMITTEE_GUARD_V2_SECS: i64 = 10;
+pub const COMMITTEE_REDRAW_V3_SECS: i64 = 30;
+pub const COMMITTEE_GUARD_V3_SECS: i64 = 5;
 pub const MAX_COMMITTEE_ATTEMPT: i64 = 10_000;
 pub const MAX_FREE_TXS_PER_BLOCK: usize = 256;
 pub const RULES_VERSION: u64 = 2;
@@ -9839,7 +9841,9 @@ pub fn storage_file_memo(call_args: &str, delete: bool) -> String {
 }
 
 fn committee_timing(height: u64) -> (i64, i64) {
-    if height >= crate::drs::DRAW_V2_FROM_HEIGHT {
+    if height >= crate::drs::DRAW_V3_FROM_HEIGHT {
+        (COMMITTEE_REDRAW_V3_SECS, COMMITTEE_GUARD_V3_SECS)
+    } else if height >= crate::drs::DRAW_V2_FROM_HEIGHT {
         (COMMITTEE_REDRAW_V2_SECS, COMMITTEE_GUARD_V2_SECS)
     } else {
         (COMMITTEE_REDRAW_SECS, COMMITTEE_GUARD_SECS)
@@ -11398,6 +11402,16 @@ mod commit_cert_tests {
         assert!(proposal_window_open(new, p, p + 100));
         assert!(proposal_window_open(new, p, p + 169));
         assert!(!proposal_window_open(new, p, p + 170));
+
+        let v3 = crate::drs::DRAW_V3_FROM_HEIGHT;
+        assert_eq!(committee_attempt(v3, p, p + 29), 0);
+        assert_eq!(committee_attempt(v3, p, p + 30), 1);
+        assert!(proposal_window_open(v3, p, empty_block_due + 5), "an empty block is due well inside the first attempt");
+        assert!(!proposal_window_open(v3, p, p + 25));
+        assert!(!proposal_window_open(v3, p, p + 34));
+        assert!(proposal_window_open(v3, p, p + 35));
+        assert!(proposal_window_open(v3, p, p + 54));
+        assert!(!proposal_window_open(v3, p, p + 55));
     }
 
     #[test]
