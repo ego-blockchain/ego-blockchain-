@@ -5259,8 +5259,9 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
         let skew = block.timestamp - crate::clock::now();
         if skew.abs() > MAX_PROPOSAL_CLOCK_SKEW_SECS {
             return Err(format!(
-                "proposal #{} is stamped {}s {} this node's clock; its producer's clock is wrong",
+                "proposal #{} from {} is stamped {}s {} this node's clock; its producer's clock is wrong or the proposal is stale",
                 block.height,
+                block.miner,
                 skew.abs(),
                 if skew > 0 { "ahead of" } else { "behind" }
             ));

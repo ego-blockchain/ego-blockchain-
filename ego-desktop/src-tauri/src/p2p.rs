@@ -36,7 +36,7 @@ static PEER_ANNOUNCE_REPLY_LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLoc
 const ANNOUNCE_REPLY_COOLDOWN_SECS: i64 = 60;
 
 static SYNC_REPLY_LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
-const SYNC_REPLY_COOLDOWN_MS: i64 = 1_500;
+const SYNC_REPLY_COOLDOWN_MS: i64 = 8_000;
 const CHAIN_PUSH_COOLDOWN_MS: i64 = 100;
 const SNAPSHOT_SERVE_MIN_LAG: u64 = 16;
 
@@ -1575,6 +1575,7 @@ async fn drs_observer_try_commit(hash: ego_core::Hash) {
     block.commit_cert = serde_json::to_string(&cert).unwrap_or_default();
     let height = block.height;
     let for_oracle = (block.clone(), txs.clone());
+    let block_ts = block.timestamp;
     let persisted = tokio::task::spawn_blocking(move || crate::chain_db::commit_staged_block(&block, &txs, vc))
         .await
         .unwrap_or(false);
@@ -1582,6 +1583,7 @@ async fn drs_observer_try_commit(hash: ego_core::Hash) {
         v2_pending_blocks().retain(|_, (b, _)| b.height > height);
         v2_pending_headers().retain(|_, h| h.height > height);
         touch_proposal_timestamp();
+        crate::clock::note_finalized_block_time(block_ts);
         eprintln!("[ConsensusV2/LIVE] followed h={height} — {vc} committee votes checked");
         tokio::spawn(async move { push_block_to_oracle(&for_oracle.0, &for_oracle.1).await; });
     }
@@ -1652,6 +1654,10 @@ fn outbox_put(outbox: &mut Option<V2Outbox>, height: u64, slot: usize, msg: P2PM
     true
 }
 
+pub(crate) fn proposal_too_old(stamp: i64, now: i64) -> bool {
+    now - stamp > crate::chain_db::MAX_PROPOSAL_CLOCK_SKEW_SECS / 2
+}
+
 fn outbox_due(outbox: &mut Option<V2Outbox>, engine_height: u64, now_ms: i64) -> Vec<P2PMessage> {
     match outbox.as_mut() {
         Some(o) if o.height < engine_height => {
@@ -1660,6 +1666,11 @@ fn outbox_due(outbox: &mut Option<V2Outbox>, engine_height: u64, now_ms: i64) ->
         }
         Some(o) if o.height == engine_height && now_ms - o.last_sent_ms >= V2_RESEND_MS => {
             o.last_sent_ms = now_ms;
+            if let Some(P2PMessage::BftV2Proposal { block, .. }) = &o.slots[0] {
+                if proposal_too_old(block.timestamp, now_ms.div_euclid(1000)) {
+                    o.slots[0] = None;
+                }
+            }
             o.slots.iter().flatten().cloned().collect()
         }
         _ => Vec::new(),
@@ -1909,6 +1920,7 @@ pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
                 crate::chain_db::commit_staged_block(&block, &txs, vc)
             }).await.unwrap_or(false);
             if persisted {
+                crate::clock::note_finalized_block_time(block_for_oracle.timestamp);
                 // Fire-and-forget the finalized block to the oracle's read-only chain index
                 // so the public explorer can display it. NOT in the consensus path.
                 tokio::spawn(async move { push_block_to_oracle(&block_for_oracle, &txs_for_oracle).await; });
@@ -2066,6 +2078,15 @@ pub async fn shadow_v2_tick() {
                 V2_VIEW_ENTERED_MS.store(now_ms, Ordering::Relaxed); // re-arm; avoid a VC storm
             }
         }
+    }
+
+    if consensus_v2_live_enabled() && !offline_mode() && !crate::clock::is_trusted() {
+        static SAID: AtomicI64 = AtomicI64::new(0);
+        let now = Utc::now().timestamp();
+        if now - SAID.swap(now, Ordering::Relaxed) > 600 {
+            eprintln!("[ConsensusV2/LIVE] not proposing: this node has no trusted time yet (no web time source answered and no finalized block has arrived)");
+        }
+        return;
     }
 
     // Decide if it's our turn and reserve this (height, round) under the lock.
@@ -5662,13 +5683,17 @@ async fn oracle_catch_up() {
     RUNNING.store(false, Ordering::SeqCst);
 }
 
+const SYNC_REQUEST_EVERY_MS: i64 = 8_000;
+const SYNC_GOSSIP_EVERY_MS: i64 = 30_000;
+
 pub async fn sync_chain_from_peers() {
     static LAST_SYNC_REQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     static LAST_FROM_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     static STUCK_ROUNDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static LAST_SYNC_GOSSIP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let now = chrono::Utc::now().timestamp_millis();
     let last = LAST_SYNC_REQ.load(std::sync::atomic::Ordering::Relaxed);
-    if now - last < 2_000 { return; }
+    if now - last < SYNC_REQUEST_EVERY_MS { return; }
     LAST_SYNC_REQ.store(now, std::sync::atomic::Ordering::Relaxed);
 
     let my_endpoint = get_public_endpoint().await;
@@ -5717,8 +5742,11 @@ pub async fn sync_chain_from_peers() {
     let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint.clone(), from_height };
 
     // Broadcast request over gossip to reach NAT-traversing peers
-    if let Ok(data) = serde_json::to_vec(&msg) {
-        publish_gossip("ego-sync-v1", data).await;
+    if now - LAST_SYNC_GOSSIP.load(Ordering::Relaxed) >= SYNC_GOSSIP_EVERY_MS {
+        LAST_SYNC_GOSSIP.store(now, Ordering::Relaxed);
+        if let Ok(data) = serde_json::to_vec(&msg) {
+            publish_gossip("ego-sync-v1", data).await;
+        }
     }
 
     let mut seen_eps: std::collections::HashSet<String> = Default::default();
@@ -5740,7 +5768,7 @@ pub async fn sync_chain_from_peers() {
     use rand::seq::SliceRandom;
     let mut rng = rand::thread_rng();
     endpoints.shuffle(&mut rng);
-    endpoints.truncate(5);
+    endpoints.truncate(3);
     let local_peer_id = my_endpoint.split("/p2p/").last().unwrap_or("");
 
     for endpoint in endpoints {
@@ -16971,6 +16999,12 @@ mod poison_tx_tests {
             blamed_in(reason, &txs).is_empty(),
             "a whole-block failure must not evict the transactions that happened to be in it",
         );
+    }
+
+    #[test]
+    fn a_proposal_older_than_the_skew_window_is_not_worth_resending() {
+        assert!(!super::proposal_too_old(1_000, 1_060));
+        assert!(super::proposal_too_old(1_000, 1_061), "past half the skew window nobody will accept it");
     }
 
     #[test]

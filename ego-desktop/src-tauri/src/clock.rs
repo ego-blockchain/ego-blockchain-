@@ -10,6 +10,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 static OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 static MEASURED: AtomicBool = AtomicBool::new(false);
+static ESTIMATED: AtomicBool = AtomicBool::new(false);
+static BLOCK_SAMPLES: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+const BLOCK_SAMPLES_KEEP: usize = 16;
+const BLOCK_SAMPLES_MIN: usize = 5;
+const RETRY_SECS: u64 = 60;
 
 const SOURCES: &[&str] = &[
     "https://www.egoblockchain.com",
@@ -40,6 +45,50 @@ pub fn offset_ms() -> i64 {
 
 pub fn is_measured() -> bool {
     MEASURED.load(Ordering::Relaxed)
+}
+
+pub fn is_estimated() -> bool {
+    ESTIMATED.load(Ordering::Relaxed)
+}
+
+/// Whether this node has any trustworthy idea of the time: measured from the web, or
+/// estimated from the blocks the network finalised.
+pub fn is_trusted() -> bool {
+    is_measured() || is_estimated()
+}
+
+/// A block the network agreed on was stamped at `block_ts`. Its makers used their own
+/// network time, so the stamps tell a node whose web lookups fail how far its clock is off.
+pub fn note_finalized_block_time(block_ts: i64) {
+    let sample = block_ts * 1000 + 500 - chrono::Utc::now().timestamp_millis();
+    let estimate = {
+        let mut s = BLOCK_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+        s.push(sample);
+        if s.len() > BLOCK_SAMPLES_KEEP {
+            s.remove(0);
+        }
+        estimate_from_samples(&s)
+    };
+    if is_measured() {
+        return;
+    }
+    if let Some(offset) = estimate {
+        let before = OFFSET_MS.swap(offset, Ordering::Relaxed);
+        if !ESTIMATED.swap(true, Ordering::Relaxed) || (before - offset).abs() > 5_000 {
+            eprintln!(
+                "[Clock] no web time source answered; following the network's blocks instead, this computer's clock is {:.1}s {}",
+                offset.abs() as f64 / 1000.0,
+                if offset > 0 { "behind" } else { "ahead" }
+            );
+        }
+    }
+}
+
+pub fn estimate_from_samples(samples: &[i64]) -> Option<i64> {
+    if samples.len() < BLOCK_SAMPLES_MIN {
+        return None;
+    }
+    median_offset(samples.to_vec())
 }
 
 /// The median of `samples`, or `None` if there aren't enough of them to trust.
@@ -87,7 +136,8 @@ pub fn start() {
     tauri::async_runtime::spawn(async {
         loop {
             sync().await;
-            tokio::time::sleep(std::time::Duration::from_secs(RESYNC_EVERY_SECS)).await;
+            let wait = if is_measured() { RESYNC_EVERY_SECS } else { RETRY_SECS };
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         }
     });
 }
@@ -95,6 +145,12 @@ pub fn start() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_few_agreed_blocks_are_enough_to_estimate_the_clock() {
+        assert_eq!(estimate_from_samples(&[170_000, 171_000, 169_000, 170_500]), None, "four blocks are too few");
+        assert_eq!(estimate_from_samples(&[170_000, 171_000, 169_000, 170_500, 9_000_000]), Some(170_500), "one late block does not move the estimate");
+    }
 
     #[test]
     fn one_wrong_source_cannot_move_the_clock() {
