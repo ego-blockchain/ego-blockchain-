@@ -17,6 +17,12 @@ pub struct UpdateInfo {
     pub download_url: String,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
+fn is_required(manifest: &serde_json::Value, current: &str) -> bool {
+    manifest["required_version"].as_str().map_or(false, |r| is_newer(r, current))
 }
 
 /// Parse "0.3.33" into comparable parts. Anything unparseable sorts as 0 so a
@@ -51,6 +57,7 @@ pub async fn check_for_update() -> Result<UpdateInfo, EgoDesktopError> {
         latest: current.clone(),
         download_url: DOWNLOAD_PAGE_URL.to_string(),
         notes: String::new(),
+        required: false,
     };
 
     // An update check is a request to a known host. On a censored connection
@@ -69,6 +76,7 @@ pub async fn check_for_update() -> Result<UpdateInfo, EgoDesktopError> {
 
     Ok(UpdateInfo {
         update_available: is_newer(&latest, &current),
+        required: is_required(&manifest, &current),
         current,
         latest,
         download_url: manifest["url"].as_str().unwrap_or(DOWNLOAD_PAGE_URL).to_string(),
@@ -120,6 +128,7 @@ pub async fn refresh_published_state_cert() -> Option<(u64, String)> {
 const NOTIFY_MARKER: &str = ".update_notified";
 const FIRST_CHECK_SECS: u64 = 90;
 const RECHECK_SECS: u64 = 6 * 60 * 60;
+const REQUIRED_RECHECK_SECS: u64 = 60 * 60;
 
 fn already_notified(version: &str) -> bool {
     let p = crate::ledger::base_data_dir().join(NOTIFY_MARKER);
@@ -135,8 +144,19 @@ pub fn spawn_update_notifier(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(FIRST_CHECK_SECS)).await;
         loop {
+            let mut wait = RECHECK_SECS;
             if let Ok(info) = check_for_update().await {
-                if info.update_available && !already_notified(&info.latest) {
+                if info.required {
+                    crate::commands::notifications::notify(
+                        &app,
+                        &format!("Required update: Ego Desktop {}", info.latest),
+                        &format!(
+                            "Your node can no longer make blocks or earn until you install version {}. {}",
+                            info.latest, info.notes
+                        ),
+                    );
+                    wait = REQUIRED_RECHECK_SECS;
+                } else if info.update_available && !already_notified(&info.latest) {
                     let body = if info.notes.is_empty() {
                         format!("Version {} is ready to download.", info.latest)
                     } else {
@@ -150,7 +170,7 @@ pub fn spawn_update_notifier(app: tauri::AppHandle) {
                     remember_notified(&info.latest);
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(RECHECK_SECS)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         }
     });
 }
@@ -179,6 +199,16 @@ mod tests {
     fn compares_numerically_not_alphabetically() {
         assert!(is_newer("0.3.10", "0.3.9"));
         assert!(!is_newer("0.3.9", "0.3.10"));
+    }
+
+    #[test]
+    fn an_update_is_required_only_when_this_build_is_older_than_the_required_version() {
+        let m = serde_json::json!({ "version": "0.3.633", "required_version": "0.3.633" });
+        assert!(is_required(&m, "0.3.632"));
+        assert!(!is_required(&m, "0.3.633"));
+        assert!(!is_required(&m, "0.3.640"));
+        assert!(!is_required(&serde_json::json!({ "version": "0.3.633" }), "0.3.600"), "no required_version means nothing is required");
+        assert!(!is_required(&serde_json::json!({ "required_version": "<html>" }), "0.3.600"), "garbage never forces anything");
     }
 
     #[test]

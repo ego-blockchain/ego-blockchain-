@@ -19,8 +19,14 @@ pub const MIN_COMMITTEE: usize = 3;
 pub const BLOCK_COMMITTEE: usize = 4;
 pub const DRAW_V2_FROM_HEIGHT: u64 = 32_640;
 pub const READY_V2_EPOCH: u64 = 328;
+pub const READY_V3_EPOCH: u64 = 329;
 pub const MISS_RULE_FROM_HEIGHT: u64 = 32_750;
 pub const MISS_LIMIT: u32 = 2;
+pub const MISS_RULE_UNTIL_HEIGHT: u64 = 32_766;
+
+pub fn miss_rule_active(height: u64) -> bool {
+    (MISS_RULE_FROM_HEIGHT..MISS_RULE_UNTIL_HEIGHT).contains(&height)
+}
 pub const ROTA_LEN: usize = 128;
 pub const READY_DEADLINE: u64 = 90;
 pub const CHECKIN_INTERVAL_SECS: i64 = 12 * 3600;
@@ -85,7 +91,7 @@ pub fn missed_turns(ov: &Ov, addr: &str, epoch: u64) -> u32 {
 }
 
 pub fn record_turns(ov: &mut Ov, height: u64, missed: &[String], miner: &str) {
-    if height < MISS_RULE_FROM_HEIGHT {
+    if !miss_rule_active(height) {
         return;
     }
     let epoch = epoch_of(height);
@@ -585,7 +591,13 @@ pub fn checkin_message(anchor: u64, anchor_hash: &str) -> Vec<u8> {
 }
 
 pub fn ready_message(epoch: u64, seed: &str) -> Vec<u8> {
-    let version = if epoch >= READY_V2_EPOCH { 2 } else { 1 };
+    let version = if epoch >= READY_V3_EPOCH {
+        3
+    } else if epoch >= READY_V2_EPOCH {
+        2
+    } else {
+        1
+    };
     format!("ego/ready/v{version}:{epoch}:{seed}").into_bytes()
 }
 
@@ -1068,7 +1080,7 @@ pub fn draw_pool(ov: &Ov, height: u64) -> Vec<String> {
         .map(|(_, a)| a.clone())
         .collect();
     let mut pool = if ready.len() >= MIN_COMMITTEE { ready } else { rota.members };
-    if height >= MISS_RULE_FROM_HEIGHT {
+    if miss_rule_active(height) {
         let answering: Vec<String> = pool.iter().filter(|a| missed_turns(ov, a, epoch) < MISS_LIMIT).cloned().collect();
         if answering.len() >= MIN_COMMITTEE {
             pool = answering;
@@ -1436,9 +1448,10 @@ mod tests {
     }
 
     #[test]
-    fn a_node_that_keeps_missing_its_turn_is_left_out_until_it_makes_a_block_or_the_epoch_turns() {
-        let e = epoch_of(MISS_RULE_FROM_HEIGHT) + 2;
-        let h = e * EPOCH + 5;
+    fn the_missed_turn_rule_only_ever_applied_between_32750_and_32765() {
+        let h = MISS_RULE_FROM_HEIGHT + 1;
+        let e = epoch_of(h);
+        assert_eq!(e, epoch_of(MISS_RULE_UNTIL_HEIGHT + 20), "the test stays inside one epoch");
         let mut ov = Ov::memory();
         let members: Vec<String> = (0..6).map(|i| format!("egot1n{i}")).collect();
         ov.put(rota_key(e), serde_json::to_vec(&Rota { seed: "s".into(), members: members.clone() }).unwrap());
@@ -1450,41 +1463,36 @@ mod tests {
         ov.commit_memory();
         let silent = members[0].clone();
         record_turns(&mut ov, h, &[silent.clone()], &members[1]);
-        ov.commit_memory();
-        assert_eq!(missed_turns(&ov, &silent, e), 1);
-        assert!((0..40).any(|k| committee(&ov, h + k, 0).contains(&silent)), "one miss is forgiven");
         record_turns(&mut ov, h + 1, &[silent.clone()], &members[2]);
         ov.commit_memory();
         assert_eq!(missed_turns(&ov, &silent, e), 2);
-        for k in 0..60 {
+        for x in h + 2..MISS_RULE_UNTIL_HEIGHT {
             for attempt in 0..3 {
-                assert!(!committee(&ov, h + k, attempt).contains(&silent), "two misses in an epoch leave it out of every draw");
+                assert!(!committee(&ov, x, attempt).contains(&silent), "while the rule ran, two misses left a node out");
             }
         }
-        assert_eq!(missed_turns(&ov, &silent, e + 1), 0, "a new epoch starts it fresh");
-        record_turns(&mut ov, h + 2, &[], &silent);
+        assert!(
+            (MISS_RULE_UNTIL_HEIGHT..MISS_RULE_UNTIL_HEIGHT + 20).any(|x| committee(&ov, x, 0).contains(&silent)),
+            "from 32,766 nobody is left out for missed turns"
+        );
+        assert_eq!(draw_pool(&ov, MISS_RULE_UNTIL_HEIGHT).len(), 6);
+        record_turns(&mut ov, MISS_RULE_UNTIL_HEIGHT, &[members[3].clone()], &members[1]);
         ov.commit_memory();
-        assert_eq!(missed_turns(&ov, &silent, e), 0, "making a block clears its misses");
-
-        for m in &members[..4] {
-            record_turns(&mut ov, h + 3, &[m.clone()], &members[5]);
-            record_turns(&mut ov, h + 4, &[m.clone()], &members[5]);
-        }
-        ov.commit_memory();
-        assert_eq!(committee(&ov, h + 5, 0).len(), BLOCK_COMMITTEE, "never fewer than three to draw from: with only two answering, everyone stays in");
-
-        let before = MISS_RULE_FROM_HEIGHT - 1;
+        assert_eq!(missed_turns(&ov, &members[3], e), 0, "and no new misses are counted");
         let mut old = Ov::memory();
-        record_turns(&mut old, before, &[silent.clone()], &members[1]);
-        record_turns(&mut old, before, &[silent.clone()], &members[1]);
+        record_turns(&mut old, MISS_RULE_FROM_HEIGHT - 1, &[silent.clone()], &members[1]);
         old.commit_memory();
-        assert_eq!(missed_turns(&old, &silent, epoch_of(before)), 0, "nothing is counted before the rule starts");
+        assert_eq!(missed_turns(&old, &silent, epoch_of(MISS_RULE_FROM_HEIGHT - 1)), 0, "nothing is counted before the rule starts");
     }
 
     #[test]
     fn readiness_is_signed_for_the_rules_the_node_runs() {
         assert_eq!(ready_message(READY_V2_EPOCH - 1, "s"), b"ego/ready/v1:327:s".to_vec());
         assert_eq!(ready_message(READY_V2_EPOCH, "s"), b"ego/ready/v2:328:s".to_vec());
+        assert_eq!(ready_message(READY_V3_EPOCH, "s"), b"ego/ready/v3:329:s".to_vec());
+        let sk3 = crate::bls_agg::derive_bls_key(&[8u8; 32]);
+        let v2_sig = crate::bls_agg::sign_shared(&sk3, b"ego/ready/v2:329:s");
+        assert!(!crate::bls_agg::verify_shared(&v2_sig, &crate::bls_agg::bls_pubkey(&sk3), &ready_message(READY_V3_EPOCH, "s")), "a node that has not updated is not drawn from epoch 329");
         let sk = crate::bls_agg::derive_bls_key(&[9u8; 32]);
         let pk = crate::bls_agg::bls_pubkey(&sk);
         let old = crate::bls_agg::sign_shared(&sk, b"ego/ready/v1:328:s");

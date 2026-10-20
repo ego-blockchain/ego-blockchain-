@@ -340,6 +340,7 @@ interface UpdateInfo {
   latest: string;
   download_url: string;
   notes: string;
+  required?: boolean;
 }
 
 /// Tells the user a newer build is published and sends them to the download
@@ -356,15 +357,15 @@ const UpdateBanner: React.FC = () => {
       invoke<UpdateInfo>('check_for_update')
         .then(res => {
           if (!alive) return;
-          if (!res.update_available) return;
-          if (localStorage.getItem('ego-update-dismissed') === res.latest) return;
+          if (!res.update_available && !res.required) return;
+          if (!res.required && localStorage.getItem('ego-update-dismissed') === res.latest) return;
           setInfo(res);
         })
         .catch(() => {});
     };
 
     check();
-    const timer = setInterval(check, 6 * 60 * 60 * 1000);
+    const timer = setInterval(check, 30 * 60 * 1000);
     const onWake = () => { if (document.visibilityState === 'visible') check(); };
     document.addEventListener('visibilitychange', onWake);
 
@@ -376,6 +377,28 @@ const UpdateBanner: React.FC = () => {
   }, []);
 
   if (!info) return null;
+
+  if (info.required) {
+    return (
+      <div className="bg-red-600/20 border-b border-red-500/40 px-5 py-3 flex items-center gap-3">
+        <span className="text-lg shrink-0">⚠️</span>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold text-red-200">
+            Required update: install Ego Desktop v{info.latest} now
+          </div>
+          <div className="text-xs text-red-100/80">
+            Until you do, your node can't make blocks or earn. You're running v{info.current}.
+          </div>
+        </div>
+        <button
+          onClick={() => { openUrl(info.download_url).catch(() => {}); }}
+          className="shrink-0 bg-red-600 hover:bg-red-500 px-4 py-1.5 rounded-xl text-xs font-semibold transition-colors"
+        >
+          Download
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-blue-600/15 border-b border-blue-500/30 px-5 py-3 flex items-center gap-3">

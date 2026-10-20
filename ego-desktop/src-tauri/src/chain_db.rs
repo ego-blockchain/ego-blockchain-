@@ -2284,7 +2284,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             .unwrap_or(0) as i128
             + balance_delta.get(NODE_POOL_ADDR).copied().unwrap_or(0);
         let seed = rota_seed_in(db, block);
-        let skipped = if block.height >= crate::drs::MISS_RULE_FROM_HEIGHT {
+        let skipped = if crate::drs::miss_rule_active(block.height) {
             committee_for_height_in(db, block.height, block.timestamp)
                 .map(|c| {
                     let group: Vec<String> = c.into_iter().map(|(a, _)| a).collect();
@@ -10946,6 +10946,20 @@ mod history_tests {
         let to: u64 = std::env::var("EGO_INSPECT_TO").ok().and_then(|v| v.parse().ok()).unwrap_or(from + 5);
         let db = DB::open_cf_for_read_only(&Options::default(), &path, ALL_CFS.to_vec(), false).expect("open read-only");
         eprintln!("tip {}", local_chain_height_in(&db));
+        if let Ok(h) = std::env::var("EGO_INSPECT_DRAW").map(|v| v.parse::<u64>().unwrap_or(0)) {
+            let ov = crate::drs::Ov::new(&db);
+            let epoch = crate::drs::epoch_of(h);
+            let rota = crate::drs::load_rota(&ov, epoch).unwrap_or_default();
+            let bits = crate::drs::ready_set(&ov, epoch);
+            for (i, a) in rota.members.iter().enumerate() {
+                let ready = bits.get(i / 8).map(|b| b & (1 << (i % 8)) != 0).unwrap_or(false);
+                eprintln!("rota {i} {a} ready {ready} missed {}", crate::drs::missed_turns(&ov, a, epoch));
+            }
+            eprintln!("pool {:?}", crate::drs::draw_pool(&ov, h));
+            for attempt in 0..8 {
+                eprintln!("attempt {attempt}: {:?}", crate::drs::committee(&ov, h, attempt));
+            }
+        }
         if let Some(cf) = db.cf_handle(CF_GOVERNANCE) {
             for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start).take(50) {
                 if let Ok((k, v)) = item {
