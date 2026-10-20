@@ -22,7 +22,9 @@ pub const READY_V2_EPOCH: u64 = 328;
 pub const READY_V3_EPOCH: u64 = 329;
 pub const DRAW_V3_FROM_HEIGHT: u64 = 32_851;
 pub const LAST_MAKERS_KEEP: usize = 16;
-pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT];
+pub const SPLIT_FROM_HEIGHT: u64 = 32_901;
+pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT];
+const KEY_STORAGE_TOTAL: &[u8] = b"n2swt";
 const KEY_LAST_MAKERS: &[u8] = b"n2last";
 
 pub fn ready_version(epoch: u64) -> u32 {
@@ -142,6 +144,27 @@ fn expiry_key(ts: i64, addr: &str) -> Vec<u8> {
 
 fn rota_key(epoch: u64) -> Vec<u8> {
     format!("n2rota:{epoch:020}").into_bytes()
+}
+
+fn storage_w_key(addr: &str) -> Vec<u8> {
+    format!("n2sw:{addr}").into_bytes()
+}
+
+pub fn storage_points(rec: &NodeRec, at: i64) -> u64 {
+    if at <= rec.storage_until {
+        (rec.storage_bytes / GB).saturating_mul(STORAGE_POINTS_PER_GB).min(STORAGE_CAP)
+    } else {
+        0
+    }
+}
+
+pub fn split_pay(budget: u128, base: u128, base_total: u128, storage: u128, storage_total: u128) -> u128 {
+    match (base_total > 0, storage_total > 0) {
+        (true, true) => budget / 2 * base / base_total + budget / 2 * storage / storage_total,
+        (true, false) => budget * base / base_total,
+        (false, true) => budget * storage / storage_total,
+        (false, false) => 0,
+    }
 }
 
 fn ready_key(epoch: u64) -> Vec<u8> {
@@ -491,11 +514,7 @@ pub fn weight_of(rec: &NodeRec, at: i64, keys_ok: bool, period: u64) -> u64 {
         return 0;
     }
     let uptime = (rec.streak as u64).min(UPTIME_CAP);
-    let storage = if at <= rec.storage_until {
-        (rec.storage_bytes / GB).saturating_mul(STORAGE_POINTS_PER_GB).min(STORAGE_CAP)
-    } else {
-        0
-    };
+    let storage = storage_points(rec, at);
     let coverage = if at <= rec.coverage_at.saturating_add(COVERAGE_VALID_SECS) {
         (rec.coverage as u64).min(COVERAGE_CAP_WITNESSES) * COVERAGE_POINTS_PER_WITNESS
     } else {
@@ -529,6 +548,19 @@ fn refresh(ov: &mut Ov, addr: &str, rec: &mut NodeRec, at: i64, period: u64) {
             let mut elig = versioned(ov, KEY_ELIGIBLE);
             elig.add(period, if new_w > 0 { 1 } else { -1 });
             ov.put(KEY_ELIGIBLE.to_vec(), elig.encode());
+        }
+    }
+    if period >= period_of(SPLIT_FROM_HEIGHT) {
+        let new_s = if new_w > 0 { storage_points(rec, at).min(new_w) } else { 0 };
+        let key = storage_w_key(addr);
+        let mut sw = versioned(ov, &key);
+        if sw.next != new_s {
+            let old_s = sw.next;
+            sw.set(period, new_s);
+            ov.put(key, sw.encode());
+            let mut total = versioned(ov, KEY_STORAGE_TOTAL);
+            total.add(period, new_s as i128 - old_s as i128);
+            ov.put(KEY_STORAGE_TOTAL.to_vec(), total.encode());
         }
     }
     if let Some(t) = next_drop(rec, at) {
@@ -917,7 +949,7 @@ pub fn apply_block(
         process_expiries(ov, at, period);
     }
     apply_registrations(ov, txs, at, period);
-    if block.height == FAST_START_HEIGHT {
+    if block.height == FAST_START_HEIGHT || block.height == SPLIT_FROM_HEIGHT {
         recount_all(ov, at, period);
     }
     if block.height < CHECKIN_FROM_HEIGHT {
@@ -927,6 +959,8 @@ pub fn apply_block(
     if let Some(tx) = txs.iter().find(|t| t.tx_type == TX_CHECKIN_BATCH) {
         if let Ok(batch) = serde_json::from_str::<CheckinBatch>(&tx.call_args) {
             let total_w = total_weight(ov, period) as u128;
+            let split = block.height >= SPLIT_FROM_HEIGHT;
+            let storage_total = if split { (versioned(ov, KEY_STORAGE_TOTAL).at(period) as u128).min(total_w) } else { 0 };
             let per_checkin = node_reward_per_day_at(at) as u128 * CHECKIN_INTERVAL_SECS as u128 / 86_400;
             let mut members: Vec<u64> = batch.groups.iter().filter_map(|g| decode_members(&g.members)).flatten().collect();
             members.sort_unstable();
@@ -939,7 +973,14 @@ pub fn apply_block(
                     continue;
                 }
                 let w = rec.weight.at(period) as u128;
-                let pay = if total_w > 0 { (per_checkin * w / total_w).min(pool_left) } else { 0 };
+                let pay = if split {
+                    let s = (versioned(ov, &storage_w_key(&addr)).at(period) as u128).min(w);
+                    split_pay(per_checkin, w - s, total_w - storage_total, s, storage_total).min(pool_left)
+                } else if total_w > 0 {
+                    (per_checkin * w / total_w).min(pool_left)
+                } else {
+                    0
+                };
                 pool_left -= pay;
                 rec.streak = if rec.streak > 0 && at.saturating_sub(rec.last_checkin) <= STREAK_GAP_SECS {
                     rec.streak.saturating_add(1)
@@ -1652,17 +1693,62 @@ mod tests {
     }
 
     #[test]
+    fn the_split_pays_each_half_by_its_own_weights_and_leaves_nothing_idle() {
+        assert_eq!(split_pay(1000, 10, 40, 0, 2000), 125, "a node without storage shares the uptime half");
+        assert_eq!(split_pay(1000, 10, 40, 500, 2000), 250, "a storage node earns from both halves");
+        assert_eq!(split_pay(1000, 10, 40, 0, 0), 250, "with no storage anywhere the whole budget goes by uptime");
+        assert_eq!(split_pay(1000, 0, 0, 500, 2000), 250, "with no uptime weight anywhere the whole budget goes by storage");
+        assert_eq!(split_pay(1000, 0, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn the_daily_pool_is_split_between_uptime_and_storage_from_the_activation() {
+        let (mut ov, addrs) = network(4);
+        let t0 = 1_900_000_000i64;
+        for a in &addrs[2..] {
+            let mut rec = load_rec(&ov, a).unwrap();
+            rec.storage_bytes = 100 * GB;
+            rec.storage_until = t0 + 400 * 86_400;
+            save_rec(&mut ov, a, &rec);
+        }
+        ov.commit_memory();
+        let all: Vec<u64> = (0..4).collect();
+        let step = CHECKIN_INTERVAL_SECS;
+        let budget = |ts: i64| node_reward_per_day_at(ts) as u128 * CHECKIN_INTERVAL_SECS as u128 / 86_400;
+        let pay_of = |paid: &[(String, u64)], a: &str| paid.iter().find(|(x, _)| x == a).map(|(_, p)| *p as u128).unwrap_or(0);
+        run(&mut ov, SPLIT_FROM_HEIGHT - 2 * EPOCH, t0, &all);
+        let before = run(&mut ov, SPLIT_FROM_HEIGHT - EPOCH, t0 + step, &all);
+        let b0 = budget(t0 + step);
+        assert!(pay_of(&before, &addrs[0]) * 50 < b0, "before the split a node without storage gets under 2%: {} of {b0}", pay_of(&before, &addrs[0]));
+        run(&mut ov, SPLIT_FROM_HEIGHT, t0 + 2 * step, &all);
+        let after = run(&mut ov, SPLIT_FROM_HEIGHT + EPOCH, t0 + 3 * step, &all);
+        let b = budget(t0 + 3 * step);
+        for a in &addrs[..2] {
+            let p = pay_of(&after, a);
+            assert!(p + 8 >= b / 8 && p <= b / 8 + 8, "a node without storage gets an eighth: {p} vs {}", b / 8);
+        }
+        for a in &addrs[2..] {
+            let p = pay_of(&after, a);
+            assert!(p + 8 >= b * 3 / 8 && p <= b * 3 / 8 + 8, "a storage node gets three eighths: {p} vs {}", b * 3 / 8);
+        }
+        let total: u128 = after.iter().map(|(_, p)| *p as u128).sum();
+        assert!(total <= b && total + 16 >= b, "the whole budget is paid out: {total} vs {b}");
+    }
+
+    #[test]
     fn readiness_is_signed_for_the_rules_the_node_runs() {
         assert_eq!(ready_message(READY_V2_EPOCH - 1, "s"), b"ego/ready/v1:327:s".to_vec());
         assert_eq!(ready_message(READY_V2_EPOCH, "s"), b"ego/ready/v2:328:s".to_vec());
         assert_eq!(ready_version(READY_V2_EPOCH - 1), 1);
         assert_eq!(ready_version(READY_V2_EPOCH), 2);
-        assert_eq!(ready_version(READY_V3_EPOCH), 4, "two rule changes land before epoch 329 starts, so it takes two versions at once");
-        assert_eq!(ready_version(READY_V3_EPOCH + 50), 4);
-        assert_eq!(ready_message(READY_V3_EPOCH, "s"), b"ego/ready/v4:329:s".to_vec());
+        let v329 = ready_version(READY_V3_EPOCH);
+        assert!(v329 >= 4, "every rule change before epoch 329 raises the version: {v329}");
+        assert_eq!(ready_message(READY_V3_EPOCH, "s"), format!("ego/ready/v{v329}:329:s").into_bytes());
+        let after_split = epoch_of(SPLIT_FROM_HEIGHT) + 1;
+        assert!(ready_version(after_split) > ready_version(epoch_of(SPLIT_FROM_HEIGHT.saturating_sub(EPOCH))), "the pool split raises the version for the epoch after it");
         let sk3 = crate::bls_agg::derive_bls_key(&[8u8; 32]);
-        for stale in [&b"ego/ready/v2:329:s"[..], b"ego/ready/v3:329:s"] {
-            let sig = crate::bls_agg::sign_shared(&sk3, stale);
+        for v in 1..v329 {
+            let sig = crate::bls_agg::sign_shared(&sk3, format!("ego/ready/v{v}:329:s").as_bytes());
             assert!(!crate::bls_agg::verify_shared(&sig, &crate::bls_agg::bls_pubkey(&sk3), &ready_message(READY_V3_EPOCH, "s")), "a node without every rule change is not drawn from epoch 329");
         }
         let sk = crate::bls_agg::derive_bls_key(&[9u8; 32]);

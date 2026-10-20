@@ -109,9 +109,14 @@ pub async fn mint_credits(
         )));
     }
 
-    let price_micro = (crate::p2p::get_egoc_price_usd() * 1_000_000.0) as u64;
+    let next_height = crate::chain_db::local_chain_height().saturating_add(1);
+    let price_micro = if next_height >= crate::chain_db::CREDITS_ONCHAIN_PRICE_FROM_HEIGHT {
+        crate::chain_db::consensus_price_micro_usd().unwrap_or(0)
+    } else {
+        (crate::p2p::get_egoc_price_usd() * 1_000_000.0) as u64
+    };
     if price_micro == 0 {
-        return Err(EgoDesktopError::WalletError("No EGOC price available".into()));
+        return Err(EgoDesktopError::WalletError("No agreed EGOC price on the chain yet".into()));
     }
     let credits = crate::chain_db::credits_mint_amount(amount_uegoc, price_micro);
     if credits == 0 {

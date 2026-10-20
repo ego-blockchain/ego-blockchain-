@@ -5276,7 +5276,7 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
     }
     for tx in txs {
         if matches!(tx.tx_type.as_str(), "credits_mint" | "credits_pay") {
-            validate_credits_tx(tx)?;
+            validate_credits_tx_at(tx, block.height)?;
         } else if tx.tx_type == "credits_escrow" {
             validate_credits_escrow_tx(tx, block.timestamp)?;
         }
@@ -7470,32 +7470,62 @@ pub fn validate_credits_escrow_tx(tx: &crate::ledger::LedgerTx, block_time: i64)
 /// price tolerance, which bounds how far a sender's attested EGOC price may sit
 /// from this validator's oracle view — the hardening path is an on-chain price
 /// feed; until then the band caps the damage of a lying sender to ±25%.
+pub const CREDITS_ONCHAIN_PRICE_FROM_HEIGHT: u64 = crate::drs::SPLIT_FROM_HEIGHT;
+
+fn credits_mint_basics(tx: &crate::ledger::LedgerTx) -> Result<u64, String> {
+    if tx.to != CREDITS_BURN_ADDR {
+        return Err(format!("credits_mint {} must burn to {}", tx.hash, CREDITS_BURN_ADDR));
+    }
+    if tx.amount == 0 {
+        return Err(format!("credits_mint {} burns zero EGOC", tx.hash));
+    }
+    let Some(price_micro) = parse_credits_mint_memo(&tx.memo) else {
+        return Err(format!("credits_mint {} missing credits_mint:{{price}} memo", tx.hash));
+    };
+    if price_micro == 0 {
+        return Err(format!("credits_mint {} has zero price", tx.hash));
+    }
+    Ok(price_micro)
+}
+
+fn credits_mint_price_ok(tx: &crate::ledger::LedgerTx, price_micro: u64, reference_micro: u64, source: &str) -> Result<(), String> {
+    let tol = reference_micro.saturating_mul(CREDITS_PRICE_TOLERANCE_PCT) / 100;
+    if price_micro > reference_micro.saturating_add(tol) || price_micro < reference_micro.saturating_sub(tol) {
+        return Err(format!(
+            "credits_mint {} price {}µ$ outside ±{}% of {source} {}µ$",
+            tx.hash, price_micro, CREDITS_PRICE_TOLERANCE_PCT, reference_micro
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_credits_mint_against(tx: &crate::ledger::LedgerTx, agreed_micro: Option<u64>) -> Result<(), String> {
+    let price_micro = credits_mint_basics(tx)?;
+    let Some(agreed) = agreed_micro else {
+        return Err(format!("credits_mint {} refused: the chain holds no agreed EGOC price yet", tx.hash));
+    };
+    credits_mint_price_ok(tx, price_micro, agreed, "the agreed on-chain price")
+}
+
+fn consensus_price_for_height(height: u64) -> Option<u64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    consensus_price_in(&db, height / STORAGE_PAY_EPOCH)
+}
+
+pub fn validate_credits_tx_at(tx: &crate::ledger::LedgerTx, height: u64) -> Result<(), String> {
+    if tx.tx_type == "credits_mint" && height >= CREDITS_ONCHAIN_PRICE_FROM_HEIGHT {
+        return validate_credits_mint_against(tx, consensus_price_for_height(height));
+    }
+    validate_credits_tx(tx)
+}
+
 pub fn validate_credits_tx(tx: &crate::ledger::LedgerTx) -> Result<(), String> {
     match tx.tx_type.as_str() {
         "credits_mint" => {
-            if tx.to != CREDITS_BURN_ADDR {
-                return Err(format!("credits_mint {} must burn to {}", tx.hash, CREDITS_BURN_ADDR));
-            }
-            if tx.amount == 0 {
-                return Err(format!("credits_mint {} burns zero EGOC", tx.hash));
-            }
-            let Some(price_micro) = parse_credits_mint_memo(&tx.memo) else {
-                return Err(format!("credits_mint {} missing credits_mint:{{price}} memo", tx.hash));
-            };
-            if price_micro == 0 {
-                return Err(format!("credits_mint {} has zero price", tx.hash));
-            }
+            let price_micro = credits_mint_basics(tx)?;
             let local_micro = (crate::p2p::get_egoc_price_usd() * 1_000_000.0) as u64;
             if local_micro > 0 {
-                let tol = local_micro.saturating_mul(CREDITS_PRICE_TOLERANCE_PCT) / 100;
-                if price_micro > local_micro.saturating_add(tol)
-                    || price_micro < local_micro.saturating_sub(tol)
-                {
-                    return Err(format!(
-                        "credits_mint {} price {}µ$ outside ±{}% of oracle {}µ$",
-                        tx.hash, price_micro, CREDITS_PRICE_TOLERANCE_PCT, local_micro
-                    ));
-                }
+                credits_mint_price_ok(tx, price_micro, local_micro, "oracle")?;
             }
             Ok(())
         }
@@ -9576,8 +9606,8 @@ pub const COMMITTEE_REDRAW_V3_SECS: i64 = 30;
 pub const COMMITTEE_GUARD_V3_SECS: i64 = 5;
 pub const MAX_COMMITTEE_ATTEMPT: i64 = 10_000;
 pub const MAX_FREE_TXS_PER_BLOCK: usize = 256;
-pub const RULES_VERSION: u64 = 2;
-pub const RULES_DERIVED_FROM_HEIGHT: u64 = LEGACY_CHECKIN_FROM_HEIGHT;
+pub const RULES_VERSION: u64 = 3;
+pub const RULES_DERIVED_FROM_HEIGHT: u64 = crate::drs::SPLIT_FROM_HEIGHT;
 const META_RULES_VERSION: &[u8] = b"rules_version";
 const META_DRS_INDEX: &[u8] = b"drs_index_v1";
 const META_RANDAO_MIX: &[u8] = b"randao_mix";
@@ -11477,5 +11507,37 @@ mod commit_cert_tests {
         let t = |h: &str| LedgerTx { hash: h.into(), ..LedgerTx::default() };
         assert_eq!(sorted_tx_root(&[t("0xb"), t("0xa"), t("0xc")]), sorted_tx_root(&[t("0xc"), t("0xa"), t("0xb")]));
         assert_ne!(sorted_tx_root(&[t("0xa")]), sorted_tx_root(&[t("0xb")]));
+    }
+}
+
+#[cfg(test)]
+mod credits_price_tests {
+    use super::*;
+
+    fn mint(price: u64) -> LedgerTx {
+        LedgerTx {
+            hash: "0xmint".into(),
+            from: "egot1me".into(),
+            to: CREDITS_BURN_ADDR.into(),
+            amount: 5_000_000,
+            tx_type: "credits_mint".into(),
+            memo: Some(format!("credits_mint:{price}")),
+            ..LedgerTx::default()
+        }
+    }
+
+    #[test]
+    fn a_mint_is_judged_against_the_agreed_price_not_this_node_s_feed() {
+        assert!(validate_credits_mint_against(&mint(1_000_000), Some(1_000_000)).is_ok());
+        assert!(validate_credits_mint_against(&mint(1_240_000), Some(1_000_000)).is_ok(), "within the 25% band");
+        assert!(validate_credits_mint_against(&mint(1_260_000), Some(1_000_000)).is_err());
+        assert!(validate_credits_mint_against(&mint(740_000), Some(1_000_000)).is_err());
+        assert!(validate_credits_mint_against(&mint(1_000_000), None).is_err(), "no agreed price, no mint");
+        let mut elsewhere = mint(1_000_000);
+        elsewhere.to = "egot1someone".into();
+        assert!(validate_credits_mint_against(&elsewhere, Some(1_000_000)).is_err());
+        let mut unpriced = mint(1_000_000);
+        unpriced.memo = None;
+        assert!(validate_credits_mint_against(&unpriced, Some(1_000_000)).is_err());
     }
 }
