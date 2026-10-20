@@ -5781,6 +5781,9 @@ pub async fn sync_chain_from_peers() {
     static STUCK_ROUNDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static LAST_SYNC_GOSSIP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     static LAST_REQ_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if state_join_active() {
+        return;
+    }
     let now = chrono::Utc::now().timestamp_millis();
     let my_height = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
         .await.unwrap_or(0);
@@ -13018,7 +13021,10 @@ async fn receive_history_pieces(nonce: String, pieces: Vec<crate::history::Histo
 }
 
 const STATE_SYNC_INFLIGHT: usize = 8;
-const STATE_SYNC_TIMEOUT_SECS: i64 = 60;
+const STATE_SYNC_TIMEOUT_SECS: i64 = 15;
+const STATE_TIP_RETRY_SECS: i64 = 8;
+const STATE_TIP_ASK: usize = 3;
+const STATE_JOIN_PATIENCE_SECS: i64 = 300;
 const STATE_SYNC_MIN_LEAD: u64 = 100;
 const STATE_CERTS_PER_REPLY: usize = 64;
 const STATE_SERVE_PER_MINUTE: u32 = 120;
@@ -13212,6 +13218,33 @@ struct StateSyncJob {
     tip_nonce: String,
     tip_asked: i64,
     turn: usize,
+    started: i64,
+}
+
+pub(crate) fn next_servers(servers: &[String], turn: usize, k: usize) -> Vec<String> {
+    if servers.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for i in 0..servers.len() {
+        if out.len() >= k {
+            break;
+        }
+        let s = &servers[(turn + i) % servers.len()];
+        if !out.contains(s) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+pub(crate) fn joining_at(started: Option<i64>, now: i64) -> bool {
+    started.map_or(false, |s| now - s < STATE_JOIN_PATIENCE_SECS)
+}
+
+pub fn state_join_active() -> bool {
+    let started = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|j| j.started);
+    joining_at(started, Utc::now().timestamp())
 }
 
 static STATE_SYNC: Mutex<Option<StateSyncJob>> = Mutex::new(None);
@@ -13316,9 +13349,10 @@ async fn start_state_sync(cert: crate::state_cert::StateCert, server: String) {
             inflight: HashMap::new(),
             done: 0,
             tips: None,
-            tip_nonce: String::new(),
+            tip_nonce: history_nonce(),
             tip_asked: 0,
             turn: 0,
+            started: Utc::now().timestamp(),
         });
     }
     pump_state_sync().await;
@@ -13352,12 +13386,12 @@ async fn pump_state_sync() {
             let height = job.cert.body.height;
             sends.push((server, P2PMessage::StateChunkRequest { nonce, height, part, index, reply_to: reply_to.clone() }));
         }
-        if job.tips.is_none() && now - job.tip_asked > STATE_SYNC_TIMEOUT_SECS {
+        if job.tips.is_none() && now - job.tip_asked >= STATE_TIP_RETRY_SECS {
             job.tip_asked = now;
-            job.tip_nonce = history_nonce();
-            let server = job.servers[job.turn % job.servers.len()].clone();
-            job.turn += 1;
-            sends.push((server, P2PMessage::StateTipRequest { nonce: job.tip_nonce.clone(), height: job.cert.body.height, reply_to: reply_to.clone() }));
+            for server in next_servers(&job.servers, job.turn, STATE_TIP_ASK) {
+                sends.push((server, P2PMessage::StateTipRequest { nonce: job.tip_nonce.clone(), height: job.cert.body.height, reply_to: reply_to.clone() }));
+            }
+            job.turn += STATE_TIP_ASK;
         }
     }
     for (ep, msg) in sends {
@@ -15590,7 +15624,8 @@ pub async fn run_sync_status_watcher() {
                     }
                 } else if now - last_progress_emit >= 2 {
                     last_progress_emit = now;
-                    emit_sync_status("catching_up", local, best, after_sleep);
+                    let shown = if state_join_active() { "joining" } else { "catching_up" };
+                    emit_sync_status(shown, local, best, after_sleep);
                 }
             }
         }
@@ -17061,6 +17096,18 @@ mod poison_tx_tests {
             blamed_in(reason, &txs).is_empty(),
             "a whole-block failure must not evict the transactions that happened to be in it",
         );
+    }
+
+    #[test]
+    fn a_joining_node_asks_several_peers_in_turn_and_gives_up_on_the_checkpoint_after_five_minutes() {
+        let s: Vec<String> = ["a", "b", "c", "d"].iter().map(|x| x.to_string()).collect();
+        assert_eq!(super::next_servers(&s, 0, 3), vec!["a", "b", "c"]);
+        assert_eq!(super::next_servers(&s, 3, 3), vec!["d", "a", "b"], "the next try starts where the last one stopped");
+        assert_eq!(super::next_servers(&s[..2], 5, 3), vec!["b", "a"], "never the same peer twice in one try");
+        assert!(super::next_servers(&[], 0, 3).is_empty());
+        assert!(super::joining_at(Some(1_000), 1_299));
+        assert!(!super::joining_at(Some(1_000), 1_300), "after five minutes ordinary block sync takes over again");
+        assert!(!super::joining_at(None, 1_000));
     }
 
     #[test]

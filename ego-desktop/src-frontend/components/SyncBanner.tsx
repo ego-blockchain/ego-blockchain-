@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 
 interface SyncStatus {
-  state: 'checking' | 'catching_up' | 'synced';
+  state: 'checking' | 'joining' | 'catching_up' | 'synced';
   local: number;
   target: number;
   after_sleep: boolean;
@@ -56,6 +56,8 @@ export default function SyncBanner() {
       <span className="w-3.5 h-3.5 rounded-full border-2 border-black/30 border-t-black animate-spin" />
       {status.state === 'checking' ? (
         <span>Woke from sleep — reconnecting to the network…</span>
+      ) : status.state === 'joining' ? (
+        <span>Joining the network from the latest checkpoint · you can keep using the app</span>
       ) : (
         <span>
           Catching up — block {status.local.toLocaleString()} of {status.target.toLocaleString()}
