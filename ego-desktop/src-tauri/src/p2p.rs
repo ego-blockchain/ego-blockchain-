@@ -1239,6 +1239,10 @@ pub(crate) fn consensus_v2_live_enabled() -> bool { std::env::var("EGO_CONSENSUS
 /// The v2 engine runs (live by default, or shadow-alongside-inline when LEGACY+SHADOW).
 fn consensus_v2_active() -> bool { consensus_v2_live_enabled() || std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() }
 static SHADOW_LAST_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+pub(crate) fn proposal_key(height: u64, round: u32, attempt: i64) -> u64 {
+    (height << 24) | ((attempt.clamp(0, 0x3FFF) as u64) << 10) | (round as u64 & 0x3FF)
+}
 static V2_HEARTBEAT_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 // Pacemaker state: the (height<<16|round) we're currently sitting in, and when we entered
 // it. If we stay past V2_VIEW_TIMEOUT_MS without finalizing, we broadcast a view-change.
@@ -2131,13 +2135,16 @@ pub async fn shadow_v2_tick() {
         }
     }
 
+    let mut attempt: i64 = 0;
     if consensus_v2_live_enabled() {
         let next = crate::chain_db::latest_block_info().0 + 1;
-        if crate::chain_db::drs_active(next)
-            && !crate::chain_db::committee_window(next, crate::clock::now()).map_or(false, |(_, open)| open)
-        {
-            V2_VIEW_ENTERED_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
-            return;
+        if crate::chain_db::drs_active(next) {
+            let window = crate::chain_db::committee_window(next, crate::clock::now());
+            if !window.map_or(false, |(_, open)| open) {
+                V2_VIEW_ENTERED_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+                return;
+            }
+            attempt = window.map_or(0, |(a, _)| a);
         }
     }
 
@@ -2183,7 +2190,7 @@ pub async fn shadow_v2_tick() {
         let guard = shadow_host_lock();
         guard.as_ref().map_or(false, |h| {
             if !h.is_proposer() { return false; }
-            let key = (h.current_height() << 16) | (h.current_round() as u64 & 0xFFFF);
+            let key = proposal_key(h.current_height(), h.current_round(), attempt);
             SHADOW_LAST_PROPOSED.swap(key, std::sync::atomic::Ordering::Relaxed) != key
         })
     };
@@ -2199,7 +2206,7 @@ pub async fn force_v2_proposal_as_elected_leader() {
     {
         let guard = shadow_host_lock();
         let Some(h) = guard.as_ref() else { return };
-        let key = (h.current_height() << 16) | (h.current_round() as u64 & 0xFFFF);
+        let key = proposal_key(h.current_height(), h.current_round(), 0);
         if SHADOW_LAST_PROPOSED.swap(key, std::sync::atomic::Ordering::Relaxed) == key {
             return;
         }
@@ -17096,6 +17103,23 @@ mod poison_tx_tests {
             blamed_in(reason, &txs).is_empty(),
             "a whole-block failure must not evict the transactions that happened to be in it",
         );
+    }
+
+    #[test]
+    fn a_new_draw_gives_its_proposer_a_fresh_turn_at_the_same_height_and_round() {
+        let k = |h: u64, r: u32, a: i64| super::proposal_key(h, r, a);
+        assert_ne!(k(32_861, 0, 0), k(32_861, 0, 3), "the stall at 32,861: a node that proposed in one draw must propose again when a later draw elects it");
+        assert_ne!(k(32_861, 0, 0), k(32_861, 1, 0));
+        assert_ne!(k(32_861, 0, 0), k(32_862, 0, 0));
+        assert_eq!(k(32_861, 2, 5), k(32_861, 2, 5), "but only once per draw and round");
+        let mut seen = std::collections::HashSet::new();
+        for h in [1u64, 32_861, 1 << 39] {
+            for a in [0i64, 1, 4_095, 10_000] {
+                for r in [0u32, 1, 7, 1_023] {
+                    assert!(seen.insert(k(h, r, a)), "keys never collide: {h} {r} {a}");
+                }
+            }
+        }
     }
 
     #[test]

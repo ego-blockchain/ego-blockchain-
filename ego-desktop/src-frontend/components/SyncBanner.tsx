@@ -48,7 +48,7 @@ export default function SyncBanner() {
 
   const pct =
     status.state === 'catching_up' && status.target > 0 && status.target > status.local
-      ? Math.min(100, Math.round((status.local / status.target) * 100))
+      ? Math.min(99, Math.floor((status.local / status.target) * 100))
       : null;
 
   return (
