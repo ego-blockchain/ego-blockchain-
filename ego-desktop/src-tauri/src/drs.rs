@@ -23,6 +23,7 @@ pub const READY_V3_EPOCH: u64 = 329;
 pub const DRAW_V3_FROM_HEIGHT: u64 = 32_851;
 pub const LAST_MAKERS_KEEP: usize = 16;
 pub const SPLIT_FROM_HEIGHT: u64 = 32_901;
+pub const TENDERMINT_FROM_HEIGHT: u64 = 33_101;
 pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT];
 const KEY_STORAGE_TOTAL: &[u8] = b"n2swt";
 const KEY_LAST_MAKERS: &[u8] = b"n2last";
@@ -69,6 +70,7 @@ const TREE_FANOUT_BITS: u32 = 4;
 const TREE_FANOUT: u64 = 1 << TREE_FANOUT_BITS;
 pub const TX_CHECKIN_BATCH: &str = "checkin_batch";
 pub const TX_READY_BATCH: &str = "ready_batch";
+pub const TX_TM_READY_BATCH: &str = "tm_ready_batch";
 const GB: u64 = 1_000_000_000;
 const KEY_COUNT: &[u8] = b"n2count";
 const KEY_ELIGIBLE: &[u8] = b"n2elig";
@@ -746,6 +748,7 @@ pub fn witness_message(beacon_id: &str) -> Vec<u8> {
 pub fn is_batch_tx(tx: &LedgerTx) -> bool {
     (tx.tx_type == TX_CHECKIN_BATCH
         || tx.tx_type == TX_READY_BATCH
+        || tx.tx_type == TX_TM_READY_BATCH
         || tx.tx_type == TX_COVERAGE_BATCH
         || tx.tx_type == crate::state_cert::TX_STATE_CERT)
         && tx.from.is_empty()
@@ -770,10 +773,11 @@ pub fn validate_batches(
     let checkins: Vec<&LedgerTx> = txs.iter().filter(|t| t.tx_type == TX_CHECKIN_BATCH).collect();
     let readies: Vec<&LedgerTx> = txs.iter().filter(|t| t.tx_type == TX_READY_BATCH).collect();
     let coverages: Vec<&LedgerTx> = txs.iter().filter(|t| t.tx_type == TX_COVERAGE_BATCH).collect();
-    if checkins.len() > 1 || readies.len() > 1 || coverages.len() > 1 {
+    let tm_readies: Vec<&LedgerTx> = txs.iter().filter(|t| t.tx_type == TX_TM_READY_BATCH).collect();
+    if checkins.len() > 1 || readies.len() > 1 || coverages.len() > 1 || tm_readies.len() > 1 {
         return Err(format!("block {} carries more than one batch of a kind", block.height));
     }
-    for tx in checkins.iter().chain(readies.iter()).chain(coverages.iter()) {
+    for tx in checkins.iter().chain(readies.iter()).chain(coverages.iter()).chain(tm_readies.iter()) {
         if block.height < CHECKIN_FROM_HEIGHT || !is_batch_tx(tx) || tx.hash != batch_hash(&tx.tx_type, block.height, &tx.call_args) {
             return Err(format!("batch tx {} is not one the rules allow in block {}", tx.hash, block.height));
         }
@@ -865,6 +869,27 @@ pub fn validate_batches(
         let sig = hex::decode(&batch.sig).map_err(|_| "ready signature not hex".to_string())?;
         if !crate::bls_agg::verify_shared_aggregate(&sig, &pks, &ready_message(batch.epoch, &rota.seed)) {
             return Err("ready batch does not verify".into());
+        }
+    }
+    if let Some(tx) = tm_readies.first() {
+        let batch: ReadyBatch = serde_json::from_str(&tx.call_args).map_err(|e| format!("consensus readiness batch unreadable: {e}"))?;
+        if tm_ready_epoch_at(block.height) != Some(batch.epoch) {
+            return Err(format!("consensus readiness for epoch {} is not open in block {}", batch.epoch, block.height));
+        }
+        let rota = load_rota(ov, batch.epoch).ok_or("consensus readiness for an epoch with no rota")?;
+        let positions = decode_members(&batch.members).ok_or("consensus readiness members unreadable")?;
+        if positions.is_empty() {
+            return Err("an empty consensus readiness batch".into());
+        }
+        let mut pks = Vec::with_capacity(positions.len());
+        for p in &positions {
+            let addr = rota.members.get(*p as usize).ok_or("consensus readiness position outside the rota")?;
+            let rec = load_rec(ov, addr).ok_or("consensus readiness from a node with no record")?;
+            pks.push(hex::decode(&rec.pop_key).ok().filter(|k| k.len() == 48).ok_or("consensus readiness from a node with no proven BLS key")?);
+        }
+        let sig = hex::decode(&batch.sig).map_err(|_| "consensus readiness signature not hex".to_string())?;
+        if !crate::bls_agg::verify_shared_aggregate(&sig, &pks, &tm_ready_message(batch.epoch, &rota.seed)) {
+            return Err("consensus readiness batch does not verify".into());
         }
     }
     Ok(())
@@ -1010,6 +1035,18 @@ pub fn apply_block(
         }
     }
 
+    if let Some(tx) = txs.iter().find(|t| t.tx_type == TX_TM_READY_BATCH) {
+        if let Ok(batch) = serde_json::from_str::<ReadyBatch>(&tx.call_args) {
+            if let Some(positions) = decode_members(&batch.members) {
+                let mut bits = tm_ready_set(ov, batch.epoch);
+                for p in positions {
+                    set_bit(&mut bits, p as usize);
+                }
+                ov.put(tm_ready_key(batch.epoch), bits);
+            }
+        }
+    }
+
     if let Some(tx) = txs.iter().find(|t| t.tx_type == TX_COVERAGE_BATCH) {
         if let Ok(batch) = serde_json::from_str::<CoverageBatch>(&tx.call_args) {
             for p in batch.proofs {
@@ -1119,18 +1156,64 @@ pub fn seed_weight_for_tests(ov: &mut Ov, addr: &str, weight: u64) {
     save_rec(ov, addr, &rec);
 }
 
-pub fn draw_pool(ov: &Ov, height: u64) -> Vec<String> {
+pub fn ready_members(ov: &Ov, height: u64) -> Vec<String> {
     let epoch = epoch_of(height);
     let rota = load_rota(ov, epoch).unwrap_or_default();
     let bits = ready_set(ov, epoch);
-    let ready: Vec<String> = rota
-        .members
+    rota.members
         .iter()
         .enumerate()
         .filter(|(i, _)| bit(&bits, *i))
         .map(|(_, a)| a.clone())
-        .collect();
-    let mut pool = if ready.len() >= MIN_COMMITTEE { ready } else { rota.members };
+        .collect()
+}
+
+fn tm_ready_key(epoch: u64) -> Vec<u8> {
+    format!("n2tmready:{epoch:020}").into_bytes()
+}
+
+pub fn tm_ready_message(epoch: u64, seed: &str) -> Vec<u8> {
+    format!("ego/ready/tendermint/v1:{epoch}:{seed}").into_bytes()
+}
+
+pub fn tm_ready_set(ov: &Ov, epoch: u64) -> Vec<u8> {
+    ov.get(&tm_ready_key(epoch)).unwrap_or_default()
+}
+
+pub fn tm_ready_epoch_at(height: u64) -> Option<u64> {
+    let e = epoch_of(height);
+    let next = e + 1;
+    let open = height.saturating_sub(e * EPOCH) <= READY_DEADLINE;
+    (open && next * EPOCH + 1 >= TENDERMINT_FROM_HEIGHT).then_some(next)
+}
+
+pub fn tm_ready_members(ov: &Ov, height: u64) -> Vec<String> {
+    let epoch = epoch_of(height);
+    let rota = load_rota(ov, epoch).unwrap_or_default();
+    let bits = tm_ready_set(ov, epoch);
+    rota.members
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| bit(&bits, *i))
+        .map(|(_, a)| a.clone())
+        .collect()
+}
+
+pub fn tendermint_active(ov: &Ov, height: u64) -> bool {
+    height >= TENDERMINT_FROM_HEIGHT && tm_ready_members(ov, height).len() >= MIN_COMMITTEE
+}
+
+pub fn draw_pool(ov: &Ov, height: u64) -> Vec<String> {
+    if tendermint_active(ov, height) {
+        return tm_ready_members(ov, height);
+    }
+    let epoch = epoch_of(height);
+    let ready = ready_members(ov, height);
+    let mut pool = if ready.len() >= MIN_COMMITTEE {
+        ready
+    } else {
+        load_rota(ov, epoch).unwrap_or_default().members
+    };
     if miss_rule_active(height) {
         let answering: Vec<String> = pool.iter().filter(|a| missed_turns(ov, a, epoch) < MISS_LIMIT).cloned().collect();
         if answering.len() >= MIN_COMMITTEE {
@@ -1297,6 +1380,77 @@ fn replay_registrations(ov: &mut Ov, blocks: &mut [(u64, i64, Vec<LedgerTx>)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consent_to_the_new_consensus_is_checked_and_recorded_only_in_its_window() {
+        let mut ov = Ov::memory();
+        let sks: Vec<_> = (0..4u8).map(|i| crate::bls_agg::derive_bls_key(&[i + 1; 32])).collect();
+        let addrs: Vec<String> = (0..4).map(|i| format!("egot1tm{i}")).collect();
+        for (i, a) in addrs.iter().enumerate() {
+            let pop_key = hex::encode(crate::bls_agg::bls_pubkey(&sks[i]));
+            save_rec(&mut ov, a, &NodeRec { idx: i as u64, pop_key, ..NodeRec::default() });
+        }
+        let e = epoch_of(TENDERMINT_FROM_HEIGHT);
+        let rota = Rota { seed: "seed".into(), members: addrs.clone() };
+        ov.put(rota_key(e), serde_json::to_vec(&rota).unwrap());
+        ov.commit_memory();
+        let signed = |signers: &[usize], msg: &dyn Fn(u64) -> Vec<u8>| -> String {
+            let sigs: Vec<Vec<u8>> = signers.iter().map(|i| crate::bls_agg::sign_shared(&sks[*i], &msg(e))).collect();
+            let ids: Vec<u64> = signers.iter().map(|i| *i as u64).collect();
+            let agg = crate::bls_agg::aggregate_shared(&sigs).unwrap();
+            serde_json::to_string(&ReadyBatch { epoch: e, sig: hex::encode(agg), members: encode_members(&ids) }).unwrap()
+        };
+        let good = signed(&[0, 1, 2], &|ep| tm_ready_message(ep, "seed"));
+        let old_kind = signed(&[0, 1, 2], &|ep| ready_message(ep, "seed"));
+        let ts = 1_900_000_000i64;
+        let check = |ov: &Ov, height: u64, args: &str| {
+            let tx = batch_tx(TX_TM_READY_BATCH, height, ts, args.to_string());
+            validate_batches(ov, &block(height, ts), &[tx], |_| None)
+        };
+        let open = TENDERMINT_FROM_HEIGHT - EPOCH + 5;
+        assert!(check(&ov, open, &good).is_ok(), "{:?}", check(&ov, open, &good));
+        assert!(check(&ov, open, &old_kind).is_err(), "a signature on the old ready message is not consent to the new consensus");
+        assert!(check(&ov, TENDERMINT_FROM_HEIGHT - EPOCH + READY_DEADLINE + 1, &good).is_err(), "after the window closes");
+        assert!(check(&ov, TENDERMINT_FROM_HEIGHT - 2 * EPOCH + 5, &good).is_err(), "before the epoch that leads into the switch");
+        let forged = signed(&[0, 1], &|ep| tm_ready_message(ep, "seed")).replace("\"members\":\"", "\"members\":\"x");
+        assert!(check(&ov, open, &forged).is_err());
+        assert!(!tendermint_active(&ov, TENDERMINT_FROM_HEIGHT));
+        let tx = batch_tx(TX_TM_READY_BATCH, open, ts, good);
+        let _ = apply_block(&mut ov, &block(open, ts), &[&tx], 0, "seed");
+        assert_eq!(tm_ready_members(&ov, TENDERMINT_FROM_HEIGHT), addrs[..3].to_vec());
+        assert!(tendermint_active(&ov, TENDERMINT_FROM_HEIGHT));
+        assert_eq!(draw_pool(&ov, TENDERMINT_FROM_HEIGHT), addrs[..3].to_vec());
+    }
+
+    #[test]
+    fn the_new_consensus_runs_only_when_three_nodes_are_ready_under_it() {
+        let mut ov = Ov::memory();
+        let h = TENDERMINT_FROM_HEIGHT;
+        let e = epoch_of(h);
+        let rota = Rota { seed: "s".into(), members: (0..5).map(|i| format!("egot1n{i}")).collect() };
+        ov.put(rota_key(e), serde_json::to_vec(&rota).unwrap());
+        let mut old_ready = Vec::new();
+        for i in 0..5 {
+            set_bit(&mut old_ready, i);
+        }
+        ov.put(ready_key(e), old_ready);
+        assert!(!tendermint_active(&ov, h), "being ready under the old rules does not count");
+        let mut bits = Vec::new();
+        set_bit(&mut bits, 0);
+        set_bit(&mut bits, 3);
+        ov.put(tm_ready_key(e), bits.clone());
+        assert!(!tendermint_active(&ov, h), "two nodes on the new rules are not enough");
+        assert_eq!(draw_pool(&ov, h).len(), 5, "until then everyone ready keeps making blocks the old way");
+        set_bit(&mut bits, 4);
+        ov.put(tm_ready_key(e), bits);
+        assert!(tendermint_active(&ov, h));
+        assert!(!tendermint_active(&ov, h - 1), "the epoch before keeps the old rules");
+        assert_eq!(tm_ready_members(&ov, h), vec!["egot1n0", "egot1n3", "egot1n4"]);
+        assert_eq!(draw_pool(&ov, h), tm_ready_members(&ov, h), "old nodes are left out of the draw");
+        let mut seated = committee(&ov, h, 0);
+        seated.sort();
+        assert_eq!(seated, vec!["egot1n0", "egot1n3", "egot1n4"], "with three ready nodes the committee is all three");
+    }
 
     #[test]
     fn an_undo_record_puts_every_touched_key_back() {

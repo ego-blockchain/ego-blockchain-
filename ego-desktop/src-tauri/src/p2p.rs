@@ -1306,6 +1306,9 @@ pub fn consensus_state_summary() -> String {
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default();
+    if let Some(s) = crate::tm_live::status_line() {
+        return format!("chain tip {tip}; consensus {s}; last block refused: {}", if last_reject.is_empty() { "nothing" } else { &last_reject });
+    }
     format!(
         "chain tip {tip}; engine height {}; round {}; committee {} of {} seated from {}; walk-back {}; last block refused: {}",
         engine_h.map(|h| h.to_string()).unwrap_or_else(|| "none (no host)".into()),
@@ -1719,7 +1722,7 @@ async fn ensure_shadow_host() -> bool {
     shadow_host_lock().is_some()
 }
 
-async fn shadow_publish(msg: &P2PMessage) {
+pub(crate) async fn shadow_publish(msg: &P2PMessage) {
     if let Ok(data) = serde_json::to_vec(msg) {
         publish_gossip(V2_TOPIC, data).await;
     }
@@ -1814,7 +1817,7 @@ async fn v2_resend_due() {
     }
 }
 
-async fn send_to_group(height: u64, msgs: Vec<P2PMessage>) {
+pub(crate) async fn send_to_group(height: u64, msgs: Vec<P2PMessage>) {
     let members: Vec<String> = tokio::task::spawn_blocking(move || {
         let me = crate::ledger::Ledger::load().address;
         crate::chain_db::committee_for_height(height, crate::clock::now())
@@ -1894,6 +1897,7 @@ pub async fn shadow_on_proposal(
     peer_round: u32,
 ) {
     if !consensus_v2_active() { return; }
+    if crate::chain_db::tendermint_active(header.height) { return; }
     let vouched = if founders_retired() {
         drs_vote_candidates(header.height).contains(&header.proposer)
     } else {
@@ -1959,10 +1963,20 @@ pub async fn shadow_on_proposal(
         }
         v2_pending_blocks().insert(header.block_hash(), (block, txs));
     }
-    let vote = {
+    let drs_height = crate::chain_db::drs_active(header.height);
+    let vote = if drs_height {
+        let hash = header.block_hash().to_hex();
+        crate::tm_live::v2_vote_guarded(header.height, &hash, || {
+            let guard = shadow_host_lock();
+            guard.as_ref().and_then(|h| h.on_proposal(&header))
+        })
+    } else {
         let guard = shadow_host_lock();
         guard.as_ref().and_then(|h| h.on_proposal(&header))
     };
+    if vote.is_none() && drs_height && consensus_v2_live_enabled() {
+        drs_observer_try_commit(header.block_hash()).await;
+    }
     if let Some(v) = vote {
         let tag = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
         eprintln!("[ConsensusV2/{}] voted h={} round={}", tag, header.height, v.round);
@@ -1975,6 +1989,7 @@ pub async fn shadow_on_proposal(
 /// PERSIST the agreed LedgerBlock to the real chain; in shadow mode just log.
 pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
     if !consensus_v2_active() { return; }
+    if crate::chain_db::tendermint_active(vote.height) { return; }
 
     // Route by height: a vote for height N can outrun the proposal it certifies (or our
     // own finalization of N-1). Buffer future-height votes and replay them when the engine
@@ -2010,7 +2025,12 @@ pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
             })
         })
     };
-    let Some((ht, hash, vc, ok, cert_hdr)) = decided else { return };
+    let Some((ht, hash, vc, ok, cert_hdr)) = decided else {
+        if consensus_v2_live_enabled() && crate::chain_db::drs_active(vote.height) {
+            drs_observer_try_commit(vote.block_hash).await;
+        }
+        return;
+    };
     if consensus_v2_live_enabled() {
         let payload = v2_pending_blocks().remove(&hash);
         v2_pending_headers().remove(&hash);
@@ -2058,6 +2078,7 @@ pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
 /// A v2 view-change arrived.
 pub async fn shadow_on_view_change(msg: ego_consensus_core::fork_choice::ViewChangeMsg) {
     if !consensus_v2_active() { return; }
+    if crate::chain_db::tendermint_active(msg.height) { return; }
     let new_round = {
         let guard = shadow_host_lock();
         guard.as_ref().and_then(|h| h.on_view_change(msg))
@@ -2072,7 +2093,15 @@ pub async fn shadow_on_view_change(msg: ego_consensus_core::fork_choice::ViewCha
 /// proposed it yet, build a candidate (real block in LIVE, empty in shadow), propose,
 /// publish, and self-vote.
 pub async fn shadow_v2_tick() {
-    if !consensus_v2_active() || !ensure_shadow_host().await { return; }
+    if !consensus_v2_active() { return; }
+    if consensus_v2_live_enabled() && crate::tm_live::tick().await {
+        let mut g = shadow_host_lock();
+        if g.is_some() {
+            *g = None;
+        }
+        return;
+    }
+    if !ensure_shadow_host().await { return; }
     if proposing_suspended() { return; }
 
     // Follow the live validator set: rebuild the committee when a node joins/drops (so a
@@ -2257,7 +2286,7 @@ async fn emit_v2_proposal() {
 
 /// Build a real LedgerBlock candidate from the mempool for the v2 LIVE proposer,
 /// mirroring the inline proposer's assembly so the persisted block is fully valid.
-async fn build_live_candidate() -> Option<(crate::ledger::LedgerBlock, Vec<LedgerTx>)> {
+pub(crate) async fn build_live_candidate() -> Option<(crate::ledger::LedgerBlock, Vec<LedgerTx>)> {
     let miner = crate::ledger::Ledger::load().address;
     if miner.is_empty() { return None; }
     let seed = get_ed25519_seed()?;
@@ -3826,6 +3855,11 @@ pub enum P2PMessage {
         pos: u64,
         sig: String,
     },
+    DrsReadyTm {
+        epoch: u64,
+        pos: u64,
+        sig: String,
+    },
     DrsBeacon {
         prover: String,
         challenge: u64,
@@ -4051,6 +4085,26 @@ pub enum P2PMessage {
     /// Engine view-change (carries the sender's high-QC for HotStuff safety).
     BftV2ViewChange {
         msg: ego_consensus_core::fork_choice::ViewChangeMsg,
+    },
+
+    TmProposal {
+        height: u64,
+        round: u32,
+        pol_round: Option<u32>,
+        block: LedgerBlock,
+        transactions: Vec<LedgerTx>,
+        proposer: String,
+        sig: String,
+        #[serde(default)]
+        pol_votes: Vec<(String, String)>,
+    },
+    TmVote {
+        height: u64,
+        round: u32,
+        kind: u8,
+        value: Option<String>,
+        voter: String,
+        sig: String,
     },
 
     ValidatorLeaving {
@@ -8321,7 +8375,7 @@ async fn handle_event(
                 let data = message.data.clone();
                 tokio::spawn(crate::gateway::receive_gossip(data));
             } else if topic == DRS_TOPIC {
-                if let Ok(msg @ (P2PMessage::DrsCheckin { .. } | P2PMessage::DrsReady { .. } | P2PMessage::DrsCoverage { .. } | P2PMessage::DrsStateVote { .. })) =
+                if let Ok(msg @ (P2PMessage::DrsCheckin { .. } | P2PMessage::DrsReady { .. } | P2PMessage::DrsReadyTm { .. } | P2PMessage::DrsCoverage { .. } | P2PMessage::DrsStateVote { .. })) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     let app2 = app.cloned();
@@ -9148,6 +9202,9 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         P2PMessage::BftV2ViewChange { msg } => {
             shadow_on_view_change(msg).await;
         }
+        msg @ (P2PMessage::TmProposal { .. } | P2PMessage::TmVote { .. }) => {
+            crate::tm_live::on_message(msg).await;
+        }
 
         // Unsealed in the gossip arm of handle_event, which then dispatches the
         // inner message here. Keeping the unseal out of this function is what
@@ -9159,6 +9216,9 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         }
         P2PMessage::DrsReady { epoch, pos, sig } => {
             receive_drs_ready(epoch, pos, sig).await;
+        }
+        P2PMessage::DrsReadyTm { epoch, pos, sig } => {
+            receive_tm_ready(epoch, pos, sig).await;
         }
         P2PMessage::DrsBeacon { prover, challenge, reply_to } => {
             answer_drs_beacon(prover, challenge, reply_to).await;
@@ -12281,6 +12341,7 @@ pub fn maybe_emit_validator_registration() {
 pub fn maybe_send_uptime_checkin() {
     static LAST_CHECKIN: AtomicI64 = AtomicI64::new(0);
     static LAST_READY: AtomicI64 = AtomicI64::new(0);
+    static LAST_TM_READY: AtomicI64 = AtomicI64::new(0);
     if is_observer() { return; }
     if let Some(reason) = crate::commands::coverage::earning_block_reason() {
         static LAST_SAID: AtomicI64 = AtomicI64::new(0);
@@ -12329,6 +12390,18 @@ pub fn maybe_send_uptime_checkin() {
             eprintln!("[DRS] drawn for epoch {} (seat {pos}) — said ready", epoch + 1);
         }
     }
+    if crate::drs::tm_ready_epoch_at(next_height) == Some(epoch + 1)
+        && now - LAST_TM_READY.load(Ordering::Relaxed) >= 120
+    {
+        if let Some((pos, seed, false)) = crate::chain_db::drs_tm_rota_position(epoch + 1, &addr) {
+            let sig = crate::bls_agg::sign_shared(sk, &crate::drs::tm_ready_message(epoch + 1, &seed));
+            ready_tm_pool().insert((epoch + 1, pos as u64), (sig.clone(), my_key.clone()));
+            LAST_TM_READY.store(now, Ordering::Relaxed);
+            let msg = P2PMessage::DrsReadyTm { epoch: epoch + 1, pos: pos as u64, sig: hex::encode(sig) };
+            tauri::async_runtime::spawn(async move { send_drs_message(msg).await; });
+            eprintln!("[DRS] said ready for the new consensus in epoch {} (seat {pos})", epoch + 1);
+        }
+    }
 }
 
 const DRS_TOPIC: &str = "ego-drs-v1";
@@ -12347,11 +12420,39 @@ fn ready_pool() -> std::sync::MutexGuard<'static, SigPool> {
     READY_POOL.get_or_init(|| std::sync::Mutex::new(Default::default())).lock().unwrap_or_else(|e| e.into_inner())
 }
 
+static READY_TM_POOL: std::sync::OnceLock<std::sync::Mutex<SigPool>> = std::sync::OnceLock::new();
+
+fn ready_tm_pool() -> std::sync::MutexGuard<'static, SigPool> {
+    READY_TM_POOL.get_or_init(|| std::sync::Mutex::new(Default::default())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+async fn receive_tm_ready(epoch: u64, pos: u64, sig: String) {
+    let tip = crate::chain_db::latest_block_info().0;
+    if crate::drs::tm_ready_epoch_at(tip.saturating_add(1)) != Some(epoch) {
+        return;
+    }
+    if ready_tm_pool().contains_key(&(epoch, pos)) {
+        return;
+    }
+    let Ok(sig_bytes) = hex::decode(&sig) else { return };
+    let signer = tokio::task::spawn_blocking(move || crate::chain_db::drs_tm_ready_signer(epoch, pos))
+        .await
+        .ok()
+        .flatten();
+    let Some((seed, pop_key)) = signer else { return };
+    let Ok(pk) = hex::decode(&pop_key) else { return };
+    if !crate::bls_agg::verify_shared(&sig_bytes, &pk, &crate::drs::tm_ready_message(epoch, &seed)) {
+        return;
+    }
+    ready_tm_pool().insert((epoch, pos), (sig_bytes, pop_key));
+}
+
 fn prune_drs_pools(tip: u64) {
     checkin_pool().retain(|(_, anchor), _| tip.saturating_sub(*anchor) <= crate::drs::ANCHOR_MAX_AGE);
     coverage_pool().retain(|_, p| tip.saturating_sub(p.challenge) <= crate::drs::ANCHOR_MAX_AGE);
     let epoch = crate::drs::epoch_of(tip.saturating_add(1));
     ready_pool().retain(|(e, _), _| *e > epoch);
+    ready_tm_pool().retain(|(e, _), _| *e > epoch);
 }
 
 fn pooled(pool: &SigPool) -> Vec<crate::chain_db::PooledSig> {
@@ -12363,8 +12464,9 @@ fn pooled(pool: &SigPool) -> Vec<crate::chain_db::PooledSig> {
 pub fn drs_batches_for(height: u64, now: i64) -> Vec<LedgerTx> {
     let checkins = pooled(&checkin_pool());
     let readies = pooled(&ready_pool());
+    let tm_readies = pooled(&ready_tm_pool());
     let coverage: Vec<crate::drs::CoverageProof> = coverage_pool().values().cloned().collect();
-    let mut out = crate::chain_db::drs_build_batches(height, now, checkins, readies, coverage);
+    let mut out = crate::chain_db::drs_build_batches(height, now, checkins, readies, tm_readies, coverage);
     if let Some(tx) = crate::chain_db::state_cert_tx_for(height, now, state_cert_votes_for_block()) {
         out.push(tx);
     }

@@ -5248,14 +5248,37 @@ pub fn validate_proposal_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<
     validate_peer_block_impl(block, txs, true)
 }
 
+pub fn validate_tm_block(block: &LedgerBlock, txs: &[LedgerTx], parent_ts: i64) -> Result<(), String> {
+    if block.timestamp < parent_ts {
+        return Err(format!("block #{} is stamped before its parent", block.height));
+    }
+    let ahead = block.timestamp - crate::clock::now();
+    if ahead > MAX_PROPOSAL_CLOCK_SKEW_SECS {
+        return Err(format!(
+            "block #{} from {} is stamped {}s ahead of this node's clock",
+            block.height, block.miner, ahead
+        ));
+    }
+    validate_peer_block_checked(block, txs, true, false)
+}
+
 fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: bool) -> Result<(), String> {
+    validate_peer_block_checked(block, txs, is_proposal, is_proposal)
+}
+
+fn validate_peer_block_checked(
+    block: &LedgerBlock,
+    txs: &[LedgerTx],
+    is_proposal: bool,
+    check_clock: bool,
+) -> Result<(), String> {
     if block.height == 0 {
         return if block.hash == GENESIS_HASH { Ok(()) } else { Err("invalid genesis hash".into()) };
     }
     if !verify_block_hash(block, txs) {
         return Err("block hash/merkle verification failed".into());
     }
-    if is_proposal {
+    if check_clock {
         let skew = block.timestamp - crate::clock::now();
         if skew.abs() > MAX_PROPOSAL_CLOCK_SKEW_SECS {
             return Err(format!(
@@ -9733,6 +9756,7 @@ pub fn drs_build_batches(
     now: i64,
     checkins: Vec<PooledSig>,
     readies: Vec<PooledSig>,
+    tm_readies: Vec<PooledSig>,
     coverage: Vec<crate::drs::CoverageProof>,
 ) -> Vec<LedgerTx> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
@@ -9821,7 +9845,74 @@ pub fn drs_build_batches(
             }
         }
     }
+    if let Some(next) = crate::drs::tm_ready_epoch_at(height) {
+        if let Some(rota) = crate::drs::load_rota(&ov, next) {
+            let bits = crate::drs::tm_ready_set(&ov, next);
+            let mut chosen: Vec<(u64, Vec<u8>)> = tm_readies
+                .into_iter()
+                .filter(|r| r.key.0 == next)
+                .filter(|r| {
+                    let pos = r.key.1 as usize;
+                    let unset = bits.get(pos / 8).map(|b| b & (1 << (pos % 8)) == 0).unwrap_or(true);
+                    unset
+                        && rota
+                            .members
+                            .get(pos)
+                            .and_then(|a| crate::drs::load_rec(&ov, a))
+                            .map_or(false, |rec| rec.pop_key == r.signer)
+                })
+                .map(|r| (r.key.1, r.sig))
+                .collect();
+            chosen.sort_by_key(|(p, _)| *p);
+            chosen.dedup_by_key(|(p, _)| *p);
+            let ids: Vec<u64> = chosen.iter().map(|(p, _)| *p).collect();
+            if !chosen.is_empty() && tm_batch_carriable(db, height, now, &rota, &bits, &ids) {
+                let sigs: Vec<Vec<u8>> = chosen.into_iter().map(|(_, s)| s).collect();
+                if let Some(agg) = crate::bls_agg::aggregate_shared(&sigs) {
+                    let rb = crate::drs::ReadyBatch { epoch: next, sig: hex::encode(agg), members: crate::drs::encode_members(&ids) };
+                    if let Ok(args) = serde_json::to_string(&rb) {
+                        out.push(crate::drs::batch_tx(crate::drs::TX_TM_READY_BATCH, height, now, args));
+                    }
+                }
+            }
+        }
+    }
     out
+}
+
+fn tm_batch_carriable(db: &DB, height: u64, now: i64, rota: &crate::drs::Rota, bits: &[u8], ids: &[u64]) -> bool {
+    if tendermint_active_in(db, height) {
+        return true;
+    }
+    let Some(committee) = committee_for_height_in(db, height, now) else { return false };
+    let signed = |pos: usize| bits.get(pos / 8).map_or(false, |b| b & (1 << (pos % 8)) != 0) || ids.contains(&(pos as u64));
+    let ready: std::collections::BTreeSet<&str> = rota
+        .members
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| signed(*i))
+        .map(|(_, a)| a.as_str())
+        .collect();
+    let on_new_rules = committee.iter().filter(|(a, _)| ready.contains(a.as_str())).count();
+    on_new_rules >= quorum_of(committee.len())
+}
+
+pub fn drs_tm_rota_position(epoch: u64, addr: &str) -> Option<(usize, String, bool)> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let (pos, seed) = crate::drs::rota_position(&ov, epoch, addr)?;
+    let bits = crate::drs::tm_ready_set(&ov, epoch);
+    let ready = bits.get(pos / 8).map(|b| b & (1 << (pos % 8)) != 0).unwrap_or(false);
+    Some((pos, seed, ready))
+}
+
+pub fn drs_tm_ready_signer(epoch: u64, pos: u64) -> Option<(String, String)> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let rota = crate::drs::load_rota(&ov, epoch)?;
+    let addr = rota.members.get(pos as usize)?;
+    let rec = crate::drs::load_rec(&ov, addr)?;
+    (!rec.pop_key.is_empty()).then(|| (rota.seed.clone(), rec.pop_key.clone()))
 }
 
 fn storage_pay_in(db: &DB, ov: &mut crate::drs::Ov, block: &LedgerBlock, txs: &[&LedgerTx]) -> Vec<(String, u64)> {
@@ -9897,9 +9988,26 @@ pub fn proposal_window_open(height: u64, parent_ts: i64, stamp: i64) -> bool {
     (attempt == 0 || stamp >= start.saturating_add(guard)) && stamp < end.saturating_sub(guard)
 }
 
+pub(crate) fn tendermint_active_in(db: &DB, height: u64) -> bool {
+    crate::drs::tendermint_active(&crate::drs::Ov::new(db), height)
+}
+
+pub fn tendermint_active(height: u64) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    tendermint_active_in(db, height)
+}
+
+fn attempt_in(db: &DB, height: u64, parent_ts: i64, stamp: i64) -> i64 {
+    if tendermint_active_in(db, height) {
+        0
+    } else {
+        committee_attempt(height, parent_ts, stamp)
+    }
+}
+
 fn committee_for_height_in(db: &DB, height: u64, stamp: i64) -> Option<Vec<(String, Vec<u8>)>> {
     let parent_ts = block_ts_at_in(db, height.checked_sub(1)?)?;
-    let attempt = committee_attempt(height, parent_ts, stamp);
+    let attempt = attempt_in(db, height, parent_ts, stamp);
     let ov = crate::drs::Ov::new(db);
     let members = crate::drs::committee(&ov, height, attempt);
     let out: Vec<(String, Vec<u8>)> = members
@@ -9932,13 +10040,16 @@ pub fn rota_members(height: u64) -> Option<Vec<String>> {
 pub fn committee_window(height: u64, now: i64) -> Option<(i64, bool)> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let parent_ts = block_ts_at_in(&db, height.checked_sub(1)?)?;
+    if tendermint_active_in(db, height) {
+        return Some((0, true));
+    }
     Some((committee_attempt(height, parent_ts, now), proposal_window_open(height, parent_ts, now)))
 }
 
 pub fn block_attempt(block: &LedgerBlock) -> Option<i64> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let parent_ts = block_ts_at_in(&db, block.height.checked_sub(1)?)?;
-    Some(committee_attempt(block.height, parent_ts, block.timestamp))
+    Some(attempt_in(db, block.height, parent_ts, block.timestamp))
 }
 
 pub fn randao_message(height: u64) -> Vec<u8> {
@@ -10154,11 +10265,88 @@ fn verify_block_certificate_in(db: &DB, block: &LedgerBlock) -> Result<(), Strin
     if block.commit_cert.is_empty() {
         return Err(format!("block #{} carries no committee votes", block.height));
     }
-    let cert: CommitCert = serde_json::from_str(&block.commit_cert)
-        .map_err(|e| format!("block #{} certificate is unreadable: {e}", block.height))?;
     let committee = committee_for_height_in(db, block.height, block.timestamp)
         .ok_or_else(|| format!("no committee known for block #{}", block.height))?;
+    if tendermint_active_in(db, block.height) {
+        let cert: TmCert = serde_json::from_str(&block.commit_cert)
+            .map_err(|e| format!("block #{} certificate is unreadable: {e}", block.height))?;
+        return cert.verify(block, &committee);
+    }
+    let cert: CommitCert = serde_json::from_str(&block.commit_cert)
+        .map_err(|e| format!("block #{} certificate is unreadable: {e}", block.height))?;
     cert.verify(block, &committee)
+}
+
+pub const TM_PREVOTE: u8 = 1;
+pub const TM_PRECOMMIT: u8 = 2;
+pub const TM_CERT_VERSION: u8 = 3;
+
+pub fn tm_vote_message(kind: u8, height: u64, round: u32, value: Option<&str>) -> Vec<u8> {
+    let mut m = b"ego/tendermint/vote/v1:".to_vec();
+    m.push(kind);
+    m.extend_from_slice(&height.to_le_bytes());
+    m.extend_from_slice(&round.to_le_bytes());
+    m.extend_from_slice(value.unwrap_or("").as_bytes());
+    m
+}
+
+pub fn tm_proposal_message(height: u64, round: u32, pol_round: Option<u32>, value: &str) -> Vec<u8> {
+    let mut m = b"ego/tendermint/proposal/v1:".to_vec();
+    m.extend_from_slice(&height.to_le_bytes());
+    m.extend_from_slice(&round.to_le_bytes());
+    m.extend_from_slice(&pol_round.map_or(u64::MAX, |r| r as u64).to_le_bytes());
+    m.extend_from_slice(value.as_bytes());
+    m
+}
+
+pub fn tm_value_id(hash: &str) -> [u8; 32] {
+    hex32(hash).unwrap_or_else(|| *blake3::hash(hash.as_bytes()).as_bytes())
+}
+
+pub fn tm_signature_ok(pk: &[u8], msg: &[u8], sig_b64: &str) -> bool {
+    let Some(sig) = decode_vote_sig(sig_b64) else { return false };
+    ego_core::verify_signature(
+        &ego_core::PublicKey::dilithium2(pk.to_vec()),
+        msg,
+        &ego_core::Signature::dilithium2(sig),
+    )
+    .unwrap_or(false)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TmCert {
+    pub v: u8,
+    pub round: u32,
+    pub votes: Vec<(String, String)>,
+}
+
+impl TmCert {
+    pub fn verify(&self, block: &LedgerBlock, committee: &[(String, Vec<u8>)]) -> Result<(), String> {
+        if self.v != TM_CERT_VERSION {
+            return Err(format!("block #{} carries a certificate of another kind", block.height));
+        }
+        if !committee.iter().any(|(a, _)| *a == block.miner) {
+            return Err(format!("block #{} was made by {} who is not on its committee", block.height, block.miner));
+        }
+        let msg = tm_vote_message(TM_PRECOMMIT, block.height, self.round, Some(&block.hash));
+        let mut seen: std::collections::BTreeSet<&str> = Default::default();
+        for (voter, sig) in &self.votes {
+            let Some((_, pk)) = committee.iter().find(|(a, _)| a == voter) else {
+                return Err(format!("{voter} is not on the committee of block #{}", block.height));
+            };
+            if !seen.insert(voter.as_str()) {
+                return Err(format!("{voter} is counted twice in the certificate of block #{}", block.height));
+            }
+            if !tm_signature_ok(pk, &msg, sig) {
+                return Err(format!("commit vote from {voter} for block #{} does not verify", block.height));
+            }
+        }
+        let quorum = quorum_of(committee.len());
+        if seen.len() < quorum {
+            return Err(format!("block #{} has {} of the {} commit votes it needs", block.height, seen.len(), quorum));
+        }
+        Ok(())
+    }
 }
 
 fn drs_block_rules_in(db: &DB, block: &LedgerBlock, txs: &[LedgerTx], is_proposal: bool) -> Result<(), String> {
@@ -11575,5 +11763,129 @@ mod credits_price_tests {
         let mut unpriced = mint(1_000_000);
         unpriced.memo = None;
         assert!(validate_credits_mint_against(&unpriced, Some(1_000_000)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tm_cert_tests {
+    use super::*;
+
+    fn block() -> LedgerBlock {
+        LedgerBlock {
+            height: 33_150,
+            hash: "ab".repeat(32),
+            miner: "egot1member0".into(),
+            ..LedgerBlock::default()
+        }
+    }
+
+    fn committee(kps: &[ego_core::KeyPair]) -> Vec<(String, Vec<u8>)> {
+        kps.iter().enumerate().map(|(i, k)| (format!("egot1member{i}"), k.dilithium_public_key().key_data)).collect()
+    }
+
+    fn vote(k: &ego_core::KeyPair, kind: u8, b: &LedgerBlock, round: u32) -> String {
+        encode_vote_sig(&k.sign_dilithium(&tm_vote_message(kind, b.height, round, Some(&b.hash))).signature_data)
+    }
+
+    fn cert(b: &LedgerBlock, round: u32, voters: &[(usize, &ego_core::KeyPair)]) -> TmCert {
+        TmCert {
+            v: TM_CERT_VERSION,
+            round,
+            votes: voters.iter().map(|(i, k)| (format!("egot1member{i}"), vote(k, TM_PRECOMMIT, b, round))).collect(),
+        }
+    }
+
+    #[test]
+    fn three_of_four_commit_votes_finalize_and_two_do_not() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let b = block();
+        assert!(cert(&b, 2, &[(0, &kps[0]), (1, &kps[1]), (2, &kps[2])]).verify(&b, &c).is_ok());
+        assert!(cert(&b, 0, &[(1, &kps[1]), (2, &kps[2]), (3, &kps[3])]).verify(&b, &c).is_ok());
+        assert!(cert(&b, 2, &[(0, &kps[0]), (1, &kps[1])]).verify(&b, &c).is_err());
+        assert!(cert(&b, 2, &[(0, &kps[0]), (0, &kps[0]), (1, &kps[1])]).verify(&b, &c).is_err());
+    }
+
+    #[test]
+    fn a_committee_of_three_needs_all_three() {
+        let kps: Vec<_> = (0..3).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let b = block();
+        assert!(cert(&b, 0, &[(0, &kps[0]), (1, &kps[1]), (2, &kps[2])]).verify(&b, &c).is_ok());
+        assert!(cert(&b, 0, &[(0, &kps[0]), (1, &kps[1])]).verify(&b, &c).is_err());
+    }
+
+    #[test]
+    fn prevotes_and_votes_from_another_round_are_not_commit_votes() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let b = block();
+        let prevotes = TmCert {
+            v: TM_CERT_VERSION,
+            round: 1,
+            votes: (0..3).map(|i| (format!("egot1member{i}"), vote(&kps[i], TM_PREVOTE, &b, 1))).collect(),
+        };
+        assert!(prevotes.verify(&b, &c).is_err());
+        let mut moved = cert(&b, 1, &[(0, &kps[0]), (1, &kps[1]), (2, &kps[2])]);
+        moved.round = 2;
+        assert!(moved.verify(&b, &c).is_err());
+        let mut mixed = cert(&b, 1, &[(0, &kps[0]), (1, &kps[1])]);
+        mixed.votes.push(("egot1member2".into(), vote(&kps[2], TM_PRECOMMIT, &b, 0)));
+        assert!(mixed.verify(&b, &c).is_err());
+    }
+
+    #[test]
+    fn votes_for_another_block_or_from_outside_are_refused() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let outsiders: Vec<_> = (0..3).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let b = block();
+        let mut other = b.clone();
+        other.hash = "99".repeat(32);
+        assert!(cert(&other, 0, &[(0, &kps[0]), (1, &kps[1]), (2, &kps[2])]).verify(&b, &c).is_err());
+        assert!(cert(&b, 0, &[(0, &outsiders[0]), (1, &outsiders[1]), (2, &outsiders[2])]).verify(&b, &c).is_err());
+        let mut stranger = cert(&b, 0, &[(0, &kps[0]), (1, &kps[1])]);
+        stranger.votes.push(("egot1stranger".into(), vote(&outsiders[0], TM_PRECOMMIT, &b, 0)));
+        assert!(stranger.verify(&b, &c).is_err());
+    }
+
+    #[test]
+    fn the_maker_must_sit_on_the_committee_and_the_kind_must_match() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let mut b = block();
+        let good = cert(&b, 0, &[(0, &kps[0]), (1, &kps[1]), (2, &kps[2])]);
+        b.miner = "egot1somebodyelse".into();
+        assert!(good.verify(&b, &c).is_err());
+        let b = block();
+        let mut wrong_kind = good.clone();
+        wrong_kind.v = 2;
+        assert!(wrong_kind.verify(&b, &c).is_err());
+        let old_style = r#"{"header":{"height":1},"votes":[]}"#;
+        assert!(serde_json::from_str::<TmCert>(old_style).is_err());
+    }
+
+    #[test]
+    fn a_block_hash_names_its_value_both_ways() {
+        let h = "6cf2f8a96ae1cbf9f7c19d7e62947cf6ccb0205c4aa771646fef19caf41291ab";
+        assert_eq!(hex::encode(tm_value_id(h)), h);
+    }
+
+    #[test]
+    fn the_new_rules_start_on_an_epoch_without_turning_old_nodes_away_first() {
+        let start = crate::drs::TENDERMINT_FROM_HEIGHT;
+        assert_eq!(start % crate::drs::EPOCH, 1, "the switch must open an epoch");
+        let e = crate::drs::epoch_of(start);
+        assert_eq!(
+            crate::drs::ready_version(e),
+            crate::drs::ready_version(e - 1),
+            "old nodes must keep saying ready the way they do now, or they would split off before the switch"
+        );
+        assert_eq!(RULES_VERSION, 3, "nothing old nodes applied becomes invalid, so nobody has to download the chain again");
+        assert_eq!(crate::drs::tm_ready_epoch_at(start - crate::drs::EPOCH), Some(e));
+        assert_eq!(crate::drs::tm_ready_epoch_at(start - crate::drs::EPOCH + crate::drs::READY_DEADLINE - 1), Some(e));
+        assert_eq!(crate::drs::tm_ready_epoch_at(start - crate::drs::EPOCH + crate::drs::READY_DEADLINE), None);
+        assert_eq!(crate::drs::tm_ready_epoch_at(start - 2 * crate::drs::EPOCH), None, "no signal before the epoch that leads into the switch");
+        assert_eq!(crate::drs::tm_ready_epoch_at(start), Some(e + 1), "the signal is collected again for every later epoch");
     }
 }

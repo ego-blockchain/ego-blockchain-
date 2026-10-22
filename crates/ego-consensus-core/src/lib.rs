@@ -8,6 +8,7 @@
 pub mod error;
 pub mod bft;
 pub mod fork_choice;
+pub mod tendermint;
 
 pub use bft::{BftEngine, BlockHeader, BlockRoots, QuorumCertificate, Vote};
 pub use fork_choice::{ForkChoiceStore, ViewChangeMsg};
