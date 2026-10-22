@@ -1,0 +1,50 @@
+name: Build & Deploy Ego Relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Copy the new relay to the server and restart it"
+        type: boolean
+        default: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-and-deploy:
+    name: Build Linux x64 (+ deploy when asked)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build ego-relay (static Linux binary)
+        run: cargo build --release -p ego-relay --target x86_64-unknown-linux-musl
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ego-relay-linux
+          path: target/x86_64-unknown-linux-musl/release/ego-relay
+
+      - name: Deploy to relay server
+        env:
+          SSH_KEY:     ${{ secrets.RELAY_SSH_KEY }}
+          RELAY_HOST:  ${{ secrets.RELAY_HOST }}
+          RELAY_USER:  ${{ secrets.RELAY_USER }}
+        if: ${{ inputs.deploy && env.SSH_KEY != '' }}
+        run: |
+          echo "$SSH_KEY" > /tmp/relay_key && chmod 600 /tmp/relay_key
+          scp -i /tmp/relay_key -o StrictHostKeyChecking=no \
+            target/x86_64-unknown-linux-musl/release/ego-relay \
+            $RELAY_USER@$RELAY_HOST:/tmp/ego-relay
+          ssh -i /tmp/relay_key -o StrictHostKeyChecking=no $RELAY_USER@$RELAY_HOST \
+            'sudo cp /usr/local/bin/ego-relay /usr/local/bin/ego-relay.previous 2>/dev/null; sudo mv /tmp/ego-relay /usr/local/bin/ego-relay && sudo chmod +x /usr/local/bin/ego-relay && sudo systemctl restart ego-relay && sleep 3 && systemctl is-active ego-relay'
