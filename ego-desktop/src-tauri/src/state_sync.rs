@@ -9,6 +9,7 @@ pub const PART_CONTRACTS: u8 = 1;
 pub const TIP_BLOCKS: u64 = 320;
 const KEEP_DIRS: usize = 3;
 const SERVER_SHARE: u8 = 16;
+const EVERYONE_SERVES_BELOW: u64 = 1_024;
 pub type Entry = (u8, Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -178,6 +179,9 @@ fn serves_state() -> bool {
         return false;
     }
     if crate::p2p::history_archive_mode(&me) {
+        return true;
+    }
+    if crate::drs::node_count(&crate::drs::Ov::new(crate::chain_db::global_db())) < EVERYONE_SERVES_BELOW {
         return true;
     }
     if let (Some(key), Some((open, signers))) = (crate::p2p::my_bls_pubkey(), crate::chain_db::state_cert_open()) {

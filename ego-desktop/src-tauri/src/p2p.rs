@@ -5708,6 +5708,10 @@ static ORACLE_CATCH_UP_WANTED: AtomicBool = AtomicBool::new(false);
 
 async fn oracle_catch_up() {
     static RUNNING: AtomicBool = AtomicBool::new(false);
+    let tip = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0).await.unwrap_or(0);
+    if tokio::task::spawn_blocking(move || below_checkpoint_here(tip)).await.unwrap_or(false) {
+        return;
+    }
     if offline_mode() || RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -5781,6 +5785,22 @@ async fn oracle_catch_up() {
 
 const SYNC_REQUEST_EVERY_MS: i64 = 8_000;
 const SYNC_GOSSIP_EVERY_MS: i64 = 30_000;
+const JOIN_CERTS_EVERY_MS: i64 = 5_000;
+const JOIN_BROADCAST_EVERY_MS: i64 = 30_000;
+const BANNER_LAG: u64 = 100;
+
+pub(crate) fn below_checkpoint(height: u64, archive: bool) -> bool {
+    !archive && height < crate::state_cert::STATE_CERT_FROM_HEIGHT
+}
+
+pub(crate) fn must_start_over_before_install(local: u64, archive: bool) -> bool {
+    local > 0 && below_checkpoint(local, archive)
+}
+
+fn below_checkpoint_here(height: u64) -> bool {
+    height < crate::state_cert::STATE_CERT_FROM_HEIGHT
+        && below_checkpoint(height, history_archive_mode(&crate::ledger::Ledger::load().address))
+}
 
 pub async fn sync_chain_from_peers() {
     static LAST_SYNC_REQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -5794,6 +5814,19 @@ pub async fn sync_chain_from_peers() {
     let now = chrono::Utc::now().timestamp_millis();
     let my_height = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
         .await.unwrap_or(0);
+    if tokio::task::spawn_blocking(move || below_checkpoint_here(my_height)).await.unwrap_or(false) {
+        static LAST_CERTS_ASK: AtomicI64 = AtomicI64::new(0);
+        static LAST_JOIN_BROADCAST: AtomicI64 = AtomicI64::new(0);
+        if now - LAST_JOIN_BROADCAST.load(Ordering::Relaxed) >= JOIN_BROADCAST_EVERY_MS {
+            LAST_JOIN_BROADCAST.store(now, Ordering::Relaxed);
+            LAST_CERTS_ASK.store(now, Ordering::Relaxed);
+            request_snapshot_because_stuck(snapshot_request_height(my_height)).await;
+        } else if now - LAST_CERTS_ASK.load(Ordering::Relaxed) >= JOIN_CERTS_EVERY_MS {
+            LAST_CERTS_ASK.store(now, Ordering::Relaxed);
+            request_state_certs().await;
+        }
+        return;
+    }
     let last = LAST_SYNC_REQ.load(std::sync::atomic::Ordering::Relaxed);
     let progressed = my_height > LAST_REQ_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
     if !sync_request_due(now - last, progressed) { return; }
@@ -13031,6 +13064,8 @@ const STATE_SYNC_INFLIGHT: usize = 8;
 const STATE_SYNC_TIMEOUT_SECS: i64 = 15;
 const STATE_TIP_RETRY_SECS: i64 = 8;
 const STATE_TIP_ASK: usize = 3;
+const STATE_CHUNK_ASK: usize = 2;
+const STATE_SYNC_TICK_SECS: u64 = 2;
 const STATE_JOIN_PATIENCE_SECS: i64 = 300;
 const STATE_SYNC_MIN_LEAD: u64 = 100;
 const STATE_CERTS_PER_REPLY: usize = 64;
@@ -13218,7 +13253,9 @@ struct StateSyncJob {
     cert: crate::state_cert::StateCert,
     servers: Vec<String>,
     queue: std::collections::VecDeque<(u8, u64)>,
-    inflight: HashMap<String, (u8, u64, i64)>,
+    inflight: HashMap<String, (u8, u64, i64, String)>,
+    completed: std::collections::HashSet<(u8, u64)>,
+    tip_asks: u32,
     done: u64,
     total: u64,
     tips: Option<Vec<LedgerBlock>>,
@@ -13354,6 +13391,8 @@ async fn start_state_sync(cert: crate::state_cert::StateCert, server: String) {
             servers,
             queue,
             inflight: HashMap::new(),
+            completed: std::collections::HashSet::new(),
+            tip_asks: 0,
             done: 0,
             tips: None,
             tip_nonce: history_nonce(),
@@ -13378,23 +13417,32 @@ async fn pump_state_sync() {
         if job.servers.is_empty() {
             return;
         }
-        let stale: Vec<String> = job.inflight.iter().filter(|(_, (_, _, t))| now - *t > STATE_SYNC_TIMEOUT_SECS).map(|(n, _)| n.clone()).collect();
+        let stale: Vec<String> = job.inflight.iter().filter(|(_, (_, _, t, _))| now - *t > STATE_SYNC_TIMEOUT_SECS).map(|(n, _)| n.clone()).collect();
         for n in stale {
-            if let Some((part, index, _)) = job.inflight.remove(&n) {
-                job.queue.push_back((part, index));
+            if let Some((part, index, _, server)) = job.inflight.remove(&n) {
+                let still_asked = job.inflight.values().any(|(p, i, _, _)| *p == part && *i == index);
+                if !job.completed.contains(&(part, index)) && !still_asked && !job.queue.contains(&(part, index)) {
+                    eprintln!("[StateCert] no answer for part {part} chunk {index} from {server} after {STATE_SYNC_TIMEOUT_SECS}s; asking other peers");
+                    job.queue.push_back((part, index));
+                }
             }
         }
-        while job.inflight.len() < STATE_SYNC_INFLIGHT {
+        while job.inflight.len() + STATE_CHUNK_ASK <= STATE_SYNC_INFLIGHT {
             let Some((part, index)) = job.queue.pop_front() else { break };
-            let server = job.servers[job.turn % job.servers.len()].clone();
-            job.turn += 1;
-            let nonce = history_nonce();
-            job.inflight.insert(nonce.clone(), (part, index, now));
+            if job.completed.contains(&(part, index)) {
+                continue;
+            }
             let height = job.cert.body.height;
-            sends.push((server, P2PMessage::StateChunkRequest { nonce, height, part, index, reply_to: reply_to.clone() }));
+            for server in next_servers(&job.servers, job.turn, STATE_CHUNK_ASK) {
+                let nonce = history_nonce();
+                job.inflight.insert(nonce.clone(), (part, index, now, server.clone()));
+                sends.push((server, P2PMessage::StateChunkRequest { nonce, height, part, index, reply_to: reply_to.clone() }));
+            }
+            job.turn += STATE_CHUNK_ASK;
         }
         if job.tips.is_none() && now - job.tip_asked >= STATE_TIP_RETRY_SECS {
             job.tip_asked = now;
+            job.tip_asks += 1;
             for server in next_servers(&job.servers, job.turn, STATE_TIP_ASK) {
                 sends.push((server, P2PMessage::StateTipRequest { nonce: job.tip_nonce.clone(), height: job.cert.body.height, reply_to: reply_to.clone() }));
             }
@@ -13411,7 +13459,7 @@ async fn receive_state_chunk(nonce: String, data: String, path: Vec<String>) {
     let (part, index, cert) = {
         let guard = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner());
         let Some(job) = guard.as_ref() else { return };
-        let Some((part, index, _)) = job.inflight.get(&nonce) else { return };
+        let Some((part, index, _, _)) = job.inflight.get(&nonce) else { return };
         (*part, *index, job.cert.clone())
     };
     let checked = tokio::task::spawn_blocking(move || {
@@ -13434,13 +13482,22 @@ async fn receive_state_chunk(nonce: String, data: String, path: Vec<String>) {
     let finished = {
         let mut guard = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner());
         let Some(job) = guard.as_mut() else { return };
-        if job.inflight.remove(&nonce).is_none() {
+        let Some((_, _, _, server)) = job.inflight.remove(&nonce) else {
             return;
-        }
+        };
+        let waited = Utc::now().timestamp() - job.started;
         if checked {
-            job.done += 1;
+            if job.completed.insert((part, index)) {
+                job.done += 1;
+                job.inflight.retain(|_, (p, i, _, _)| !(*p == part && *i == index));
+                eprintln!("[StateCert] part {part} chunk {index} from {server} checked ({}/{}) at {waited}s", job.done, job.total);
+            }
         } else {
-            job.queue.push_back((part, index));
+            eprintln!("[StateCert] part {part} chunk {index} from {server} did not match the certificate; asking other peers");
+            let still_asked = job.inflight.values().any(|(p, i, _, _)| *p == part && *i == index);
+            if !job.completed.contains(&(part, index)) && !still_asked && !job.queue.contains(&(part, index)) {
+                job.queue.push_back((part, index));
+            }
         }
         job.done == job.total && job.tips.is_some()
     };
@@ -13463,11 +13520,21 @@ async fn receive_state_tip(nonce: String, blocks: Vec<LedgerBlock>) {
     let b2 = blocks.clone();
     let ok = tokio::task::spawn_blocking(move || crate::chain_db::tip_blocks_ok(&cert, &b2)).await.unwrap_or(false);
     if !ok {
+        eprintln!("[StateCert] {} recent blocks from a peer do not lead to the certified block; waiting for another", blocks.len());
         return;
     }
     let finished = {
         let mut guard = STATE_SYNC.lock().unwrap_or_else(|e| e.into_inner());
         let Some(job) = guard.as_mut() else { return };
+        if job.tips.is_some() {
+            return;
+        }
+        eprintln!(
+            "[StateCert] the {} blocks before the checkpoint arrived at {}s after {} request round(s)",
+            blocks.len(),
+            Utc::now().timestamp() - job.started,
+            job.tip_asks
+        );
         job.tips = Some(blocks);
         job.done == job.total
     };
@@ -13485,6 +13552,20 @@ async fn finish_state_sync() {
         let _ = std::fs::remove_dir_all(crate::state_sync::staging_dir());
         return;
     }
+    let local = crate::chain_db::local_chain_height();
+    let archive = history_archive_mode(&crate::ledger::Ledger::load().address);
+    if must_start_over_before_install(local, archive) {
+        if let Some(app) = APP_HANDLE.get() {
+            eprintln!(
+                "[StateCert] this node replayed {local} old blocks before the checkpoint reached it; clearing them and restarting so it joins exactly like a new node"
+            );
+            if crate::chain_db::request_resync().is_ok() {
+                app.restart();
+                return;
+            }
+        }
+        eprintln!("[StateCert] this node replayed {local} old blocks before the checkpoint reached it; installing over them");
+    }
     let cert = job.cert.clone();
     let result = tokio::task::spawn_blocking(move || crate::chain_db::install_certified_state(&cert, &tips)).await;
     match result {
@@ -13495,6 +13576,13 @@ async fn finish_state_sync() {
         }
         Ok(Err(e)) => eprintln!("[StateCert] could not install the certified state: {e}"),
         Err(_) => {}
+    }
+}
+
+pub async fn run_state_sync_loop() {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(STATE_SYNC_TICK_SECS)).await;
+        state_sync_tick().await;
     }
 }
 
@@ -15528,6 +15616,14 @@ pub async fn run_solo_liveness_watchdog() {
     }
 }
 
+fn banner_state(local: u64) -> &'static str {
+    if state_join_active() || local < crate::state_cert::STATE_CERT_FROM_HEIGHT {
+        "joining"
+    } else {
+        "catching_up"
+    }
+}
+
 fn emit_sync_status(state: &str, local: u64, target: u64, after_sleep: bool) {
     if let Some(h) = APP_HANDLE.get() {
         let _ = h.emit_all("ego://sync-status", serde_json::json!({
@@ -15540,7 +15636,7 @@ fn emit_sync_status(state: &str, local: u64, target: u64, after_sleep: bool) {
 }
 
 pub async fn run_sync_status_watcher() {
-    const LAG_ENTER: u64 = 8;
+    const LAG_ENTER: u64 = BANNER_LAG;
     const LAG_EXIT: u64 = 2;
     const SLEEP_GAP_SECS: i64 = 30;
     const CHECKING_GRACE_SECS: i64 = 20;
@@ -15587,7 +15683,7 @@ pub async fn run_sync_status_watcher() {
                     after_sleep = false;
                     last_progress_emit = now;
                     eprintln!("[SyncStatus] {} blocks behind the network — catching up", behind);
-                    emit_sync_status("catching_up", local, best, false);
+                    emit_sync_status(banner_state(local), local, best, false);
                     if let Some(h) = APP_HANDLE.get() {
                         crate::commands::notifications::notify(
                             h,
@@ -15617,7 +15713,7 @@ pub async fn run_sync_status_watcher() {
                 }
             }
             _ => {
-                if behind <= LAG_EXIT {
+                if behind <= BANNER_LAG && !state_join_active() {
                     state = 0;
                     after_sleep = false;
                     eprintln!("[SyncStatus] Caught up to the network at height {}", local);
@@ -15631,8 +15727,7 @@ pub async fn run_sync_status_watcher() {
                     }
                 } else if now - last_progress_emit >= 2 {
                     last_progress_emit = now;
-                    let shown = if state_join_active() { "joining" } else { "catching_up" };
-                    emit_sync_status(shown, local, best, after_sleep);
+                    emit_sync_status(banner_state(local), local, best, after_sleep);
                 }
             }
         }
@@ -17103,6 +17198,20 @@ mod poison_tx_tests {
             blamed_in(reason, &txs).is_empty(),
             "a whole-block failure must not evict the transactions that happened to be in it",
         );
+    }
+
+    #[test]
+    fn a_new_node_joins_from_the_checkpoint_and_never_replays_the_old_history() {
+        let cp = crate::state_cert::STATE_CERT_FROM_HEIGHT;
+        assert!(super::below_checkpoint(0, false), "an empty node waits for the checkpoint");
+        assert!(super::below_checkpoint(13_817, false), "a node stuck at the old gap does too");
+        assert!(!super::below_checkpoint(cp, false), "from the checkpoint on, blocks are synced as usual");
+        assert!(!super::below_checkpoint(0, true), "a history keeper replays everything");
+        assert!(!super::must_start_over_before_install(0, false), "a new node installs the checkpoint straight away");
+        assert!(super::must_start_over_before_install(13_817, false), "a node that replayed old blocks starts over, so leftovers cannot change its balances");
+        assert!(!super::must_start_over_before_install(cp + 5, false), "a node already past the checkpoint installs a newer one in place");
+        assert!(!super::must_start_over_before_install(13_817, true), "a history keeper keeps what it replayed");
+        assert!(super::BANNER_LAG >= 100, "a node a few blocks behind is not told it is catching up");
     }
 
     #[test]

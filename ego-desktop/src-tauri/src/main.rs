@@ -549,10 +549,11 @@ fn headless_main() {
                 tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
                 tokio::task::spawn_blocking(crate::p2p::maybe_send_uptime_checkin).await.ok();
                 tokio::task::spawn_blocking(crate::p2p::maybe_send_state_vote).await.ok();
-                crate::p2p::state_sync_tick().await;
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             }
         });
+
+        tokio::spawn(crate::p2p::run_state_sync_loop());
 
         tokio::spawn(async {
             crate::p2p::run_porep_challenge_loop().await;
@@ -1530,10 +1531,11 @@ fn main() {
                         tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
                         tokio::task::spawn_blocking(crate::p2p::maybe_send_uptime_checkin).await.ok();
                         tokio::task::spawn_blocking(crate::p2p::maybe_send_state_vote).await.ok();
-                        crate::p2p::state_sync_tick().await;
                         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                     }
                 });
+
+                tokio::spawn(crate::p2p::run_state_sync_loop());
 
                 crate::p2p::restore_dht_cache().await;
 

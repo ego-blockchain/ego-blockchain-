@@ -10981,6 +10981,21 @@ mod history_tests {
         let to: u64 = std::env::var("EGO_INSPECT_TO").ok().and_then(|v| v.parse().ok()).unwrap_or(from + 5);
         let db = DB::open_cf_for_read_only(&Options::default(), &path, ALL_CFS.to_vec(), false).expect("open read-only");
         eprintln!("tip {}", local_chain_height_in(&db));
+        if std::env::var("EGO_INSPECT_META").is_ok() {
+            let mut groups: std::collections::BTreeMap<String, (u64, bool)> = std::collections::BTreeMap::new();
+            if let Some(cf) = db.cf_handle(CF_META) {
+                for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+                    let Ok((k, _)) = item else { break };
+                    let s = String::from_utf8_lossy(&k).to_string();
+                    let g = s.split(|c: char| c == ':' || c.is_ascii_digit()).next().unwrap_or("").chars().take(24).collect::<String>();
+                    let e = groups.entry(g).or_insert((0, crate::state_cert::is_state_meta(&k)));
+                    e.0 += 1;
+                }
+            }
+            for (g, (c, st)) in groups {
+                eprintln!("meta {g} {c} {}", if st { "state" } else { "local" });
+            }
+        }
         if std::env::var("EGO_INSPECT_CERTS").is_ok() {
             let ov = crate::drs::Ov::new(&db);
             let last = crate::state_cert::last_index(&ov);
@@ -11006,8 +11021,13 @@ mod history_tests {
                 eprintln!("rota {i} {a} ready {ready} missed {}", crate::drs::missed_turns(&ov, a, epoch));
             }
             eprintln!("pool {:?}", crate::drs::draw_pool(&ov, h));
-            for attempt in 0..8 {
+            let span: i64 = std::env::var("EGO_INSPECT_ATTEMPTS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            for attempt in 0..span {
                 eprintln!("attempt {attempt}: {:?}", crate::drs::committee(&ov, h, attempt));
+            }
+            for a in crate::drs::draw_pool(&ov, h) {
+                let w = crate::drs::load_rec(&ov, &a).map_or(0, |r| r.weight.at(crate::drs::period_of(h)));
+                eprintln!("weight {a} {w}");
             }
         }
         if let Some(cf) = db.cf_handle(CF_GOVERNANCE) {
