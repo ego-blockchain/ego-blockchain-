@@ -428,9 +428,6 @@ const WalletPage: React.FC = () => {
   const addressQR = useMemo(() => makeQR(myAddress), [myAddress]);
 
   const [balance, setBalance]       = useState<Balance | null>(cachedBalance);
-  const [faucet, setFaucet]         = useState<{ claimed_uegoc: number; cap_uegoc: number; step_uegoc: number } | null>(null);
-  const [faucetClaiming, setFaucetClaiming] = useState(false);
-  const [faucetMsg, setFaucetMsg]   = useState<string | null>(null);
   const [creditsBal, setCreditsBal] = useState<{ credits: number; usd_value: number; egoc_price_usd: number } | null>(null);
   const [showCredits, setShowCredits] = useState(false);
   const [creditsAmt, setCreditsAmt]   = useState('');
@@ -635,30 +632,6 @@ const WalletPage: React.FC = () => {
     const id = setInterval(load, 30000);
     return () => clearInterval(id);
   }, []);
-
-  useEffect(() => {
-    const loadFaucet = () =>
-      invoke<{ claimed_uegoc: number; cap_uegoc: number; step_uegoc: number }>('get_faucet_status')
-        .then(setFaucet).catch(() => {});
-    loadFaucet();
-    const unsub = listen('wallet-balance-updated', loadFaucet);
-    return () => { unsub.then(fn => fn()); };
-  }, [myAddress]);
-
-  async function claimFaucet() {
-    if (faucetClaiming) return;
-    setFaucetClaiming(true);
-    setFaucetMsg(null);
-    try {
-      const status = await invoke<{ claimed_uegoc: number; cap_uegoc: number; step_uegoc: number }>('claim_faucet');
-      setFaucet(status);
-      setFaucetMsg(`+${(status.step_uegoc / 1_000_000).toFixed(0)} EGOC claimed`);
-    } catch (e) {
-      setFaucetMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      setFaucetClaiming(false);
-    }
-  }
 
   const loadingRef = useRef(false);
   const lastTxSigRef = useRef<string>('');
@@ -1491,43 +1464,6 @@ const WalletPage: React.FC = () => {
           }
         `}</style>
       </div>
-
-      {!isLiveMode && faucet && (
-        <div className="bg-gray-800/60 rounded-2xl border border-gray-700/50 p-5">
-          <div className="flex items-center justify-between mb-3">
-            <div>
-              <div className="font-semibold text-sm flex items-center gap-2">🚰 Testnet Faucet</div>
-              <div className="text-xs text-gray-400 mt-0.5">
-                {(faucet.claimed_uegoc / 1_000_000).toFixed(0)} / {(faucet.cap_uegoc / 1_000_000).toFixed(0)} EGOC claimed
-              </div>
-            </div>
-            <button
-              onClick={claimFaucet}
-              disabled={faucetClaiming || faucet.claimed_uegoc >= faucet.cap_uegoc}
-              className={`px-4 py-2.5 rounded-xl text-sm font-semibold transition whitespace-nowrap ${
-                faucet.claimed_uegoc >= faucet.cap_uegoc
-                  ? 'bg-white/5 text-white/30 cursor-not-allowed'
-                  : 'bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30'
-              }`}
-            >
-              {faucetClaiming
-                ? 'Claiming…'
-                : faucet.claimed_uegoc >= faucet.cap_uegoc
-                ? 'Fully claimed'
-                : `Claim ${(faucet.step_uegoc / 1_000_000).toFixed(0)} EGOC`}
-            </button>
-          </div>
-          <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-emerald-500/60 transition-all duration-500"
-              style={{ width: `${Math.min(100, (faucet.claimed_uegoc / faucet.cap_uegoc) * 100)}%` }}
-            />
-          </div>
-          {faucetMsg && (
-            <div className="text-xs mt-2 text-gray-400">{faucetMsg}</div>
-          )}
-        </div>
-      )}
 
       {}
       <div className="bg-gray-800/60 rounded-2xl border border-gray-700/50 overflow-hidden">

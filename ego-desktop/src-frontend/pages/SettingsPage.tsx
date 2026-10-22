@@ -38,6 +38,7 @@ const SettingsPage: React.FC = () => {
   const avatarInputRef                        = useRef<HTMLInputElement>(null);
 
   const [lockError, setLockError]             = useState('');
+  const [autoLock, setAutoLock]               = useState(0);
 
   const [hasPin, setHasPin]                   = useState(false);
   const [showSetPin, setShowSetPin]           = useState(false);
@@ -78,6 +79,19 @@ const SettingsPage: React.FC = () => {
       .then(s => { console.log('[Settings] password status:', s); setHasPin(s.has_pin); })
       .catch((e) => console.error('[Settings] password status error:', e));
   }, [wallet?.address]);
+
+  useEffect(() => {
+    invoke<number>('get_auto_lock').then(setAutoLock).catch(() => {});
+  }, [wallet?.address]);
+
+  async function changeAutoLock(minutes: number) {
+    setLockError('');
+    try {
+      setAutoLock(await invoke<number>('set_auto_lock', { minutes }));
+    } catch (e) {
+      setLockError(String(e));
+    }
+  }
 
   useEffect(() => {
     invoke<string>('get_display_name')
@@ -373,6 +387,34 @@ const SettingsPage: React.FC = () => {
           >
             🔒 Lock
           </button>
+        </div>
+        <div className="flex items-center justify-between gap-4 px-5 py-4 border-t border-gray-700">
+          <div>
+            <div className="text-sm font-medium">Lock automatically</div>
+            <div className="text-xs text-gray-400">
+              {!hasPin
+                ? 'Set a password under Security & Keys to use automatic locking.'
+                : autoLock === -1
+                ? 'Ego Desktop stays unlocked until you press Lock. It still asks for your password when it starts.'
+                : autoLock === 0
+                ? 'Ego Desktop locks when you close its window. It always asks for your password when it starts.'
+                : 'Ego Desktop locks after this long without you using it, even when its window is closed.'}
+            </div>
+          </div>
+          <select
+            value={autoLock}
+            onChange={e => changeAutoLock(Number(e.target.value))}
+            disabled={!hasPin}
+            className="shrink-0 bg-gray-700 border border-gray-600 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-40"
+          >
+            <option value={0}>When I close the window</option>
+            <option value={1}>After 1 minute</option>
+            <option value={5}>After 5 minutes</option>
+            <option value={15}>After 15 minutes</option>
+            <option value={30}>After 30 minutes</option>
+            <option value={60}>After 1 hour</option>
+            <option value={-1}>Never</option>
+          </select>
         </div>
         <div className="px-5 pb-4 -mt-1 text-xs text-gray-500">
           Ego Desktop starts by itself when you log in to your computer, so your node never misses a check-in.

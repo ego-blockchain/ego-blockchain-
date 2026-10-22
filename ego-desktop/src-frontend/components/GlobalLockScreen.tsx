@@ -31,6 +31,7 @@ export function GlobalLockScreen({ children }: { children: React.ReactNode }) {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [hasPin, setHasPin] = useState(false);
+  const [autoLock, setAutoLock] = useState(0);
 
   const [showResetPassword, setShowResetPassword] = useState(false);
   const [resetPhraseWords, setResetPhraseWords]   = useState<string[]>(Array(24).fill(''));
@@ -68,6 +69,39 @@ export function GlobalLockScreen({ children }: { children: React.ReactNode }) {
     });
     return () => { unlisten.then(f => f()); };
   }, [checkLock]);
+
+  useEffect(() => {
+    invoke<number>('get_auto_lock').then(setAutoLock).catch(() => {});
+    const unlisten = listen<number>('ego://auto-lock-changed', e => setAutoLock(e.payload));
+    return () => { unlisten.then(f => f()); };
+  }, []);
+
+  useEffect(() => {
+    if (!hasPin || isLocked || autoLock <= 0) return;
+    const limit = autoLock * 60_000;
+    let last = Date.now();
+    const touch = () => { last = Date.now(); };
+    const check = () => {
+      if (Date.now() - last >= limit) {
+        invoke('lock_app').catch(() => {});
+      }
+    };
+    const onReturn = () => {
+      check();
+      touch();
+    };
+    const activity = ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart'] as const;
+    activity.forEach(ev => window.addEventListener(ev, touch, { passive: true }));
+    window.addEventListener('focus', onReturn);
+    document.addEventListener('visibilitychange', onReturn);
+    const id = setInterval(check, 10_000);
+    return () => {
+      clearInterval(id);
+      activity.forEach(ev => window.removeEventListener(ev, touch));
+      window.removeEventListener('focus', onReturn);
+      document.removeEventListener('visibilitychange', onReturn);
+    };
+  }, [hasPin, isLocked, autoLock]);
 
   async function handleUnlock(e: React.FormEvent) {
     e.preventDefault();

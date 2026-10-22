@@ -239,7 +239,9 @@ fn hide_main(window: &tauri::Window) {
     }
     APP_HIDDEN.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::commands::auth::invalidate_pin_cache();
-    let _ = window.emit("ego://app-locked", ());
+    if crate::commands::auth::locks_when_hidden() {
+        let _ = window.emit("ego://app-locked", ());
+    }
 }
 
 fn show_main(window: &tauri::Window) {
@@ -987,8 +989,6 @@ fn main() {
             commands::auth::generate_keypair,
             commands::auth::import_keypair,
             commands::auth::get_address,
-            commands::auth::get_faucet_status,
-            commands::auth::claim_faucet,
             commands::auth::list_wallets,
             commands::auth::create_wallet,
             commands::auth::import_wallet,
@@ -1003,6 +1003,8 @@ fn main() {
             commands::auth::set_password,
             commands::auth::verify_password,
             commands::auth::lock_app,
+            commands::auth::get_auto_lock,
+            commands::auth::set_auto_lock,
             commands::auth::password_cache_status,
             commands::auth::reset_password_with_recovery_phrase,
             commands::auth::get_recovery_info,

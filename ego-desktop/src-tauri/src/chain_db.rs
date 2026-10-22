@@ -3086,138 +3086,10 @@ pub fn balance_of(address: &str) -> u64 {
         .unwrap_or(0)
 }
 
-pub fn get_faucet_drops(address: &str) -> u32 {
-    let global_drops = get_tx_history_for_addr(address)
-        .into_iter()
-        .filter(|tx| tx.tx_type == "faucet")
-        .count() as u32;
-
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf_meta = match db.cf_handle(CF_META) { Some(c) => c, None => return global_drops };
-    let faucet_key = format!("faucet_drops:{}", address);
-    let local_drops = db.get_cf(cf_meta, faucet_key.as_bytes())
-        .ok().flatten()
-        .map(|v| read_u64_le(&v) as u32)
-        .unwrap_or(0);
-
-    global_drops.max(local_drops)
-}
-
-pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
-    static FAUCET_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    let _guard = FAUCET_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
-
-    let pool_bal = {
-        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-        let cf_balances = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return false };
-
-        db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
-            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
-    };
-
-    let credited = amount_uegoc.min(pool_bal);
-    if credited == 0 { return false; }
-
-    // Check mempool — don't grant if a faucet tx is already pending (not yet committed).
-    let already_pending = crate::mempool::get_mempool()
-        .pending_txs_for_address(address)
-        .into_iter()
-        .any(|tx| tx.tx_type == "faucet" && tx.to == address);
-
-    if get_faucet_drops(address) >= 1 {
-        if already_pending {
-            return false;
-        }
-        // Not confirmed on-chain (get_faucet_drops would count it) and not sitting
-        // in the live mempool either — the original grant was lost (e.g. evicted
-        // under mempool pressure before the eviction fix protected faucet txs).
-        // Recover once: a stale local record older than 30 min with no live copy
-        // anywhere means it is never coming back on its own. Clear the "already
-        // granted" marker and the dead local record, then fall through to issue
-        // a fresh one below.
-        const STUCK_AFTER_SECS: i64 = 30 * 60;
-        let now = chrono::Utc::now().timestamp();
-        let stuck_locally = crate::commands::tx_pending::get_all().iter().any(|tx| {
-            tx.tx_type == "faucet" && tx.to == address && now - tx.timestamp > STUCK_AFTER_SECS
-        });
-        if !stuck_locally {
-            return false;
-        }
-        eprintln!("[Faucet] Recovering lost grant for {} — clearing stale record and retrying", address);
-        for tx in crate::commands::tx_pending::get_all().iter().filter(|tx| tx.tx_type == "faucet" && tx.to == address) {
-            crate::commands::tx_pending::remove(&tx.hash);
-        }
-        {
-            let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(cf_meta) = db.cf_handle(CF_META) {
-                let faucet_key = format!("faucet_drops:{}", address);
-                let _ = db.delete_cf(cf_meta, faucet_key.as_bytes());
-            }
-        }
-    } else if already_pending {
-        return false;
-    }
-
-    // Generate transaction (nonce MUST be 0 for system txs to prevent network collisions)
-    let current_time = chrono::Utc::now().timestamp();
-    let nonce = 0;
-
-    let sign_bytes = crate::ledger::tx_signing_bytes_v2(
-        NODE_POOL_ADDR, address, credited, nonce, current_time, 1, "testnet faucet",
-    );
-    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-
-    let tx = crate::ledger::LedgerTx {
-        hash:        hash.clone(),
-        from:        NODE_POOL_ADDR.into(),
-        to:          address.into(),
-        amount:      credited,
-        fee_uegoc:   0,
-        tx_type:     "faucet".into(),
-        memo:        Some("testnet faucet".into()),
-        timestamp:   current_time,
-        status:      "Pending".into(),
-        block_height: None,
-        nonce,
-        signature:   "faucet".into(),
-        tx_version:  2,
-        chain_id:    1,
-        ..crate::ledger::LedgerTx::default()
-    };
-
-    eprintln!("[Faucet] Queuing {} uEGOC for {} via Mempool", credited, address);
-
-    {
-        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cf_meta) = db.cf_handle(CF_META) {
-            let faucet_key = format!("faucet_drops:{}", address);
-            let prev = db.get_cf(cf_meta, faucet_key.as_bytes())
-                .ok().flatten()
-                .map(|v| read_u64_le(&v))
-                .unwrap_or(0);
-            let _ = db.put_cf(cf_meta, faucet_key.as_bytes(), u64_le(prev + 1));
-        }
-    }
-
-    crate::commands::tx_pending::add(&tx);
-    let pool = crate::mempool::get_mempool();
-    let _ = pool.push(tx.clone());
-    tokio::spawn(async move {
-        crate::p2p::broadcast_pending_tx(tx).await;
-    });
-    true
-}
-
 /// Amount granted per manual desktop-app faucet claim (button click).
 pub const FAUCET_STEP_UEGOC: u64 = 1_000 * 1_000_000;
 /// Lifetime cap per address for manual desktop-app faucet claims.
 pub const FAUCET_CAP_UEGOC: u64 = 5_000 * 1_000_000;
-
-/// Sum of all *confirmed* faucet grants ever received by `address`.
-pub fn get_faucet_total_uegoc(address: &str) -> u64 {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    faucet_total_to_in(&db, address)
-}
 
 pub(crate) fn migrate_faucet_totals(db: &DB) {
     const FLAG: &[u8] = b"ftotal_v1";
@@ -3262,86 +3134,6 @@ pub fn tx_age_ok(tx: &LedgerTx, block_ts: i64) -> bool {
     generated_with_block(tx)
         || (tx.timestamp >= block_ts.saturating_sub(TX_MAX_AGE_SECS)
             && tx.timestamp <= block_ts.saturating_add(TX_MAX_AHEAD_SECS))
-}
-
-/// Amount from a faucet grant to `address` still sitting unconfirmed in the mempool.
-pub fn get_faucet_pending_uegoc(address: &str) -> u64 {
-    crate::mempool::get_mempool()
-        .pending_txs_for_address(address)
-        .into_iter()
-        .filter(|tx| tx.tx_type == "faucet" && tx.to == address)
-        .map(|tx| tx.amount)
-        .sum()
-}
-
-/// Manual, button-driven testnet faucet claim: grants `FAUCET_STEP_UEGOC` per
-/// call, capped cumulatively at `FAUCET_CAP_UEGOC` per address. Unlike
-/// `grant_testnet_faucet` (one-time, auto-fired), this is meant to be called
-/// repeatedly by explicit user action, so a claim that never confirms (e.g.
-/// evicted from mempool) simply stops counting against the cap once it drops
-/// out of the mempool — no separate stuck-grant recovery needed.
-pub fn claim_desktop_faucet(address: &str) -> Result<u64, String> {
-    static CLAIM_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    let _guard = CLAIM_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
-
-    if get_faucet_pending_uegoc(address) > 0 {
-        return Err("A previous test-coin claim is still pending confirmation".into());
-    }
-
-    let total_granted = get_faucet_total_uegoc(address);
-    if total_granted >= FAUCET_CAP_UEGOC {
-        return Err("You've already claimed the maximum 5000 test EGOC".into());
-    }
-
-    let pool_bal = {
-        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-        let cf_balances = db.cf_handle(CF_BALANCES).ok_or("balances column family missing")?;
-        db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
-            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
-    };
-
-    let grant = FAUCET_STEP_UEGOC
-        .min(FAUCET_CAP_UEGOC - total_granted)
-        .min(pool_bal);
-    if grant == 0 {
-        return Err("Faucet pool is empty — try again later".into());
-    }
-
-    let current_time = chrono::Utc::now().timestamp();
-    let nonce = 0;
-    let sign_bytes = crate::ledger::tx_signing_bytes_v2(
-        NODE_POOL_ADDR, address, grant, nonce, current_time, 1, "testnet faucet",
-    );
-    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-
-    let tx = crate::ledger::LedgerTx {
-        hash: hash.clone(),
-        from: NODE_POOL_ADDR.into(),
-        to: address.into(),
-        amount: grant,
-        fee_uegoc: 0,
-        tx_type: "faucet".into(),
-        memo: Some("testnet faucet".into()),
-        timestamp: current_time,
-        status: "Pending".into(),
-        block_height: None,
-        nonce,
-        signature: "faucet".into(),
-        tx_version: 2,
-        chain_id: 1,
-        ..crate::ledger::LedgerTx::default()
-    };
-
-    eprintln!("[Faucet] Queuing {} uEGOC claim for {} via Mempool", grant, address);
-
-    crate::commands::tx_pending::add(&tx);
-    let pool = crate::mempool::get_mempool();
-    let _ = pool.push(tx.clone());
-    tokio::spawn(async move {
-        crate::p2p::broadcast_pending_tx(tx).await;
-    });
-
-    Ok(grant)
 }
 
 pub fn recent_blocks(limit: usize) -> Vec<LedgerBlock> {
@@ -5274,6 +5066,11 @@ fn validate_peer_block_checked(
 ) -> Result<(), String> {
     if block.height == 0 {
         return if block.hash == GENESIS_HASH { Ok(()) } else { Err("invalid genesis hash".into()) };
+    }
+    if is_proposal {
+        if let Some(tx) = txs.iter().find(|t| t.tx_type == "faucet") {
+            return Err(format!("faucet tx {} refused: the testnet faucet is closed", tx.hash));
+        }
     }
     if !verify_block_hash(block, txs) {
         return Err("block hash/merkle verification failed".into());
@@ -11887,5 +11684,30 @@ mod tm_cert_tests {
         assert_eq!(crate::drs::tm_ready_epoch_at(start - crate::drs::EPOCH + crate::drs::READY_DEADLINE), None);
         assert_eq!(crate::drs::tm_ready_epoch_at(start - 2 * crate::drs::EPOCH), None, "no signal before the epoch that leads into the switch");
         assert_eq!(crate::drs::tm_ready_epoch_at(start), Some(e + 1), "the signal is collected again for every later epoch");
+    }
+}
+
+#[cfg(test)]
+mod faucet_closed_tests {
+    use super::*;
+
+    fn faucet_tx() -> LedgerTx {
+        LedgerTx {
+            hash: "0xfaucet".into(),
+            from: NODE_POOL_ADDR.into(),
+            to: "egot1someone".into(),
+            amount: FAUCET_STEP_UEGOC,
+            tx_type: "faucet".into(),
+            ..LedgerTx::default()
+        }
+    }
+
+    #[test]
+    fn a_proposed_block_with_a_faucet_payout_gets_no_vote() {
+        let block = LedgerBlock { height: 33_500, ..LedgerBlock::default() };
+        let e = validate_proposal_block(&block, &[faucet_tx()]).unwrap_err();
+        assert!(e.contains("faucet is closed"), "{e}");
+        let e = validate_tm_block(&block, &[faucet_tx()], 0).unwrap_err();
+        assert!(e.contains("faucet is closed"), "{e}");
     }
 }

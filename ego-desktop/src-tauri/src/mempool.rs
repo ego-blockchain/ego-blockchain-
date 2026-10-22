@@ -172,6 +172,10 @@ impl ShardedMempool {
 
         let is_validator_reg = crate::ledger::fee_exempt(&tx);
 
+        if is_pool_faucet {
+            return Err("the testnet faucet is closed".into());
+        }
+
         if is_system && !is_pool_faucet {
             tracing::warn!("Mempool rejected {} - system txs are only valid inside verified blocks", tx.hash);
             return Err("System txs are only valid inside verified blocks".into());
@@ -182,10 +186,6 @@ impl ShardedMempool {
             if self.seen_hashes[shard_idx].lock().expect("lock poisoned").contains(&tx.hash) {
                 return Ok(());
             }
-        }
-
-        if is_pool_faucet {
-            crate::chain_db::faucet_grant_fits(&tx)?;
         }
 
         if !is_pool_faucet {
@@ -677,8 +677,6 @@ mod tests {
     use super::*;
     use crate::ledger::LedgerTx;
 
-    /// The one system-shaped tx the pool does accept: a faucet payout from the
-    /// node pool, which `push` allows explicitly via `is_pool_faucet`.
     fn pool_faucet_tx(hash: &str) -> LedgerTx {
         LedgerTx {
             hash: hash.to_string(),
@@ -706,12 +704,10 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_hash_rejected() {
+    fn a_faucet_payout_is_refused_now_that_the_faucet_is_closed() {
         let pool = ShardedMempool::new();
-        let tx = pool_faucet_tx("0xdup");
-        let _ = pool.push(tx.clone());
-        let _ = pool.push(tx);
-        assert_eq!(pool.pending_count(), 1);
+        assert!(pool.push(pool_faucet_tx("0xf1")).is_err());
+        assert_eq!(pool.pending_count(), 0);
     }
 
     /// Coinbase and reward transactions must never be accepted from the
@@ -731,9 +727,7 @@ mod tests {
     #[test]
     fn drain_empties_pool() {
         let pool = ShardedMempool::new();
-        for i in 0..4u64 {
-            let _ = pool.push(pool_faucet_tx(&format!("0xd{i}")));
-        }
+        pool.requeue((0..4u64).map(|i| pool_faucet_tx(&format!("0xd{i}"))).collect());
         let got = pool.drain_all();
         assert_eq!(got.len(), 4);
         assert_eq!(pool.pending_count(), 0);
@@ -742,9 +736,7 @@ mod tests {
     #[test]
     fn requeued_transactions_return_to_the_pool_once() {
         let pool = ShardedMempool::new();
-        for i in 0..3u64 {
-            let _ = pool.push(pool_faucet_tx(&format!("0xrq{i}")));
-        }
+        pool.requeue((0..3u64).map(|i| pool_faucet_tx(&format!("0xrq{i}"))).collect());
         let drained = pool.drain_all();
         assert_eq!(pool.pending_count(), 0);
         pool.requeue(drained.clone());

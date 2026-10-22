@@ -990,6 +990,37 @@ pub fn lock_app(window: tauri::Window) {
     let _ = window.emit("ego://app-locked", ());
 }
 
+pub const AUTO_LOCK_ON_CLOSE: i32 = 0;
+pub const AUTO_LOCK_NEVER: i32 = -1;
+pub const AUTO_LOCK_MAX_MINUTES: i32 = 24 * 60;
+
+pub fn normalize_auto_lock(minutes: i32) -> i32 {
+    if minutes < 0 {
+        AUTO_LOCK_NEVER
+    } else {
+        minutes.min(AUTO_LOCK_MAX_MINUTES)
+    }
+}
+
+pub(crate) fn locks_when_hidden() -> bool {
+    Ledger::load().auto_lock_minutes == AUTO_LOCK_ON_CLOSE
+}
+
+#[tauri::command]
+pub async fn get_auto_lock() -> Result<i32, String> {
+    Ok(normalize_auto_lock(Ledger::load().auto_lock_minutes))
+}
+
+#[tauri::command]
+pub async fn set_auto_lock(window: tauri::Window, minutes: i32) -> Result<i32, EgoDesktopError> {
+    let minutes = normalize_auto_lock(minutes);
+    let mut ledger = Ledger::load();
+    ledger.auto_lock_minutes = minutes;
+    ledger.save().map_err(EgoDesktopError::WalletError)?;
+    let _ = window.emit("ego://auto-lock-changed", minutes);
+    Ok(minutes)
+}
+
 pub(crate) fn invalidate_pin_cache() {
     PIN_CACHE_TS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1206,55 +1237,6 @@ pub async fn get_address(_state: State<'_, AppState>) -> Result<Option<String>, 
 }
 
 // ── faucet (manual, button-driven test coins) ─────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FaucetStatus {
-    pub claimed_uegoc: u64,
-    pub cap_uegoc: u64,
-    pub step_uegoc: u64,
-}
-
-#[tauri::command]
-pub async fn get_faucet_status() -> Result<FaucetStatus, EgoDesktopError> {
-    // Off the async runtime: summing faucet claims walks this address's history.
-    let claimed_uegoc = tokio::task::spawn_blocking(|| {
-        let addr = Ledger::load().address;
-        if addr.is_empty() {
-            0
-        } else {
-            crate::chain_db::get_faucet_total_uegoc(&addr) + crate::chain_db::get_faucet_pending_uegoc(&addr)
-        }
-    })
-    .await
-    .unwrap_or(0);
-    Ok(FaucetStatus {
-        claimed_uegoc,
-        cap_uegoc: crate::chain_db::FAUCET_CAP_UEGOC,
-        step_uegoc: crate::chain_db::FAUCET_STEP_UEGOC,
-    })
-}
-
-#[tauri::command]
-pub async fn claim_faucet() -> Result<FaucetStatus, EgoDesktopError> {
-    if std::env::var("EGO_NO_FAUCET").map(|v| v == "1").unwrap_or(false) {
-        return Err(EgoDesktopError::WalletError("Faucet disabled".into()));
-    }
-    let addr = Ledger::load().address;
-    if addr.is_empty() {
-        return Err(EgoDesktopError::WalletError("No wallet loaded".into()));
-    }
-    let addr2 = addr.clone();
-    tokio::task::spawn_blocking(move || crate::chain_db::claim_desktop_faucet(&addr2))
-        .await
-        .map_err(|e| EgoDesktopError::WalletError(format!("Claim panicked: {e}")))?
-        .map_err(EgoDesktopError::WalletError)?;
-
-    Ok(FaucetStatus {
-        claimed_uegoc: crate::chain_db::get_faucet_total_uegoc(&addr) + crate::chain_db::get_faucet_pending_uegoc(&addr),
-        cap_uegoc: crate::chain_db::FAUCET_CAP_UEGOC,
-        step_uegoc: crate::chain_db::FAUCET_STEP_UEGOC,
-    })
-}
 
 /// Encode the wallet's 32-byte seed as a 24-word BIP39-compatible mnemonic.
 ///
@@ -2235,5 +2217,20 @@ mod phrase_compat_tests {
         let seed = [1u8; 32];
         let expected = "absurd amount dress acoustic aware mask advice can absurd amount dress acoustic aware mask advice can absurd amount dress acoustic aware mask advice combine";
         assert_eq!(phrase_from_seed(&seed).join(" "), expected);
+    }
+}
+
+#[cfg(test)]
+mod auto_lock_tests {
+    use super::*;
+
+    #[test]
+    fn auto_lock_choices_stay_within_range() {
+        assert_eq!(normalize_auto_lock(0), AUTO_LOCK_ON_CLOSE);
+        assert_eq!(normalize_auto_lock(-1), AUTO_LOCK_NEVER);
+        assert_eq!(normalize_auto_lock(-50), AUTO_LOCK_NEVER);
+        assert_eq!(normalize_auto_lock(15), 15);
+        assert_eq!(normalize_auto_lock(100_000), AUTO_LOCK_MAX_MINUTES);
+        assert_eq!(Ledger::default().auto_lock_minutes, AUTO_LOCK_ON_CLOSE, "existing wallets keep locking when the window closes");
     }
 }

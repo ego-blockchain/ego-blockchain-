@@ -909,6 +909,9 @@ pub struct Ledger {
     #[serde(default)]
     pub avatar: String,
 
+    #[serde(default)]
+    pub auto_lock_minutes: i32,
+
     /// Unix timestamp (seconds) when storage allocation was last configured.
     /// Nodes are locked from changing their allocation for 60 days after this.
     #[serde(default)]
