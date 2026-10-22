@@ -819,6 +819,21 @@ static DIRECT_PEER_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 const MIN_DIRECT_PEERS_RELAY_OPTIONAL: usize = 10;
+const DISCOVERY_WHEN_ISOLATED_SECS: u64 = 30;
+const DISCOVERY_WHEN_CONNECTED_SECS: u64 = 900;
+const DISCOVERY_ENOUGH_PEERS: usize = 3;
+
+pub(crate) fn discovery_pause_for(direct_peers: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(if direct_peers >= DISCOVERY_ENOUGH_PEERS {
+        DISCOVERY_WHEN_CONNECTED_SECS
+    } else {
+        DISCOVERY_WHEN_ISOLATED_SECS
+    })
+}
+
+pub fn discovery_pause() -> std::time::Duration {
+    discovery_pause_for(DIRECT_PEER_COUNT.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 const MAX_STARTUP_REMOTE_DIALS: usize = 8;
 
@@ -5704,84 +5719,6 @@ pub async fn broadcast_pending_tx(tx: LedgerTx) {
 /// Raised by the sync when this node is too far behind for peers to serve, and acted on
 /// by the sync-status watcher. The sync cannot start the catch-up itself: the catch-up
 /// merges blocks, a merge can trigger a sync, and that loop has no finite type.
-static ORACLE_CATCH_UP_WANTED: AtomicBool = AtomicBool::new(false);
-
-async fn oracle_catch_up() {
-    static RUNNING: AtomicBool = AtomicBool::new(false);
-    let tip = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0).await.unwrap_or(0);
-    if tokio::task::spawn_blocking(move || below_checkpoint_here(tip)).await.unwrap_or(false) {
-        return;
-    }
-    if offline_mode() || RUNNING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    const CHUNK: u64 = 200;
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => { RUNNING.store(false, Ordering::SeqCst); return; }
-    };
-
-    loop {
-        let local = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
-            .await
-            .unwrap_or(0);
-        let target = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed);
-        if target <= local.saturating_add(1) {
-            break;
-        }
-        let from = local.saturating_add(1);
-        let end  = from.saturating_add(CHUNK - 1);
-
-        let mut fetched: Option<(Vec<LedgerBlock>, Vec<LedgerTx>)> = None;
-        for base in ORACLE_RPCS {
-            let blocks: Vec<LedgerBlock> = match client
-                .get(format!("{base}/chain/blocks?fromHeight={from}&limit={CHUNK}"))
-                .send().await
-            {
-                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
-                _ => continue,
-            };
-            let blocks: Vec<LedgerBlock> = blocks.into_iter().filter(|b| b.height >= from && b.height <= end).collect();
-            if blocks.is_empty() {
-                continue;
-            }
-            let last = blocks.iter().map(|b| b.height).max().unwrap_or(end);
-            let wanted: u64 = blocks.iter().map(|b| b.tx_count as u64).sum();
-            let txs: Vec<LedgerTx> = match client
-                .get(format!("{base}/chain/transactions?fromHeight={from}&limit={}", wanted + 64))
-                .send().await
-            {
-                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
-                _ => continue,
-            };
-            let txs: Vec<LedgerTx> = txs.into_iter()
-                .filter(|t| t.block_height.map_or(false, |h| h >= from && h <= last))
-                .collect();
-            fetched = Some((blocks, txs));
-            break;
-        }
-
-        let Some((blocks, txs)) = fetched else {
-            tracing::warn!("[Sync] oracle archive unreachable — will retry on the next sync round");
-            break;
-        };
-        let top = blocks.iter().map(|b| b.height).max().unwrap_or(from);
-        tracing::info!("[Sync] oracle archive: blocks #{}..#{} ({} txs)", from, top, txs.len());
-        merge_remote_chain_inner(blocks, txs, APP_HANDLE.get(), false).await;
-
-        let after = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
-            .await
-            .unwrap_or(0);
-        if after <= local {
-            tracing::warn!("[Sync] oracle blocks from #{} were not accepted — stopping archive catch-up", from);
-            break;
-        }
-    }
-    RUNNING.store(false, Ordering::SeqCst);
-}
 
 const SYNC_REQUEST_EVERY_MS: i64 = 8_000;
 const SYNC_GOSSIP_EVERY_MS: i64 = 30_000;
@@ -5855,7 +5792,6 @@ pub async fn sync_chain_from_peers() {
             network_best - my_height, my_height, network_best
         );
         request_snapshot_because_stuck(snapshot_request_height(my_height)).await;
-        ORACLE_CATCH_UP_WANTED.store(true, Ordering::Relaxed);
     }
 
     if LAST_FROM_HEIGHT.swap(from_height, std::sync::atomic::Ordering::Relaxed) == from_height {
@@ -15657,10 +15593,6 @@ pub async fn run_sync_status_watcher() {
         let best = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed).max(local);
         let behind = best.saturating_sub(local);
 
-        if ORACLE_CATCH_UP_WANTED.swap(false, Ordering::Relaxed) {
-            tokio::spawn(oracle_catch_up());
-        }
-
         if woke {
             eprintln!("[SyncStatus] Wake from sleep detected — reconnecting and checking the chain tip");
             SUSPENDING.store(false, Ordering::Relaxed);
@@ -17198,6 +17130,14 @@ mod poison_tx_tests {
             blamed_in(reason, &txs).is_empty(),
             "a whole-block failure must not evict the transactions that happened to be in it",
         );
+    }
+
+    #[test]
+    fn a_connected_node_asks_the_server_for_peers_rarely() {
+        assert_eq!(super::discovery_pause_for(0).as_secs(), 30, "an isolated node keeps asking until it finds peers");
+        assert_eq!(super::discovery_pause_for(2).as_secs(), 30);
+        assert_eq!(super::discovery_pause_for(3).as_secs(), 900, "once it has peers it learns new ones from them");
+        assert_eq!(super::discovery_pause_for(40).as_secs(), 900);
     }
 
     #[test]

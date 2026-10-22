@@ -143,9 +143,9 @@ async fn main() -> anyhow::Result<()> {
                     max_reservations_per_peer: 4,
                     reservation_duration:      Duration::from_secs(3600),
                     max_circuits:              4096,
-                    max_circuits_per_peer:     64,
-                    max_circuit_duration:      Duration::from_secs(7200),
-                    max_circuit_bytes:         u64::MAX,
+                    max_circuits_per_peer:     8,
+                    max_circuit_duration:      Duration::from_secs(600),
+                    max_circuit_bytes:         16 * 1024 * 1024,
                     ..Default::default()
                 },
             ),

@@ -18,7 +18,6 @@ const RETRY_SECS: u64 = 60;
 
 const SOURCES: &[&str] = &[
     "https://www.egoblockchain.com",
-    "https://rpc.egoblockchain.com",
     "https://www.google.com",
     "https://www.cloudflare.com",
     "https://www.microsoft.com",

@@ -574,7 +574,7 @@ fn headless_main() {
         tokio::spawn(async {
             loop {
                 crate::p2p::oracle_peer_discovery_tick().await;
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                tokio::time::sleep(crate::p2p::discovery_pause()).await;
             }
         });
 
@@ -1515,7 +1515,7 @@ fn main() {
                 crate::p2p::oracle_peer_discovery_tick().await;
                 tokio::spawn(async {
                     loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        tokio::time::sleep(crate::p2p::discovery_pause()).await;
                         crate::p2p::oracle_peer_discovery_tick().await;
                     }
                 });
