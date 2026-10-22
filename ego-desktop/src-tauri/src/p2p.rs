@@ -5780,17 +5780,20 @@ const JOIN_CERTS_EVERY_MS: i64 = 5_000;
 const JOIN_BROADCAST_EVERY_MS: i64 = 30_000;
 const BANNER_LAG: u64 = 100;
 
-pub(crate) fn below_checkpoint(height: u64, archive: bool) -> bool {
-    !archive && height < crate::state_cert::STATE_CERT_FROM_HEIGHT
+pub(crate) fn below_checkpoint(height: u64, replay: bool) -> bool {
+    !replay && height < crate::state_cert::STATE_CERT_FROM_HEIGHT
 }
 
-pub(crate) fn must_start_over_before_install(local: u64, archive: bool) -> bool {
-    local > 0 && below_checkpoint(local, archive)
+pub(crate) fn must_start_over_before_install(local: u64, replay: bool) -> bool {
+    local > 0 && below_checkpoint(local, replay)
+}
+
+fn replays_old_history() -> bool {
+    std::env::var("EGO_ARCHIVE").map_or(false, |v| v == "1")
 }
 
 fn below_checkpoint_here(height: u64) -> bool {
-    height < crate::state_cert::STATE_CERT_FROM_HEIGHT
-        && below_checkpoint(height, history_archive_mode(&crate::ledger::Ledger::load().address))
+    below_checkpoint(height, replays_old_history())
 }
 
 pub async fn sync_chain_from_peers() {
@@ -10031,21 +10034,11 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
             };
             if checkpointed {
                 eprintln!("[P2PSnapshot] snapshot at height {} matches the state checkpoint this release ships", snapshot.height);
-            } else if snapshot.height >= crate::state_cert::STATE_CERT_FROM_HEIGHT {
+            } else {
                 eprintln!(
-                    "[P2PSnapshot] refused a snapshot at height {}: from block {} only state certified by a committee is installed",
+                    "[P2PSnapshot] refused a snapshot at height {}: nodes join from the official checkpoint at block {}, and only state certified by a committee is installed",
                     snapshot.height,
                     crate::state_cert::STATE_CERT_FROM_HEIGHT
-                );
-                return;
-            } else if let Err(e) = snapshot.verify() {
-                eprintln!("[P2PSnapshot] refused a snapshot at height {}: {e}", snapshot.height);
-                return;
-            }
-            if !checkpointed && !snapshot_is_from_our_network(&snapshot) {
-                eprintln!(
-                    "[P2PSnapshot] refused a snapshot at height {} — none of its recent blocks were produced by this network's starting committee",
-                    snapshot.height
                 );
                 return;
             }
@@ -11269,25 +11262,6 @@ pub fn snapshot_serve_allowed(local_tip: u64, have_height: u64, stuck: bool) -> 
         return local_tip > have_height;
     }
     local_tip > have_height + SNAPSHOT_SERVE_MIN_LAG
-}
-
-/// Whether a snapshot describes the chain this build belongs to. A node that wipes its
-/// database and restarts is, for a few seconds, far behind every chain on the network,
-/// and will happily adopt whichever one answers first — including one left running by
-/// nodes on older rules. The starting committee is the only thing a fresh node knows
-/// about its own network, so it is what the offer is measured against.
-///
-/// This stops a node joining the wrong chain by accident. It is not a defence against a
-/// deliberate attacker: `LedgerBlock` carries no producer signature, so `miner` is a claim
-/// rather than proof. Signing blocks is what would make this a real boundary.
-fn snapshot_is_from_our_network(snap: &crate::chain_db::StateSnapshot) -> bool {
-    if crate::genesis::addresses().is_empty() {
-        return true;
-    }
-    if snap.blocks.is_empty() {
-        return false;
-    }
-    snap.blocks.iter().any(|b| crate::genesis::is_member(&b.miner) || crate::chain_db::drs_active(b.height))
 }
 
 /// Whether a batch of blocks belongs to the chain this build is part of. Fork choice is
@@ -13591,8 +13565,7 @@ async fn finish_state_sync() {
         return;
     }
     let local = crate::chain_db::local_chain_height();
-    let archive = history_archive_mode(&crate::ledger::Ledger::load().address);
-    if must_start_over_before_install(local, archive) {
+    if must_start_over_before_install(local, replays_old_history()) {
         if let Some(app) = APP_HANDLE.get() {
             eprintln!(
                 "[StateCert] this node replayed {local} old blocks before the checkpoint reached it; clearing them and restarting so it joins exactly like a new node"
@@ -17248,11 +17221,11 @@ mod poison_tx_tests {
         assert!(super::below_checkpoint(0, false), "an empty node waits for the checkpoint");
         assert!(super::below_checkpoint(13_817, false), "a node stuck at the old gap does too");
         assert!(!super::below_checkpoint(cp, false), "from the checkpoint on, blocks are synced as usual");
-        assert!(!super::below_checkpoint(0, true), "a history keeper replays everything");
+        assert!(!super::below_checkpoint(0, true), "a node told to keep the whole history replays it");
         assert!(!super::must_start_over_before_install(0, false), "a new node installs the checkpoint straight away");
         assert!(super::must_start_over_before_install(13_817, false), "a node that replayed old blocks starts over, so leftovers cannot change its balances");
         assert!(!super::must_start_over_before_install(cp + 5, false), "a node already past the checkpoint installs a newer one in place");
-        assert!(!super::must_start_over_before_install(13_817, true), "a history keeper keeps what it replayed");
+        assert!(!super::must_start_over_before_install(13_817, true), "a node told to keep the whole history keeps what it replayed");
         assert!(super::BANNER_LAG >= 100, "a node a few blocks behind is not told it is catching up");
     }
 
