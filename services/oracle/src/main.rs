@@ -1,4 +1,5 @@
 mod acme;
+mod comments;
 mod dns;
 mod gateways;
 
@@ -1352,6 +1353,11 @@ async fn main() {
         dns::run_dns_server(relay_ip, dns_upstream, dns_nodes, dns_challenges).await;
     });
 
+    let comments_path = std::env::var("BLOG_COMMENTS_DATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| chain_data_path().with_file_name("blog-comments.json"));
+    comments::init(comments_path).await;
+
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
     let app = Router::new()
@@ -1373,6 +1379,10 @@ async fn main() {
         .route("/nodes",                    get(handle_nodes_list))
         .route("/gateways",                 get(gateways::handle_list))
         .route("/gateways/register",        post(gateways::handle_register))
+        .route("/blog/comments/:slug",      get(comments::handle_list).post(comments::handle_create))
+        .route("/blog/comments/:slug/:id/edit",   post(comments::handle_edit))
+        .route("/blog/comments/:slug/:id/delete", post(comments::handle_delete))
+        .route("/blog/comments/:slug/:id/like",   post(comments::handle_like))
         .route("/cert/request",             post(handle_cert_request))
         .route("/cert/status/:domain",      get(handle_cert_status))
         .route("/post/proof",               post(handle_post_proof))
