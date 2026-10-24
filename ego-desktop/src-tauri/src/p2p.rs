@@ -4163,6 +4163,10 @@ pub enum P2PMessage {
         #[serde(default)]
         attempt: u32,
     },
+    TmCommit {
+        block: LedgerBlock,
+        transactions: Vec<LedgerTx>,
+    },
     TmSkip {
         height: u64,
         attempt: u32,
@@ -7773,7 +7777,8 @@ async fn build_swarm(
                 request_response: request_response::Behaviour::new(
                     [(StreamProtocol::new("/ego/msg/1.1.0"), ProtocolSupport::Full)],
                     request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(120)),
+                        .with_request_timeout(Duration::from_secs(120))
+                        .with_max_concurrent_streams(1024),
                 ),
                 compute_exec: request_response::Behaviour::new(
                     [(StreamProtocol::new("/ego/compute-exec/1.0.0"), ProtocolSupport::Full)],
@@ -9315,6 +9320,12 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         }
         msg @ (P2PMessage::TmProposal { .. } | P2PMessage::TmVote { .. } | P2PMessage::TmSkip { .. }) => {
             crate::tm_live::on_message(msg).await;
+        }
+        P2PMessage::TmCommit { block, transactions } => {
+            let next = crate::chain_db::latest_block_info().0.saturating_add(1);
+            if block.height == next && !block.commit_cert.is_empty() {
+                merge_remote_chain(vec![block], transactions, app).await;
+            }
         }
 
         // Unsealed in the gossip arm of handle_event, which then dispatches the

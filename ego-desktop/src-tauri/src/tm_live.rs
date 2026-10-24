@@ -704,7 +704,7 @@ impl Driver {
         }
         self.last_resend = now;
         if let Some(vote) = &self.gave_up {
-            out.push((self.give_up_message(vote), Via::Direct));
+            out.push((self.give_up_message(vote), Via::Both));
         } else {
             let round = self.engine.round();
             if let Some(m) = self.my_proposals.get(&round) {
@@ -712,7 +712,7 @@ impl Driver {
             }
             for code in [TM_PREVOTE, TM_PRECOMMIT] {
                 if let Some(m) = self.my_votes.get(&(round, code)) {
-                    out.push((m.clone(), Via::Direct));
+                    out.push((m.clone(), Via::Both));
                 }
             }
             if let Some((lr, lv)) = self.engine.locked() {
@@ -721,7 +721,7 @@ impl Driver {
                 }
                 if lr != round {
                     if let Some(m) = self.my_votes.get(&(lr, TM_PRECOMMIT)) {
-                        out.push((m.clone(), Via::Direct));
+                        out.push((m.clone(), Via::Both));
                     }
                 }
             }
@@ -1349,6 +1349,8 @@ async fn maybe_commit() {
         crate::p2p::LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed);
         crate::clock::note_finalized_block_time(block.timestamp);
         crate::p2p::touch_proposal_timestamp();
+        let announce = P2PMessage::TmCommit { block: block.clone(), transactions: txs.clone() };
+        tokio::spawn(async move { flush(height, vec![(announce, Via::Both)]).await });
         tokio::spawn(async move { crate::p2p::push_block_to_oracle(&block, &txs).await });
         let mut g = driver();
         if g.as_ref().map_or(false, |d| d.height == height) {
@@ -1485,6 +1487,18 @@ mod tests {
             !replacement_reachable(&[c(&[me, "egot1stale", "egot1old1", "egot1old2"]), c(&[me, "egot1new1", "egot1new2", "egot1old3"])], me),
             "a committee with one able member is a dead end"
         );
+    }
+
+    #[test]
+    fn a_finished_block_travels_with_its_certificate() {
+        let block = LedgerBlock { height: 40_000, hash: "ab".repeat(32), commit_cert: "{}".into(), ..LedgerBlock::default() };
+        let msg = P2PMessage::TmCommit { block, transactions: vec![] };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "tm_commit");
+        match serde_json::from_value::<P2PMessage>(json).unwrap() {
+            P2PMessage::TmCommit { block, .. } => assert_eq!(block.commit_cert, "{}"),
+            other => panic!("wrong message: {other:?}"),
+        }
     }
 
     #[test]
