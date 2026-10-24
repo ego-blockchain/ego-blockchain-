@@ -964,6 +964,11 @@ pub async fn run_batch_loop() {
             // The engine's own requirement, not a floor from configuration. A committee of
             // four needs three to agree; comparing against a minimum of two said quorum was
             // met while the chain was short of it, every five seconds, for hours.
+            if last_fin == 0 {
+                last_block_at    = Instant::now();
+                batch_started_at = None;
+                continue;
+            }
             let (seats, must_agree) = crate::p2p::committee_quorum().unwrap_or((known_count, needed));
             if known_count < must_agree {
                 tracing::warn!(
