@@ -1841,14 +1841,18 @@ async fn v2_resend_due() {
 
 pub(crate) async fn send_to_group(height: u64, msgs: Vec<P2PMessage>) {
     let members: Vec<String> = tokio::task::spawn_blocking(move || {
-        let me = crate::ledger::Ledger::load().address;
         crate::chain_db::committee_for_height(height, crate::clock::now())
-            .map(|c| c.into_iter().map(|(a, _)| a).filter(|a| *a != me).collect())
+            .map(|c| c.into_iter().map(|(a, _)| a).collect())
             .unwrap_or_default()
     })
     .await
     .unwrap_or_default();
-    for member in members {
+    send_to_members(members, msgs).await;
+}
+
+pub(crate) async fn send_to_members(members: Vec<String>, msgs: Vec<P2PMessage>) {
+    let me = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address).await.unwrap_or_default();
+    for member in members.into_iter().filter(|a| *a != me) {
         let Some(ep) = get_relay_endpoint(&member).await else { continue };
         {
             let mut g = V2_SENDS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
@@ -4121,6 +4125,10 @@ pub enum P2PMessage {
         sig: String,
         #[serde(default)]
         pol_votes: Vec<(String, String)>,
+        #[serde(default)]
+        attempt: u32,
+        #[serde(default)]
+        skips: Vec<crate::chain_db::TmSkipCert>,
     },
     TmVote {
         height: u64,
@@ -4129,6 +4137,17 @@ pub enum P2PMessage {
         value: Option<String>,
         voter: String,
         sig: String,
+        #[serde(default)]
+        attempt: u32,
+    },
+    TmSkip {
+        height: u64,
+        attempt: u32,
+        vote: crate::chain_db::TmSkipVote,
+        #[serde(default)]
+        block: Option<LedgerBlock>,
+        #[serde(default)]
+        transactions: Vec<LedgerTx>,
     },
 
     ValidatorLeaving {
@@ -9271,7 +9290,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         P2PMessage::BftV2ViewChange { msg } => {
             shadow_on_view_change(msg).await;
         }
-        msg @ (P2PMessage::TmProposal { .. } | P2PMessage::TmVote { .. }) => {
+        msg @ (P2PMessage::TmProposal { .. } | P2PMessage::TmVote { .. } | P2PMessage::TmSkip { .. }) => {
             crate::tm_live::on_message(msg).await;
         }
 

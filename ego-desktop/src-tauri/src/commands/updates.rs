@@ -120,6 +120,15 @@ pub fn note_peer_version(address: &str, version: &str) {
     seen.insert(address.to_string(), (version.to_string(), now));
 }
 
+pub fn runs_at_least(address: &str, min: &str, within_secs: i64) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    PEER_VERSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(address)
+        .map_or(false, |(v, at)| now - *at <= within_secs && parse_version(v) >= parse_version(min))
+}
+
 fn peer_backed_latest(seen: &std::collections::BTreeMap<String, (String, i64)>, current: &str, now: i64) -> Option<String> {
     let recent: Vec<(u32, u32, u32)> = seen
         .values()

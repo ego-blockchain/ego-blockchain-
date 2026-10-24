@@ -24,6 +24,7 @@ pub const DRAW_V3_FROM_HEIGHT: u64 = 32_851;
 pub const LAST_MAKERS_KEEP: usize = 16;
 pub const SPLIT_FROM_HEIGHT: u64 = 32_901;
 pub const TENDERMINT_FROM_HEIGHT: u64 = 33_101;
+pub const SKIP_FROM_HEIGHT: u64 = 39_523;
 pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT];
 const KEY_STORAGE_TOTAL: &[u8] = b"n2swt";
 const KEY_LAST_MAKERS: &[u8] = b"n2last";
@@ -1351,6 +1352,15 @@ pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
     ranked.into_iter().take(size).map(|(_, a)| a).collect()
 }
 
+pub fn skip_committee(ov: &Ov, height: u64, attempt: u32) -> Vec<String> {
+    let rota = load_rota(ov, epoch_of(height)).unwrap_or_default();
+    let pool = draw_pool(ov, height);
+    let recent = last_makers(ov);
+    let answering: Vec<String> = pool.iter().filter(|a| recent.contains(a)).cloned().collect();
+    let pool = if answering.len() >= MIN_COMMITTEE { answering } else { pool };
+    weighted_committee(ov, height, i64::from(attempt), &rota.seed, pool)
+}
+
 pub fn rota_position(ov: &Ov, epoch: u64, addr: &str) -> Option<(usize, String)> {
     let rota = load_rota(ov, epoch)?;
     let pos = rota.members.iter().position(|a| a == addr)?;
@@ -1844,6 +1854,26 @@ mod tests {
         record_maker(&mut before, DRAW_V3_FROM_HEIGHT - 1, "egot1x");
         before.commit_memory();
         assert!(last_makers(&before).is_empty(), "nothing is recorded before the rule starts");
+    }
+
+    #[test]
+    fn a_replacement_committee_is_drawn_the_same_everywhere_from_nodes_that_made_blocks_lately() {
+        let (mut ov, members, first) = weighted_network(&[50, 50, 50, 50, 50, 50, 50, 50]);
+        let h = first + 20;
+        for i in 0..LAST_MAKERS_KEEP {
+            record_maker(&mut ov, h - 1, &members[i % 5]);
+        }
+        ov.commit_memory();
+        let c1 = skip_committee(&ov, h, 1);
+        assert_eq!(c1, skip_committee(&ov, h, 1), "every node draws the same replacement");
+        assert_eq!(c1.len(), BLOCK_COMMITTEE);
+        assert!(c1.iter().all(|a| members[..5].contains(a)), "only nodes that made blocks lately are drawn: {c1:?}");
+        assert!((2..8).any(|a| skip_committee(&ov, h, a) != c1), "later attempts draw other groups");
+
+        let (quiet, members, first) = weighted_network(&[50, 50, 50, 50, 50, 50]);
+        let c = skip_committee(&quiet, first + 1, 1);
+        assert_eq!(c.len(), BLOCK_COMMITTEE, "with no recent makers the whole pool is drawn from");
+        assert!(c.iter().all(|a| members.contains(a)));
     }
 
     #[test]

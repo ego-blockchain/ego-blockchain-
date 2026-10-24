@@ -5041,6 +5041,10 @@ pub fn validate_proposal_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<
 }
 
 pub fn validate_tm_block(block: &LedgerBlock, txs: &[LedgerTx], parent_ts: i64) -> Result<(), String> {
+    validate_tm_block_for(block, txs, parent_ts, &[])
+}
+
+pub fn validate_tm_block_for(block: &LedgerBlock, txs: &[LedgerTx], parent_ts: i64, miners: &[String]) -> Result<(), String> {
     if block.timestamp < parent_ts {
         return Err(format!("block #{} is stamped before its parent", block.height));
     }
@@ -5051,11 +5055,11 @@ pub fn validate_tm_block(block: &LedgerBlock, txs: &[LedgerTx], parent_ts: i64) 
             block.height, block.miner, ahead
         ));
     }
-    validate_peer_block_checked(block, txs, true, false)
+    validate_peer_block_checked(block, txs, true, false, Some(miners))
 }
 
 fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: bool) -> Result<(), String> {
-    validate_peer_block_checked(block, txs, is_proposal, is_proposal)
+    validate_peer_block_checked(block, txs, is_proposal, is_proposal, None)
 }
 
 fn validate_peer_block_checked(
@@ -5063,6 +5067,7 @@ fn validate_peer_block_checked(
     txs: &[LedgerTx],
     is_proposal: bool,
     check_clock: bool,
+    proposal_miners: Option<&[String]>,
 ) -> Result<(), String> {
     if block.height == 0 {
         return if block.hash == GENESIS_HASH { Ok(()) } else { Err("invalid genesis hash".into()) };
@@ -5142,7 +5147,7 @@ fn validate_peer_block_checked(
             }
         }
         if drs_active(block.height) {
-            drs_block_rules_in(&db, block, txs, is_proposal)?;
+            drs_block_rules_in(&db, block, txs, is_proposal, proposal_miners)?;
         }
         if block.height >= STORAGE_PAY_FROM_HEIGHT {
             for tx in txs.iter() {
@@ -10067,6 +10072,9 @@ fn verify_block_certificate_in(db: &DB, block: &LedgerBlock) -> Result<(), Strin
     if tendermint_active_in(db, block.height) {
         let cert: TmCert = serde_json::from_str(&block.commit_cert)
             .map_err(|e| format!("block #{} certificate is unreadable: {e}", block.height))?;
+        if cert.v == TM_CERT_V4 {
+            return verify_replacement_cert_in(db, block, &cert);
+        }
         return cert.verify(block, &committee);
     }
     let cert: CommitCert = serde_json::from_str(&block.commit_cert)
@@ -10077,6 +10085,210 @@ fn verify_block_certificate_in(db: &DB, block: &LedgerBlock) -> Result<(), Strin
 pub const TM_PREVOTE: u8 = 1;
 pub const TM_PRECOMMIT: u8 = 2;
 pub const TM_CERT_VERSION: u8 = 3;
+pub const TM_CERT_V4: u8 = 4;
+pub const TM_MAX_ATTEMPT: u32 = 32;
+
+pub fn tm_vote_message_at(attempt: u32, kind: u8, height: u64, round: u32, value: Option<&str>) -> Vec<u8> {
+    if attempt == 0 {
+        return tm_vote_message(kind, height, round, value);
+    }
+    let mut m = b"ego/tendermint/vote/v2:".to_vec();
+    m.extend_from_slice(&attempt.to_le_bytes());
+    m.push(kind);
+    m.extend_from_slice(&height.to_le_bytes());
+    m.extend_from_slice(&round.to_le_bytes());
+    m.extend_from_slice(value.unwrap_or("").as_bytes());
+    m
+}
+
+pub fn tm_proposal_message_at(attempt: u32, height: u64, round: u32, pol_round: Option<u32>, value: &str) -> Vec<u8> {
+    if attempt == 0 {
+        return tm_proposal_message(height, round, pol_round, value);
+    }
+    let mut m = b"ego/tendermint/proposal/v2:".to_vec();
+    m.extend_from_slice(&attempt.to_le_bytes());
+    m.extend_from_slice(&height.to_le_bytes());
+    m.extend_from_slice(&round.to_le_bytes());
+    m.extend_from_slice(&pol_round.map_or(u64::MAX, |r| r as u64).to_le_bytes());
+    m.extend_from_slice(value.as_bytes());
+    m
+}
+
+pub fn tm_skip_message(height: u64, attempt: u32, locked: Option<(u32, &str)>) -> Vec<u8> {
+    let mut m = b"ego/tendermint/skip/v1:".to_vec();
+    m.extend_from_slice(&height.to_le_bytes());
+    m.extend_from_slice(&attempt.to_le_bytes());
+    match locked {
+        Some((round, value)) => {
+            m.push(1);
+            m.extend_from_slice(&round.to_le_bytes());
+            m.extend_from_slice(value.as_bytes());
+        }
+        None => m.push(0),
+    }
+    m
+}
+
+pub fn skip_threshold_of(n: usize) -> usize {
+    n.saturating_sub(quorum_of(n)) + 1
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TmLock {
+    pub round: u32,
+    pub value: String,
+    pub pol: Vec<(String, String)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TmSkipVote {
+    pub voter: String,
+    #[serde(default)]
+    pub locked: Option<TmLock>,
+    pub sig: String,
+}
+
+impl TmSkipVote {
+    pub fn verify(&self, height: u64, attempt: u32, committee: &[(String, Vec<u8>)]) -> Result<(), String> {
+        let Some((_, pk)) = committee.iter().find(|(a, _)| *a == self.voter) else {
+            return Err(format!("{} gave up attempt {attempt} of #{height} without being on that committee", self.voter));
+        };
+        let lock = self.locked.as_ref().map(|l| (l.round, l.value.as_str()));
+        if !tm_signature_ok(pk, &tm_skip_message(height, attempt, lock), &self.sig) {
+            return Err(format!("the give-up from {} for attempt {attempt} of #{height} does not verify", self.voter));
+        }
+        if let Some(l) = &self.locked {
+            let msg = tm_vote_message_at(attempt, TM_PREVOTE, height, l.round, Some(&l.value));
+            let backers: std::collections::BTreeSet<&str> = l
+                .pol
+                .iter()
+                .filter(|(voter, sig)| {
+                    committee.iter().any(|(a, k)| a == voter && tm_signature_ok(k, &msg, sig))
+                })
+                .map(|(voter, _)| voter.as_str())
+                .collect();
+            if backers.len() < quorum_of(committee.len()) {
+                return Err(format!(
+                    "{} reports a lock on block {:.12} at #{height} without the prevotes that justify it",
+                    self.voter, l.value
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TmSkipCert {
+    pub attempt: u32,
+    pub votes: Vec<TmSkipVote>,
+}
+
+impl TmSkipCert {
+    pub fn verify(&self, height: u64, committee: &[(String, Vec<u8>)]) -> Result<Option<TmLock>, String> {
+        let mut seen: std::collections::BTreeSet<&str> = Default::default();
+        let mut best: Option<TmLock> = None;
+        for vote in &self.votes {
+            vote.verify(height, self.attempt, committee)?;
+            if !seen.insert(vote.voter.as_str()) {
+                return Err(format!("{} gave up attempt {} of #{height} twice in one certificate", vote.voter, self.attempt));
+            }
+            if let Some(l) = &vote.locked {
+                if best.as_ref().map_or(true, |b| l.round > b.round) {
+                    best = Some(l.clone());
+                }
+            }
+        }
+        let need = skip_threshold_of(committee.len());
+        if seen.len() < need {
+            return Err(format!(
+                "attempt {} of #{height} was given up by {} of the {need} members it takes",
+                self.attempt,
+                seen.len()
+            ));
+        }
+        Ok(best)
+    }
+}
+
+pub fn carried_lock(locks: &[Option<TmLock>]) -> Option<TmLock> {
+    locks.iter().flatten().last().cloned()
+}
+
+pub(crate) fn committee_for_attempt_in(db: &DB, height: u64, attempt: u32) -> Option<Vec<(String, Vec<u8>)>> {
+    if attempt == 0 {
+        let parent_ts = block_ts_at_in(db, height.checked_sub(1)?)?;
+        return committee_for_height_in(db, height, parent_ts);
+    }
+    let ov = crate::drs::Ov::new(db);
+    let out: Vec<(String, Vec<u8>)> = crate::drs::skip_committee(&ov, height, attempt)
+        .into_iter()
+        .filter_map(|a| dilithium_key_in(db, &a).map(|k| (a, k)))
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+pub fn committee_for_attempt(height: u64, attempt: u32) -> Option<Vec<(String, Vec<u8>)>> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    committee_for_attempt_in(&db, height, attempt)
+}
+
+pub struct SkipChain {
+    pub committee: Vec<(String, Vec<u8>)>,
+    pub miners: Vec<String>,
+    pub carried: Option<TmLock>,
+}
+
+fn skip_chain_in(db: &DB, height: u64, skips: &[TmSkipCert]) -> Result<SkipChain, String> {
+    let attempt = skips.len() as u32;
+    if attempt > TM_MAX_ATTEMPT {
+        return Err(format!("#{height} cannot have {attempt} committees"));
+    }
+    if attempt > 0 && height < crate::drs::SKIP_FROM_HEIGHT {
+        return Err(format!("replacement committees are not in force at #{height}"));
+    }
+    let mut miners: Vec<String> = Vec::new();
+    let mut locks: Vec<Option<TmLock>> = Vec::new();
+    for (i, skip) in skips.iter().enumerate() {
+        if skip.attempt != i as u32 {
+            return Err(format!("the give-up certificates of #{height} are out of order"));
+        }
+        let committee = committee_for_attempt_in(db, height, i as u32)
+            .ok_or_else(|| format!("no committee known for attempt {i} of #{height}"))?;
+        locks.push(skip.verify(height, &committee)?);
+        miners.extend(committee.into_iter().map(|(a, _)| a));
+    }
+    let committee = committee_for_attempt_in(db, height, attempt)
+        .ok_or_else(|| format!("no committee known for attempt {attempt} of #{height}"))?;
+    miners.extend(committee.iter().map(|(a, _)| a.clone()));
+    Ok(SkipChain { committee, miners, carried: carried_lock(&locks) })
+}
+
+pub fn skip_chain(height: u64, skips: &[TmSkipCert]) -> Result<SkipChain, String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    skip_chain_in(&db, height, skips)
+}
+
+fn verify_replacement_cert_in(db: &DB, block: &LedgerBlock, cert: &TmCert) -> Result<(), String> {
+    let h = block.height;
+    if cert.attempt == 0 || cert.skips.len() != cert.attempt as usize {
+        return Err(format!("block #{h} certificate names attempt {} with {} give-ups", cert.attempt, cert.skips.len()));
+    }
+    let chain = skip_chain_in(db, h, &cert.skips)?;
+    if !chain.miners.iter().any(|a| *a == block.miner) {
+        return Err(format!("block #{h} was made by {} who sat on none of its committees", block.miner));
+    }
+    if let Some(lock) = &chain.carried {
+        if lock.value != block.hash {
+            return Err(format!(
+                "a committee of #{h} locked on block {:.12} before it gave up, so block {:.12} cannot be final there",
+                lock.value, block.hash
+            ));
+        }
+    }
+    let msg = tm_vote_message_at(cert.attempt, TM_PRECOMMIT, h, cert.round, Some(&block.hash));
+    cert.verify_votes(block, &chain.committee, &msg)
+}
 
 pub fn tm_vote_message(kind: u8, height: u64, round: u32, value: Option<&str>) -> Vec<u8> {
     let mut m = b"ego/tendermint/vote/v1:".to_vec();
@@ -10110,22 +10322,34 @@ pub fn tm_signature_ok(pk: &[u8], msg: &[u8], sig_b64: &str) -> bool {
     .unwrap_or(false)
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+fn is_zero_attempt(a: &u32) -> bool {
+    *a == 0
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct TmCert {
     pub v: u8,
     pub round: u32,
     pub votes: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "is_zero_attempt")]
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skips: Vec<TmSkipCert>,
 }
 
 impl TmCert {
     pub fn verify(&self, block: &LedgerBlock, committee: &[(String, Vec<u8>)]) -> Result<(), String> {
-        if self.v != TM_CERT_VERSION {
+        if self.v != TM_CERT_VERSION || self.attempt != 0 || !self.skips.is_empty() {
             return Err(format!("block #{} carries a certificate of another kind", block.height));
         }
         if !committee.iter().any(|(a, _)| *a == block.miner) {
             return Err(format!("block #{} was made by {} who is not on its committee", block.height, block.miner));
         }
         let msg = tm_vote_message(TM_PRECOMMIT, block.height, self.round, Some(&block.hash));
+        self.verify_votes(block, committee, &msg)
+    }
+
+    pub fn verify_votes(&self, block: &LedgerBlock, committee: &[(String, Vec<u8>)], msg: &[u8]) -> Result<(), String> {
         let mut seen: std::collections::BTreeSet<&str> = Default::default();
         for (voter, sig) in &self.votes {
             let Some((_, pk)) = committee.iter().find(|(a, _)| a == voter) else {
@@ -10134,7 +10358,7 @@ impl TmCert {
             if !seen.insert(voter.as_str()) {
                 return Err(format!("{voter} is counted twice in the certificate of block #{}", block.height));
             }
-            if !tm_signature_ok(pk, &msg, sig) {
+            if !tm_signature_ok(pk, msg, sig) {
                 return Err(format!("commit vote from {voter} for block #{} does not verify", block.height));
             }
         }
@@ -10146,14 +10370,23 @@ impl TmCert {
     }
 }
 
-fn drs_block_rules_in(db: &DB, block: &LedgerBlock, txs: &[LedgerTx], is_proposal: bool) -> Result<(), String> {
+fn drs_block_rules_in(
+    db: &DB,
+    block: &LedgerBlock,
+    txs: &[LedgerTx],
+    is_proposal: bool,
+    proposal_miners: Option<&[String]>,
+) -> Result<(), String> {
     if block.tx_merkle_root != sorted_tx_root(txs) {
         return Err(format!("block {} tx root does not match its transactions", block.height));
     }
     randao_reveal_in(db, block)?;
     let committee = committee_for_height_in(db, block.height, block.timestamp)
         .ok_or_else(|| format!("no committee known for block #{}", block.height))?;
-    if !committee.iter().any(|(a, _)| a == &block.miner) {
+    let on_first = committee.iter().any(|(a, _)| a == &block.miner);
+    let on_later = proposal_miners.map_or(false, |m| m.iter().any(|a| a == &block.miner));
+    let checked_by_cert = !is_proposal && tendermint_active_in(db, block.height);
+    if !on_first && !(is_proposal && on_later) && !checked_by_cert {
         return Err(format!("block #{} miner {} is not on its committee", block.height, block.miner));
     }
     if !is_proposal {
@@ -11567,6 +11800,117 @@ mod credits_price_tests {
 mod tm_cert_tests {
     use super::*;
 
+    fn sign_at(k: &ego_core::KeyPair, msg: &[u8]) -> String {
+        encode_vote_sig(&k.sign_dilithium(msg).signature_data)
+    }
+
+    fn skip(k: &ego_core::KeyPair, i: usize, height: u64, attempt: u32, locked: Option<TmLock>) -> TmSkipVote {
+        let msg = tm_skip_message(height, attempt, locked.as_ref().map(|l| (l.round, l.value.as_str())));
+        TmSkipVote { voter: format!("egot1member{i}"), locked, sig: sign_at(k, &msg) }
+    }
+
+    fn lock(kps: &[ego_core::KeyPair], height: u64, attempt: u32, round: u32, value: &str, backers: &[usize]) -> TmLock {
+        let msg = tm_vote_message_at(attempt, TM_PREVOTE, height, round, Some(value));
+        TmLock {
+            round,
+            value: value.to_string(),
+            pol: backers.iter().map(|i| (format!("egot1member{i}"), sign_at(&kps[*i], &msg))).collect(),
+        }
+    }
+
+    #[test]
+    fn votes_of_a_replacement_committee_sign_different_bytes() {
+        let h = "ab".repeat(32);
+        assert_eq!(tm_vote_message_at(0, TM_PRECOMMIT, 9, 1, Some(&h)), tm_vote_message(TM_PRECOMMIT, 9, 1, Some(&h)), "attempt 0 keeps today's votes");
+        assert_ne!(tm_vote_message_at(1, TM_PRECOMMIT, 9, 1, Some(&h)), tm_vote_message(TM_PRECOMMIT, 9, 1, Some(&h)));
+        assert_ne!(tm_vote_message_at(1, TM_PRECOMMIT, 9, 1, Some(&h)), tm_vote_message_at(2, TM_PRECOMMIT, 9, 1, Some(&h)));
+        assert_eq!(tm_proposal_message_at(0, 9, 1, None, &h), tm_proposal_message(9, 1, None, &h));
+        assert_ne!(tm_proposal_message_at(1, 9, 1, None, &h), tm_proposal_message(9, 1, None, &h));
+        assert_ne!(tm_skip_message(9, 0, None), tm_skip_message(9, 1, None));
+        assert_ne!(tm_skip_message(9, 0, None), tm_skip_message(9, 0, Some((0, &h))));
+        assert_ne!(tm_skip_message(9, 0, Some((0, &h))), tm_skip_message(9, 0, Some((1, &h))));
+    }
+
+    #[test]
+    fn two_of_four_members_giving_up_end_an_attempt_and_one_does_not() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let h = 40_000;
+        assert_eq!(skip_threshold_of(4), 2);
+        assert_eq!(skip_threshold_of(3), 1);
+        let one = TmSkipCert { attempt: 0, votes: vec![skip(&kps[0], 0, h, 0, None)] };
+        assert!(one.verify(h, &c).is_err());
+        let two = TmSkipCert { attempt: 0, votes: vec![skip(&kps[0], 0, h, 0, None), skip(&kps[3], 3, h, 0, None)] };
+        assert_eq!(two.verify(h, &c), Ok(None));
+        let twice = TmSkipCert { attempt: 0, votes: vec![skip(&kps[0], 0, h, 0, None), skip(&kps[0], 0, h, 0, None)] };
+        assert!(twice.verify(h, &c).is_err(), "one member cannot count twice");
+        let wrong_attempt = TmSkipCert { attempt: 1, votes: two.votes.clone() };
+        assert!(wrong_attempt.verify(h, &c).is_err(), "a give-up for one attempt is not one for another");
+        let stranger = ego_core::KeyPair::generate();
+        let mut outsider = skip(&stranger, 9, h, 0, None);
+        outsider.voter = "egot1stranger".into();
+        let with_outsider = TmSkipCert { attempt: 0, votes: vec![skip(&kps[0], 0, h, 0, None), outsider] };
+        assert!(with_outsider.verify(h, &c).is_err());
+    }
+
+    #[test]
+    fn a_reported_lock_must_carry_the_prevotes_behind_it() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let h = 40_000;
+        let value = "cd".repeat(32);
+        let backed = lock(&kps, h, 0, 2, &value, &[0, 1, 2]);
+        let cert = TmSkipCert { attempt: 0, votes: vec![skip(&kps[1], 1, h, 0, Some(backed.clone())), skip(&kps[3], 3, h, 0, None)] };
+        assert_eq!(cert.verify(h, &c), Ok(Some(backed)), "a justified lock is carried");
+        let thin = lock(&kps, h, 0, 2, &value, &[0, 1]);
+        let cert = TmSkipCert { attempt: 0, votes: vec![skip(&kps[1], 1, h, 0, Some(thin)), skip(&kps[3], 3, h, 0, None)] };
+        assert!(cert.verify(h, &c).is_err(), "a lock backed by two prevotes of four is not a lock");
+        let mut forged = lock(&kps, h, 0, 2, &value, &[0, 1, 2]);
+        forged.round = 3;
+        let cert = TmSkipCert { attempt: 0, votes: vec![skip(&kps[1], 1, h, 0, Some(forged)), skip(&kps[3], 3, h, 0, None)] };
+        assert!(cert.verify(h, &c).is_err(), "prevotes from another round do not back a lock");
+    }
+
+    #[test]
+    fn a_block_finalized_by_three_of_four_is_always_carried_by_any_two_who_give_up() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let c = committee(&kps);
+        let h = 40_000;
+        let value = "ef".repeat(32);
+        let precommitted = [0usize, 1, 2];
+        for a in 0..4usize {
+            for b in (a + 1)..4 {
+                let vote_of = |i: usize| {
+                    let locked = precommitted.contains(&i).then(|| lock(&kps, h, 0, 1, &value, &precommitted));
+                    skip(&kps[i], i, h, 0, locked)
+                };
+                let cert = TmSkipCert { attempt: 0, votes: vec![vote_of(a), vote_of(b)] };
+                let carried = cert.verify(h, &c).unwrap();
+                assert_eq!(carried.map(|l| l.value), Some(value.clone()), "givers-up {a} and {b} must carry the finalized block");
+            }
+        }
+    }
+
+    #[test]
+    fn the_latest_reported_lock_is_the_one_carried_forward() {
+        let l = |r: u32, v: &str| Some(TmLock { round: r, value: v.into(), pol: vec![] });
+        assert_eq!(carried_lock(&[None, None]), None);
+        assert_eq!(carried_lock(&[l(1, "a"), None]).map(|x| x.value), Some("a".into()), "a later attempt that locked nothing keeps the carried block");
+        assert_eq!(carried_lock(&[l(1, "a"), l(0, "a")]).map(|x| x.round), Some(0));
+    }
+
+    #[test]
+    fn a_certificate_from_attempt_zero_keeps_its_old_shape() {
+        let kps: Vec<_> = (0..4).map(|_| ego_core::KeyPair::generate()).collect();
+        let b = block();
+        let c = cert(&b, 1, &[(0, &kps[0]), (1, &kps[1]), (2, &kps[2])]);
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(json.get("attempt").is_none() && json.get("skips").is_none(), "old nodes read the same certificate as before: {json}");
+        let mut later = c.clone();
+        later.attempt = 1;
+        assert!(later.verify(&b, &committee(&kps)).is_err(), "a replacement certificate is never read as an old one");
+    }
+
     fn block() -> LedgerBlock {
         LedgerBlock {
             height: 33_150,
@@ -11589,6 +11933,7 @@ mod tm_cert_tests {
             v: TM_CERT_VERSION,
             round,
             votes: voters.iter().map(|(i, k)| (format!("egot1member{i}"), vote(k, TM_PRECOMMIT, b, round))).collect(),
+            ..TmCert::default()
         }
     }
 
@@ -11621,6 +11966,7 @@ mod tm_cert_tests {
             v: TM_CERT_VERSION,
             round: 1,
             votes: (0..3).map(|i| (format!("egot1member{i}"), vote(&kps[i], TM_PREVOTE, &b, 1))).collect(),
+            ..TmCert::default()
         };
         assert!(prevotes.verify(&b, &c).is_err());
         let mut moved = cert(&b, 1, &[(0, &kps[0]), (1, &kps[1]), (2, &kps[2])]);

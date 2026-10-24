@@ -117,6 +117,7 @@ pub struct Tendermint {
     decision: Option<(u32, ValueId)>,
     started: bool,
     resumed: bool,
+    carried: Option<ValueId>,
 }
 
 impl Tendermint {
@@ -142,7 +143,18 @@ impl Tendermint {
             decision: None,
             started: false,
             resumed: false,
+            carried: None,
         }
+    }
+
+    pub fn carry(&mut self, value: ValueId) {
+        if !self.started {
+            self.carried = Some(value);
+        }
+    }
+
+    pub fn carried(&self) -> Option<ValueId> {
+        self.carried
     }
 
     pub fn restore(&mut self, saved: &Saved) {
@@ -388,7 +400,7 @@ impl Tendermint {
     fn find_decision(&self) -> Option<(u32, ValueId)> {
         for round in self.precommits.keys() {
             if let Some(v) = self.value_with_quorum(VoteKind::Precommit, *round) {
-                if self.validity.get(&v) == Some(&true) {
+                if self.validity.get(&v) == Some(&true) && self.carried.map_or(true, |c| c == v) {
                     return Some((*round, v));
                 }
             }
@@ -422,7 +434,7 @@ impl Tendermint {
             out.push(Action::Propose {
                 round,
                 pol_round: self.valid.map(|(r, _)| r),
-                value: self.valid.map(|(_, v)| v),
+                value: self.valid.map(|(_, v)| v).or(self.carried),
             });
         }
         self.arm(Timer::Propose, round, now);
@@ -460,6 +472,7 @@ impl Tendermint {
             if self.step == Step::Propose {
                 if let Some((v, pol)) = self.proposals.get(&round).copied() {
                     if let Some(ok) = self.validity.get(&v).copied() {
+                        let ok = ok && self.carried.map_or(true, |c| c == v);
                         let verdict = match pol {
                             None => Some(ok && self.locked.map_or(true, |(_, lv)| lv == v)),
                             Some(vr) if self.count(VoteKind::Prevote, vr, Some(v)) >= q => {
@@ -480,7 +493,7 @@ impl Tendermint {
             }
             if self.step != Step::Propose && !self.polka_done.contains(&round) {
                 if let Some(v) = self.value_with_quorum(VoteKind::Prevote, round) {
-                    if self.validity.get(&v) == Some(&true) {
+                    if self.validity.get(&v) == Some(&true) && self.carried.map_or(true, |c| c == v) {
                         self.polka_done.insert(round);
                         if self.step == Step::Prevote {
                             self.locked = Some((round, v));

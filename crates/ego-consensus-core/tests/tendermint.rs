@@ -723,3 +723,64 @@ fn the_split_at_32939_cannot_happen() {
         );
     }
 }
+
+#[test]
+fn a_replacement_committee_proposes_the_carried_block_first() {
+    let height = 30u64;
+    let me = (height % 4) as usize;
+    let mut e = Tendermint::new(height, 4, Some(me), fast());
+    e.carry(v(5));
+    let acts = e.start(0);
+    assert!(
+        acts.contains(&Action::Propose { round: 0, pol_round: None, value: Some(v(5)) }),
+        "the first proposer of a replacement committee offers the carried block, got {acts:?}"
+    );
+}
+
+#[test]
+fn a_replacement_committee_never_backs_a_block_other_than_the_carried_one() {
+    let height = 31u64;
+    let me = ((height + 1) % 4) as usize;
+    let mut e = Tendermint::new(height, 4, Some(me), fast());
+    e.carry(v(5));
+    e.start(0);
+    let p0 = e.proposer(0);
+    let acts = e.on_proposal(1, 0, p0, v(6), None, true);
+    assert!(
+        acts.contains(&Action::Vote { kind: VoteKind::Prevote, round: 0, value: None }),
+        "a different block must get a nil prevote, got {acts:?}"
+    );
+    let others: Vec<usize> = (0..4).filter(|i| *i != me).collect();
+    for (t, j) in others.iter().enumerate() {
+        e.on_vote(10 + t as u64, VoteKind::Prevote, 0, *j, Some(v(6)));
+        e.on_vote(20 + t as u64, VoteKind::Precommit, 0, *j, Some(v(6)));
+    }
+    assert_eq!(e.decision(), None, "precommits for another block never decide while a block is carried");
+    assert_eq!(e.locked(), None);
+}
+
+#[test]
+fn a_replacement_committee_finalizes_the_carried_block() {
+    let height = 32u64;
+    let me = ((height + 2) % 4) as usize;
+    let mut e = Tendermint::new(height, 4, Some(me), fast());
+    e.carry(v(5));
+    e.start(0);
+    let p0 = e.proposer(0);
+    let acts = e.on_proposal(1, 0, p0, v(5), None, true);
+    assert!(acts.contains(&Action::Vote { kind: VoteKind::Prevote, round: 0, value: Some(v(5)) }));
+    let others: Vec<usize> = (0..4).filter(|i| *i != me).collect();
+    e.on_vote(2, VoteKind::Prevote, 0, others[0], Some(v(5)));
+    e.on_vote(3, VoteKind::Prevote, 0, others[1], Some(v(5)));
+    e.on_vote(4, VoteKind::Precommit, 0, others[0], Some(v(5)));
+    let acts = e.on_vote(5, VoteKind::Precommit, 0, others[1], Some(v(5)));
+    assert!(acts.contains(&Action::Decide { round: 0, value: v(5) }), "got {acts:?}");
+}
+
+#[test]
+fn carrying_is_fixed_once_the_engine_runs() {
+    let mut e = Tendermint::new(33, 4, Some(0), fast());
+    e.start(0);
+    e.carry(v(9));
+    assert_eq!(e.carried(), None, "a running engine cannot be told to carry a block");
+}
