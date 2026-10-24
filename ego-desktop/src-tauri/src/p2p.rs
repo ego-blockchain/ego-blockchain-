@@ -1759,7 +1759,44 @@ struct V2Outbox {
 }
 
 static V2_OUTBOX: Mutex<Option<V2Outbox>> = Mutex::new(None);
-static V2_SENDS_IN_FLIGHT: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+const MEMBER_SEND_TIMEOUT_SECS: u64 = 6;
+const MEMBER_QUEUE_MAX: usize = 48;
+static MEMBER_QUEUES: Mutex<Option<HashMap<String, std::collections::VecDeque<P2PMessage>>>> = Mutex::new(None);
+
+fn queue_for_member(ep: &str, msgs: &[P2PMessage]) -> bool {
+    let mut g = MEMBER_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    let start = !map.contains_key(ep);
+    let q = map.entry(ep.to_string()).or_default();
+    q.extend(msgs.iter().cloned());
+    while q.len() > MEMBER_QUEUE_MAX {
+        q.pop_front();
+    }
+    start
+}
+
+fn next_member_batch(ep: &str) -> Option<Vec<P2PMessage>> {
+    let mut g = MEMBER_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    match map.get_mut(ep) {
+        Some(q) if !q.is_empty() => Some(q.drain(..).collect()),
+        _ => {
+            map.remove(ep);
+            None
+        }
+    }
+}
+
+async fn drain_member_queue(ep: String) {
+    while let Some(batch) = next_member_batch(&ep) {
+        for msg in &batch {
+            let sent = tokio::time::timeout(Duration::from_secs(MEMBER_SEND_TIMEOUT_SECS), send_message(&ep, msg)).await;
+            if !matches!(sent, Ok(Ok(()))) {
+                break;
+            }
+        }
+    }
+}
 
 fn v2_slot(msg: &P2PMessage) -> Option<usize> {
     match msg {
@@ -1854,23 +1891,9 @@ pub(crate) async fn send_to_members(members: Vec<String>, msgs: Vec<P2PMessage>)
     let me = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address).await.unwrap_or_default();
     for member in members.into_iter().filter(|a| *a != me) {
         let Some(ep) = get_relay_endpoint(&member).await else { continue };
-        {
-            let mut g = V2_SENDS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-            if !g.get_or_insert_with(Default::default).insert(ep.clone()) {
-                continue;
-            }
+        if queue_for_member(&ep, &msgs) {
+            tokio::spawn(drain_member_queue(ep));
         }
-        let msgs = msgs.clone();
-        tokio::spawn(async move {
-            for msg in &msgs {
-                if send_message(&ep, msg).await.is_err() {
-                    break;
-                }
-            }
-            if let Some(set) = V2_SENDS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                set.remove(&ep);
-            }
-        });
     }
 }
 
@@ -17998,5 +18021,37 @@ mod seed_peer_tests {
             P2PMessage::PeerAnnounce { app_version, .. } => assert!(app_version.is_empty()),
             _ => panic!("wrong variant"),
         }
+    }
+}
+
+#[cfg(test)]
+mod member_queue_tests {
+    use super::*;
+
+    fn ping(i: u64) -> P2PMessage {
+        P2PMessage::ValidatorLeaving { address: format!("egot1q{i}"), timestamp: i as i64, signature: String::new() }
+    }
+
+    #[test]
+    fn a_busy_member_queues_messages_instead_of_dropping_them() {
+        let ep = "/ip4/10.9.9.9/tcp/1/p2p/queue-test-a";
+        assert!(queue_for_member(ep, &[ping(1)]), "the first batch starts a sender");
+        assert!(!queue_for_member(ep, &[ping(2), ping(3)]), "later batches join the queue while it runs");
+        assert_eq!(next_member_batch(ep).map(|b| b.len()), Some(3), "nothing queued is lost");
+        assert!(next_member_batch(ep).is_none(), "an empty queue ends the sender");
+        assert!(queue_for_member(ep, &[ping(4)]), "and the next batch starts a new one");
+        assert_eq!(next_member_batch(ep).map(|b| b.len()), Some(1));
+        assert!(next_member_batch(ep).is_none());
+    }
+
+    #[test]
+    fn a_full_queue_keeps_the_newest_messages() {
+        let ep = "/ip4/10.9.9.9/tcp/1/p2p/queue-test-b";
+        let many: Vec<P2PMessage> = (0..(MEMBER_QUEUE_MAX as u64 + 10)).map(ping).collect();
+        queue_for_member(ep, &many);
+        let batch = next_member_batch(ep).unwrap();
+        assert_eq!(batch.len(), MEMBER_QUEUE_MAX);
+        assert!(matches!(&batch[MEMBER_QUEUE_MAX - 1], P2PMessage::ValidatorLeaving { timestamp, .. } if *timestamp == MEMBER_QUEUE_MAX as i64 + 9));
+        assert!(next_member_batch(ep).is_none());
     }
 }

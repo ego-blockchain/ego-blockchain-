@@ -26,7 +26,14 @@ const REPLACEMENT_VERSION: &str = "0.3.646";
 const LIVE_WITHIN_SECS: i64 = 900;
 const LOOKAHEAD: u32 = 6;
 
-type Out = Vec<(P2PMessage, bool)>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Via {
+    Both,
+    Direct,
+    Gossip,
+}
+
+type Out = Vec<(P2PMessage, Via)>;
 type Payload = (LedgerBlock, Vec<LedgerTx>);
 
 fn mono_ms() -> u64 {
@@ -198,6 +205,7 @@ struct Driver {
     said_cannot_give_up: bool,
     said_no_replacement: bool,
     caught_up: HashMap<u32, u64>,
+    heard: HashSet<usize>,
 }
 
 static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
@@ -346,6 +354,7 @@ impl Driver {
             said_cannot_give_up: false,
             said_no_replacement: false,
             caught_up: HashMap::new(),
+            heard: HashSet::new(),
         };
         if let Some(saved) = restored {
             eprintln!(
@@ -462,7 +471,7 @@ impl Driver {
                                 None => eprintln!("[Consensus] h={} attempt {} round {round}: offering the block the previous committee locked on", self.height, self.attempt),
                             }
                             self.my_proposals.insert(round, msg.clone());
-                            out.push((msg, true));
+                            out.push((msg, Via::Both));
                             queue.extend(self.engine.on_proposal(now, round, me, v, pol_round, true));
                         }
                         _ => eprintln!("[Consensus] h={} round {round}: cannot offer the backed block again, its contents are not here", self.height),
@@ -475,7 +484,7 @@ impl Driver {
                             self.sigs.entry((code_of(kind), round, v)).or_default().insert(me, sig.clone());
                         }
                         self.my_votes.insert((round, code_of(kind)), msg.clone());
-                        out.push((msg, true));
+                        out.push((msg, Via::Both));
                         persist = true;
                     }
                 }
@@ -582,7 +591,7 @@ impl Driver {
             now.saturating_sub(self.attempt_started) / 1000,
             if vote.locked.is_some() { " and passes on the block it locked on" } else { "" }
         );
-        out.push((self.give_up_message(&vote), true));
+        out.push((self.give_up_message(&vote), Via::Both));
         self.give_ups.insert(vote.voter.clone(), vote);
     }
 
@@ -639,6 +648,7 @@ impl Driver {
         self.said_cannot_give_up = false;
         self.said_no_replacement = false;
         self.caught_up.clear();
+        self.heard.clear();
         self.attempt_started = now;
         self.last_progress = now;
         let acts = self.engine.start(now);
@@ -656,11 +666,11 @@ impl Driver {
         }
         self.caught_up.insert(round, now);
         if let Some(m) = self.my_proposals.get(&round) {
-            out.push((m.clone(), true));
+            out.push((m.clone(), Via::Both));
         }
         for code in [TM_PREVOTE, TM_PRECOMMIT] {
             if let Some(m) = self.my_votes.get(&(round, code)) {
-                out.push((m.clone(), true));
+                out.push((m.clone(), Via::Both));
             }
         }
     }
@@ -681,7 +691,7 @@ impl Driver {
                         block: payload.as_ref().map(|p| p.0.clone()),
                         transactions: payload.map(|p| p.1).unwrap_or_default(),
                     },
-                    true,
+                    Via::Gossip,
                 ));
             }
         }
@@ -694,24 +704,24 @@ impl Driver {
         }
         self.last_resend = now;
         if let Some(vote) = &self.gave_up {
-            out.push((self.give_up_message(vote), false));
+            out.push((self.give_up_message(vote), Via::Direct));
         } else {
             let round = self.engine.round();
             if let Some(m) = self.my_proposals.get(&round) {
-                out.push((m.clone(), false));
+                out.push((m.clone(), Via::Direct));
             }
             for code in [TM_PREVOTE, TM_PRECOMMIT] {
                 if let Some(m) = self.my_votes.get(&(round, code)) {
-                    out.push((m.clone(), false));
+                    out.push((m.clone(), Via::Direct));
                 }
             }
             if let Some((lr, lv)) = self.engine.locked() {
                 if let Some(m) = self.proposal_msgs.get(&lv) {
-                    out.push((m.clone(), false));
+                    out.push((m.clone(), Via::Direct));
                 }
                 if lr != round {
                     if let Some(m) = self.my_votes.get(&(lr, TM_PRECOMMIT)) {
-                        out.push((m.clone(), false));
+                        out.push((m.clone(), Via::Direct));
                     }
                 }
             }
@@ -724,7 +734,7 @@ impl Driver {
 
     fn status(&self) -> String {
         format!(
-            "h={}{} round {} step {:?}, committee {} quorum {}, {}, locked {}{}, waiting {}s",
+            "h={}{} round {} step {:?}, committee {} quorum {}, {}, heard from {} other member(s), locked {}{}, waiting {}s",
             self.height,
             if self.attempt > 0 { format!(" attempt {}", self.attempt) } else { String::new() },
             self.engine.round(),
@@ -735,6 +745,7 @@ impl Driver {
                 Some(i) => format!("member {i}"),
                 None => "following".into(),
             },
+            self.heard.len(),
             if self.engine.locked().is_some() { "yes" } else { "no" },
             if self.give_ups.is_empty() {
                 String::new()
@@ -755,11 +766,16 @@ async fn flush(height: u64, out: Out) {
         return;
     }
     let mut direct = Vec::new();
-    for (msg, gossip) in out {
-        if gossip {
+    for (msg, via) in out {
+        if via != Via::Direct {
             crate::p2p::shadow_publish(&msg).await;
         }
-        direct.push(msg);
+        if via != Via::Gossip {
+            direct.push(msg);
+        }
+    }
+    if direct.is_empty() {
+        return;
     }
     let group = GROUP
         .lock()
@@ -1042,6 +1058,7 @@ async fn on_proposal(
         }
         let v = tm_value_id(&block.hash);
         d.names.entry(v).or_insert_with(|| block.hash.clone());
+        d.heard.insert(idx);
         d.catch_up(round, now, &mut out);
         let mut acts = Vec::new();
         if let Some(vr) = pol_round {
@@ -1143,6 +1160,7 @@ async fn on_vote(height: u64, round: u32, kind: u8, value: Option<String>, voter
             d.names.entry(v).or_insert_with(|| name.clone());
             d.sigs.entry((kind, round, v)).or_default().insert(j, sig);
         }
+        d.heard.insert(j);
         d.catch_up(round, now, &mut out);
         let acts = d.engine.on_vote(now, k, round, j, v);
         d.apply(acts, now, &mut out);
@@ -1191,6 +1209,9 @@ async fn on_give_up(height: u64, attempt: u32, vote: TmSkipVote, block: Option<L
             d.give_ups.len() + 1,
             skip_threshold_of(d.members.len())
         );
+        if let Some(j) = d.index_of(&vote.voter) {
+            d.heard.insert(j);
+        }
         d.give_ups.insert(vote.voter.clone(), vote);
         d.ready_skips()
     };
@@ -1276,7 +1297,7 @@ async fn maybe_propose() {
         eprintln!("[Consensus] h={height} round {round}: proposing block {:.12} with {tx_count} transactions", d.names[&v]);
         d.my_proposals.insert(round, msg.clone());
         d.proposal_msgs.insert(v, msg.clone());
-        out.push((msg, true));
+        out.push((msg, Via::Both));
         let acts = d.engine.on_proposal(now, round, me, v, None, true);
         d.apply(acts, now, &mut out);
     }
