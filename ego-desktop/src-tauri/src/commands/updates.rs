@@ -67,7 +67,18 @@ pub async fn check_for_update() -> Result<UpdateInfo, EgoDesktopError> {
         return Ok(fallback);
     }
 
-    let Some(manifest) = fetch_manifest().await else { return Ok(fallback) };
+    let Some(manifest) = fetch_manifest().await else {
+        let seen = PEER_VERSIONS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        return Ok(match peer_backed_latest(&seen, &current, chrono::Utc::now().timestamp()) {
+            Some(latest) => UpdateInfo {
+                update_available: true,
+                latest,
+                notes: "The download page could not be reached, but other nodes on the network already run this version.".to_string(),
+                ..fallback
+            },
+            None => fallback,
+        });
+    };
 
     let latest = manifest["version"].as_str().unwrap_or("").trim().to_string();
     if latest.is_empty() {
@@ -82,6 +93,47 @@ pub async fn check_for_update() -> Result<UpdateInfo, EgoDesktopError> {
         download_url: manifest["url"].as_str().unwrap_or(DOWNLOAD_PAGE_URL).to_string(),
         notes: manifest["notes"].as_str().unwrap_or("").to_string(),
     })
+}
+
+const PEER_VERSION_QUORUM: usize = 3;
+const PEER_VERSION_WINDOW_SECS: i64 = 24 * 3600;
+const PEER_VERSION_MAX_TRACKED: usize = 4096;
+
+static PEER_VERSIONS: std::sync::Mutex<std::collections::BTreeMap<String, (String, i64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+pub fn note_peer_version(address: &str, version: &str) {
+    let version = version.trim();
+    if address.is_empty() || parse_version(version) == (0, 0, 0) {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut seen = PEER_VERSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= PEER_VERSION_MAX_TRACKED && !seen.contains_key(address) {
+        seen.retain(|_, (_, at)| now - *at <= PEER_VERSION_WINDOW_SECS);
+        if seen.len() >= PEER_VERSION_MAX_TRACKED {
+            if let Some(oldest) = seen.iter().min_by_key(|(_, (_, at))| *at).map(|(a, _)| a.clone()) {
+                seen.remove(&oldest);
+            }
+        }
+    }
+    seen.insert(address.to_string(), (version.to_string(), now));
+}
+
+fn peer_backed_latest(seen: &std::collections::BTreeMap<String, (String, i64)>, current: &str, now: i64) -> Option<String> {
+    let recent: Vec<(u32, u32, u32)> = seen
+        .values()
+        .filter(|(_, at)| now - *at <= PEER_VERSION_WINDOW_SECS)
+        .map(|(v, _)| parse_version(v))
+        .filter(|v| *v > parse_version(current))
+        .collect();
+    let mut candidates = recent.clone();
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .find(|c| recent.iter().filter(|v| *v >= c).count() >= PEER_VERSION_QUORUM)
+        .map(|(a, b, c)| format!("{a}.{b}.{c}"))
 }
 
 async fn fetch_manifest() -> Option<serde_json::Value> {
@@ -227,6 +279,32 @@ mod tests {
         ] {
             assert_eq!(published_cert_in(&bad), None, "{bad}");
         }
+    }
+
+    fn peers(list: &[(&str, &str, i64)]) -> std::collections::BTreeMap<String, (String, i64)> {
+        list.iter().map(|(a, v, at)| (a.to_string(), (v.to_string(), *at))).collect()
+    }
+
+    #[test]
+    fn peers_announce_an_update_only_when_enough_of_them_run_it() {
+        let now = 1_900_000_000;
+        let two = peers(&[("a", "0.3.646", now), ("b", "0.3.646", now), ("c", "0.3.644", now)]);
+        assert_eq!(peer_backed_latest(&two, "0.3.645", now), None, "two peers are not enough");
+        let three = peers(&[("a", "0.3.646", now), ("b", "0.3.646", now), ("c", "0.3.647", now)]);
+        assert_eq!(peer_backed_latest(&three, "0.3.645", now).as_deref(), Some("0.3.646"));
+        let ahead = peers(&[("a", "0.3.650", now), ("b", "0.3.650", now), ("c", "0.3.650", now), ("d", "0.3.651", now)]);
+        assert_eq!(peer_backed_latest(&ahead, "0.3.645", now).as_deref(), Some("0.3.650"), "one peer alone cannot name a version");
+        assert_eq!(peer_backed_latest(&ahead, "0.3.650", now), None, "nothing newer than this build");
+    }
+
+    #[test]
+    fn stale_or_garbage_peer_versions_are_ignored() {
+        let now = 1_900_000_000;
+        let old = now - PEER_VERSION_WINDOW_SECS - 1;
+        let stale = peers(&[("a", "0.3.646", old), ("b", "0.3.646", old), ("c", "0.3.646", now)]);
+        assert_eq!(peer_backed_latest(&stale, "0.3.645", now), None);
+        let junk = peers(&[("a", "<html>", now), ("b", "", now), ("c", "9.9.9", now)]);
+        assert_eq!(peer_backed_latest(&junk, "0.3.645", now), None);
     }
 
     /// A corrupt or HTML manifest must never appear newer than a real build.

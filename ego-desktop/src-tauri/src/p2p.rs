@@ -421,16 +421,38 @@ pub fn offline_mode() -> bool {
 }
 
 pub const RELAY_NODES: &[&str] = &[
-    "/dns4/rpc.egoblockchain.com/tcp/4001/p2p/12D3KooWJ2t1k3nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
     "/dns4/egorelay.egoblockchain.com/tcp/4001/p2p/12D3KooWFFjZdk4nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
-    "/dns4/relay2.egoblockchain.com/tcp/4001/p2p/12D3KooWJ2t1k3nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
-    "/dns4/relay3.egoblockchain.com/tcp/4001/p2p/12D3KooWK3u2k3nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
-    "/dns4/relay4.egoblockchain.com/tcp/4001/p2p/12D3KooWL4v3k3nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
 ];
 
-pub const BOOTSTRAP_PEERS: &[&str] = &[
-    "/ip4/40.233.82.42/tcp/47393/p2p/12D3KooWBJthxzWdKk4FgwKWn98oytdzr9BDnrb6MJ1LynnU3Spz",
-];
+const SEED_PEERS: &str = include_str!("../seed_peers.txt");
+const SEED_DIALS_PER_TICK: usize = 12;
+const SEED_WHEN_FEWER_PEERS_THAN: usize = 3;
+
+pub fn seed_peers() -> Vec<Multiaddr> {
+    SEED_PEERS
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.parse::<Multiaddr>().ok())
+        .filter(|a| peer_id_from_multiaddr(a).is_some())
+        .collect()
+}
+
+fn is_relay_itself(endpoint: &str, relay_ids: &std::collections::HashSet<String>) -> bool {
+    endpoint
+        .parse::<Multiaddr>()
+        .ok()
+        .and_then(|a| peer_id_from_multiaddr(&a))
+        .map_or(false, |target| relay_ids.contains(&target.to_string()))
+}
+
+fn seeds_to_dial(mut seeds: Vec<Multiaddr>, me: Option<&PeerId>, n: usize) -> Vec<Multiaddr> {
+    use rand::seq::SliceRandom;
+    seeds.retain(|a| me.map_or(true, |m| peer_id_from_multiaddr(a).as_ref() != Some(m)));
+    seeds.shuffle(&mut rand::thread_rng());
+    seeds.truncate(n);
+    seeds
+}
 
 fn shuffled_relay_nodes() -> Vec<&'static str> {
     use std::collections::hash_map::DefaultHasher;
@@ -3808,6 +3830,8 @@ pub enum P2PMessage {
         signature: String,
         #[serde(default)]
         machine_id: String,
+        #[serde(default)]
+        app_version: String,
     },
     ChatMessage {
         bundle: String,
@@ -5948,6 +5972,7 @@ pub async fn send_direct_peer_announce(target_endpoint: String) {
         city: my_city, country: my_country, lat: my_lat, lon: my_lon,
         coverage_score, dilithium_pubkey: dil_hex, vrf_pubkey: vrf_hex,
         staked_amount, genesis_hash, signature, machine_id,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     if let Err(e) = send_message_any(&[target_endpoint.clone()], &announce).await {
         if !e.contains("none of the requested protocols") {
@@ -6046,6 +6071,7 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
         genesis_hash,
         signature,
         machine_id,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
     if let Ok(data) = serde_json::to_vec(&msg) {
@@ -6463,7 +6489,7 @@ pub async fn check_file_replication() {
     // Drop copies of files whose owners deleted them, before any of them is replicated again.
     crate::file_delete::sweep().await;
     if known_validator_count() < 2 { return; }
-    let _guard = crate::ledger::TX_MUTEX.lock().await; // This is fine, it's a tokio mutex
+    let guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
         .await.unwrap_or_default();
     if ledger.address.is_empty() { return; }
@@ -6473,6 +6499,8 @@ pub async fn check_file_replication() {
     let mut need_save   = false;
     let mut pin_needed: Vec<String> = Vec::new();
     let mut payouts: Vec<(String, u64, String)> = Vec::new(); // (recipient, amount_uegoc, cid)
+    let mut heartbeats: Vec<P2PMessage> = Vec::new();
+    let mut promotions: Vec<P2PMessage> = Vec::new();
 
     // ── Re-publish under-distributed Active files when connectivity returns ───
     // Files stored while offline have replication_role="" and replica_peers=[].
@@ -6600,19 +6628,12 @@ pub async fn check_file_replication() {
                 }
 
                 // Broadcast heartbeat to all known slaves
-                let hb = P2PMessage::ReplicaHeartbeat {
+                heartbeats.push(P2PMessage::ReplicaHeartbeat {
                     cid:          file.cid.clone(),
                     master_addr:  my_addr.clone(),
                     timestamp:    now,
                     master_since: file.master_since,
-                };
-                let peers = tokio::task::spawn_blocking(load_peer_cache)
-                    .await.unwrap_or_default();
-                for peer in &peers {
-                    if !peer.endpoint.is_empty() {
-                        let _ = send_message_any(&[peer.endpoint.clone()], &hb).await;
-                    }
-                }
+                });
 
                 // ── Recruitment gate ──────────────────────────────────────
                 // A slot covered by a holder in its 24h grace does NOT trigger a
@@ -6709,19 +6730,12 @@ pub async fn check_file_replication() {
                     need_save = true;
 
                     // Broadcast promotion so other slaves know who the new master is
-                    let promote_msg = P2PMessage::ReplicaPromote {
+                    promotions.push(P2PMessage::ReplicaPromote {
                         cid:        file.cid.clone(),
                         new_master: my_addr.clone(),
                         old_master,
                         timestamp:  now,
-                    };
-                    let peers = tokio::task::spawn_blocking(load_peer_cache)
-                        .await.unwrap_or_default();
-                    for peer in &peers {
-                        if !peer.endpoint.is_empty() {
-                            let _ = send_message_any(&[peer.endpoint.clone()], &promote_msg).await;
-                        }
-                    }
+                    });
 
                     // Immediately request a new slave
                     pin_needed.push(file.cid.clone());
@@ -6735,9 +6749,6 @@ pub async fn check_file_replication() {
     if need_save {
         tokio::task::spawn_blocking(move || ledger.save())
             .await.unwrap_or(Ok(())).ok();
-    }
-    if !pin_needed.is_empty() {
-        request_file_pinning(pin_needed).await;
     }
     if !payouts.is_empty() {
         let now2 = now;
@@ -6762,6 +6773,51 @@ pub async fn check_file_replication() {
             let _ = crate::ledger::save_chain(&chain);
         }).await.ok();
     }
+    drop(guard);
+    broadcast_replication(promotions, true);
+    broadcast_replication(heartbeats, false);
+    if !pin_needed.is_empty() {
+        request_file_pinning(pin_needed).await;
+    }
+}
+
+const REPLICATION_SEND_CONCURRENCY: usize = 16;
+const REPLICATION_SEND_TIMEOUT_SECS: u64 = 8;
+static REPLICATION_HEARTBEATS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn replication_sends(messages: usize, endpoints: usize) -> Vec<(usize, usize)> {
+    (0..messages).flat_map(|m| (0..endpoints).map(move |e| (m, e))).collect()
+}
+
+fn broadcast_replication(messages: Vec<P2PMessage>, always: bool) {
+    if messages.is_empty() {
+        return;
+    }
+    if !always && REPLICATION_HEARTBEATS_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async move {
+        let endpoints: Vec<String> = tokio::task::spawn_blocking(load_peer_cache)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.endpoint)
+            .filter(|e| !e.is_empty())
+            .collect();
+        let (messages, endpoints) = (&messages, &endpoints);
+        futures::stream::iter(replication_sends(messages.len(), endpoints.len()))
+            .for_each_concurrent(REPLICATION_SEND_CONCURRENCY, |(m, e)| async move {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(REPLICATION_SEND_TIMEOUT_SECS),
+                    send_message_any(std::slice::from_ref(&endpoints[e]), &messages[m]),
+                )
+                .await;
+            })
+            .await;
+        if !always {
+            REPLICATION_HEARTBEATS_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    });
 }
 
 fn peer_cache_path() -> std::path::PathBuf { base_data_dir().join("peers.json") }
@@ -6949,7 +7005,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                 let ep = &p.endpoint;
                 let is_old_relay = ep.contains("egorelay2.") || ep.contains("egorelay3.")
                     || ep.contains("egorelay4.") || ep.contains("egorelay5.");
-                let is_active_relay = active_relay_ids.iter().any(|id| ep.contains(id.as_str()));
+                let is_active_relay = is_relay_itself(ep, &active_relay_ids);
                 !is_old_relay && !is_active_relay
             })
             .collect();
@@ -6977,6 +7033,16 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                 "{} cached peers held back from the startup burst so LAN and mDNS dials are not starved",
                 remote.len() - MAX_STARTUP_REMOTE_DIALS
             );
+        }
+        if remote.len() < MIN_CACHED_PEERS_FOR_DIRECT_BOOT && !offline_mode() {
+            let seeds = seeds_to_dial(seed_peers(), Some(&local_peer_id), SEED_DIALS_PER_TICK);
+            tracing::info!(
+                "{} remote peer(s) cached — dialling {} built-in seed peer(s) so this node can join without the node list",
+                remote.len(), seeds.len()
+            );
+            for addr in seeds {
+                let _ = swarm.dial(addr);
+            }
         }
     }
 
@@ -9707,7 +9773,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             }
         }
 
-        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints, city, country, lat, lon, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, signature, machine_id } => {
+        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints, city, country, lat, lon, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, signature, machine_id, app_version } => {
             if genesis_hash != crate::ledger::GENESIS_HASH {
                 tracing::warn!("[P2P] Rejected peer {} — Parallel network attempt detected (Genesis mismatch)", address);
                 return;
@@ -9736,6 +9802,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 register_validator_pubkey(&address, &dilithium_pubkey);
                 if !vrf_pubkey.is_empty() { record_peer_ed25519(&address, &vrf_pubkey); }
                 register_announced_validator(&address);
+                crate::commands::updates::note_peer_version(&address, &app_version);
             } else if staked_amount > 0 || coverage_score > 0 || !dilithium_pubkey.is_empty() || !vrf_pubkey.is_empty() {
                 tracing::warn!(
                     "PeerAnnounce from {} FAILED identity verification — not registering as validator (genesis_match={}, has_dil={}, has_vrf={})",
@@ -12061,24 +12128,24 @@ async fn merge_remote_chain_inner(
 /// other (otherwise each runs an isolated solo chain — "Active Nodes: 1" — and
 /// transactions never cross). Pure-P2P DHT discovery alone was not bridging
 /// remote nodes; this is the reliable centralized fallback for the testnet.
-/// Dial the always-on public validator anchors directly. Cheap + idempotent —
-/// libp2p ignores a dial to an already-connected peer and self-rejects our own
-/// address, so it's safe to call on startup and on every discovery tick.
 pub async fn dial_bootstrap_peers() {
     if offline_mode() {
         return;
     }
+    let live = live_peer_count();
+    if live >= SEED_WHEN_FEWER_PEERS_THAN {
+        return;
+    }
     let Some(tx) = SWARM_TX.get() else { return };
     let mut dialed = 0usize;
-    for ep in BOOTSTRAP_PEERS {
-        let addr: Multiaddr = match ep.parse() { Ok(a) => a, Err(_) => continue };
+    for addr in seeds_to_dial(seed_peers(), None, SEED_DIALS_PER_TICK) {
         let (rtx, _rrx) = oneshot::channel();
         if tx.send(SwarmCmd::Dial { peer_addr: addr, reply: rtx }).await.is_ok() {
             dialed += 1;
         }
     }
     if dialed > 0 {
-        eprintln!("[P2P] dialed {} direct bootstrap peer(s)", dialed);
+        eprintln!("[P2P] only {live} live peer(s) — dialed {dialed} built-in seed peer(s) through the relay");
     }
 }
 
@@ -17834,5 +17901,83 @@ mod peer_storage_tests {
         let (gb, n) = fresh_peer_storage(now);
         assert_eq!(n, before_n + 2);
         assert!((gb - before_gb - 20.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod seed_peer_tests {
+    use super::*;
+
+    #[test]
+    fn every_built_in_seed_is_a_relay_address_with_a_peer_id() {
+        let seeds = seed_peers();
+        assert!(!seeds.is_empty(), "a release must ship seed peers");
+        let lines = SEED_PEERS.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(seeds.len(), lines, "every line of seed_peers.txt must parse");
+        let relay = RELAY_NODES[0];
+        for s in &seeds {
+            let text = s.to_string();
+            assert!(text.starts_with(relay) && text.contains("/p2p-circuit/p2p/"), "{text}");
+        }
+    }
+
+    #[test]
+    fn seed_selection_skips_this_node_and_respects_the_limit() {
+        let seeds = seed_peers();
+        let me = peer_id_from_multiaddr(&seeds[0]).unwrap();
+        let picked = seeds_to_dial(seeds.clone(), Some(&me), 5);
+        assert!(picked.len() <= 5);
+        assert!(picked.iter().all(|a| peer_id_from_multiaddr(a) != Some(me)));
+        assert_eq!(seeds_to_dial(seeds.clone(), None, usize::MAX).len(), seeds.len());
+    }
+
+    #[test]
+    fn a_peer_reached_through_the_relay_is_not_mistaken_for_the_relay() {
+        let relay = RELAY_NODES[0];
+        let relay_id = peer_id_from_multiaddr(&relay.parse().unwrap()).unwrap().to_string();
+        let ids: std::collections::HashSet<String> = [relay_id].into_iter().collect();
+        assert!(is_relay_itself(relay, &ids));
+        let circuit = seed_peers()[0].to_string();
+        assert!(!is_relay_itself(&circuit, &ids), "a cached circuit peer must still be dialled");
+        assert!(!is_relay_itself("not an address", &ids));
+    }
+
+    #[test]
+    fn replication_sends_every_message_to_every_peer_once() {
+        let jobs = replication_sends(2, 3);
+        assert_eq!(jobs.len(), 6);
+        let unique: std::collections::HashSet<_> = jobs.iter().collect();
+        assert_eq!(unique.len(), 6);
+        assert!(replication_sends(0, 5).is_empty());
+        assert!(replication_sends(4, 0).is_empty());
+    }
+
+    #[test]
+    fn an_announce_from_an_older_node_without_a_version_still_parses() {
+        let msg = P2PMessage::PeerAnnounce {
+            address: "egot1x".into(), name: "n".into(), endpoint: String::new(), endpoints: vec![],
+            city: None, country: None, lat: None, lon: None, coverage_score: 0,
+            dilithium_pubkey: String::new(), vrf_pubkey: String::new(), staked_amount: 0,
+            genesis_hash: String::new(), signature: String::new(), machine_id: String::new(),
+            app_version: "0.3.645".into(),
+        };
+        let mut json = serde_json::to_value(&msg).unwrap();
+        let strip = |v: &mut serde_json::Value| -> bool {
+            fn walk(v: &mut serde_json::Value) -> bool {
+                match v {
+                    serde_json::Value::Object(m) => {
+                        if m.remove("app_version").is_some() { return true; }
+                        m.values_mut().any(walk)
+                    }
+                    _ => false,
+                }
+            }
+            walk(v)
+        };
+        assert!(strip(&mut json), "the version travels with the announce");
+        match serde_json::from_value::<P2PMessage>(json).unwrap() {
+            P2PMessage::PeerAnnounce { app_version, .. } => assert!(app_version.is_empty()),
+            _ => panic!("wrong variant"),
+        }
     }
 }

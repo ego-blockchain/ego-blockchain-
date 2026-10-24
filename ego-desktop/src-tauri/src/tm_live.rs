@@ -785,6 +785,7 @@ async fn maybe_commit() {
         .unwrap_or(false);
     if persisted {
         eprintln!("[Consensus] finalized h={height} in round {round} with {count} commit votes, block {:.12}", block.hash);
+        crate::p2p::LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed);
         crate::clock::note_finalized_block_time(block.timestamp);
         crate::p2p::touch_proposal_timestamp();
         tokio::spawn(async move { crate::p2p::push_block_to_oracle(&block, &txs).await });
