@@ -1269,6 +1269,8 @@ const WalletPage: React.FC = () => {
     // Hide internal protocol txs (e.g. validator BLS-key registration) — they're
     // not user transfers and only confuse the wallet history.
     if (tx.tx_type === 'validator_register') return false;
+    if (tx.tx_type === 'poc_proof') return false;
+    if (tx.from === myAddress && tx.to === myAddress && tx.amount === 0) return false;
     if (tab === 'sent')     return tx.from === myAddress;
     if (tab === 'received') return tx.to === myAddress;
     return true;
@@ -1847,9 +1849,7 @@ const WalletPage: React.FC = () => {
           <div className="divide-y divide-gray-700/50">
             {pagedTxs.map(tx => {
               const isReward = isRewardTx(tx);
-              const isSelf = !isReward && tx.from === myAddress && tx.to === myAddress && tx.amount === 0;
-              const isSent = !isReward && !isSelf && tx.from === myAddress;
-              const selfLabel = tx.tx_type === 'poc_proof' ? 'Coverage proof' : 'Network service';
+              const isSent = !isReward && tx.from === myAddress;
               const rewardLabel = tx.tx_type === 'coinbase' ? 'Block Reward'
                 : tx.from.startsWith('egot1staking') ? 'Staking Reward'
                 : (tx.from.startsWith('egot1faucet') || tx.tx_type === 'faucet') ? 'Test Coins'
@@ -1862,21 +1862,19 @@ const WalletPage: React.FC = () => {
                 >
                   <div className="flex items-center gap-3 min-w-0">
                     <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-lg shrink-0 ${
-                      isReward ? 'bg-yellow-500/15' : isSelf ? 'bg-gray-700/50' : isSent ? 'bg-red-500/15' : 'bg-green-500/15'
+                      isReward ? 'bg-yellow-500/15' : isSent ? 'bg-red-500/15' : 'bg-green-500/15'
                     }`}>
-                      {isReward ? '⚡' : isSelf ? '📡' : isSent ? '↑' : '↓'}
+                      {isReward ? '⚡' : isSent ? '↑' : '↓'}
                     </div>
                     <div className="min-w-0">
                       <div className="text-sm font-mono text-gray-300 truncate">
                         {tx.tx_type === 'shield' ? <span className="text-amber-300 font-bold">🛡 Shielded deposit</span>
                           : tx.tx_type === 'unshield' ? <span className="text-amber-300 font-bold">🛡 Unshielded payout</span>
-                          : isSelf ? <span className="font-sans">{selfLabel}</span>
                           : (isReward ? rewardLabel : shortHash(tx.hash))}
                       </div>
                       <div className="text-xs text-gray-500">
                         {isReward
                           ? `Block #${tx.block_height ?? '—'}`
-                          : isSelf ? 'No coins moved'
                           : isSent ? `To: ${shortAddr(tx.to)}` : `From: ${shortAddr(tx.from)}`}
                         {tx.memo && <span className="ml-2 text-gray-600">• {tx.memo}</span>}
                         {tx.transport && tx.transport !== 'internet' && (
@@ -1891,8 +1889,8 @@ const WalletPage: React.FC = () => {
                     </div>
                   </div>
                   <div className="text-right shrink-0 ml-3">
-                    <div className={`text-sm font-semibold ${isReward ? 'text-yellow-400' : isSelf ? 'text-gray-500' : isSent ? 'text-red-400' : 'text-green-400'}`}>
-                      {isSelf ? '' : isSent ? '-' : '+'}{txDisplayAmount(tx, 2)}
+                    <div className={`text-sm font-semibold ${isReward ? 'text-yellow-400' : isSent ? 'text-red-400' : 'text-green-400'}`}>
+                      {isSent ? '-' : '+'}{txDisplayAmount(tx, 2)}
                     </div>
                     <div className="flex items-center justify-end gap-1.5 mt-0.5">
                       <span className={`inline-block w-1.5 h-1.5 rounded-full ${
