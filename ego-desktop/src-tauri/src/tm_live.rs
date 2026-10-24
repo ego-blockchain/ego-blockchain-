@@ -197,6 +197,7 @@ struct Driver {
     last_progress: u64,
     said_cannot_give_up: bool,
     said_no_replacement: bool,
+    caught_up: HashMap<u32, u64>,
 }
 
 static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
@@ -344,6 +345,7 @@ impl Driver {
             last_progress: now,
             said_cannot_give_up: false,
             said_no_replacement: false,
+            caught_up: HashMap::new(),
         };
         if let Some(saved) = restored {
             eprintln!(
@@ -636,12 +638,31 @@ impl Driver {
         self.advancing = false;
         self.said_cannot_give_up = false;
         self.said_no_replacement = false;
+        self.caught_up.clear();
         self.attempt_started = now;
         self.last_progress = now;
         let acts = self.engine.start(now);
         self.apply(acts, now, out);
         self.persist();
         *GROUP.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.height, self.group()));
+    }
+
+    fn catch_up(&mut self, round: u32, now: u64, out: &mut Out) {
+        if self.gave_up.is_some() || round >= self.engine.round() {
+            return;
+        }
+        if self.caught_up.get(&round).map_or(false, |at| now.saturating_sub(*at) < RESEND_MS) {
+            return;
+        }
+        self.caught_up.insert(round, now);
+        if let Some(m) = self.my_proposals.get(&round) {
+            out.push((m.clone(), true));
+        }
+        for code in [TM_PREVOTE, TM_PRECOMMIT] {
+            if let Some(m) = self.my_votes.get(&(round, code)) {
+                out.push((m.clone(), true));
+            }
+        }
     }
 
     fn resend_skips(&mut self, now: u64, out: &mut Out) {
@@ -1021,6 +1042,7 @@ async fn on_proposal(
         }
         let v = tm_value_id(&block.hash);
         d.names.entry(v).or_insert_with(|| block.hash.clone());
+        d.catch_up(round, now, &mut out);
         let mut acts = Vec::new();
         if let Some(vr) = pol_round {
             let msg = tm_vote_message_at(attempt, TM_PREVOTE, height, vr, Some(&block.hash));
@@ -1121,6 +1143,7 @@ async fn on_vote(height: u64, round: u32, kind: u8, value: Option<String>, voter
             d.names.entry(v).or_insert_with(|| name.clone());
             d.sigs.entry((kind, round, v)).or_default().insert(j, sig);
         }
+        d.catch_up(round, now, &mut out);
         let acts = d.engine.on_vote(now, k, round, j, v);
         d.apply(acts, now, &mut out);
     }
