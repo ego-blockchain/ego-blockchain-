@@ -138,11 +138,30 @@ code {
 [data-theme="light"] .to-purple-700 {
   --tw-gradient-to: rgb(229 231 235);
 }
+[data-theme="light"] .from-gray-900 {
+  --tw-gradient-from: rgb(243 244 246);
+  --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgb(243 244 246 / 0));
+}
+[data-theme="light"] .via-gray-800 {
+  --tw-gradient-stops: var(--tw-gradient-from), rgb(229 231 235) var(--tw-gradient-via-position, 50%), var(--tw-gradient-to, rgb(229 231 235 / 0));
+}
+[data-theme="light"] .to-gray-900 {
+  --tw-gradient-to: rgb(243 244 246);
+}
 
 /* Overlay elements inside the card (address bar, action buttons) */
 [data-theme="light"] .bg-white\/10  { background-color: rgba(0, 0, 0, 0.05); }
 [data-theme="light"] .bg-white\/20  { background-color: rgba(0, 0, 0, 0.07); }
 [data-theme="light"] .hover\:bg-white\/30:hover { background-color: rgba(0, 0, 0, 0.10); }
+
+[data-theme="light"] .bg-slate-950     { background-color: rgb(255 255 255); }
+[data-theme="light"] .border-slate-800 { border-color: rgb(229 231 235); }
+[data-theme="light"] .text-slate-500   { color: rgb(107 114 128); }
+[data-theme="light"] .text-slate-600   { color: rgb(107 114 128); }
+[data-theme="light"] .text-emerald-400 { color: rgb(5 150 105); }
+[data-theme="light"] .text-amber-200   { color: rgb(146 64 14); }
+[data-theme="light"] .text-amber-300   { color: rgb(180 83 9); }
+[data-theme="light"] .bg-amber-500\/10 { background-color: rgb(255 251 235); }
 
 /* Text inside the balance card */
 [data-theme="light"] .text-blue-100 { color: rgb(55 65 81);   } /* gray-700 */

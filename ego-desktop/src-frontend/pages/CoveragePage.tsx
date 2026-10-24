@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import Pagination from '../components/Pagination';
-import { useWallet } from '../App';
+import { useWallet, useTheme } from '../App';
 import { decodeLandDots, decodeBorders, DOT_LAT_TOP, DOT_LAT_BOTTOM } from '../components/landDots';
 
 interface Location {
@@ -174,7 +174,33 @@ interface Cluster {
 
 interface TooltipState { x: number; y: number; cluster: Cluster }
 
+const MAP_DARK = {
+  sky: ['#0b1224', '#04060d'],
+  grid: 'rgba(120,150,255,0.035)',
+  land: '#2c3a63',
+  border: (a: number) => `rgba(130,160,235,${a})`,
+  city: 'rgba(150,170,220,0.8)',
+  cityLabel: 'rgba(160,180,225,0.6)',
+  tagFill: 'rgba(8,18,34,0.85)',
+  tagText: '#7dd3fc',
+};
+
+const MAP_LIGHT = {
+  sky: ['#f8fafc', '#e2e8f0'],
+  grid: 'rgba(71,85,105,0.07)',
+  land: '#cbd5e1',
+  border: (a: number) => `rgba(100,116,139,${a})`,
+  city: 'rgba(71,85,105,0.7)',
+  cityLabel: 'rgba(51,65,85,0.75)',
+  tagFill: 'rgba(255,255,255,0.92)',
+  tagText: '#0369a1',
+};
+
 const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = ({ myNode, peers }) => {
+  const { theme } = useTheme();
+  const light = theme === 'light';
+  const paletteRef = useRef(MAP_DARK);
+  paletteRef.current = light ? MAP_LIGHT : MAP_DARK;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const vsRef     = useRef({ scale: 1, ox: 0, oy: 0, drag: false, lx: 0, ly: 0, moved: false });
   const frameRef  = useRef(0);
@@ -234,7 +260,8 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
 
     const renderBase = (w: number, h: number): HTMLCanvasElement => {
       const vs  = vsRef.current;
-      const key = `${vs.scale.toFixed(4)}|${vs.ox.toFixed(1)}|${vs.oy.toFixed(1)}|${w}|${h}|${dpr}`;
+      const pal = paletteRef.current;
+      const key = `${vs.scale.toFixed(4)}|${vs.ox.toFixed(1)}|${vs.oy.toFixed(1)}|${w}|${h}|${dpr}|${pal.land}`;
       if (baseRef.current?.key === key) return baseRef.current.canvas;
 
       let off = baseRef.current?.canvas;
@@ -246,12 +273,12 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
       bctx.scale(dpr, dpr);
 
       const grad = bctx.createRadialGradient(w / 2, h / 2, 40, w / 2, h / 2, Math.max(w, h) * 0.75);
-      grad.addColorStop(0, '#0b1224');
-      grad.addColorStop(1, '#04060d');
+      grad.addColorStop(0, pal.sky[0]);
+      grad.addColorStop(1, pal.sky[1]);
       bctx.fillStyle = grad;
       bctx.fillRect(0, 0, w, h);
 
-      bctx.strokeStyle = 'rgba(120,150,255,0.035)';
+      bctx.strokeStyle = pal.grid;
       bctx.lineWidth = 0.5;
       for (let lon = -180; lon <= 180; lon += 30) {
         const [x] = project(lon, 0, w, h);
@@ -263,7 +290,7 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
       }
 
       const r = Math.min(3.2, Math.max(0.9, 1.15 * Math.sqrt(vs.scale)));
-      bctx.fillStyle = '#2c3a63';
+      bctx.fillStyle = pal.land;
       bctx.beginPath();
       for (let i = 0; i < LAND_DOTS.length; i += 2) {
         const [x, y] = project(LAND_DOTS[i], LAND_DOTS[i + 1], w, h);
@@ -273,7 +300,7 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
       }
       bctx.fill();
 
-      bctx.strokeStyle = `rgba(130,160,235,${Math.min(0.34, 0.16 + vs.scale * 0.05)})`;
+      bctx.strokeStyle = pal.border(Math.min(0.34, 0.16 + vs.scale * 0.05));
       bctx.lineWidth = Math.min(1.1, 0.55 + vs.scale * 0.08);
       bctx.beginPath();
       for (const line of BORDER_LINES) {
@@ -292,12 +319,12 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
         for (const [name, [lat, lon]] of Object.entries(CITY_COORDS)) {
           const [x, y] = project(lon, lat, w, h);
           if (x < -10 || x > w + 10 || y < -10 || y > h + 10) continue;
-          bctx.fillStyle = 'rgba(150,170,220,0.8)';
+          bctx.fillStyle = pal.city;
           bctx.beginPath();
           bctx.arc(x, y, 1.6, 0, Math.PI * 2);
           bctx.fill();
           if (showLabels) {
-            bctx.fillStyle = 'rgba(160,180,225,0.6)';
+            bctx.fillStyle = pal.cityLabel;
             bctx.fillText(name, x + 5, y + 3);
           }
         }
@@ -464,13 +491,13 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
         ctx.font = 'bold 10px sans-serif';
         const tw = ctx.measureText(label).width;
         const bx = mx + 11, by = my - 19;
-        ctx.fillStyle = 'rgba(8,18,34,0.85)';
+        ctx.fillStyle = paletteRef.current.tagFill;
         ctx.strokeStyle = 'rgba(56,189,248,0.5)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         (ctx as any).roundRect ? (ctx as any).roundRect(bx, by, tw + 12, 16, 5) : ctx.rect(bx, by, tw + 12, 16);
         ctx.fill(); ctx.stroke();
-        ctx.fillStyle = '#7dd3fc';
+        ctx.fillStyle = paletteRef.current.tagText;
         ctx.fillText(label, bx + 6, by + 11.5);
       }
 
@@ -556,22 +583,28 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
             key={b.label}
             title={b.title}
             onClick={b.fn}
-            className="w-7 h-7 rounded-lg bg-gray-900/80 border border-gray-600/50 text-gray-300 text-sm font-bold
-                       hover:bg-gray-700/80 hover:text-white hover:border-gray-500 transition-colors backdrop-blur-sm
-                       flex items-center justify-center leading-none"
+            className={`w-7 h-7 rounded-lg border text-sm font-bold transition-colors backdrop-blur-sm flex items-center justify-center leading-none ${
+              light
+                ? 'bg-white/90 border-slate-300 text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                : 'bg-gray-900/80 border-gray-600/50 text-gray-300 hover:bg-gray-700/80 hover:text-white hover:border-gray-500'
+            }`}
           >
             {b.label}
           </button>
         ))}
       </div>
-      <div className="absolute bottom-2 right-2 flex gap-3 text-xs text-gray-400 bg-black/50 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-gray-700/40">
+      <div className={`absolute bottom-2 right-2 flex gap-3 text-xs text-gray-400 backdrop-blur-sm rounded-lg px-3 py-1.5 border ${
+        light ? 'bg-white/80 border-slate-300' : 'bg-black/50 border-gray-700/40'
+      }`}>
         <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-sky-400 inline-block"/>You</span>
         <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-red-400 inline-block"/>Peers</span>
         <span className="text-gray-600 hidden sm:inline">Scroll=zoom · Drag=pan</span>
       </div>
       {tooltip && (
         <div
-          className="absolute pointer-events-none bg-gray-900/95 border border-gray-600 rounded-lg px-3 py-2 text-xs shadow-xl backdrop-blur-sm"
+          className={`absolute pointer-events-none border rounded-lg px-3 py-2 text-xs shadow-xl backdrop-blur-sm ${
+            light ? 'bg-white/95 border-slate-300' : 'bg-gray-900/95 border-gray-600'
+          }`}
           style={{ left: Math.min(tooltip.x + 14, 320), top: tooltip.y - 14, zIndex: 20 }}
         >
           <div className={`font-bold mb-1 ${tooltip.cluster.hasMe ? 'text-sky-300' : 'text-red-300'}`}>
