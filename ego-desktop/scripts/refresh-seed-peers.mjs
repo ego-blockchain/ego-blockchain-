@@ -23,6 +23,9 @@ const add = (endpoint, seen) => {
 
 const now = Math.floor(Date.now() / 1000);
 try {
+  for (const line of fs.readFileSync(out, "utf8").split(/\r?\n/)) add(line.trim(), 0);
+} catch {}
+try {
   const res = await fetch("https://rpc.egoblockchain.com/nodes");
   const body = await res.json();
   for (const ep of body.nodes || []) add(ep, now);
