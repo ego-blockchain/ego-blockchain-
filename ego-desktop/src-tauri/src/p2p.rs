@@ -347,9 +347,9 @@ async fn broadcast_validator_leaving() {
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-peers-v1", data).await;
     }
-    for p in load_peer_cache().into_iter().filter(|p| !p.endpoint.is_empty()) {
+    for ep in live_endpoints(DIRECT_FANOUT) {
         let msg_clone = msg.clone();
-        tokio::spawn(async move { let _ = send_message(&p.endpoint, &msg_clone).await; });
+        tokio::spawn(async move { let _ = send_message(&ep, &msg_clone).await; });
     }
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 }
@@ -1761,6 +1761,121 @@ struct V2Outbox {
 static V2_OUTBOX: Mutex<Option<V2Outbox>> = Mutex::new(None);
 const MESSAGE_STREAMS_PER_PEER: usize = 400;
 const YAMUX_STREAMS_PER_CONNECTION: usize = 512;
+const OUTBOUND_REQUESTS_PER_PEER: usize = 192;
+const OUTBOUND_BACKLOG_PER_PEER: usize = 256;
+const OUTBOUND_BACKLOG_TOTAL: usize = 4_096;
+
+type SendReply = oneshot::Sender<Result<(), String>>;
+
+struct SendBudget<T> {
+    open: HashMap<PeerId, usize>,
+    waiting: HashMap<PeerId, std::collections::VecDeque<T>>,
+    waiting_total: usize,
+}
+
+impl<T> SendBudget<T> {
+    fn new() -> Self {
+        Self { open: HashMap::new(), waiting: HashMap::new(), waiting_total: 0 }
+    }
+
+    fn offer(&mut self, peer: PeerId, item: T) -> Result<Option<T>, T> {
+        let open = self.open.entry(peer).or_insert(0);
+        if *open < OUTBOUND_REQUESTS_PER_PEER {
+            *open += 1;
+            return Ok(Some(item));
+        }
+        if self.waiting_total >= OUTBOUND_BACKLOG_TOTAL {
+            return Err(item);
+        }
+        let queue = self.waiting.entry(peer).or_default();
+        if queue.len() >= OUTBOUND_BACKLOG_PER_PEER {
+            return Err(item);
+        }
+        queue.push_back(item);
+        self.waiting_total += 1;
+        Ok(None)
+    }
+
+    fn finished(&mut self, peer: &PeerId) {
+        if let Some(open) = self.open.get_mut(peer) {
+            *open = open.saturating_sub(1);
+            if *open == 0 && !self.waiting.contains_key(peer) {
+                self.open.remove(peer);
+            }
+        }
+    }
+
+    fn next_waiting(&mut self, peer: &PeerId) -> Option<T> {
+        let queue = self.waiting.get_mut(peer)?;
+        let open = self.open.entry(*peer).or_insert(0);
+        if *open >= OUTBOUND_REQUESTS_PER_PEER {
+            return None;
+        }
+        let item = queue.pop_front()?;
+        if queue.is_empty() {
+            self.waiting.remove(peer);
+        }
+        *open += 1;
+        self.waiting_total = self.waiting_total.saturating_sub(1);
+        Some(item)
+    }
+
+    fn take_waiting(&mut self, peer: &PeerId) -> Vec<T> {
+        let items: Vec<T> = self.waiting.remove(peer).map(Vec::from).unwrap_or_default();
+        self.waiting_total = self.waiting_total.saturating_sub(items.len());
+        if self.open.get(peer) == Some(&0) {
+            self.open.remove(peer);
+        }
+        items
+    }
+}
+
+struct Outbound {
+    budget: SendBudget<(P2PMessage, SendReply)>,
+    in_flight: HashMap<OutboundRequestId, (PeerId, SendReply)>,
+}
+
+impl Outbound {
+    fn new() -> Self {
+        Self { budget: SendBudget::new(), in_flight: HashMap::new() }
+    }
+
+    fn send(&mut self, swarm: &mut libp2p::Swarm<EgoBehaviour>, peer: PeerId, msg: P2PMessage, reply: SendReply) {
+        match self.budget.offer(peer, (msg, reply)) {
+            Ok(Some((msg, reply))) => self.dispatch(swarm, peer, msg, reply),
+            Ok(None) => {}
+            Err((_, reply)) => {
+                let _ = reply.send(Err(format!(
+                    "{} messages are already waiting for {}", OUTBOUND_BACKLOG_PER_PEER, peer
+                )));
+            }
+        }
+    }
+
+    fn dispatch(&mut self, swarm: &mut libp2p::Swarm<EgoBehaviour>, peer: PeerId, msg: P2PMessage, reply: SendReply) {
+        let req_id = swarm.behaviour_mut().request_response.send_request(&peer, msg);
+        self.in_flight.insert(req_id, (peer, reply));
+    }
+
+    fn settle(&mut self, swarm: &mut libp2p::Swarm<EgoBehaviour>, request_id: OutboundRequestId, result: Result<(), String>) {
+        let Some((peer, reply)) = self.in_flight.remove(&request_id) else { return };
+        let _ = reply.send(result);
+        self.budget.finished(&peer);
+        while let Some((msg, reply)) = self.budget.next_waiting(&peer) {
+            if reply.is_closed() {
+                self.budget.finished(&peer);
+                continue;
+            }
+            self.dispatch(swarm, peer, msg, reply);
+        }
+    }
+
+    fn fail_waiting(&mut self, peer: &PeerId, reason: &str) {
+        for (_, reply) in self.budget.take_waiting(peer) {
+            let _ = reply.send(Err(reason.to_string()));
+        }
+    }
+}
 const MEMBER_SEND_TIMEOUT_SECS: u64 = 6;
 const MEMBER_QUEUE_MAX: usize = 48;
 static MEMBER_QUEUES: Mutex<Option<HashMap<String, std::collections::VecDeque<P2PMessage>>>> = Mutex::new(None);
@@ -4466,7 +4581,7 @@ pub enum P2PMessage {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerEntry {
     pub address:   String,
     pub endpoint:  String,
@@ -5805,14 +5920,6 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
         });
     }
 
-    // Direct send to cached peers ensures early validator discovery before gossip connects
-    for p in load_peer_cache().iter().filter(|p| !p.endpoint.is_empty()) {
-        let ep = p.endpoint.clone();
-        let msg_clone = msg.clone();
-        tokio::spawn(async move {
-            let _ = send_message_any(&[ep], &msg_clone).await;
-        });
-    }
     tokio::spawn(try_proactive_proposal());
 }
 
@@ -5823,9 +5930,7 @@ pub async fn broadcast_pending_tx(tx: LedgerTx) {
     }
     offer_to_sideband(&msg, &tx.hash).await;
     
-    // Direct send to cached peers ensures delivery before gossip mesh connects
-    for p in load_peer_cache().iter().filter(|p| !p.endpoint.is_empty()) {
-        let ep = p.endpoint.clone();
+    for ep in tokio::task::spawn_blocking(|| live_endpoints(DIRECT_FANOUT)).await.unwrap_or_default() {
         let msg_clone = msg.clone();
         tokio::spawn(async move {
             let _ = send_message_any(&[ep], &msg_clone).await;
@@ -6870,16 +6975,29 @@ fn broadcast_replication(messages: Vec<P2PMessage>, always: bool) {
 
 fn peer_cache_path() -> std::path::PathBuf { base_data_dir().join("peers.json") }
 
-pub fn load_peer_cache() -> Vec<PeerEntry> {
-    let data = std::fs::read_to_string(peer_cache_path()).unwrap_or_default();
-    let mut peers: Vec<PeerEntry> = serde_json::from_str(&data).unwrap_or_default();
-    let cutoff = Utc::now().timestamp() - 30 * 86_400;
+const PEER_CACHE_MAX: usize = 2_000;
+const PEER_LIST_REPLY_MAX: usize = 200;
+const DIRECT_FANOUT: usize = 8;
+
+fn newest_peers(mut peers: Vec<PeerEntry>, now: i64) -> Vec<PeerEntry> {
+    let cutoff = now - 30 * 86_400;
     peers.retain(|p| p.last_seen >= cutoff);
+    if peers.len() > PEER_CACHE_MAX {
+        peers.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        peers.truncate(PEER_CACHE_MAX);
+    }
     peers
 }
 
+pub fn load_peer_cache() -> Vec<PeerEntry> {
+    let data = std::fs::read_to_string(peer_cache_path()).unwrap_or_default();
+    let peers: Vec<PeerEntry> = serde_json::from_str(&data).unwrap_or_default();
+    newest_peers(peers, Utc::now().timestamp())
+}
+
 fn save_peer_cache(peers: &[PeerEntry]) {
-    if let Ok(data) = serde_json::to_string_pretty(peers) {
+    let kept = newest_peers(peers.to_vec(), Utc::now().timestamp());
+    if let Ok(data) = serde_json::to_string(&kept) {
         let _ = crate::utils::atomic_write(&peer_cache_path(), data.as_bytes());
     }
 }
@@ -7199,7 +7317,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
         }
     }
     let mut pending_sends:    HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>> = HashMap::new();
-    let mut in_flight:        HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
+    let mut outbound = Outbound::new();
     let mut circuit_listener: Option<libp2p_core::transport::ListenerId> = None;
 
     // Compute-exec state — separate maps so a long-running shell command
@@ -7359,7 +7477,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                 match cmd {
                     SwarmCmd::Send { peer_addr, msg, reply } => {
                         handle_send(&mut swarm, peer_addr, msg, reply,
-                            &mut pending_sends, &mut in_flight);
+                            &mut pending_sends, &mut outbound);
                     }
                     SwarmCmd::GetEndpoint { reply } => {
                         let ep = best_endpoint(&external_addrs, &local_peer_id);
@@ -7406,7 +7524,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
             event = swarm.select_next_some() => {
                 handle_event(
                     event, app.as_ref(),
-                    &mut external_addrs, &mut pending_sends, &mut in_flight,
+                    &mut external_addrs, &mut pending_sends, &mut outbound,
                     &mut pending_exec_sends, &mut exec_in_flight, &exec_resp_tx,
                     &mut swarm, &relay_addrs,
                     &mut circuit_listener, &mut pending_dials,
@@ -7827,7 +7945,7 @@ fn handle_send(
     msg:           P2PMessage,
     reply:         oneshot::Sender<Result<(), String>>,
     pending_sends: &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
-    in_flight:     &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
+    outbound:      &mut Outbound,
 ) {
     let peer_id = match peer_id_from_multiaddr(&peer_addr) {
         Some(id) => id,
@@ -7844,8 +7962,7 @@ fn handle_send(
     }
 
     if swarm.is_connected(&peer_id) {
-        let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
-        in_flight.insert(req_id, reply);
+        outbound.send(swarm, peer_id, msg, reply);
     } else {
         pending_sends.entry(peer_id).or_default().push((msg, reply));
         let _ = swarm.dial(peer_addr);
@@ -7971,7 +8088,7 @@ async fn handle_event(
     app:                Option<&tauri::AppHandle<tauri::Wry>>,
     external_addrs:     &mut Vec<Multiaddr>,
     pending_sends:      &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
-    in_flight:          &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
+    outbound:           &mut Outbound,
     pending_exec_sends: &mut HashMap<PeerId, Vec<(ComputeExecRequest, oneshot::Sender<Result<ComputeExecResponse, String>>)>>,
     exec_in_flight:     &mut HashMap<OutboundRequestId, oneshot::Sender<Result<ComputeExecResponse, String>>>,
     exec_resp_tx:       &mpsc::Sender<(request_response::ResponseChannel<ComputeExecResponse>, ComputeExecResponse)>,
@@ -8061,9 +8178,7 @@ async fn handle_event(
             if let Some(pending) = pending_sends.remove(&peer_id) {
                 eprintln!("[P2P] Flushing {} queued message(s) to {} on connect", pending.len(), peer_id);
                 for (msg, reply) in pending {
-                    let req_id = swarm.behaviour_mut()
-                        .request_response.send_request(&peer_id, msg);
-                    in_flight.insert(req_id, reply);
+                    outbound.send(swarm, peer_id, msg, reply);
                 }
             }
 
@@ -8163,6 +8278,9 @@ async fn handle_event(
                 for (_, reply) in pending {
                     let _ = reply.send(Err("Connection closed before send".into()));
                 }
+            }
+            if num_established == 0 {
+                outbound.fail_waiting(&peer_id, "Connection closed before send");
             }
             if let Some(pending) = pending_exec_sends.remove(&peer_id) {
                 for (_, reply) in pending {
@@ -8280,9 +8398,7 @@ async fn handle_event(
             for (peer_id, pending) in pending_sends.drain() {
                 eprintln!("[P2P] Flushing {} queued messages to {} after reservation", pending.len(), peer_id);
                 for (msg, reply) in pending {
-                    let req_id = swarm.behaviour_mut()
-                        .request_response.send_request(&peer_id, msg);
-                    in_flight.insert(req_id, reply);
+                    outbound.send(swarm, peer_id, msg, reply);
                 }
             }
             for (peer_id, pending) in pending_exec_sends.drain() {
@@ -8410,17 +8526,13 @@ async fn handle_event(
                 message: request_response::Message::Response { request_id, .. }, ..
             },
         )) => {
-            if let Some(reply) = in_flight.remove(&request_id) {
-                let _ = reply.send(Ok(()));
-            }
+            outbound.settle(swarm, request_id, Ok(()));
         }
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::RequestResponse(
             request_response::Event::OutboundFailure { request_id, error, .. },
         )) => {
-            if let Some(reply) = in_flight.remove(&request_id) {
-                let _ = reply.send(Err(format!("Network error: {}", error)));
-            }
+            outbound.settle(swarm, request_id, Err(format!("Network error: {}", error)));
         }
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::ComputeExec(
@@ -10292,7 +10404,9 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
         }
 
         P2PMessage::PeerListRequest { requester_endpoint } => {
-            let peers    = load_peer_cache();
+            let mut peers = load_peer_cache();
+            peers.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+            peers.truncate(PEER_LIST_REPLY_MAX);
             let response = P2PMessage::PeerListResponse { peers };
             tokio::spawn(async move {
                 let eps = vec![requester_endpoint.clone()];
@@ -18063,6 +18177,83 @@ mod member_queue_tests {
             MESSAGE_STREAMS_PER_PEER + 64 <= YAMUX_STREAMS_PER_CONNECTION,
             "past the yamux cap the whole connection is closed, not just one stream"
         );
+        assert!(
+            2 * OUTBOUND_REQUESTS_PER_PEER + 64 <= YAMUX_STREAMS_PER_CONNECTION,
+            "both ends sending their full budget at once must still fit one connection"
+        );
+        assert!(
+            2 * OUTBOUND_REQUESTS_PER_PEER <= MESSAGE_STREAMS_PER_PEER,
+            "the request handler must be able to work every stream the budgets allow"
+        );
+    }
+
+    #[test]
+    fn a_burst_to_one_peer_never_opens_more_streams_than_the_budget() {
+        let peer = PeerId::random();
+        let other = PeerId::random();
+        let mut budget = SendBudget::new();
+        let mut open = 0;
+        for i in 0..OUTBOUND_REQUESTS_PER_PEER + 10 {
+            if let Ok(Some(_)) = budget.offer(peer, i) {
+                open += 1;
+            }
+        }
+        assert_eq!(open, OUTBOUND_REQUESTS_PER_PEER, "the rest wait");
+        assert_eq!(budget.offer(other, 0), Ok(Some(0)), "another peer has its own budget");
+        assert_eq!(budget.next_waiting(&peer), None, "nothing more goes out until a reply comes back");
+        budget.finished(&peer);
+        assert_eq!(budget.next_waiting(&peer), Some(OUTBOUND_REQUESTS_PER_PEER), "waiting messages go out in order");
+        assert_eq!(budget.next_waiting(&peer), None);
+    }
+
+    #[test]
+    fn a_full_backlog_refuses_instead_of_growing() {
+        let peer = PeerId::random();
+        let mut budget = SendBudget::new();
+        for i in 0..OUTBOUND_REQUESTS_PER_PEER + OUTBOUND_BACKLOG_PER_PEER {
+            assert!(budget.offer(peer, i).is_ok());
+        }
+        assert_eq!(budget.offer(peer, 7), Err(7));
+        assert_eq!(budget.take_waiting(&peer).len(), OUTBOUND_BACKLOG_PER_PEER);
+        for _ in 0..OUTBOUND_REQUESTS_PER_PEER {
+            budget.finished(&peer);
+        }
+        assert!(budget.open.is_empty() && budget.waiting.is_empty(), "a quiet peer leaves nothing behind");
+        assert_eq!(budget.waiting_total, 0);
+    }
+
+    #[test]
+    fn the_peer_cache_keeps_only_the_most_recently_seen() {
+        let now = 1_800_000_000;
+        let peer = |i: i64| PeerEntry {
+            address: format!("egot1peer{i}"),
+            endpoint: format!("/ip4/10.0.0.1/tcp/{i}"),
+            last_seen: now - i,
+            ..Default::default()
+        };
+        let mut peers: Vec<PeerEntry> = (0..PEER_CACHE_MAX as i64 + 500).map(peer).collect();
+        peers.push(peer(31 * 86_400));
+        let kept = newest_peers(peers, now);
+        assert_eq!(kept.len(), PEER_CACHE_MAX, "a network of millions never grows the file past the cap");
+        assert!(kept.iter().all(|p| p.last_seen > now - PEER_CACHE_MAX as i64), "the newest are the ones kept");
+    }
+
+    #[test]
+    fn many_busy_peers_share_one_backlog_limit() {
+        let mut budget = SendBudget::new();
+        let mut refused = 0;
+        for _ in 0..64 {
+            let peer = PeerId::random();
+            for i in 0..OUTBOUND_REQUESTS_PER_PEER + OUTBOUND_BACKLOG_PER_PEER {
+                if budget.offer(peer, i).is_err() {
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(budget.waiting_total, OUTBOUND_BACKLOG_TOTAL, "memory stays bounded however many peers are busy");
+        assert_eq!(refused, 64 * OUTBOUND_BACKLOG_PER_PEER - OUTBOUND_BACKLOG_TOTAL);
+        let counted: usize = budget.waiting.values().map(|q| q.len()).sum();
+        assert_eq!(counted, budget.waiting_total);
     }
 
     #[test]
