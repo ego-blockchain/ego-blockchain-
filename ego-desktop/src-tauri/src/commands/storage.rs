@@ -931,35 +931,9 @@ pub async fn configure_storage(
     }
 
     let mut ledger = Ledger::load();
-
-    // Enforce 60-day lock: once a node commits storage it cannot reduce or change
-    // allocation until the lock period expires, so subscribers keep their guarantee.
-    const LOCK_SECS: i64 = 60 * 24 * 3600;
     let now = chrono::Utc::now().timestamp();
-    if ledger.storage_allocated_bytes > 0 {
-        if let Some(cfg_at) = ledger.storage_configured_at {
-            let unlock_at = cfg_at + LOCK_SECS;
-            if now < unlock_at {
-                let days_left = ((unlock_at - now) as f64 / 86400.0).ceil() as i64;
-                return Err(EgoDesktopError::InvalidInput(format!(
-                    "Storage allocation is locked for {days_left} more day{}. \
-                     Nodes must keep their committed space for 60 days to protect active subscribers.",
-                    if days_left == 1 { "" } else { "s" }
-                )));
-            }
-        }
-    }
-
-    // Penalty: lowering allocation suspends all rewards for 14 days and adds a slash strike.
-    if ledger.storage_allocated_bytes > 0 && requested_bytes < ledger.storage_allocated_bytes {
-        const PENALTY_SECS: i64 = 14 * 86_400;
-        ledger.reward_suspended_until = Some(now + PENALTY_SECS);
-        ledger.slash_strikes = ledger.slash_strikes.saturating_add(1);
-        ledger.last_slash_ts = Some(now);
-        eprintln!(
-            "[Storage] Reduction penalty: {} bytes → {} bytes; rewards suspended 14 days; strikes={}",
-            ledger.storage_allocated_bytes, requested_bytes, ledger.slash_strikes
-        );
+    if let Some(e) = below_held_error(bytes_held_for_others(&ledger), requested_bytes) {
+        return Err(EgoDesktopError::InvalidInput(e));
     }
 
     ledger.storage_allocated_bytes = requested_bytes;
@@ -1640,80 +1614,35 @@ pub async fn import_secure_share(
 
 // ── reset_storage ─────────────────────────────────────────────────────────────
 
-/// Release the 60-day storage lock early.
-///
-/// The lock exists so subscribers keep the availability guarantee they paid for,
-/// so leaving before it expires is a broken commitment rather than a free choice.
-/// It is allowed, but it carries the same class of penalty as reducing allocation
-/// after the lock, only longer: rewards are suspended and a slash strike is
-/// recorded. Stored data is left in place so it can be re-replicated elsewhere
-/// before the operator reclaims the space.
-#[tauri::command]
-pub async fn unlock_storage_early(_state: State<'_, AppState>) -> Result<UnlockResult, EgoDesktopError> {
-    const LOCK_SECS: i64 = 60 * 24 * 3600;
-    const EARLY_EXIT_PENALTY_SECS: i64 = 30 * 86_400;
-
-    let mut ledger = Ledger::load();
-    let now = chrono::Utc::now().timestamp();
-
-    let cfg_at = ledger.storage_configured_at.ok_or_else(|| {
-        EgoDesktopError::InvalidInput("Storage has not been configured, nothing to unlock.".into())
-    })?;
-
-    let unlock_at = cfg_at + LOCK_SECS;
-    if now >= unlock_at {
-        return Err(EgoDesktopError::InvalidInput(
-            "Storage is not locked. You can change or reset your allocation directly.".into(),
-        ));
-    }
-
-    let days_remaining = ((unlock_at - now) as f64 / 86400.0).ceil() as i64;
-
-    ledger.storage_configured_at   = None;
-    ledger.reward_suspended_until  = Some(now + EARLY_EXIT_PENALTY_SECS);
-    ledger.slash_strikes           = ledger.slash_strikes.saturating_add(1);
-    ledger.last_slash_ts           = Some(now);
-    ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
-
-    eprintln!(
-        "[Storage] Early unlock: {days_remaining} days remained; rewards suspended for 30 days; strikes={}",
-        ledger.slash_strikes
-    );
-
-    Ok(UnlockResult {
-        days_forfeited: days_remaining,
-        rewards_suspended_until: now + EARLY_EXIT_PENALTY_SECS,
-        slash_strikes: ledger.slash_strikes,
-    })
+pub(crate) fn bytes_held_for_others(ledger: &Ledger) -> u64 {
+    ledger
+        .stored_files
+        .iter()
+        .filter(|f| {
+            f.status == "Active"
+                && !f.owner.is_empty()
+                && f.owner != ledger.address
+                && !f.local_path.is_empty()
+                && !f.local_path.starts_with("sender:")
+        })
+        .map(|f| f.encrypted_size)
+        .sum()
 }
 
-#[derive(Debug, Serialize)]
-pub struct UnlockResult {
-    pub days_forfeited: i64,
-    pub rewards_suspended_until: i64,
-    pub slash_strikes: u32,
+fn below_held_error(held: u64, requested: u64) -> Option<String> {
+    (requested < held).then(|| {
+        format!(
+            "Your node is keeping {:.1} GB of other people's files, so its storage cannot go below that. \
+             Space frees up as those files expire or move to other nodes.",
+            held as f64 / 1_000_000_000.0
+        )
+    })
 }
 
 #[tauri::command]
 pub async fn reset_storage(_state: State<'_, AppState>) -> Result<(), EgoDesktopError> {
-    // Block reset while the 60-day lock is active.
-    {
-        let ledger = Ledger::load();
-        const LOCK_SECS: i64 = 60 * 24 * 3600;
-        let now = chrono::Utc::now().timestamp();
-        if ledger.storage_allocated_bytes > 0 {
-            if let Some(cfg_at) = ledger.storage_configured_at {
-                let unlock_at = cfg_at + LOCK_SECS;
-                if now < unlock_at {
-                    let days_left = ((unlock_at - now) as f64 / 86400.0).ceil() as i64;
-                    return Err(EgoDesktopError::InvalidInput(format!(
-                        "Storage is locked for {days_left} more day{}. \
-                         Cannot reset while active subscribers may be using your node.",
-                        if days_left == 1 { "" } else { "s" }
-                    )));
-                }
-            }
-        }
+    if let Some(e) = below_held_error(bytes_held_for_others(&Ledger::load()), 0) {
+        return Err(EgoDesktopError::InvalidInput(e));
     }
 
     // 1. Delete every file in storage_dir() (blocks, manifests, encrypted files)
@@ -1855,5 +1784,42 @@ mod renewal_tests {
         assert!(renewal_due(&plan, 29 * DAY));
         assert!(renewal_due(&plan, 50 * DAY));
         assert!(!renewal_due(&plan, 61 * DAY));
+    }
+}
+
+#[cfg(test)]
+mod held_floor_tests {
+    use super::*;
+
+    #[test]
+    fn storage_can_shrink_freely_down_to_what_it_holds_for_others() {
+        let gb = 1_000_000_000u64;
+        assert!(below_held_error(0, 0).is_none(), "an empty node can reset");
+        assert!(below_held_error(20 * gb, 25 * gb).is_none());
+        assert!(below_held_error(20 * gb, 20 * gb).is_none(), "exactly what it holds is fine");
+        let e = below_held_error(20 * gb, 10 * gb).unwrap();
+        assert!(e.contains("20.0 GB"), "{e}");
+        assert!(below_held_error(1, 0).is_some(), "a reset is refused while it holds anything");
+    }
+
+    #[test]
+    fn only_other_peoples_live_files_count() {
+        let mut ledger = Ledger::default();
+        ledger.address = "egot1me".into();
+        let file = |owner: &str, status: &str, path: &str, size: u64| crate::ledger::StoredFile {
+            owner: owner.into(),
+            status: status.into(),
+            local_path: path.into(),
+            encrypted_size: size,
+            ..Default::default()
+        };
+        ledger.stored_files = vec![
+            file("egot1other", "Active", "/s/a.blk", 7),
+            file("egot1me", "Active", "/s/b.blk", 100),
+            file("egot1other", "Expired", "/s/c.blk", 100),
+            file("egot1other", "Active", "sender:x", 100),
+            file("", "Active", "/s/d.blk", 100),
+        ];
+        assert_eq!(bytes_held_for_others(&ledger), 7);
     }
 }

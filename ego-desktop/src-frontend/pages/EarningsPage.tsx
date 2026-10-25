@@ -16,7 +16,6 @@ interface EarningsData {
   pending_rewards: number;
   session_started: number;
   coverage_online: boolean;
-  reward_suspended_until: number | null;
 }
 
 interface ChainDrs {
@@ -256,20 +255,6 @@ const EarningsPage: React.FC = () => {
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
 
-
-      {/* ── Reward suspension warning ──────────────────────────────────────── */}
-      {earnings?.reward_suspended_until != null && earnings.reward_suspended_until > Math.floor(Date.now() / 1000) && (
-        <div className="bg-red-500/10 border border-red-500/40 rounded-2xl px-5 py-4 flex items-start gap-3">
-          <span className="text-2xl shrink-0 mt-0.5">🚫</span>
-          <div>
-            <div className="font-semibold text-red-400 text-sm">Rewards Suspended — Storage Reduction Penalty</div>
-            <div className="text-xs text-red-300/80 mt-0.5">
-              You reduced your storage allocation. All rewards are suspended for 14 days as a network penalty.
-              Resumes on <span className="font-semibold text-red-300">{new Date(earnings.reward_suspended_until * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}</span>.
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ── Storage setup prompt ───────────────────────────────────────────── */}
       {!isStorageSetup && (

@@ -213,14 +213,6 @@ const StoragePage: React.FC = () => {
   const [netCapacity, setNetCapacity]     = useState<{ total_allocated_gb: number; total_available_gb: number; node_count: number; fill_ratio: number } | null>(null);
   const [capacityLoading, setCapacityLoading] = useState(false);
   const [manageMode, setManageMode]           = useState(false);
-  const [nowSec, setNowSec]                   = useState(() => Math.floor(Date.now() / 1000));
-
-  // Live countdown tick — updates every second so the lock timer counts down in real time.
-  useEffect(() => {
-    const id = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000);
-    return () => clearInterval(id);
-  }, []);
-
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const storeResultRef = useRef<StoreFileResult | null>(null);
   const storeErrorRef  = useRef<string>('');
@@ -591,67 +583,11 @@ const StoragePage: React.FC = () => {
                 <div className="text-2xl font-bold">{fmtBytes(peerHosted)}</div>
                 <div className="text-xs text-gray-500">of {fmtBytes(allocated)} allocated</div>
               </div>
-              {(() => {
-                const LOCK_SECS = 60 * 86400;
-                const cfgAt    = metrics?.storage_configured_at;
-                const lockUntil = cfgAt ? cfgAt + LOCK_SECS : 0;
-                const secsLeft  = lockUntil > nowSec ? lockUntil - nowSec : 0;
-                const locked    = secsLeft > 0;
-                const d = Math.floor(secsLeft / 86400);
-                const h = Math.floor((secsLeft % 86400) / 3600);
-                const m = Math.floor((secsLeft % 3600) / 60);
-                const s = secsLeft % 60;
-                const countdown = d > 0
-                  ? `${d}d ${h.toString().padStart(2,'0')}h ${m.toString().padStart(2,'0')}m ${s.toString().padStart(2,'0')}s`
-                  : `${h.toString().padStart(2,'0')}h ${m.toString().padStart(2,'0')}m ${s.toString().padStart(2,'0')}s`;
-                return (
               <div className="text-right">
                 <div className={`rounded-lg px-2 py-1 text-xs font-medium ${peerUsedPct > 0 ? 'bg-green-500/20 text-green-400' : 'bg-gray-600/40 text-gray-400'}`}>
                   {peerUsedPct}% utilized
                 </div>
-                {locked ? (
-                  <span className="text-xs text-yellow-500 mt-1 block font-mono" title={`Locked until ${new Date(lockUntil * 1000).toLocaleDateString()}`}>
-                    🔒 {countdown}
-                  </span>
-                ) : (
-                  <button onClick={openProvConfig} className="text-xs text-gray-500 hover:text-gray-300 mt-1 block">change</button>
-                )}
-                {locked ? (
-                  <button
-                    onClick={async () => {
-                      const ok = await confirm(
-                        `Release the storage lock early?`,
-                        {
-                          detail:
-                            `${d} day${d === 1 ? '' : 's'} remain on your commitment. Subscribers rely on the ` +
-                            `space you pledged, so leaving early costs you: rewards suspended for 30 days, and ` +
-                            `one slash strike recorded against your node. Your stored data stays in place so it ` +
-                            `can be re-replicated elsewhere.`,
-                          confirmLabel: 'Unlock anyway',
-                        },
-                      );
-                      if (!ok) return;
-                      try {
-                        const r: any = await invoke('unlock_storage_early');
-                        await confirm(
-                          `Storage unlocked.`,
-                          {
-                            detail:
-                              `${r.days_forfeited} day${r.days_forfeited === 1 ? '' : 's'} forfeited. ` +
-                              `Rewards resume ${new Date(r.rewards_suspended_until * 1000).toLocaleDateString()}. ` +
-                              `Slash strikes: ${r.slash_strikes}.`,
-                            confirmLabel: 'OK',
-                          },
-                        );
-                        await loadData();
-                      } catch (e: any) { alert(String(e)); }
-                    }}
-                    className="text-xs text-amber-500 hover:text-amber-400 mt-1 block"
-                    title="Release the lock early and accept the penalty"
-                  >
-                    unlock early
-                  </button>
-                ) : (
+                <button onClick={openProvConfig} className="text-xs text-gray-500 hover:text-gray-300 mt-1 block">change</button>
                 <button
                   onClick={async () => {
                     if (!await confirm('Reset all storage?', {
@@ -667,10 +603,7 @@ const StoragePage: React.FC = () => {
                 >
                   reset
                 </button>
-                )}
               </div>
-                );
-              })()}
             </div>
             <div className="bg-gray-700 rounded-full h-2">
               <div className="bg-gradient-to-r from-green-500 to-blue-500 h-2 rounded-full transition-all" style={{ width: `${peerUsedPct}%` }} />
@@ -1119,12 +1052,8 @@ const StoragePage: React.FC = () => {
               const maxUsableGb = Math.max(1, Math.floor(diskFreeGb - RESERVE_GB));
               const overLimit    = allocGb > maxUsableGb;
               const currentAllocGb = (metrics?.storage_allocated_bytes ?? 0) / 1e9;
-              const isReducing   = currentAllocGb > 0 && allocGb < currentAllocGb;
-              const LOCK_SECS    = 60 * 86400;
-              const cfgAtSec     = metrics?.storage_configured_at;
-              const unlockAt     = currentAllocGb > 0 && cfgAtSec ? cfgAtSec + LOCK_SECS : 0;
-              const isLocked     = unlockAt > Date.now() / 1000;
-              const daysLeft     = isLocked ? Math.ceil((unlockAt - Date.now() / 1000) / 86400) : 0;
+              const heldGb       = peerHosted / 1e9;
+              const belowHeld    = allocGb < heldGb;
               return (
                 <div className="space-y-3">
                   <div className="text-sm text-gray-400">
@@ -1200,26 +1129,16 @@ const StoragePage: React.FC = () => {
                     Data is stored in your local app data directory.
                   </div>
 
-                  {isLocked ? (
-                    <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl px-4 py-3 text-sm text-orange-300">
-                      🔒 <span className="font-semibold">Locked for {daysLeft} more day{daysLeft === 1 ? '' : 's'}.</span> Your {currentAllocGb.toFixed(0)} GB allocation can be changed on <span className="font-semibold">{new Date(unlockAt * 1000).toLocaleDateString()}</span>.
-                    </div>
-                  ) : (
-                    <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl px-4 py-3 text-sm text-orange-300">
-                      🔒 <span className="font-semibold">60-day lock:</span> Once you allocate storage, this setting cannot be changed or reset for <span className="font-semibold">60 days</span>. Choose carefully.
-                    </div>
-                  )}
-
-                  {isReducing && (
+                  {belowHeld && (
                     <div className="bg-red-500/10 border border-red-500/40 rounded-xl px-4 py-3 text-sm text-red-300">
-                      ⚠️ <span className="font-semibold">Penalty warning:</span> Lowering your allocation below the current <span className="font-semibold">{currentAllocGb.toFixed(0)} GB</span> will <span className="font-semibold">suspend all rewards for 14 days</span> and add a slash strike to your node record.
+                      Your node is keeping <span className="font-semibold">{heldGb.toFixed(1)} GB</span> of other people's files, so its storage cannot go below that. Space frees up as those files expire or move to other nodes.
                     </div>
                   )}
 
                   <div className="grid grid-cols-2 gap-3">
                     <button onClick={() => setShowProvConfig(false)} className="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">Cancel</button>
-                    <button onClick={handleConfigureStorage} disabled={configuring || overLimit || isLocked} className={`${isReducing ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-500'} disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition`}>
-                      {configuring ? 'Saving…' : isLocked ? 'Locked' : isReducing ? `Reduce to ${allocGb} GB (penalty)` : `Allocate ${allocGb} GB`}
+                    <button onClick={handleConfigureStorage} disabled={configuring || overLimit || belowHeld} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition">
+                      {configuring ? 'Saving…' : `${allocGb < currentAllocGb ? 'Reduce' : 'Allocate'} ${allocGb} GB`}
                     </button>
                   </div>
                 </div>

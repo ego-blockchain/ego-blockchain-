@@ -1076,7 +1076,6 @@ fn main() {
             commands::shielded::shield_deposit,
             commands::shielded::shield_withdraw,
             commands::shielded::invariant_report,
-            commands::storage::unlock_storage_early,
             commands::storage::create_public_share,
             commands::storage::create_secure_share,
             commands::storage::import_secure_share,

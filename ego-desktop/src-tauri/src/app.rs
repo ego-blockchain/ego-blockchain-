@@ -175,10 +175,6 @@ pub struct EarningsData {
     pub session_started: i64,
 
     pub coverage_online: bool,
-
-    /// Unix timestamp until which rewards are suspended due to a storage reduction penalty.
-    /// None = no penalty active.
-    pub reward_suspended_until: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -50,13 +50,9 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
     let billable_gb = (hosted_bytes as f64 / 1_000_000_000.0)
         .min(ledger.storage_allocated_bytes as f64 / 1_000_000_000.0);
 
-    let reward_suspended = ledger.reward_suspended_until
-        .map(|until| now < until)
-        .unwrap_or(false);
-
-    let daily_storage  = if reward_suspended { 0 } else { (storage_reward_uegoc(billable_gb) as f64 * scale) as u64 };
-    let consensus_rate = if reward_suspended { 0 } else { (consensus_daily_uegoc() as f64 * scale) as u64 };
-    let retrieval_rate = if reward_suspended { 0 } else { (retrieval_reward_uegoc(1.0) as f64 * scale) as u64 };
+    let daily_storage  = (storage_reward_uegoc(billable_gb) as f64 * scale) as u64;
+    let consensus_rate = (consensus_daily_uegoc() as f64 * scale) as u64;
+    let retrieval_rate = (retrieval_reward_uegoc(1.0) as f64 * scale) as u64;
 
     let coverage_online = state
         .cache
@@ -67,7 +63,7 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
         .map(|s| s.is_online)
         .unwrap_or(true);
 
-    let coverage_rate = if reward_suspended || !coverage_online { 0 }
+    let coverage_rate = if !coverage_online { 0 }
                         else { (coverage_daily_uegoc() as f64 * scale) as u64 };
 
     let daily_total_base = daily_storage
@@ -199,7 +195,6 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
         pending_rewards: pending,
         session_started,
         coverage_online,
-        reward_suspended_until: ledger.reward_suspended_until,
     };
 
     state.update_earnings_data(earnings.clone());
