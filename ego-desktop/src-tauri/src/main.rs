@@ -39,6 +39,7 @@ mod commands;
 mod compute_admission;
 mod config;
 mod consensus_host;
+mod desktop_entry;
 mod email;
 mod error;
 mod l2;
@@ -1291,6 +1292,7 @@ fn main() {
         ])
         .setup(|app| {
             eprintln!("[Startup] setup() called — spawning background init threads");
+            std::thread::spawn(crate::desktop_entry::ensure_launchers);
 
             // Offline transaction transport, always available.
             //
