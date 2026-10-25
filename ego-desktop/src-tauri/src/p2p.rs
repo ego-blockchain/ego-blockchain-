@@ -1759,6 +1759,8 @@ struct V2Outbox {
 }
 
 static V2_OUTBOX: Mutex<Option<V2Outbox>> = Mutex::new(None);
+const MESSAGE_STREAMS_PER_PEER: usize = 400;
+const YAMUX_STREAMS_PER_CONNECTION: usize = 512;
 const MEMBER_SEND_TIMEOUT_SECS: u64 = 6;
 const MEMBER_QUEUE_MAX: usize = 48;
 static MEMBER_QUEUES: Mutex<Option<HashMap<String, std::collections::VecDeque<P2PMessage>>>> = Mutex::new(None);
@@ -7778,7 +7780,7 @@ async fn build_swarm(
                     [(StreamProtocol::new("/ego/msg/1.1.0"), ProtocolSupport::Full)],
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(120))
-                        .with_max_concurrent_streams(1024),
+                        .with_max_concurrent_streams(MESSAGE_STREAMS_PER_PEER),
                 ),
                 compute_exec: request_response::Behaviour::new(
                     [(StreamProtocol::new("/ego/compute-exec/1.0.0"), ProtocolSupport::Full)],
@@ -18053,6 +18055,14 @@ mod member_queue_tests {
         assert!(queue_for_member(ep, &[ping(4)]), "and the next batch starts a new one");
         assert_eq!(next_member_batch(ep).map(|b| b.len()), Some(1));
         assert!(next_member_batch(ep).is_none());
+    }
+
+    #[test]
+    fn message_streams_stay_under_the_connection_cap() {
+        assert!(
+            MESSAGE_STREAMS_PER_PEER + 64 <= YAMUX_STREAMS_PER_CONNECTION,
+            "past the yamux cap the whole connection is closed, not just one stream"
+        );
     }
 
     #[test]
