@@ -1760,8 +1760,9 @@ struct V2Outbox {
 
 static V2_OUTBOX: Mutex<Option<V2Outbox>> = Mutex::new(None);
 const MESSAGE_STREAMS_PER_PEER: usize = 400;
-const YAMUX_STREAMS_PER_CONNECTION: usize = 512;
+const YAMUX_STREAMS_PER_CONNECTION: usize = 2_048;
 const OUTBOUND_REQUESTS_PER_PEER: usize = 192;
+const STUCK_TIMEOUTS: u32 = 8;
 const OUTBOUND_BACKLOG_PER_PEER: usize = 256;
 const OUTBOUND_BACKLOG_TOTAL: usize = 4_096;
 
@@ -1833,11 +1834,26 @@ impl<T> SendBudget<T> {
 struct Outbound {
     budget: SendBudget<(P2PMessage, SendReply)>,
     in_flight: HashMap<OutboundRequestId, (PeerId, SendReply)>,
+    timeouts: HashMap<PeerId, u32>,
+}
+
+fn stuck_after(timeouts: &mut HashMap<PeerId, u32>, peer: PeerId, timed_out: bool) -> bool {
+    if !timed_out {
+        timeouts.remove(&peer);
+        return false;
+    }
+    let n = timeouts.entry(peer).or_insert(0);
+    *n += 1;
+    if *n >= STUCK_TIMEOUTS {
+        timeouts.remove(&peer);
+        return true;
+    }
+    false
 }
 
 impl Outbound {
     fn new() -> Self {
-        Self { budget: SendBudget::new(), in_flight: HashMap::new() }
+        Self { budget: SendBudget::new(), in_flight: HashMap::new(), timeouts: HashMap::new() }
     }
 
     fn send(&mut self, swarm: &mut libp2p::Swarm<EgoBehaviour>, peer: PeerId, msg: P2PMessage, reply: SendReply) {
@@ -1857,10 +1873,14 @@ impl Outbound {
         self.in_flight.insert(req_id, (peer, reply));
     }
 
-    fn settle(&mut self, swarm: &mut libp2p::Swarm<EgoBehaviour>, request_id: OutboundRequestId, result: Result<(), String>) {
+    fn settle(&mut self, swarm: &mut libp2p::Swarm<EgoBehaviour>, request_id: OutboundRequestId, result: Result<(), String>, timed_out: bool) {
         let Some((peer, reply)) = self.in_flight.remove(&request_id) else { return };
         let _ = reply.send(result);
         self.budget.finished(&peer);
+        if stuck_after(&mut self.timeouts, peer, timed_out) {
+            eprintln!("[P2P] {peer} left {STUCK_TIMEOUTS} messages in a row unanswered, dropping the connection so both sides start clean");
+            let _ = swarm.disconnect_peer_id(peer);
+        }
         while let Some((msg, reply)) = self.budget.next_waiting(&peer) {
             if reply.is_closed() {
                 self.budget.finished(&peer);
@@ -6987,6 +7007,11 @@ const DIRECT_FANOUT: usize = 8;
 fn newest_peers(mut peers: Vec<PeerEntry>, now: i64) -> Vec<PeerEntry> {
     let cutoff = now - 30 * 86_400;
     peers.retain(|p| p.last_seen >= cutoff);
+    for p in peers.iter_mut() {
+        if p.endpoint.matches("/p2p/").count() > 1 {
+            p.endpoint = tidy_endpoint(&p.endpoint);
+        }
+    }
     if peers.len() > PEER_CACHE_MAX {
         peers.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         peers.truncate(PEER_CACHE_MAX);
@@ -7800,6 +7825,32 @@ fn strip_p2p_suffix(addr: &Multiaddr) -> Multiaddr {
     addr.iter().filter(|p| !matches!(p, Protocol::P2p(_))).collect()
 }
 
+fn without_trailing_peer(addr: &Multiaddr) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    let mut a = addr.clone();
+    while matches!(a.iter().last(), Some(Protocol::P2p(_))) {
+        a.pop();
+    }
+    a
+}
+
+fn with_peer(addr: &Multiaddr, peer: &PeerId) -> Multiaddr {
+    without_trailing_peer(addr).with(libp2p::multiaddr::Protocol::P2p(*peer))
+}
+
+fn tidy_endpoint(endpoint: &str) -> String {
+    match (endpoint.parse::<Multiaddr>(), endpoint.parse::<Multiaddr>().ok().and_then(|a| peer_id_from_multiaddr(&a))) {
+        (Ok(addr), Some(peer)) => with_peer(&addr, &peer).to_string(),
+        _ => endpoint.to_string(),
+    }
+}
+
+fn yamux_config() -> yamux::Config {
+    let mut cfg = yamux::Config::default();
+    cfg.set_max_num_streams(YAMUX_STREAMS_PER_CONNECTION);
+    cfg
+}
+
 async fn build_swarm(
     identity: libp2p::identity::Keypair,
 ) -> Result<libp2p::Swarm<EgoBehaviour>, Box<dyn std::error::Error>> {
@@ -7811,10 +7862,10 @@ async fn build_swarm(
     let tcp_cfg = tcp::Config::default().nodelay(true);
     let swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
-        .with_tcp(tcp_cfg, noise::Config::new, yamux::Config::default)?
+        .with_tcp(tcp_cfg, noise::Config::new, yamux_config)?
         .with_quic()
         .with_dns()?
-        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_relay_client(noise::Config::new, yamux_config)?
         .with_behaviour(|key, relay_client| {
             // ── Gossipsub ─────────────────────────────────────────────────────
             let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -8337,7 +8388,7 @@ async fn handle_event(
         SwarmEvent::Behaviour(EgoBehaviourEvent::Identify(
             identify::Event::Received { peer_id: remote_peer_id, info, .. },
         )) => {
-            let observed = info.observed_addr.clone();
+            let observed = without_trailing_peer(&info.observed_addr);
             swarm.add_external_address(observed.clone());
             if !external_addrs.contains(&observed) {
                 external_addrs.push(observed.clone());
@@ -8363,18 +8414,12 @@ async fn handle_event(
                     else if s.starts_with("/ip4/192.168.") || s.starts_with("/ip4/10.") { 0 }
                     else { 1 }
                 })
-                .map(|a| {
-                    let s = a.to_string();
-                    if s.contains("/p2p/") { s } else { format!("{}/p2p/{}", s, pid_str) }
-                })
+                .map(|a| with_peer(a, &remote_peer_id).to_string())
                 .or_else(|| {
                     info.listen_addrs.iter()
                         .filter(|a| !a.to_string().contains("/ip4/169.254."))
                         .next()
-                        .map(|a| {
-                            let s = a.to_string();
-                            if s.contains("/p2p/") { s } else { format!("{}/p2p/{}", s, pid_str) }
-                        })
+                        .map(|a| with_peer(a, &remote_peer_id).to_string())
                 });
             if let Some(ep) = best_ep {
                 upsert_peer_cache(PeerEntry {
@@ -8531,13 +8576,14 @@ async fn handle_event(
                 message: request_response::Message::Response { request_id, .. }, ..
             },
         )) => {
-            outbound.settle(swarm, request_id, Ok(()));
+            outbound.settle(swarm, request_id, Ok(()), false);
         }
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::RequestResponse(
             request_response::Event::OutboundFailure { request_id, error, .. },
         )) => {
-            outbound.settle(swarm, request_id, Err(format!("Network error: {}", error)));
+            let timed_out = matches!(error, request_response::OutboundFailure::Timeout);
+            outbound.settle(swarm, request_id, Err(format!("Network error: {}", error)), timed_out);
         }
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::ComputeExec(
@@ -9319,10 +9365,7 @@ async fn handle_event(
             eprintln!("[DHT] Routing updated: {} ({} addrs)", peer, addresses.len());
 
             if let Some(addr) = addresses.iter().next() {
-                let full: Multiaddr = format!("{}/p2p/{}", addr, peer)
-                    .parse()
-                    .unwrap_or_else(|_| addr.clone());
-                let _ = swarm.dial(full);
+                let _ = swarm.dial(with_peer(addr, &peer));
             }
         }
 
@@ -18190,6 +18233,42 @@ mod member_queue_tests {
             2 * OUTBOUND_REQUESTS_PER_PEER <= MESSAGE_STREAMS_PER_PEER,
             "the request handler must be able to work every stream the budgets allow"
         );
+        assert!(
+            8 * OUTBOUND_REQUESTS_PER_PEER <= YAMUX_STREAMS_PER_CONNECTION,
+            "streams a sender gave up on stay counted until both ends close them, so the cap leaves room for them"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_keeps_timing_out_is_disconnected_and_one_answer_forgives_it() {
+        let peer = PeerId::random();
+        let mut timeouts = HashMap::new();
+        for _ in 1..STUCK_TIMEOUTS {
+            assert!(!stuck_after(&mut timeouts, peer, true));
+        }
+        assert!(!stuck_after(&mut timeouts, peer, false), "an answer resets the count");
+        for _ in 1..STUCK_TIMEOUTS {
+            assert!(!stuck_after(&mut timeouts, peer, true));
+        }
+        assert!(stuck_after(&mut timeouts, peer, true), "the eighth timeout in a row drops the connection");
+        assert!(timeouts.is_empty(), "and the count starts over");
+    }
+
+    #[test]
+    fn an_address_carries_its_peer_id_exactly_once() {
+        let id = "12D3KooWKTL9urvxKbgNGntijVkQU6nJ8iFJEhUcWJ2e3T6RR1yo";
+        let grown = format!("/ip4/192.168.1.99/udp/47397/quic-v1/p2p/{id}/p2p/{id}/p2p/{id}");
+        assert_eq!(tidy_endpoint(&grown), format!("/ip4/192.168.1.99/udp/47397/quic-v1/p2p/{id}"));
+        let relayed = format!("/dns4/egorelay.egoblockchain.com/tcp/4001/p2p/12D3KooWFFjZdk4nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y/p2p-circuit/p2p/{id}/p2p/{id}");
+        assert_eq!(
+            tidy_endpoint(&relayed),
+            format!("/dns4/egorelay.egoblockchain.com/tcp/4001/p2p/12D3KooWFFjZdk4nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y/p2p-circuit/p2p/{id}"),
+            "the relay's own id stays"
+        );
+        let plain: Multiaddr = "/ip4/10.0.0.5/tcp/47393".parse().unwrap();
+        let peer: PeerId = id.parse().unwrap();
+        assert_eq!(with_peer(&plain, &peer).to_string(), format!("/ip4/10.0.0.5/tcp/47393/p2p/{id}"));
+        assert_eq!(with_peer(&with_peer(&plain, &peer), &peer), with_peer(&plain, &peer), "appending twice changes nothing");
     }
 
     #[test]
