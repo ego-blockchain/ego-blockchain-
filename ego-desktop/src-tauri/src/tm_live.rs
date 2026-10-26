@@ -292,10 +292,20 @@ fn able(addr: &str, me: &str) -> bool {
     addr == me || crate::commands::updates::runs_at_least(addr, REPLACEMENT_VERSION, LIVE_WITHIN_SECS)
 }
 
+fn present_addr(addr: &str, me: &str, now: u64) -> bool {
+    addr == me
+        || (!is_silent(addr, now)
+            && (heard_within(addr, now) || crate::p2p::validator_announced_within(addr, ANNOUNCED_WITHIN_SECS)))
+}
+
 fn replacement_reachable(plan: &[Vec<String>], me: &str) -> bool {
+    replacement_reachable_by(plan, |a| able(a, me))
+}
+
+fn replacement_reachable_by(plan: &[Vec<String>], ok: impl Fn(&str) -> bool) -> bool {
     for committee in plan {
         let n = committee.len();
-        let ready = committee.iter().filter(|a| able(a, me)).count();
+        let ready = committee.iter().filter(|a| ok(a)).count();
         if ready >= quorum_of(n) {
             return true;
         }
@@ -638,11 +648,12 @@ impl Driver {
             return;
         }
         let Some(plan) = plan else { return };
-        if !replacement_reachable(plan, &self.me_addr) {
+        let me = self.me_addr.clone();
+        if !replacement_reachable_by(plan, |a| able(a, &me) && present_addr(a, &me, now)) {
             if !self.said_no_replacement {
                 self.said_no_replacement = true;
                 eprintln!(
-                    "[Consensus] h={} attempt {}: not giving up yet, the next committees do not have enough nodes online on {REPLACEMENT_VERSION} or later to finish the block",
+                    "[Consensus] h={} attempt {}: not giving up yet, none of the next committees has enough members present on {REPLACEMENT_VERSION} or later to finish the block, so this node keeps waiting here instead of using up attempts",
                     self.height, self.attempt
                 );
             }
@@ -1590,6 +1601,23 @@ mod tests {
         }
         assert_eq!(kind_of(0), None);
         assert_eq!(kind_of(9), None);
+    }
+
+    #[test]
+    fn attempts_are_not_spent_on_committees_whose_members_are_away() {
+        let c = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let away = ["egot1tc5p", "egot1cczr"];
+        let here = |a: &str| !away.contains(&a);
+        let plan = vec![
+            c(&["egot1me", "egot1tzz8", "egot1tc5p", "egot1cczr"]),
+            c(&["egot1me", "egot1y2dm", "egot1tc5p", "egot1cczr"]),
+        ];
+        assert!(!replacement_reachable_by(&plan, here), "with two of four away in every next committee, giving up only burns attempts");
+        let plan = vec![
+            c(&["egot1me", "egot1tzz8", "egot1tc5p", "egot1cczr"]),
+            c(&["egot1me", "egot1tzz8", "egot1y2dm", "egot1tc5p"]),
+        ];
+        assert!(replacement_reachable_by(&plan, here), "a committee two steps on with three present is worth moving to");
     }
 
     #[test]

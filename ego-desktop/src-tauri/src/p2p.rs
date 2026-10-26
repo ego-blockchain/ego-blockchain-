@@ -56,29 +56,40 @@ fn chain_push_allowed(endpoint: &str) -> bool {
 }
 
 const SYNC_REPLY_PROGRESS_MS: i64 = 500;
+const SYNC_REPLY_MAX_COOLDOWN_MS: i64 = 600_000;
 const SYNC_REQUEST_PROGRESS_MS: i64 = 1_000;
 const GOSSIP_SYNC_ANSWERERS: u64 = 4;
 const GOSSIP_SYNC_REDRAW_SECS: i64 = 30;
-static BLOCK_SYNC_SERVED: OnceLock<Mutex<HashMap<String, (i64, u64)>>> = OnceLock::new();
+static BLOCK_SYNC_SERVED: OnceLock<Mutex<HashMap<String, (i64, u64, u32)>>> = OnceLock::new();
 
-pub(crate) fn block_sync_reply_due(last: (i64, u64), from_height: u64, now_ms: i64) -> bool {
-    let (at, served) = last;
+fn repeat_cooldown_ms(repeats: u32) -> i64 {
+    SYNC_REPLY_COOLDOWN_MS.saturating_mul(1i64 << repeats.min(16)).min(SYNC_REPLY_MAX_COOLDOWN_MS)
+}
+
+pub(crate) fn block_sync_reply_due(last: (i64, u64, u32), from_height: u64, now_ms: i64) -> bool {
+    let (at, served, repeats) = last;
     if from_height > served {
         now_ms - at >= SYNC_REPLY_PROGRESS_MS
     } else {
-        now_ms - at >= SYNC_REPLY_COOLDOWN_MS
+        now_ms - at >= repeat_cooldown_ms(repeats)
     }
+}
+
+fn next_sync_reply_state(last: (i64, u64, u32), from_height: u64, now_ms: i64) -> (i64, u64, u32) {
+    let (_, served, repeats) = last;
+    let repeats = if from_height > served { 0 } else { repeats.saturating_add(1) };
+    (now_ms, from_height, repeats)
 }
 
 fn block_sync_reply_allowed(endpoint: &str, from_height: u64) -> bool {
     let now = Utc::now().timestamp_millis();
     let mut map = BLOCK_SYNC_SERVED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
     if map.len() > 4096 {
-        map.retain(|_, (at, _)| now - *at < SYNC_REPLY_COOLDOWN_MS);
+        map.retain(|_, (at, _, _)| now - *at < SYNC_REPLY_MAX_COOLDOWN_MS);
     }
-    let entry = map.entry(endpoint.to_string()).or_insert((0, 0));
+    let entry = map.entry(endpoint.to_string()).or_insert((0, 0, 0));
     if block_sync_reply_due(*entry, from_height, now) {
-        *entry = (now, from_height);
+        *entry = next_sync_reply_state(*entry, from_height, now);
         true
     } else {
         false
@@ -17563,12 +17574,22 @@ mod poison_tx_tests {
     #[test]
     fn a_syncing_node_is_answered_at_once_while_it_moves_forward_and_slowly_when_it_repeats() {
         let now = 100_000;
-        assert!(super::block_sync_reply_due((0, 0), 1, now), "a first request is answered");
-        assert!(super::block_sync_reply_due((now - 600, 500), 1000, now), "the next page is answered at once");
-        assert!(!super::block_sync_reply_due((now - 100, 500), 1000, now), "but not twice in the same half second");
-        assert!(!super::block_sync_reply_due((now - 7_000, 500), 500, now), "the same page again waits");
-        assert!(super::block_sync_reply_due((now - 8_000, 500), 500, now));
-        assert!(!super::block_sync_reply_due((now - 7_000, 500), 400, now), "going backwards is not progress");
+        assert!(super::block_sync_reply_due((0, 0, 0), 1, now), "a first request is answered");
+        assert!(super::block_sync_reply_due((now - 600, 500, 0), 1000, now), "the next page is answered at once");
+        assert!(!super::block_sync_reply_due((now - 100, 500, 0), 1000, now), "but not twice in the same half second");
+        assert!(!super::block_sync_reply_due((now - 7_000, 500, 0), 500, now), "the same page again waits");
+        assert!(super::block_sync_reply_due((now - 8_000, 500, 0), 500, now));
+        assert!(!super::block_sync_reply_due((now - 7_000, 500, 0), 400, now), "going backwards is not progress");
+        assert!(!super::block_sync_reply_due((now - 8_000, 500, 1), 500, now), "a second repeat waits twice as long");
+        assert!(super::block_sync_reply_due((now - 16_000, 500, 1), 500, now));
+        assert!(!super::block_sync_reply_due((now - 599_000, 500, 30), 500, now), "a node stuck on one page is answered at most every ten minutes");
+        assert!(super::block_sync_reply_due((now - 600_000, 500, 30), 500, now));
+        let mut state = (0i64, 0u64, 0u32);
+        for _ in 0..5 {
+            state = super::next_sync_reply_state(state, 500, now);
+        }
+        assert_eq!(state.2, 4, "each unchanged request counts as a repeat");
+        assert_eq!(super::next_sync_reply_state(state, 1000, now).2, 0, "progress resets the wait");
         assert!(super::sync_request_due(1_000, true));
         assert!(!super::sync_request_due(1_000, false));
         assert!(super::sync_request_due(8_000, false));
