@@ -1,4 +1,4 @@
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bech32::{ToBase32, Variant};
@@ -19,6 +19,73 @@ const MAX_GATEWAYS: usize = 10_000;
 const LIST_LIMIT: usize = 100;
 const LIST_REBUILD_SECS: i64 = 30;
 const CACHE_CONTROL: &str = "public, max-age=300, stale-while-revalidate=3600";
+const CHECK_AGAIN_SECS: i64 = 10 * 60;
+const CHECKS_AT_ONCE: usize = 8;
+const CHECK_TIMEOUT_SECS: u64 = 6;
+const CHECKED_MAX: usize = 100_000;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckRequest {
+    pub endpoint: String,
+}
+
+static CHECKED: Lazy<RwLock<HashMap<String, (i64, bool)>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static CHECKING: Lazy<tokio::sync::Semaphore> = Lazy::new(|| tokio::sync::Semaphore::new(CHECKS_AT_ONCE));
+static PROBE: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(CHECK_TIMEOUT_SECS))
+        .build()
+        .ok()
+});
+
+pub fn caller_ip(headers: &HeaderMap) -> Option<Ipv4Addr> {
+    headers.get("x-real-ip")?.to_str().ok()?.trim().parse().ok()
+}
+
+pub fn may_check(endpoint: &str, caller: Option<Ipv4Addr>) -> Result<(Ipv4Addr, u16), &'static str> {
+    let (ip, port) = parse_endpoint(endpoint).ok_or("The address must look like https://<public IPv4>:<port>/rpc.")?;
+    match caller {
+        None => Err("This server can't tell where the request came from."),
+        Some(c) if c != ip => Err("A node can only ask for its own address to be checked."),
+        Some(_) => Ok((ip, port)),
+    }
+}
+
+async fn reaches(ip: Ipv4Addr, port: u16) -> bool {
+    let Some(client) = PROBE.as_ref() else { return false };
+    match client.get(format!("https://{ip}:{port}/health")).send().await {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<serde_json::Value>()
+            .await
+            .map(|v| v["service"] == "ego-gateway")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+pub async fn handle_check(headers: HeaderMap, Json(req): Json<CheckRequest>) -> impl IntoResponse {
+    let now = chrono::Utc::now().timestamp();
+    let (ip, port) = match may_check(&req.endpoint, caller_ip(&headers)) {
+        Ok(target) => target,
+        Err(e) => return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))),
+    };
+    if let Some((at, reachable)) = CHECKED.read().await.get(&req.endpoint).copied() {
+        if now - at < CHECK_AGAIN_SECS {
+            return (StatusCode::OK, Json(json!({ "reachable": reachable, "checked_at": at })));
+        }
+    }
+    let Ok(_permit) = CHECKING.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "Busy checking other nodes, try again later." })));
+    };
+    let reachable = reaches(ip, port).await;
+    let mut checked = CHECKED.write().await;
+    if checked.len() >= CHECKED_MAX {
+        checked.retain(|_, (at, _)| now - *at < CHECK_AGAIN_SECS);
+    }
+    checked.insert(req.endpoint, (now, reachable));
+    (StatusCode::OK, Json(json!({ "reachable": reachable, "checked_at": now })))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Announcement {
@@ -147,6 +214,22 @@ pub async fn handle_list() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_only_checks_the_address_the_request_comes_from() {
+        let me: Ipv4Addr = "50.66.180.231".parse().unwrap();
+        assert_eq!(may_check("https://50.66.180.231:47398/rpc", Some(me)), Ok((me, 47398)));
+        assert!(may_check("https://8.8.8.8:47398/rpc", Some(me)).is_err(), "no checking someone else's machine");
+        assert!(may_check("https://50.66.180.231:47398/rpc", None).is_err(), "no checking without knowing the caller");
+        assert!(may_check("https://192.168.1.5:47398/rpc", Some("192.168.1.5".parse().unwrap())).is_err(), "never a private address");
+        assert!(may_check("https://50.66.180.231:22/rpc", Some(me)).is_err(), "never a system port");
+        assert!(may_check("http://50.66.180.231:47398/health", Some(me)).is_err());
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "50.66.180.231".parse().unwrap());
+        assert_eq!(caller_ip(&h), Some(me));
+        h.insert("x-real-ip", "not an ip".parse().unwrap());
+        assert_eq!(caller_ip(&h), None);
+    }
     use ed25519_dalek::{Signer, SigningKey};
 
     fn announcement(key: &SigningKey, endpoint: &str, ts: i64) -> Announcement {

@@ -42,6 +42,32 @@ const MAX_STORAGE_BODY_BYTES: usize = 512 * 1024;
 const NOT_HERE: &str = "That method isn't available on this gateway.";
 const NOT_OWNER: &str = "Only the owner of this computer can see its earnings.";
 pub const EARNINGS_DOMAIN: &str = "ego/node-earnings/v1";
+const SELF_CHECK_FIRST_SECS: i64 = 30 * 60;
+const SELF_CHECK_MAX_SECS: i64 = 24 * 3600;
+const SELF_CHECK_KEEP_SECS: i64 = 50 * 60;
+
+static SELF_CHECK: Mutex<(i64, i64)> = Mutex::new((0, SELF_CHECK_FIRST_SECS));
+
+fn next_self_check(backoff: i64, reachable: Option<bool>, now: i64) -> (i64, i64) {
+    match reachable {
+        Some(true) => (now + SELF_CHECK_KEEP_SECS, SELF_CHECK_FIRST_SECS),
+        Some(false) => (now + backoff, (backoff * 2).min(SELF_CHECK_MAX_SECS)),
+        None => (now + SELF_CHECK_FIRST_SECS, backoff),
+    }
+}
+
+async fn ask_to_be_checked(client: &reqwest::Client, endpoint: &str) -> Option<bool> {
+    let resp = client
+        .post(format!("{}/gateways/check", crate::p2p::ORACLE_RPC))
+        .json(&json!({ "endpoint": endpoint }))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Value>().await.ok()?["reachable"].as_bool()
+}
 
 const PASSTHROUGH: &[&str] = &[
     "wallet.getBalance",
@@ -769,6 +795,20 @@ async fn announce_once(client: &reqwest::Client, cert_sha256: &str) -> bool {
     };
     let now = chrono::Utc::now().timestamp();
     let public_ip = parse_endpoint(&a.endpoint).map(|(ip, _)| ip.to_string()).unwrap_or_default();
+    let before = status();
+    let mapped = before.router_port_open == Some(true) && before.router_public_ip.as_deref() == Some(public_ip.as_str());
+    let due = SELF_CHECK.lock().map(|g| now >= g.0).unwrap_or(false);
+    if !declared_public() && !mapped && due {
+        let result = ask_to_be_checked(client, &a.endpoint).await;
+        if let Ok(mut g) = SELF_CHECK.lock() {
+            *g = next_self_check(g.1, result, now);
+        }
+        match result {
+            Some(true) => eprintln!("[Gateway] the bootstrap server reached {} from the internet, so this gateway can be listed", a.endpoint),
+            Some(false) => eprintln!("[Gateway] the bootstrap server could not reach {}: open TCP port {} on your router to serve phones and apps", a.endpoint, port()),
+            None => {}
+        }
+    }
     let snapshot = status();
     let reachable = should_announce(
         declared_public(),
@@ -997,6 +1037,18 @@ pub async fn supervise() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreachable_node_asks_less_and_less_often_and_a_reachable_one_stays_fresh() {
+        let now = 1_000_000;
+        assert_eq!(next_self_check(SELF_CHECK_FIRST_SECS, Some(false), now), (now + 1_800, 3_600));
+        assert_eq!(next_self_check(3_600, Some(false), now), (now + 3_600, 7_200));
+        assert_eq!(next_self_check(SELF_CHECK_MAX_SECS, Some(false), now), (now + SELF_CHECK_MAX_SECS, SELF_CHECK_MAX_SECS), "at most once a day");
+        let (next, backoff) = next_self_check(7_200, Some(true), now);
+        assert!(next - now < REACHED_FOR_SECS, "a reachable node is checked again before its last reach expires");
+        assert_eq!(backoff, SELF_CHECK_FIRST_SECS, "and starts over if it later becomes unreachable");
+        assert_eq!(next_self_check(7_200, None, now), (now + SELF_CHECK_FIRST_SECS, 7_200), "a busy server is retried without counting as a failure");
+    }
     use ed25519_dalek::{Signer, SigningKey};
 
     fn signed(key: &SigningKey, endpoint: &str, cert: &str, ts: i64) -> Announcement {

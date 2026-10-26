@@ -1379,6 +1379,7 @@ async fn main() {
         .route("/nodes",                    get(handle_nodes_list))
         .route("/gateways",                 get(gateways::handle_list))
         .route("/gateways/register",        post(gateways::handle_register))
+        .route("/gateways/check",           post(gateways::handle_check))
         .route("/blog/comments/:slug",      get(comments::handle_list).post(comments::handle_create))
         .route("/blog/comments/:slug/:id/edit",   post(comments::handle_edit))
         .route("/blog/comments/:slug/:id/delete", post(comments::handle_delete))
