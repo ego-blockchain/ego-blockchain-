@@ -18,9 +18,15 @@ const LATER_MAX: usize = 256;
 const WAL_FILE: &str = "consensus_wal.json";
 const V2_LOCK_SECS: i64 = 90;
 const V2_LOCK_KEEP: u64 = 200;
-const GIVE_UP_AFTER_MS: u64 = 45_000;
-const GIVE_UP_STEP_MS: u64 = 15_000;
-const GIVE_UP_CAP_MS: u64 = 120_000;
+const GIVE_UP_AFTER_MS: u64 = 30_000;
+const GIVE_UP_STEP_MS: u64 = 10_000;
+const GIVE_UP_CAP_MS: u64 = 90_000;
+const ABSENT_GIVE_UP_MS: u64 = 10_000;
+const SILENT_AFTER_MS: u64 = 20_000;
+const HEARD_WITHIN_MS: u64 = 60_000;
+const ANNOUNCED_WITHIN_SECS: i64 = 100;
+const LAST_HEARD_MAX: usize = 1_024;
+const SILENT_KEEP_MS: u64 = 600_000;
 const SKIPS_RESEND_MS: u64 = 10_000;
 const REPLACEMENT_VERSION: &str = "0.3.646";
 const LIVE_WITHIN_SECS: i64 = 900;
@@ -39,6 +45,57 @@ type Payload = (LedgerBlock, Vec<LedgerTx>);
 fn mono_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+static LAST_HEARD: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+fn note_heard(addr: &str, now: u64) {
+    let mut g = LAST_HEARD.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() >= LAST_HEARD_MAX && !g.contains_key(addr) {
+        g.retain(|_, at| now.saturating_sub(*at) < HEARD_WITHIN_MS);
+        if g.len() >= LAST_HEARD_MAX {
+            return;
+        }
+    }
+    g.insert(addr.to_string(), now);
+}
+
+fn heard_within(addr: &str, now: u64) -> bool {
+    LAST_HEARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(addr)
+        .map_or(false, |at| now.saturating_sub(*at) < HEARD_WITHIN_MS)
+}
+
+static SILENT: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+fn mark_silent(addr: &str, now: u64) -> bool {
+    let mut g = SILENT.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|_, at| now.saturating_sub(*at) < SILENT_KEEP_MS);
+    if g.len() >= LAST_HEARD_MAX {
+        return false;
+    }
+    g.insert(addr.to_string(), now).is_none()
+}
+
+fn clear_silent(addr: &str) {
+    SILENT.lock().unwrap_or_else(|e| e.into_inner()).remove(addr);
+}
+
+fn is_silent(addr: &str, now: u64) -> bool {
+    SILENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(addr)
+        .map_or(false, |at| now.saturating_sub(*at) < SILENT_KEEP_MS)
+}
+
+fn present_in(members: &[(String, Vec<u8>)], me: &str, silent: impl Fn(&str) -> bool, live: impl Fn(&str) -> bool) -> usize {
+    members
+        .iter()
+        .filter(|(a, _)| a == me || (!silent(a) && live(a)))
+        .count()
 }
 
 fn give_up_after(attempt: u32) -> u64 {
@@ -206,6 +263,7 @@ struct Driver {
     said_no_replacement: bool,
     caught_up: HashMap<u32, u64>,
     heard: HashSet<usize>,
+    seen_at_height: HashSet<String>,
 }
 
 static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
@@ -355,6 +413,7 @@ impl Driver {
             said_no_replacement: false,
             caught_up: HashMap::new(),
             heard: HashSet::new(),
+            seen_at_height: HashSet::new(),
         };
         if let Some(saved) = restored {
             eprintln!(
@@ -542,13 +601,36 @@ impl Driver {
         }
     }
 
+    fn mark_heard(&mut self, j: usize) {
+        self.heard.insert(j);
+        if let Some((addr, _)) = self.members.get(j) {
+            clear_silent(addr);
+            self.seen_at_height.insert(addr.clone());
+            note_heard(addr, mono_ms());
+        }
+    }
+
+    fn present_members(&self, now: u64) -> usize {
+        present_in(&self.members, &self.me_addr, |a| is_silent(a, now), |a| {
+            heard_within(a, now) || crate::p2p::validator_announced_within(a, ANNOUNCED_WITHIN_SECS)
+        })
+    }
+
+    fn short_of_quorum(&self, now: u64) -> bool {
+        self.present_members(now) < quorum_of(self.members.len())
+    }
+
     fn give_up_due(&self, now: u64) -> bool {
-        self.gave_up.is_none()
-            && self.decided.is_none()
-            && self.me.is_some()
-            && self.attempt < TM_MAX_ATTEMPT
-            && self.height >= crate::drs::SKIP_FROM_HEIGHT
-            && now.saturating_sub(self.attempt_started) >= give_up_after(self.attempt)
+        if self.gave_up.is_some()
+            || self.decided.is_some()
+            || self.me.is_none()
+            || self.attempt >= TM_MAX_ATTEMPT
+            || self.height < crate::drs::SKIP_FROM_HEIGHT
+        {
+            return false;
+        }
+        let waited = now.saturating_sub(self.attempt_started);
+        waited >= give_up_after(self.attempt) || (waited >= ABSENT_GIVE_UP_MS && self.short_of_quorum(now))
     }
 
     fn maybe_give_up(&mut self, now: u64, plan: Option<&[Vec<String>]>, out: &mut Out) {
@@ -584,10 +666,16 @@ impl Driver {
         let vote = TmSkipVote { voter: self.me_addr.clone(), locked, sig: sign(&kp, &msg) };
         self.gave_up = Some(vote.clone());
         self.persist();
+        let present = self.present_members(now);
         eprintln!(
-            "[Consensus] h={} attempt {}: no block after {}s, this node gives up on this committee{}",
+            "[Consensus] h={} attempt {}: {} after {}s, this node gives up on this committee{}",
             self.height,
             self.attempt,
+            if present < quorum_of(self.members.len()) {
+                format!("only {present} of {} members are present", self.members.len())
+            } else {
+                "no block".to_string()
+            },
             now.saturating_sub(self.attempt_started) / 1000,
             if vote.locked.is_some() { " and passes on the block it locked on" } else { "" }
         );
@@ -624,6 +712,13 @@ impl Driver {
             },
             if carried.is_some() { ", and it may only finish the block the last one locked on" } else { "" }
         );
+        if now.saturating_sub(self.attempt_started) >= SILENT_AFTER_MS {
+            for (addr, _) in &self.members {
+                if *addr != self.me_addr && !self.seen_at_height.contains(addr) && mark_silent(addr, now) {
+                    eprintln!("[Consensus] h={}: {} sent nothing while on committee {}, so it no longer counts as present", self.height, short(addr), self.attempt);
+                }
+            }
+        }
         self.attempt = attempt;
         self.skips = skips;
         self.members = committee;
@@ -734,7 +829,7 @@ impl Driver {
 
     fn status(&self) -> String {
         format!(
-            "h={}{} round {} step {:?}, committee {} quorum {}, {}, heard from {} other member(s), locked {}{}, waiting {}s",
+            "h={}{} round {} step {:?}, committee {} quorum {}, {}, heard from {} other member(s), {} present, locked {}{}, waiting {}s",
             self.height,
             if self.attempt > 0 { format!(" attempt {}", self.attempt) } else { String::new() },
             self.engine.round(),
@@ -746,6 +841,7 @@ impl Driver {
                 None => "following".into(),
             },
             self.heard.len(),
+            self.present_members(mono_ms()),
             if self.engine.locked().is_some() { "yes" } else { "no" },
             if self.give_ups.is_empty() {
                 String::new()
@@ -1056,9 +1152,9 @@ async fn on_proposal(
             eprintln!("[Consensus] h={height} round {round}: proposal from {:.14} does not verify", proposer);
             return;
         }
+        d.mark_heard(idx);
         let v = tm_value_id(&block.hash);
         d.names.entry(v).or_insert_with(|| block.hash.clone());
-        d.heard.insert(idx);
         d.catch_up(round, now, &mut out);
         let mut acts = Vec::new();
         if let Some(vr) = pol_round {
@@ -1160,7 +1256,7 @@ async fn on_vote(height: u64, round: u32, kind: u8, value: Option<String>, voter
             d.names.entry(v).or_insert_with(|| name.clone());
             d.sigs.entry((kind, round, v)).or_default().insert(j, sig);
         }
-        d.heard.insert(j);
+        d.mark_heard(j);
         d.catch_up(round, now, &mut out);
         let acts = d.engine.on_vote(now, k, round, j, v);
         d.apply(acts, now, &mut out);
@@ -1210,7 +1306,7 @@ async fn on_give_up(height: u64, attempt: u32, vote: TmSkipVote, block: Option<L
             skip_threshold_of(d.members.len())
         );
         if let Some(j) = d.index_of(&vote.voter) {
-            d.heard.insert(j);
+            d.mark_heard(j);
         }
         d.give_ups.insert(vote.voter.clone(), vote);
         d.ready_skips()
@@ -1371,6 +1467,33 @@ async fn maybe_commit() {
 mod tests {
     use super::*;
     use crate::chain_db::{tm_proposal_message, tm_vote_message};
+
+    #[test]
+    fn a_committee_short_of_present_members_is_left_quickly_and_a_full_one_gets_time() {
+        let m = |names: &[&str]| names.iter().map(|n| (n.to_string(), Vec::new())).collect::<Vec<(String, Vec<u8>)>>();
+        let committee = m(&["egot1me", "egot1a", "egot1b", "egot1gone"]);
+        let live = |a: &str| a != "egot1gone";
+        assert_eq!(present_in(&committee, "egot1me", |_| false, live), 3, "three present members can still finish");
+        assert_eq!(
+            present_in(&committee, "egot1me", |a| a == "egot1b", live),
+            2,
+            "a member that sent nothing on its last committee no longer counts, even if it still announces"
+        );
+        assert_eq!(present_in(&committee, "egot1me", |a| a == "egot1me", |_| false), 1, "a node always counts itself");
+        assert!(ABSENT_GIVE_UP_MS < give_up_after(0), "an absent committee is left before the normal wait");
+        assert!(ABSENT_GIVE_UP_MS < SILENT_AFTER_MS, "members get longer to speak than an absent committee is kept");
+    }
+
+    #[test]
+    fn a_silent_member_is_forgotten_the_moment_it_speaks_and_marks_expire() {
+        let now = 1_000_000;
+        assert!(mark_silent("egot1test-silent", now));
+        assert!(!mark_silent("egot1test-silent", now + 1), "marking twice reports nothing new");
+        assert!(is_silent("egot1test-silent", now + SILENT_KEEP_MS), "staying silent keeps the mark fresh");
+        assert!(!is_silent("egot1test-silent", now + 1 + SILENT_KEEP_MS), "a mark expires");
+        clear_silent("egot1test-silent");
+        assert!(!is_silent("egot1test-silent", now + 1), "speaking clears it");
+    }
 
     #[test]
     fn the_new_messages_travel_under_their_own_names() {

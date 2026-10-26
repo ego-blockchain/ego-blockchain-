@@ -3248,6 +3248,11 @@ pub fn live_validators() -> Vec<String> {
     out
 }
 
+pub fn validator_announced_within(addr: &str, secs: i64) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    validator_last_seen().get(addr).map_or(false, |&t| now - t < secs)
+}
+
 pub fn known_validator_count() -> usize {
     live_validators().len()
 }
