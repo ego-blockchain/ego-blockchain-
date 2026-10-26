@@ -5,6 +5,9 @@ const HEIGHT: u64 = 40_000;
 const SIZE: usize = 4;
 const GIVE_UP_MS: u64 = 20_000;
 
+type Lock = Option<(u32, u32, ValueId)>;
+type Cert = (u32, Vec<(usize, Lock)>);
+
 struct Rng(u64);
 
 impl Rng {
@@ -48,11 +51,15 @@ fn value_of(node: usize, attempt: u32, round: u32) -> ValueId {
     v
 }
 
+fn attempt_of(skips: &[Cert]) -> u32 {
+    skips.last().map_or(0, |(a, _)| a + 1)
+}
+
 #[derive(Clone, Debug)]
 enum Body {
     Proposal { round: u32, v: ValueId, pol: Option<u32>, backers: Vec<usize> },
     Vote { kind: VoteKind, round: u32, v: Option<ValueId> },
-    GiveUp { lock: Option<(u32, ValueId)> },
+    GiveUp { lock: Lock },
     Decided { v: ValueId },
 }
 
@@ -61,32 +68,30 @@ struct Msg {
     attempt: u32,
     from: usize,
     body: Body,
-    skips: Vec<Vec<(usize, Option<(u32, ValueId)>)>>,
+    skips: Vec<Cert>,
 }
 
 struct Node {
     id: usize,
     attempt: u32,
-    skips: Vec<Vec<(usize, Option<(u32, ValueId)>)>>,
+    skips: Vec<Cert>,
+    carried: Lock,
     engine: Option<Tendermint>,
     members: Vec<usize>,
     entered: u64,
     gave_up: bool,
-    give_ups: BTreeMap<usize, Option<(u32, ValueId)>>,
+    give_ups: BTreeMap<usize, Lock>,
     prevotes_seen: BTreeMap<(u32, ValueId), HashSet<usize>>,
     decided: Option<ValueId>,
     later: Vec<Msg>,
     sent: Vec<Msg>,
 }
 
-fn carried(skips: &[Vec<(usize, Option<(u32, ValueId)>)>]) -> Option<ValueId> {
-    let mut out = None;
-    for cert in skips {
-        if let Some((_, v)) = cert.iter().filter_map(|(_, l)| *l).max_by_key(|(r, _)| *r) {
-            out = Some(v);
-        }
-    }
-    out
+fn carried(skips: &[Cert]) -> Lock {
+    skips
+        .iter()
+        .flat_map(|(_, votes)| votes.iter().filter_map(|(_, l)| *l))
+        .max_by_key(|(a, r, _)| (*a, *r))
 }
 
 struct Sim {
@@ -100,16 +105,36 @@ struct Sim {
     max_delay: u64,
     loss_permille: u64,
     crash_first_decider: bool,
+    compact: bool,
+    inherit: bool,
 }
 
 impl Sim {
     fn new(pool: usize, seed: u64, max_delay: u64) -> Sim {
-        let mut sim = Sim { rng: Rng(seed | 1), seed, pool, now: 0, nodes: Vec::new(), online: vec![true; pool], queue: Vec::new(), max_delay, loss_permille: 0, crash_first_decider: false };
+        Sim::with(pool, seed, max_delay, false)
+    }
+
+    fn with(pool: usize, seed: u64, max_delay: u64, compact: bool) -> Sim {
+        let mut sim = Sim {
+            rng: Rng(seed | 1),
+            seed,
+            pool,
+            now: 0,
+            nodes: Vec::new(),
+            online: vec![true; pool],
+            queue: Vec::new(),
+            max_delay,
+            loss_permille: 0,
+            crash_first_decider: false,
+            compact,
+            inherit: true,
+        };
         for id in 0..pool {
             sim.nodes.push(Node {
                 id,
                 attempt: 0,
                 skips: Vec::new(),
+                carried: None,
                 engine: None,
                 members: Vec::new(),
                 entered: 0,
@@ -128,17 +153,19 @@ impl Sim {
         sim
     }
 
-    fn enter(&mut self, id: usize, skips: Vec<Vec<(usize, Option<(u32, ValueId)>)>>) -> Vec<Msg> {
-        let attempt = skips.len() as u32;
+    fn enter(&mut self, id: usize, skips: Vec<Cert>) -> Vec<Msg> {
+        let attempt = attempt_of(&skips);
         let members = committee(self.pool, attempt, self.seed);
         let me = members.iter().position(|m| *m == id);
         let mut engine = Tendermint::new(HEIGHT, members.len(), me, fast());
-        if let Some(v) = carried(&skips) {
+        let carry = carried(&skips);
+        if let Some((_, _, v)) = carry {
             engine.carry(v);
         }
         let n = &mut self.nodes[id];
         n.attempt = attempt;
         n.skips = skips;
+        n.carried = carry;
         n.members = members;
         n.entered = self.now;
         n.gave_up = false;
@@ -203,7 +230,7 @@ impl Sim {
             return Vec::new();
         }
         if m.attempt > mine {
-            if m.skips.len() as u32 == m.attempt {
+            if attempt_of(&m.skips) == m.attempt {
                 let mut out = self.enter(id, m.skips.clone());
                 out.extend(self.receive(id, m));
                 return out;
@@ -251,23 +278,33 @@ impl Sim {
         if n.decided.is_some() || n.give_ups.len() < skip_threshold(n.members.len()) {
             return Vec::new();
         }
-        let mut skips = n.skips.clone();
-        skips.push(n.give_ups.iter().map(|(a, l)| (*a, *l)).collect());
+        let cert: Cert = (n.attempt, n.give_ups.iter().map(|(a, l)| (*a, *l)).collect());
+        let skips = if self.compact {
+            vec![cert]
+        } else {
+            let mut s = n.skips.clone();
+            s.push(cert);
+            s
+        };
         self.enter(id, skips)
     }
 
     fn give_up_if_due(&mut self, id: usize) -> Vec<Msg> {
         let now = self.now;
+        let compact = self.compact;
+        let inherit = self.inherit;
         let n = &mut self.nodes[id];
         let Some(e) = n.engine.as_ref() else { return Vec::new() };
         if n.gave_up || n.decided.is_some() || e.me().is_none() || now.saturating_sub(n.entered) < GIVE_UP_MS * (1 + n.attempt as u64) {
             return Vec::new();
         }
-        let lock = e.locked();
-        if let Some((r, v)) = lock {
+        let own = e.locked();
+        if let Some((r, v)) = own {
             let backed = n.prevotes_seen.get(&(r, v)).map_or(0, |s| s.len());
             assert!(backed >= quorum(n.members.len()), "a node locks only after seeing a quorum of prevotes");
         }
+        let own: Lock = own.map(|(r, v)| (n.attempt, r, v));
+        let lock = if compact && inherit { own.or(n.carried) } else { own };
         n.gave_up = true;
         n.give_ups.insert(id, lock);
         let msg = Msg { attempt: n.attempt, from: id, body: Body::GiveUp { lock }, skips: n.skips.clone() };
@@ -282,9 +319,9 @@ impl Sim {
             return vec![Msg { attempt: n.attempt, from: id, body: Body::Decided { v }, skips: Vec::new() }];
         }
         let mut out: Vec<Msg> = n.sent.iter().rev().take(6).cloned().collect();
-        for (a, cert) in n.skips.iter().enumerate() {
+        for (i, (a, cert)) in n.skips.iter().enumerate() {
             for (voter, lock) in cert {
-                out.push(Msg { attempt: a as u32, from: *voter, body: Body::GiveUp { lock: *lock }, skips: n.skips[..a].to_vec() });
+                out.push(Msg { attempt: *a, from: *voter, body: Body::GiveUp { lock: *lock }, skips: n.skips[..i].to_vec() });
             }
         }
         out
@@ -367,16 +404,15 @@ impl Sim {
     fn assert_one_block(&self) {
         let d = self.decisions();
         if let Some(first) = d.first() {
-            assert!(d.iter().all(|v| v == first), "two different blocks were finalized at one height (seed {})", self.seed);
+            assert!(d.iter().all(|v| v == first), "two different blocks were finalized at one height (seed {}, compact {})", self.seed, self.compact);
         }
     }
 }
 
-#[test]
-fn two_offline_members_no_longer_stop_the_chain() {
+fn two_offline_members(compact: bool) {
     let mut finished = 0;
     for seed in 1..=40u64 {
-        let mut sim = Sim::new(7, seed, 300);
+        let mut sim = Sim::with(7, seed, 300, compact);
         let c0 = committee(7, 0, seed);
         sim.online[c0[0]] = false;
         sim.online[c0[1]] = false;
@@ -390,10 +426,9 @@ fn two_offline_members_no_longer_stop_the_chain() {
     assert_eq!(finished, 40, "with five of seven nodes up every online node must finalize the height");
 }
 
-#[test]
-fn crashes_and_returns_at_random_never_finalize_two_blocks() {
+fn crashes_and_returns(compact: bool) {
     for seed in 1..=150u64 {
-        let mut sim = Sim::new(7, seed, 1_500);
+        let mut sim = Sim::with(7, seed, 1_500, compact);
         let mut rng = Rng(seed.wrapping_mul(31) | 1);
         for _ in 0..40 {
             let who = rng.below(7) as usize;
@@ -416,10 +451,9 @@ fn crashes_and_returns_at_random_never_finalize_two_blocks() {
     }
 }
 
-#[test]
-fn a_block_finalized_just_before_the_committee_gives_up_is_the_one_kept() {
+fn finalized_just_before_giving_up(compact: bool) {
     for seed in 1..=60u64 {
-        let mut sim = Sim::new(6, seed, 4_000);
+        let mut sim = Sim::with(6, seed, 4_000, compact);
         sim.step(9_000);
         let c0 = committee(6, 0, seed);
         for m in &c0[2..] {
@@ -435,11 +469,10 @@ fn a_block_finalized_just_before_the_committee_gives_up_is_the_one_kept() {
     }
 }
 
-#[test]
-fn lost_commit_votes_and_crashes_never_finalize_two_blocks() {
+fn lost_commit_votes(compact: bool) {
     let mut finished = 0;
     for seed in 1..=600u64 {
-        let mut sim = Sim::new(6, seed, 2_500);
+        let mut sim = Sim::with(6, seed, 2_500, compact);
         sim.loss_permille = 600;
         let mut rng = Rng(seed.wrapping_mul(97) | 1);
         let c0 = committee(6, 0, seed);
@@ -462,11 +495,10 @@ fn lost_commit_votes_and_crashes_never_finalize_two_blocks() {
     assert_eq!(finished, 600, "every height is finalized once the network heals");
 }
 
-#[test]
-fn a_member_that_finalizes_and_crashes_at_once_is_never_contradicted() {
+fn finalizer_crashes_at_once(compact: bool) {
     let mut forks_possible = 0;
     for seed in 1..=800u64 {
-        let mut sim = Sim::new(6, seed, 2_000);
+        let mut sim = Sim::with(6, seed, 2_000, compact);
         sim.loss_permille = 450;
         sim.crash_first_decider = true;
         sim.step(150_000);
@@ -481,4 +513,73 @@ fn a_member_that_finalizes_and_crashes_at_once_is_never_contradicted() {
         }
     }
     assert!(forks_possible > 50, "the scenario must actually occur often enough to mean something: {forks_possible}");
+}
+
+#[test]
+fn two_offline_members_no_longer_stop_the_chain() {
+    two_offline_members(false);
+}
+
+#[test]
+fn crashes_and_returns_at_random_never_finalize_two_blocks() {
+    crashes_and_returns(false);
+}
+
+#[test]
+fn a_block_finalized_just_before_the_committee_gives_up_is_the_one_kept() {
+    finalized_just_before_giving_up(false);
+}
+
+#[test]
+fn lost_commit_votes_and_crashes_never_finalize_two_blocks() {
+    lost_commit_votes(false);
+}
+
+#[test]
+fn a_member_that_finalizes_and_crashes_at_once_is_never_contradicted() {
+    finalizer_crashes_at_once(false);
+}
+
+#[test]
+fn compact_two_offline_members_no_longer_stop_the_chain() {
+    two_offline_members(true);
+}
+
+#[test]
+fn compact_crashes_and_returns_at_random_never_finalize_two_blocks() {
+    crashes_and_returns(true);
+}
+
+#[test]
+fn compact_a_block_finalized_just_before_the_committee_gives_up_is_the_one_kept() {
+    finalized_just_before_giving_up(true);
+}
+
+#[test]
+fn compact_lost_commit_votes_and_crashes_never_finalize_two_blocks() {
+    lost_commit_votes(true);
+}
+
+#[test]
+fn compact_a_member_that_finalizes_and_crashes_at_once_is_never_contradicted() {
+    finalizer_crashes_at_once(true);
+}
+
+#[test]
+fn compact_without_inherited_locks_would_fork() {
+    let mut forks = 0;
+    for seed in 1..=800u64 {
+        let mut sim = Sim::with(6, seed, 2_000, true);
+        sim.inherit = false;
+        sim.loss_permille = 450;
+        sim.crash_first_decider = true;
+        sim.step(150_000);
+        sim.loss_permille = 0;
+        sim.step(sim.now + 400_000);
+        let d = sim.decisions();
+        if d.first().map_or(false, |f| d.iter().any(|v| v != f)) {
+            forks += 1;
+        }
+    }
+    assert!(forks > 0, "dropping the inherited lock must be caught by this scenario, or it proves nothing");
 }

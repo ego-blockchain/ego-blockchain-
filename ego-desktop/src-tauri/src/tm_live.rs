@@ -1,6 +1,6 @@
 use crate::chain_db::{
-    quorum_of, skip_threshold_of, tm_proposal_message_at, tm_signature_ok, tm_skip_message, tm_value_id, tm_vote_message_at,
-    SkipChain, TmCert, TmLock, TmSkipCert, TmSkipVote, TM_CERT_V4, TM_CERT_VERSION, TM_MAX_ATTEMPT, TM_PRECOMMIT, TM_PREVOTE,
+    attempt_of, compact_skip, extended_attempts_at, quorum_of, skip_threshold_of, tm_proposal_message_at, tm_signature_ok,
+    tm_skip_message, tm_skip_message_v2, tm_value_id, tm_vote_message_at, SkipChain, TmCert, TmLock, TmSkipCert, TmSkipVote, TM_CERT_V4, TM_CERT_VERSION, TM_MAX_ATTEMPT, TM_PRECOMMIT, TM_PREVOTE,
 };
 use crate::ledger::{LedgerBlock, LedgerTx};
 use crate::p2p::P2PMessage;
@@ -264,6 +264,7 @@ struct Driver {
     caught_up: HashMap<u32, u64>,
     heard: HashSet<usize>,
     seen_at_height: HashSet<String>,
+    carried: Option<TmLock>,
 }
 
 static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
@@ -348,7 +349,7 @@ impl Driver {
                 (Vec::new(), crate::chain_db::skip_chain(height, &[]).ok()?, None, None, None)
             }
         };
-        let attempt = skips.len() as u32;
+        let attempt = attempt_of(&skips);
         let SkipChain { committee: members, miners, carried } = chain;
         let me = seat(&members, &me_addr, &kp, height);
 
@@ -424,6 +425,7 @@ impl Driver {
             caught_up: HashMap::new(),
             heard: HashSet::new(),
             seen_at_height: HashSet::new(),
+            carried: carried.clone(),
         };
         if let Some(saved) = restored {
             eprintln!(
@@ -521,6 +523,7 @@ impl Driver {
             round,
             value: name,
             pol: sigs.iter().map(|(j, s)| (self.members[*j].0.clone(), s.clone())).collect(),
+            attempt: compact_skip(self.attempt).then_some(self.attempt),
         })
     }
 
@@ -634,7 +637,7 @@ impl Driver {
         if self.gave_up.is_some()
             || self.decided.is_some()
             || self.me.is_none()
-            || self.attempt >= TM_MAX_ATTEMPT
+            || !self.may_move_on()
             || self.height < crate::drs::SKIP_FROM_HEIGHT
         {
             return false;
@@ -673,7 +676,19 @@ impl Driver {
                 }
             },
         };
-        let msg = tm_skip_message(self.height, self.attempt, locked.as_ref().map(|l| (l.round, l.value.as_str())));
+        let msg = if compact_skip(self.attempt) {
+            let reported = locked.or_else(|| self.carried.clone());
+            let msg = tm_skip_message_v2(
+                self.height,
+                self.attempt,
+                reported.as_ref().map(|l| (l.attempt.unwrap_or(self.attempt), l.round, l.value.as_str())),
+            );
+            (reported, msg)
+        } else {
+            let msg = tm_skip_message(self.height, self.attempt, locked.as_ref().map(|l| (l.round, l.value.as_str())));
+            (locked, msg)
+        };
+        let (locked, msg) = msg;
         let vote = TmSkipVote { voter: self.me_addr.clone(), locked, sig: sign(&kp, &msg) };
         self.gave_up = Some(vote.clone());
         self.persist();
@@ -694,20 +709,28 @@ impl Driver {
         self.give_ups.insert(vote.voter.clone(), vote);
     }
 
+    fn may_move_on(&self) -> bool {
+        self.attempt < TM_MAX_ATTEMPT || extended_attempts_at(self.height)
+    }
+
     fn ready_skips(&self) -> Option<Vec<TmSkipCert>> {
-        if self.advancing || self.decided.is_some() || self.attempt >= TM_MAX_ATTEMPT {
+        if self.advancing || self.decided.is_some() || !self.may_move_on() {
             return None;
         }
         if self.give_ups.len() < skip_threshold_of(self.members.len()) {
             return None;
         }
+        let cert = TmSkipCert { attempt: self.attempt, votes: self.give_ups.values().cloned().collect() };
+        if self.attempt.saturating_add(1) > TM_MAX_ATTEMPT {
+            return Some(vec![cert]);
+        }
         let mut skips = self.skips.clone();
-        skips.push(TmSkipCert { attempt: self.attempt, votes: self.give_ups.values().cloned().collect() });
+        skips.push(cert);
         Some(skips)
     }
 
     fn enter(&mut self, skips: Vec<TmSkipCert>, chain: SkipChain, now: u64, out: &mut Out) {
-        let attempt = skips.len() as u32;
+        let attempt = attempt_of(&skips);
         let SkipChain { committee, miners, carried } = chain;
         let me = seat(&committee, &self.me_addr, &self.kp, self.height);
         eprintln!(
@@ -732,6 +755,7 @@ impl Driver {
         }
         self.attempt = attempt;
         self.skips = skips;
+        self.carried = carried.clone();
         self.members = committee;
         self.miners = miners;
         self.me = me;
@@ -945,7 +969,7 @@ pub async fn tick() -> bool {
 }
 
 async fn advance(height: u64, skips: Vec<TmSkipCert>) {
-    let attempt = skips.len() as u32;
+    let attempt = attempt_of(&skips);
     {
         let mut g = driver();
         let Some(d) = g.as_mut() else { return };
@@ -1132,7 +1156,7 @@ async fn on_proposal(
         d.height == height && attempt > d.attempt
     };
     if behind {
-        if skips.len() as u32 != attempt {
+        if attempt_of(&skips) != attempt {
             return;
         }
         advance(height, skips.clone()).await;
@@ -1286,6 +1310,11 @@ async fn on_give_up(height: u64, attempt: u32, vote: TmSkipVote, block: Option<L
         }
         Route::Now => {}
     }
+    let backing_attempt = vote.lock_attempt(attempt).filter(|a| *a != attempt);
+    let backing = match backing_attempt {
+        Some(a) => tokio::task::spawn_blocking(move || crate::chain_db::committee_for_attempt(height, a)).await.ok().flatten(),
+        None => None,
+    };
     let ready = {
         let mut g = driver();
         let Some(d) = g.as_mut() else { return };
@@ -1299,7 +1328,8 @@ async fn on_give_up(height: u64, attempt: u32, vote: TmSkipVote, block: Option<L
         if d.give_ups.contains_key(&vote.voter) {
             return;
         }
-        if let Err(e) = vote.verify(height, attempt, &d.members) {
+        let earlier = |a: u32| if Some(a) == backing_attempt { backing.clone() } else { None };
+        if let Err(e) = vote.verify_with(height, attempt, &d.members, &earlier) {
             eprintln!("[Consensus] h={height}: ignoring a give-up: {e}");
             return;
         }
@@ -1567,7 +1597,7 @@ mod tests {
             attempt: 1,
             vote: TmSkipVote {
                 voter: "egot1x".into(),
-                locked: Some(TmLock { round: 2, value: "ab".repeat(32), pol: vec![("egot1y".into(), "c2ln".into())] }),
+                locked: Some(TmLock { round: 2, value: "ab".repeat(32), pol: vec![("egot1y".into(), "c2ln".into())], attempt: None }),
                 sig: "c2ln".into(),
             },
             block: Some(LedgerBlock { height: 40_000, hash: "ab".repeat(32), ..LedgerBlock::default() }),
