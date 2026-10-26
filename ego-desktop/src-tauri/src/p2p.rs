@@ -6658,6 +6658,10 @@ const UNDER_REPLICATED_CRITICAL_SECS: i64 = 86_400;     // 24 hours → critical
 const STORAGE_PAYOUT_INTERVAL_SECS:   i64 = 3_600;      // stream escrow at most hourly
 const STORAGE_FEES_POOL: &str = "egot1storagefees000000000000000000000000000000";
 
+fn holds_file_data(local_path: &str) -> bool {
+    !local_path.is_empty() && !local_path.starts_with("sender:") && std::path::Path::new(local_path).exists()
+}
+
 pub async fn check_file_replication() {
     // Replicate as soon as there is at least one OTHER node to hold a copy. A client's
     // paid-for data must never live on a single machine that can be turned off — with 2
@@ -6687,7 +6691,7 @@ pub async fn check_file_replication() {
     for file in ledger.stored_files.iter_mut() {
         if file.status != "Active" { continue; }
         if file.from_egosafe && file.replication_role.is_empty() { continue; }
-        let has_data = !file.local_path.is_empty() && !file.local_path.starts_with("sender:");
+        let has_data = holds_file_data(&file.local_path);
 
         // ── Assign initial role ───────────────────────────────────────────
         if file.replication_role.is_empty() && has_data {
@@ -6695,6 +6699,17 @@ pub async fn check_file_replication() {
             file.master_last_seen = now;
             file.master_since     = now;
             need_save = true;
+        }
+
+        if file.replication_role == "master" && !has_data {
+            tracing::warn!(
+                "Replication: {} — this node never received the file's data, so it stops acting as its master",
+                &file.cid[..16.min(file.cid.len())]
+            );
+            file.replication_role.clear();
+            file.under_replicated_since = 0;
+            need_save = true;
+            continue;
         }
 
         match file.replication_role.as_str() {
@@ -6880,6 +6895,9 @@ pub async fn check_file_replication() {
 
                 // A quiet master may mean the owner deleted the file: look for a
                 // tombstone on the DHT and wait for it before taking over.
+                if !master_alive && !has_data {
+                    continue;
+                }
                 if !master_alive && crate::file_delete::may_promote(&file.owner, &file.cid, now) {
                     // Master has not sent a heartbeat within the timeout window.
                     // Promote self to master and broadcast to find a new slave.
@@ -18237,6 +18255,19 @@ mod member_queue_tests {
             8 * OUTBOUND_REQUESTS_PER_PEER <= YAMUX_STREAMS_PER_CONNECTION,
             "streams a sender gave up on stay counted until both ends close them, so the cap leaves room for them"
         );
+    }
+
+    #[test]
+    fn only_a_copy_on_disk_counts_as_holding_a_file() {
+        let dir = std::env::temp_dir().join(format!("ego-holds-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("abc.enc");
+        std::fs::write(&path, b"x").unwrap();
+        assert!(holds_file_data(&path.to_string_lossy()));
+        assert!(!holds_file_data("sender:egot1someone"), "a replica that is still waiting for the data holds nothing");
+        assert!(!holds_file_data(""));
+        assert!(!holds_file_data(&dir.join("gone.enc").to_string_lossy()), "a path whose file is gone holds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
