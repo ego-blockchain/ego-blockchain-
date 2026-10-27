@@ -2,7 +2,6 @@ use anyhow::{anyhow, Context};
 use instant_acme::{
     Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus,
 };
-use rcgen::{Certificate, CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
@@ -12,9 +11,11 @@ pub type ChallengeMap = Arc<RwLock<HashMap<String, String>>>;
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum CertStatus {
     Pending,
-    Ready { cert_pem: String, key_pem: String },
+    Ready { cert_pem: String, issued_at: i64 },
     Failed { reason: String },
 }
+
+const RENEW_AFTER_SECS: i64 = 60 * 86_400;
 
 pub struct AcmeState {
     pub challenges: ChallengeMap,
@@ -33,11 +34,13 @@ impl AcmeState {
         self.certs.read().await.get(domain).cloned()
     }
 
-    pub async fn request(self: &Arc<Self>, domain: String) {
+    pub async fn request(self: &Arc<Self>, domain: String, csr_der: Vec<u8>) {
         {
+            let now = chrono::Utc::now().timestamp();
             let mut c = self.certs.write().await;
             match c.get(&domain) {
-                Some(CertStatus::Ready { .. }) | Some(CertStatus::Pending) => return,
+                Some(CertStatus::Pending) => return,
+                Some(CertStatus::Ready { issued_at, .. }) if now - issued_at < RENEW_AFTER_SECS => return,
                 _ => {}
             }
             c.insert(domain.clone(), CertStatus::Pending);
@@ -45,10 +48,13 @@ impl AcmeState {
         let challenges = self.challenges.clone();
         let certs      = self.certs.clone();
         tokio::spawn(async move {
-            match issue_cert(&domain, &challenges).await {
-                Ok((cert_pem, key_pem)) => {
+            let result = issue_cert(&domain, &csr_der, &challenges).await;
+            challenges.write().await.remove(&format!("_acme-challenge.{}", domain));
+            match result {
+                Ok(cert_pem) => {
                     tracing::info!("[ACME] Cert issued for {}", domain);
-                    certs.write().await.insert(domain, CertStatus::Ready { cert_pem, key_pem });
+                    let issued_at = chrono::Utc::now().timestamp();
+                    certs.write().await.insert(domain, CertStatus::Ready { cert_pem, issued_at });
                 }
                 Err(e) => {
                     tracing::error!("[ACME] Cert failed for {}: {}", domain, e);
@@ -59,7 +65,7 @@ impl AcmeState {
     }
 }
 
-async fn issue_cert(domain: &str, challenges: &ChallengeMap) -> anyhow::Result<(String, String)> {
+async fn issue_cert(domain: &str, csr_der: &[u8], challenges: &ChallengeMap) -> anyhow::Result<String> {
     tracing::info!("[ACME] Starting DNS-01 for {}", domain);
 
     let (account, _) = Account::create(
@@ -124,27 +130,22 @@ async fn issue_cert(domain: &str, challenges: &ChallengeMap) -> anyhow::Result<(
         return Err(anyhow!("validation timed out after 120s"));
     }
 
-    let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256).context("generate key pair")?;
-    let mut params = CertificateParams::new(vec![domain.to_string()]);
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    params.key_pair = Some(key_pair);
-    let cert    = Certificate::from_params(params).context("build cert params")?;
-    let key_pem = cert.serialize_private_key_pem();
-    let csr_der = cert.serialize_request_der().context("serialize CSR")?;
+    order.finalize(csr_der).await.context("finalize order")?;
 
-    order.finalize(&csr_der).await.context("finalize order")?;
-
-    let cert_chain_pem = loop {
+    let mut cert_chain_pem = None;
+    for _ in 0..40u8 {
         tokio::time::sleep(Duration::from_secs(3)).await;
         if let Some(cert) = order.certificate().await.context("poll certificate")? {
-            break cert;
+            cert_chain_pem = Some(cert);
+            break;
         }
-    };
+    }
+    let cert_chain_pem = cert_chain_pem.ok_or_else(|| anyhow!("the certificate was not ready after 120s"))?;
 
     challenges
         .write()
         .await
         .remove(&format!("_acme-challenge.{}", domain));
 
-    Ok((cert_chain_pem, key_pem))
+    Ok(cert_chain_pem)
 }

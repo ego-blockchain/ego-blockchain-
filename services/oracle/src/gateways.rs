@@ -19,6 +19,8 @@ const MAX_GATEWAYS: usize = 10_000;
 const LIST_LIMIT: usize = 100;
 const LIST_REBUILD_SECS: i64 = 30;
 const CACHE_CONTROL: &str = "public, max-age=300, stale-while-revalidate=3600";
+pub const GW_ZONE: &str = "gw.egoblockchain.com";
+const CERT_DOMAIN: &str = "ego/cert/v1";
 const CHECK_AGAIN_SECS: i64 = 10 * 60;
 const CHECKS_AT_ONCE: usize = 8;
 const CHECK_TIMEOUT_SECS: u64 = 6;
@@ -124,6 +126,48 @@ pub fn parse_endpoint(endpoint: &str) -> Option<(Ipv4Addr, u16)> {
     (is_public(&ip) && port >= 1024 && format!("https://{ip}:{port}/rpc") == endpoint).then_some((ip, port))
 }
 
+pub fn gateway_label(name: &str) -> Option<&str> {
+    let label = name.strip_suffix(GW_ZONE)?.strip_suffix('.')?;
+    (!label.is_empty() && !label.contains('.') && label.len() <= 63).then_some(label)
+}
+
+pub fn cert_request_bytes(domain: &str, ts: i64, csr_hex: &str) -> Vec<u8> {
+    format!("{CERT_DOMAIN}\n{domain}\n{ts}\n{csr_hex}").into_bytes()
+}
+
+pub fn may_issue_signed(domain: &str, csr_hex: &str, pubkey_hex: &str, sig_hex: &str, ts: i64, now: i64) -> Result<String, &'static str> {
+    let label = gateway_label(domain).ok_or("Certificates are issued only for gateway names under gw.egoblockchain.com.")?;
+    if (ts - now).abs() > CLOCK_SKEW_SECS {
+        return Err("The request's time is off by more than five minutes.");
+    }
+    let pk: [u8; 32] = hex::decode(pubkey_hex).ok().and_then(|v| v.try_into().ok()).ok_or("The public key is not 32 bytes of hex.")?;
+    let sig: [u8; 64] = hex::decode(sig_hex).ok().and_then(|v| v.try_into().ok()).ok_or("The signature is not 64 bytes of hex.")?;
+    if address_of(&pk) != label {
+        return Err("A gateway can only ask for a certificate for its own name.");
+    }
+    let key = VerifyingKey::from_bytes(&pk).map_err(|_| "The public key is not valid.")?;
+    key.verify_strict(&cert_request_bytes(domain, ts, csr_hex), &Signature::from_bytes(&sig))
+        .map_err(|_| "The request is not signed by that gateway.")?;
+    Ok(label.to_string())
+}
+
+pub async fn listed(node: &str, pubkey_hex: &str, now: i64) -> bool {
+    GATEWAYS.read().await.values().any(|g| g.node == node && g.pubkey == pubkey_hex && now - g.ts < FRESH_SECS)
+}
+
+pub async fn ip_for_name(name: &str) -> Option<[u8; 4]> {
+    let label = gateway_label(name)?;
+    let now = chrono::Utc::now().timestamp();
+    GATEWAYS
+        .read()
+        .await
+        .values()
+        .filter(|g| g.node == label && now - g.ts < FRESH_SECS)
+        .max_by_key(|g| g.ts)
+        .and_then(|g| parse_endpoint(&g.endpoint))
+        .map(|(ip, _)| ip.octets())
+}
+
 pub fn announcement_bytes(endpoint: &str, cert_sha256: &str, ts: i64) -> Vec<u8> {
     format!("{ANNOUNCE_DOMAIN}\n{endpoint}\n{cert_sha256}\n{ts}").into_bytes()
 }
@@ -214,6 +258,25 @@ pub async fn handle_list() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_certificate_is_issued_only_to_a_gateway_for_its_own_name() {
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let pk = key.verifying_key().to_bytes();
+        let me = address_of(&pk);
+        let name = format!("{me}.{GW_ZONE}");
+        let csr = "3082aa";
+        let now = 1_800_000_000;
+        let sign = |domain: &str, ts: i64| hex::encode(key.sign(&cert_request_bytes(domain, ts, csr)).to_bytes());
+        assert_eq!(may_issue_signed(&name, csr, &hex::encode(pk), &sign(&name, now), now, now), Ok(me.clone()));
+        let other = format!("egot1someoneelse.{GW_ZONE}");
+        assert!(may_issue_signed(&other, csr, &hex::encode(pk), &sign(&other, now), now, now).is_err(), "not someone else's name");
+        assert!(may_issue_signed("shop.example.com", csr, &hex::encode(pk), &sign("shop.example.com", now), now, now).is_err(), "not a hosted or outside domain");
+        assert!(may_issue_signed(&name, "3082bb", &hex::encode(pk), &sign(&name, now), now, now).is_err(), "the signature covers the exact request");
+        assert!(may_issue_signed(&name, csr, &hex::encode(pk), &sign(&name, now - 600), now - 600, now).is_err(), "an old request is refused");
+        assert_eq!(gateway_label(&format!("a.b.{GW_ZONE}")), None, "one label only");
+        assert_eq!(gateway_label(GW_ZONE), None);
+    }
 
     #[test]
     fn the_server_only_checks_the_address_the_request_comes_from() {

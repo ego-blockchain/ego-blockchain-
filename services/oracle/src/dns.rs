@@ -60,6 +60,12 @@ async fn handle_dns_query(
         return Some(build_a_response(&query, relay_ip));
     }
 
+    if qtype == QTYPE_A && crate::gateways::gateway_label(&domain).is_some() {
+        if let Some(ip) = crate::gateways::ip_for_name(&domain).await {
+            return Some(build_a_response(&query, ip));
+        }
+    }
+
     let ips = resolve_hosting(&domain, &hosting_nodes).await;
     if !ips.is_empty() {
         tracing::info!("[DNS] {} → {} node(s)", domain, ips.len());

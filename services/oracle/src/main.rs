@@ -1037,7 +1037,13 @@ async fn handle_snapshot_get(State(state): State<AppState>) -> impl IntoResponse
 // ── Handlers: TLS cert automation (Let's Encrypt DNS-01) ─────────────────
 
 #[derive(serde::Deserialize)]
-struct CertRequest { domain: String }
+struct CertRequest {
+    domain: String,
+    csr: String,
+    pubkey: String,
+    sig: String,
+    ts: i64,
+}
 
 // Cert-request abuse guard: each ACME issuance counts against Let's Encrypt
 // rate limits, so we cap per-domain re-requests and total issuance volume.
@@ -1055,6 +1061,17 @@ async fn handle_cert_request(
     if domain.is_empty() || !domain.contains('.') || domain.len() > 253 {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid domain" })));
     }
+    let now = Utc::now().timestamp();
+    let node = match gateways::may_issue_signed(&domain, &body.csr, &body.pubkey, &body.sig, body.ts, now) {
+        Ok(node) => node,
+        Err(e) => return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))),
+    };
+    if !gateways::listed(&node, &body.pubkey, now).await {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Only a gateway on the public list can ask for its name's certificate." })));
+    }
+    let Ok(csr_der) = hex::decode(&body.csr) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "the certificate request must be hex" })));
+    };
     // Basic hostname sanity — block obvious junk before hitting ACME.
     if !domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid domain characters" })));
@@ -1075,7 +1092,7 @@ async fn handle_cert_request(
         }
         rate.insert(domain.clone(), now);
     }
-    state.acme.request(domain.clone()).await;
+    state.acme.request(domain.clone(), csr_der).await;
     (StatusCode::ACCEPTED, Json(json!({ "domain": domain, "status": "pending" })))
 }
 
