@@ -5020,7 +5020,7 @@ fn drop_foreign_peer(swarm: &mut libp2p::Swarm<EgoBehaviour>, peer: PeerId, prot
     eprintln!("[P2P] {peer} is not an Ego node ({protocol_version}), disconnected and forgotten");
 }
 
-async fn read_frame<S: futures::AsyncRead + Unpin>(stream: &mut S, max: usize) -> Result<Vec<u8>, String> {
+pub(crate) async fn read_frame<S: futures::AsyncRead + Unpin>(stream: &mut S, max: usize) -> Result<Vec<u8>, String> {
     let mut len_buf = [0u8; 4];
     AsyncReadExt::read_exact(stream, &mut len_buf).await.map_err(|e| e.to_string())?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -5032,7 +5032,7 @@ async fn read_frame<S: futures::AsyncRead + Unpin>(stream: &mut S, max: usize) -
     Ok(buf)
 }
 
-async fn write_frame<S: futures::AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Result<(), String> {
+pub(crate) async fn write_frame<S: futures::AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Result<(), String> {
     AsyncWriteExt::write_all(stream, &(data.len() as u32).to_be_bytes()).await.map_err(|e| e.to_string())?;
     AsyncWriteExt::write_all(stream, data).await.map_err(|e| e.to_string())?;
     AsyncWriteExt::flush(stream).await.map_err(|e| e.to_string())

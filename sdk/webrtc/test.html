@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ego WebRTC Gateway Test</title>
+<style>
+  :root { --bg: #0e1110; --panel: #171b19; --text: #e8efe9; --muted: #9aa69e; --accent: #c6f432; --bad: #ff7a6b; --line: #2a302d; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 20px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  label { display: block; color: var(--muted); font-size: 13px; margin: 10px 0 4px; }
+  input { width: 100%; padding: 9px 10px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg); color: var(--text); font: 13px ui-monospace, Consolas, monospace; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  button { padding: 9px 14px; border: 0; border-radius: 7px; background: var(--accent); color: #0e1110; font-weight: 600; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12.5px/1.5 ui-monospace, Consolas, monospace; }
+  .ok { color: var(--accent); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Ego WebRTC Gateway Test</h1>
+  <p class="lead">Connects this browser straight to an Ego gateway over WebRTC-direct. No domain name and no certificate authority: the gateway is checked against the certificate fingerprint from the gateway list.</p>
+
+  <section>
+    <label for="endpoint">Gateway endpoint (leave empty to try the public gateway list)</label>
+    <input id="endpoint" placeholder="https://203.0.113.7:47398/rpc" autocomplete="off">
+    <label for="cert">Certificate fingerprint (cert_sha256)</label>
+    <input id="cert" placeholder="64 hex characters" autocomplete="off">
+    <div class="row">
+      <button id="connect">Connect</button>
+      <button id="disconnect" class="ghost" disabled>Disconnect</button>
+      <button id="details" class="ghost">Show connection details</button>
+    </div>
+  </section>
+
+  <section>
+    <label for="address">Wallet address for wallet.getBalance</label>
+    <input id="address" placeholder="egot1..." autocomplete="off">
+    <div class="row">
+      <button class="call" data-method="chain.getFinalizedHeight" disabled>chain.getFinalizedHeight</button>
+      <button class="call" data-method="chain.getNetworkStats" disabled>chain.getNetworkStats</button>
+      <button class="call" data-method="gateway.list" disabled>gateway.list</button>
+      <button class="call" data-method="wallet.getBalance" disabled>wallet.getBalance</button>
+    </div>
+  </section>
+
+  <section>
+    <pre id="log" class="muted">Not connected.</pre>
+  </section>
+</main>
+<script type="module">
+  const DEBUG_KEY = 'debug'
+  const DEBUG_VALUE = 'libp2p:webrtc*,libp2p:connection-manager:dial-queue*'
+  const detailed = (() => { try { return localStorage.getItem(DEBUG_KEY) === DEBUG_VALUE } catch { return false } })()
+  if (detailed) {
+    for (const level of ['debug', 'log', 'info', 'warn', 'error']) {
+      const original = console[level].bind(console)
+      console[level] = (...args) => {
+        original(...args)
+        const text = args.filter((a) => typeof a === 'string').join(' ').replace(/%c/g, '')
+        if (text.includes('libp2p')) {
+          const line = document.createElement('div')
+          line.className = 'muted'
+          line.textContent = text.slice(0, 400)
+          document.getElementById('log')?.appendChild(line)
+        }
+      }
+    }
+  }
+  const { connect, connectAny, listGateways } = await import('./dist/ego-webrtc.js')
+
+  const $ = (id) => document.getElementById(id)
+  const log = $('log')
+  let client = null
+  const query = new URLSearchParams(location.search)
+  $('endpoint').value = query.get('endpoint') ?? ''
+  $('cert').value = query.get('cert') ?? ''
+  $('details').textContent = detailed ? 'Hide connection details' : 'Show connection details'
+  $('details').addEventListener('click', () => {
+    try {
+      if (detailed) localStorage.removeItem(DEBUG_KEY)
+      else localStorage.setItem(DEBUG_KEY, DEBUG_VALUE)
+    } catch {}
+    location.reload()
+  })
+
+  function write(text, kind = '') {
+    const line = document.createElement('div')
+    line.className = kind
+    line.textContent = text
+    if (log.classList.contains('muted')) {
+      log.textContent = ''
+      log.classList.remove('muted')
+    }
+    log.appendChild(line)
+  }
+
+  function setConnected(on) {
+    $('connect').disabled = on
+    $('disconnect').disabled = !on
+    document.querySelectorAll('button.call').forEach((b) => { b.disabled = !on })
+  }
+
+  $('connect').addEventListener('click', async () => {
+    $('connect').disabled = true
+    const endpoint = $('endpoint').value.trim()
+    const cert = $('cert').value.trim().toLowerCase()
+    const started = performance.now()
+    try {
+      if (endpoint) {
+        write(`Connecting to ${endpoint} ...`)
+        client = await connect({ endpoint, cert_sha256: cert })
+      } else {
+        write('Fetching the public gateway list ...')
+        const gateways = await listGateways()
+        write(`${gateways.length} gateway(s) listed, trying each over WebRTC ...`)
+        client = await connectAny(gateways)
+      }
+      write(`Connected in ${Math.round(performance.now() - started)} ms to ${client.address}`, 'ok')
+      setConnected(true)
+    } catch (e) {
+      write(e.message, 'bad')
+      $('connect').disabled = false
+    }
+  })
+
+  $('disconnect').addEventListener('click', async () => {
+    await client?.close()
+    client = null
+    setConnected(false)
+    write('Disconnected.')
+  })
+
+  document.querySelectorAll('button.call').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const method = button.dataset.method
+      const params = method === 'wallet.getBalance' ? { address: $('address').value.trim() } : {}
+      const started = performance.now()
+      try {
+        const result = await client.call(method, params)
+        write(`${method} (${Math.round(performance.now() - started)} ms): ${JSON.stringify(result).slice(0, 600)}`, 'ok')
+      } catch (e) {
+        write(`${method}: ${e.code ?? ''} ${e.message}`, 'bad')
+      }
+    })
+  })
+</script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "@ego/webrtc-gateway",
+  "version": "0.1.0",
+  "description": "Call Ego gateways straight from a browser over WebRTC-direct, with no domain or certificate authority",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "build": "esbuild src/browser.js --bundle --format=esm --target=es2022 --minify --outfile=dist/ego-webrtc.js",
+    "test:node": "node test/node-call.mjs"
+  },
+  "dependencies": {
+    "@libp2p/webrtc": "6.1.0",
+    "@multiformats/multiaddr": "13.0.1",
+    "libp2p": "3.3.12"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  },
+  "license": "MIT"
+}

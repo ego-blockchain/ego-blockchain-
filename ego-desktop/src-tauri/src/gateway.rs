@@ -36,9 +36,9 @@ const SHARE_LIMIT: usize = 50;
 const MAX_FAILURES: u8 = 2;
 const BUCKET_SIZE: f64 = 120.0;
 const REFILL_PER_SEC: f64 = 6.0;
-const MAX_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
 /// /storage takes a whole encrypted block, base64-encoded, in one request.
-const MAX_STORAGE_BODY_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_STORAGE_BODY_BYTES: usize = 512 * 1024;
 const NOT_HERE: &str = "That method isn't available on this gateway.";
 const NOT_OWNER: &str = "Only the owner of this computer can see its earnings.";
 pub const EARNINGS_DOMAIN: &str = "ego/node-earnings/v1";
@@ -337,7 +337,7 @@ fn ok(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "result": result, "id": id })
 }
 
-fn fail(id: Value, code: i32, message: &str) -> Value {
+pub(crate) fn fail(id: Value, code: i32, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "error": { "code": code, "message": message }, "id": id })
 }
 
@@ -589,15 +589,25 @@ async fn node_earnings(params: &Value) -> Result<Value, (i32, String)> {
     }))
 }
 
+pub(crate) fn fits(method: &str, len: usize) -> bool {
+    len <= MAX_BODY_BYTES || (len <= MAX_STORAGE_BODY_BYTES && crate::phone_storage::METHODS.contains(&method))
+}
+
 async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>) -> Response {
+    match answer(peer.ip(), body).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(reply) => (StatusCode::TOO_MANY_REQUESTS, Json(reply)).into_response(),
+    }
+}
+
+pub(crate) async fn answer(ip: IpAddr, body: Value) -> Result<Value, Value> {
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let method = body.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
-    if !allow(peer.ip(), cost(&method)) {
-        let reply = fail(id, -32005, "Too many requests from your connection. Wait a moment and try again.");
-        return (StatusCode::TOO_MANY_REQUESTS, Json(reply)).into_response();
+    if !allow(ip, cost(&method)) {
+        return Err(fail(id, -32005, "Too many requests from your connection. Wait a moment and try again."));
     }
     if PASSTHROUGH.contains(&method.as_str()) {
-        return Json(crate::rpc::dispatch_value(body)).into_response();
+        return Ok(crate::rpc::dispatch_value(body));
     }
     let params = body.get("params").cloned().unwrap_or(Value::Null);
     let result = match method.as_str() {
@@ -616,11 +626,10 @@ async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>
             .unwrap_or_else(|| Err((-32601, NOT_HERE.to_string()))),
         _ => Err((-32601, NOT_HERE.to_string())),
     };
-    Json(match result {
+    Ok(match result {
         Ok(v) => ok(id, v),
         Err((code, message)) => fail(id, code, &message),
     })
-    .into_response()
 }
 
 async fn health(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Json<Value> {
@@ -891,6 +900,18 @@ async fn open_router_port() -> Result<Ipv4Addr, String> {
         )
         .await
         .map_err(|e| format!("the router refused to open port {}: {e}", port()))?;
+    if let Err(e) = router
+        .add_port(
+            igd_next::PortMappingProtocol::UDP,
+            port(),
+            SocketAddr::from((local, port())),
+            ROUTER_LEASE_SECS,
+            "Ego Desktop browser gateway",
+        )
+        .await
+    {
+        tracing::debug!("[gateway] the router refused to open UDP port {} for browsers: {e}", port());
+    }
     match router.get_external_ip().await {
         Ok(IpAddr::V4(ip)) => Ok(ip),
         Ok(_) => Err("the router has no IPv4 address".into()),
@@ -901,6 +922,7 @@ async fn open_router_port() -> Result<Ipv4Addr, String> {
 async fn close_router_port() {
     if let Ok(router) = find_router().await {
         let _ = router.remove_port(igd_next::PortMappingProtocol::TCP, port()).await;
+        let _ = router.remove_port(igd_next::PortMappingProtocol::UDP, port()).await;
     }
 }
 
@@ -1005,7 +1027,9 @@ pub async fn supervise() {
                         s.cert_sha256 = Some(fingerprint.clone());
                         s.problem = None;
                     });
+                    let webrtc = tokio::spawn(crate::webrtc_gateway::serve(cert.clone(), key.clone(), fingerprint.clone(), port()));
                     tasks.push(tokio::spawn(serve(cert, key)));
+                    tasks.push(webrtc);
                     tasks.push(tokio::spawn(router_loop()));
                     tasks.push(tokio::spawn(advertise_loop(fingerprint.clone())));
                     tasks.push(tokio::spawn(announce_loop(fingerprint)));

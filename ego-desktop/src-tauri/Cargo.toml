@@ -97,6 +97,7 @@ libp2p = { version = "0.56", features = [
     "gossipsub", "kad", "mdns", "upnp",
 ] }
 libp2p-stream = { version = "0.4.0-alpha" }
+libp2p-webrtc = { version = "=0.9.0-alpha.1", features = ["tokio", "pem"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 keyring = "2"
@@ -155,5 +156,7 @@ wat = "1.219"
 [patch.crates-io]
 wry = { path = "patches/wry" }
 libp2p-upnp = { path = "patches/libp2p-upnp" }
+libp2p-webrtc = { path = "patches/libp2p-webrtc" }
+webrtc-dtls = { path = "patches/webrtc-dtls" }
 
 [workspace]

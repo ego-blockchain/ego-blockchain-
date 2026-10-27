@@ -33,6 +33,7 @@ mod storage_pay;
 mod contract_exec;
 mod dao_chat;
 mod gateway;
+mod webrtc_gateway;
 mod phone_storage;
 mod file_delete;
 mod commands;
