@@ -13,10 +13,19 @@ pub fn min_streak(period: u64) -> u32 {
     if period >= period_of(FAST_START_HEIGHT) { 1 } else { MIN_STREAK }
 }
 pub const EPOCH: u64 = 100;
+pub const SHORT_EPOCH: u64 = 20;
+pub const SHORT_EPOCH_FROM_HEIGHT: u64 = 40_601;
+const SHORT_EPOCH_FIRST: u64 = (SHORT_EPOCH_FROM_HEIGHT - 1) / EPOCH;
+const _: () = assert!(SHORT_EPOCH_FROM_HEIGHT % EPOCH == 1);
+pub const SHORT_READY_DEADLINE: u64 = 18;
 pub const WEIGHT_LEAD: u64 = 50;
 pub const COMMITTEE_SIZE: usize = 32;
 pub const MIN_COMMITTEE: usize = 3;
 pub const BLOCK_COMMITTEE: usize = 4;
+pub const WIDE_COMMITTEE: usize = 8;
+pub const WIDE_POOL_MIN: usize = 16;
+pub const WIDE_COMMITTEE_FROM_HEIGHT: u64 = SHORT_EPOCH_FROM_HEIGHT;
+pub const WIDE_LAST_MAKERS_KEEP: usize = 32;
 pub const DRAW_V2_FROM_HEIGHT: u64 = 32_640;
 pub const READY_V2_EPOCH: u64 = 328;
 pub const READY_V3_EPOCH: u64 = 329;
@@ -30,7 +39,7 @@ const KEY_STORAGE_TOTAL: &[u8] = b"n2swt";
 const KEY_LAST_MAKERS: &[u8] = b"n2last";
 
 pub fn ready_version(epoch: u64) -> u32 {
-    let first = epoch.saturating_mul(EPOCH).saturating_add(1);
+    let first = epoch_start(epoch);
     1 + RULE_CHANGES.iter().filter(|h| **h <= first).count() as u32
 }
 pub const MISS_RULE_FROM_HEIGHT: u64 = 32_750;
@@ -82,7 +91,44 @@ pub fn period_of(height: u64) -> u64 {
 }
 
 pub fn epoch_of(height: u64) -> u64 {
-    height.saturating_sub(1) / EPOCH
+    if height < SHORT_EPOCH_FROM_HEIGHT {
+        height.saturating_sub(1) / EPOCH
+    } else {
+        SHORT_EPOCH_FIRST + (height - SHORT_EPOCH_FROM_HEIGHT) / SHORT_EPOCH
+    }
+}
+
+pub fn epoch_start(epoch: u64) -> u64 {
+    if epoch < SHORT_EPOCH_FIRST {
+        epoch.saturating_mul(EPOCH).saturating_add(1)
+    } else {
+        (epoch - SHORT_EPOCH_FIRST).saturating_mul(SHORT_EPOCH).saturating_add(SHORT_EPOCH_FROM_HEIGHT)
+    }
+}
+
+pub fn epoch_offset(height: u64) -> u64 {
+    height.saturating_add(1).saturating_sub(epoch_start(epoch_of(height)))
+}
+
+pub fn ready_deadline(epoch: u64) -> u64 {
+    if epoch < SHORT_EPOCH_FIRST { READY_DEADLINE } else { SHORT_READY_DEADLINE }
+}
+
+pub fn ready_open(height: u64) -> bool {
+    epoch_offset(height) <= ready_deadline(epoch_of(height))
+}
+
+pub fn ends_epoch(height: u64) -> bool {
+    epoch_of(height.saturating_add(1)) != epoch_of(height)
+}
+
+pub fn committee_size(height: u64, pool: usize) -> usize {
+    let wide = height >= WIDE_COMMITTEE_FROM_HEIGHT && pool >= WIDE_POOL_MIN;
+    (if wide { WIDE_COMMITTEE } else { BLOCK_COMMITTEE }).min(pool)
+}
+
+pub fn last_makers_keep(height: u64) -> usize {
+    if height >= WIDE_COMMITTEE_FROM_HEIGHT { WIDE_LAST_MAKERS_KEEP } else { LAST_MAKERS_KEEP }
 }
 
 pub fn first_drs_epoch() -> u64 {
@@ -851,9 +897,7 @@ pub fn validate_batches(
     }
     if let Some(tx) = readies.first() {
         let batch: ReadyBatch = serde_json::from_str(&tx.call_args).map_err(|e| format!("ready batch unreadable: {e}"))?;
-        let e = epoch_of(block.height);
-        let offset = block.height - e * EPOCH;
-        if batch.epoch != e + 1 || offset > READY_DEADLINE {
+        if batch.epoch != epoch_of(block.height) + 1 || !ready_open(block.height) {
             return Err(format!("ready batch for epoch {} in block {}", batch.epoch, block.height));
         }
         let rota = load_rota(ov, batch.epoch).ok_or("ready batch for an epoch with no rota")?;
@@ -1071,8 +1115,8 @@ pub fn apply_block(
         record_maker(ov, block.height, &block.miner);
     }
 
-    if block.height % EPOCH == 0 {
-        let next_epoch = block.height / EPOCH + 1;
+    if ends_epoch(block.height) {
+        let next_epoch = epoch_of(block.height) + 2;
         if next_epoch >= first_drs_epoch() && ov.get(&rota_key(next_epoch)).is_none() {
             let rota = Rota { seed: rota_seed.to_string(), members: draw_rota(ov, period, next_epoch, rota_seed) };
             if let Ok(v) = serde_json::to_vec(&rota) {
@@ -1182,14 +1226,11 @@ pub fn tm_ready_set(ov: &Ov, epoch: u64) -> Vec<u8> {
 }
 
 pub fn tm_ready_epoch_at(height: u64) -> Option<u64> {
-    let e = epoch_of(height);
-    let next = e + 1;
-    let open = height.saturating_sub(e * EPOCH) <= READY_DEADLINE;
-    (open && next * EPOCH + 1 >= TENDERMINT_FROM_HEIGHT).then_some(next)
+    let next = epoch_of(height) + 1;
+    (ready_open(height) && epoch_start(next) >= TENDERMINT_FROM_HEIGHT).then_some(next)
 }
 
-pub fn tm_ready_members(ov: &Ov, height: u64) -> Vec<String> {
-    let epoch = epoch_of(height);
+fn tm_ready_in(ov: &Ov, epoch: u64) -> Vec<String> {
     let rota = load_rota(ov, epoch).unwrap_or_default();
     let bits = tm_ready_set(ov, epoch);
     rota.members
@@ -1198,6 +1239,20 @@ pub fn tm_ready_members(ov: &Ov, height: u64) -> Vec<String> {
         .filter(|(i, _)| bit(&bits, *i))
         .map(|(_, a)| a.clone())
         .collect()
+}
+
+pub fn tm_ready_members(ov: &Ov, height: u64) -> Vec<String> {
+    let epoch = epoch_of(height);
+    let mut ready = tm_ready_in(ov, epoch);
+    if ready.len() >= MIN_COMMITTEE || epoch <= SHORT_EPOCH_FIRST {
+        return ready;
+    }
+    for a in tm_ready_in(ov, epoch - 1) {
+        if !ready.contains(&a) {
+            ready.push(a);
+        }
+    }
+    ready
 }
 
 pub fn tendermint_active(ov: &Ov, height: u64) -> bool {
@@ -1234,7 +1289,7 @@ pub fn record_maker(ov: &mut Ov, height: u64, miner: &str) {
     }
     let mut list = last_makers(ov);
     list.insert(0, miner.to_string());
-    list.truncate(LAST_MAKERS_KEEP);
+    list.truncate(last_makers_keep(height));
     if let Ok(v) = serde_json::to_vec(&list) {
         ov.put(KEY_LAST_MAKERS.to_vec(), v);
     }
@@ -1275,7 +1330,7 @@ fn weighted_pick(candidates: &[(String, u64)], r: u128) -> usize {
 
 fn weighted_committee(ov: &Ov, height: u64, attempt: i64, seed: &str, pool: Vec<String>) -> Vec<String> {
     let period = period_of(height);
-    let size = BLOCK_COMMITTEE.min(pool.len());
+    let size = committee_size(height, pool.len());
     let mut remaining: Vec<(String, u64)> = pool
         .into_iter()
         .map(|a| {
@@ -1874,6 +1929,125 @@ mod tests {
         let c = skip_committee(&quiet, first + 1, 1);
         assert_eq!(c.len(), BLOCK_COMMITTEE, "with no recent makers the whole pool is drawn from");
         assert!(c.iter().all(|a| members.contains(a)));
+    }
+
+    #[test]
+    fn short_epochs_follow_the_last_long_one_without_a_gap() {
+        let s = SHORT_EPOCH_FROM_HEIGHT;
+        let e0 = epoch_of(s);
+        assert_eq!(epoch_of(s - 1), e0 - 1);
+        assert_eq!(epoch_start(e0 - 1), s - EPOCH);
+        assert_eq!((epoch_start(e0), epoch_start(e0 + 1), epoch_start(e0 + 2)), (s, s + SHORT_EPOCH, s + 2 * SHORT_EPOCH));
+        assert_eq!((epoch_of(s + SHORT_EPOCH - 1), epoch_of(s + SHORT_EPOCH)), (e0, e0 + 1));
+        for h in 33_000..s {
+            let e = (h - 1) / EPOCH;
+            assert_eq!(epoch_of(h), e, "before the switch nothing moves (h={h})");
+            assert_eq!(epoch_offset(h), h - e * EPOCH);
+            assert_eq!(ready_open(h), h - e * EPOCH <= READY_DEADLINE);
+            assert_eq!(ends_epoch(h), h % EPOCH == 0);
+            assert_eq!(epoch_start(e), e * EPOCH + 1);
+        }
+        for h in s - 3 * EPOCH..s + 10 * SHORT_EPOCH {
+            let e = epoch_of(h);
+            assert!(epoch_start(e) <= h && h < epoch_start(e + 1), "h={h} sits inside its epoch");
+            assert!((1..=epoch_start(e + 1) - epoch_start(e)).contains(&epoch_offset(h)));
+            assert_eq!(ends_epoch(h), h + 1 == epoch_start(e + 1));
+        }
+        assert!(ends_epoch(s - 1) && ends_epoch(s + SHORT_EPOCH - 1) && !ends_epoch(s));
+        assert_eq!(tm_ready_epoch_at(s - EPOCH + READY_DEADLINE - 1), Some(e0), "the last long epoch keeps its long window");
+        assert_eq!(tm_ready_epoch_at(s - EPOCH + READY_DEADLINE), None);
+        assert_eq!(tm_ready_epoch_at(s), Some(e0 + 1));
+        assert_eq!(tm_ready_epoch_at(s + SHORT_READY_DEADLINE - 1), Some(e0 + 1));
+        assert_eq!(tm_ready_epoch_at(s + SHORT_READY_DEADLINE), None, "a short epoch closes readiness two blocks before it ends");
+        assert_eq!(tm_ready_epoch_at(s + SHORT_EPOCH), Some(e0 + 2));
+        assert_eq!(ready_version(e0 + 5), ready_version(e0 - 1), "no rule change hides in the new numbering");
+    }
+
+    #[test]
+    fn every_short_epoch_has_its_rota_drawn_two_epochs_ahead() {
+        let (mut ov, _) = network(6);
+        let s = SHORT_EPOCH_FROM_HEIGHT;
+        let e0 = epoch_of(s);
+        let apply = |ov: &mut Ov, h: u64| {
+            let _ = apply_block(ov, &block(h, 1_900_000_000 + h as i64), &[], 0, &format!("seed{h}"));
+            ov.commit_memory();
+        };
+        apply(&mut ov, s - EPOCH - 1);
+        assert!(load_rota(&ov, e0).is_some(), "the old rule draws the first short epoch");
+        apply(&mut ov, s - 1);
+        assert!(load_rota(&ov, e0 + 1).is_some(), "and the one after it, from the last long epoch");
+        for h in s..s + SHORT_EPOCH - 1 {
+            apply(&mut ov, h);
+        }
+        assert!(load_rota(&ov, e0 + 2).is_none(), "nothing is drawn inside an epoch");
+        apply(&mut ov, s + SHORT_EPOCH - 1);
+        assert_eq!(load_rota(&ov, e0 + 2).map(|r| r.seed), Some(format!("seed{}", s + SHORT_EPOCH - 1)));
+        apply(&mut ov, s + 2 * SHORT_EPOCH - 1);
+        assert!(load_rota(&ov, e0 + 3).is_some());
+        assert!(load_rota(&ov, e0 + 4).is_none());
+    }
+
+    #[test]
+    fn committees_widen_to_eight_only_for_a_big_pool_after_the_switch() {
+        let s = WIDE_COMMITTEE_FROM_HEIGHT;
+        assert_eq!(committee_size(s - 1, 100), BLOCK_COMMITTEE);
+        assert_eq!(committee_size(s, WIDE_POOL_MIN - 1), BLOCK_COMMITTEE, "a small network keeps committees of four");
+        assert_eq!(committee_size(s, WIDE_POOL_MIN), WIDE_COMMITTEE);
+        assert_eq!(committee_size(s, 3), 3, "three nodes still make blocks");
+        assert_eq!(crate::chain_db::quorum_of(WIDE_COMMITTEE), 6);
+        assert_eq!(crate::chain_db::skip_threshold_of(WIDE_COMMITTEE), 3, "three give-ups move a wide committee on");
+
+        let e = epoch_of(s + 3 * SHORT_EPOCH);
+        let h = epoch_start(e) + 1;
+        let mut ov = Ov::memory();
+        let members: Vec<String> = (0..20).map(|i| format!("egot1wide{i:02}")).collect();
+        seed_rota_for_tests(&mut ov, e, &members, &(0..20).collect::<Vec<_>>());
+        for m in &members {
+            seed_weight_for_tests(&mut ov, m, 50);
+        }
+        ov.commit_memory();
+        let c = committee(&ov, h, 0);
+        let mut unique = c.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!((c.len(), unique.len()), (WIDE_COMMITTEE, WIDE_COMMITTEE));
+        for i in 0..40 {
+            record_maker(&mut ov, h, &members[i % 20]);
+        }
+        ov.commit_memory();
+        assert_eq!(last_makers(&ov).len(), WIDE_LAST_MAKERS_KEEP);
+        assert_eq!(skip_committee(&ov, h, 1).len(), WIDE_COMMITTEE, "replacements are drawn from the last 32 makers");
+
+        let mut small = Ov::memory();
+        seed_rota_for_tests(&mut small, e, &members[..10], &(0..10).collect::<Vec<_>>());
+        small.commit_memory();
+        assert_eq!(committee(&small, h, 0).len(), BLOCK_COMMITTEE);
+    }
+
+    #[test]
+    fn a_short_epoch_with_too_few_ready_keeps_the_nodes_ready_one_epoch_before() {
+        let mut ov = Ov::memory();
+        let e0 = epoch_of(SHORT_EPOCH_FROM_HEIGHT);
+        let names = |r: std::ops::Range<usize>| -> Vec<String> { r.map(|i| format!("egot1carry{i}")).collect() };
+        let seat = |ov: &mut Ov, e: u64, members: &[String], ready: &[usize]| {
+            ov.put(rota_key(e), serde_json::to_vec(&Rota { seed: "s".into(), members: members.to_vec() }).unwrap());
+            let mut bits = Vec::new();
+            for i in ready {
+                set_bit(&mut bits, *i);
+            }
+            ov.put(tm_ready_key(e), bits);
+        };
+        seat(&mut ov, e0, &names(0..5), &[0, 1]);
+        seat(&mut ov, e0 + 1, &names(0..5), &[0, 1, 2, 3]);
+        seat(&mut ov, e0 + 2, &names(0..6), &[5]);
+        seat(&mut ov, e0 + 3, &names(0..6), &[1, 2, 5]);
+        ov.commit_memory();
+        assert_eq!(tm_ready_members(&ov, epoch_start(e0)).len(), 2, "the first short epoch keeps the old rule");
+        assert_eq!(tm_ready_members(&ov, epoch_start(e0 + 1)), names(0..4));
+        let carried = tm_ready_members(&ov, epoch_start(e0 + 2));
+        assert_eq!(carried, vec!["egot1carry5", "egot1carry0", "egot1carry1", "egot1carry2", "egot1carry3"]);
+        assert!(tendermint_active(&ov, epoch_start(e0 + 2)), "one thin epoch does not drop back to the old engine");
+        assert_eq!(tm_ready_members(&ov, epoch_start(e0 + 3)), vec!["egot1carry1", "egot1carry2", "egot1carry5"], "with three ready, only they are drawn");
     }
 
     #[test]

@@ -9613,9 +9613,8 @@ pub fn drs_build_batches(
             out.push(crate::drs::batch_tx(crate::drs::TX_COVERAGE_BATCH, height, now, args));
         }
     }
-    let epoch = crate::drs::epoch_of(height);
-    let next = epoch + 1;
-    if height - epoch * DRS_EPOCH <= crate::drs::READY_DEADLINE {
+    let next = crate::drs::epoch_of(height) + 1;
+    if crate::drs::ready_open(height) {
         if let Some(rota) = crate::drs::load_rota(&ov, next) {
             let bits = crate::drs::ready_set(&ov, next);
             let mut chosen: Vec<(u64, Vec<u8>)> = readies
@@ -11333,6 +11332,39 @@ mod history_tests {
                 eprintln!("rota {i} {a} ready {ready} missed {}", crate::drs::missed_turns(&ov, a, epoch));
             }
             eprintln!("pool {:?}", crate::drs::draw_pool(&ov, h));
+            let tm_bits = crate::drs::tm_ready_set(&ov, epoch);
+            for (i, a) in rota.members.iter().enumerate() {
+                let tm = tm_bits.get(i / 8).map(|b| b & (1 << (i % 8)) != 0).unwrap_or(false);
+                let rec = crate::drs::load_rec(&ov, a);
+                eprintln!(
+                    "tm {i} {a} tm_ready {tm} streak {:?} last_checkin {:?}",
+                    rec.as_ref().map(|r| r.streak),
+                    rec.as_ref().map(|r| r.last_checkin)
+                );
+            }
+            eprintln!("tm_ready {:?}", crate::drs::tm_ready_members(&ov, h));
+            eprintln!("last_makers {:?}", crate::drs::last_makers(&ov));
+            if let Some(cf) = db.cf_handle(CF_META) {
+                let mut registered = 0usize;
+                for item in db.prefix_iterator_cf(cf, b"n2addr:") {
+                    let Ok((k, v)) = item else { break };
+                    if !k.starts_with(b"n2addr:") {
+                        break;
+                    }
+                    registered += 1;
+                    let a = String::from_utf8_lossy(&v).to_string();
+                    let rec = crate::drs::load_rec(&ov, &a);
+                    eprintln!(
+                        "registered {a} streak {:?} last_checkin {:?}",
+                        rec.as_ref().map(|r| r.streak),
+                        rec.as_ref().map(|r| r.last_checkin)
+                    );
+                }
+                eprintln!("registered total {registered}");
+            }
+            for attempt in 30..40u32 {
+                eprintln!("skip committee {attempt}: {:?}", crate::drs::skip_committee(&ov, h, attempt));
+            }
             let span: i64 = std::env::var("EGO_INSPECT_ATTEMPTS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
             for attempt in 0..span {
                 eprintln!("attempt {attempt}: {:?}", crate::drs::committee(&ov, h, attempt));

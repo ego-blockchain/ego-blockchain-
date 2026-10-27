@@ -277,7 +277,8 @@ fn vouches_for_height(claimant: &str) -> bool {
     if now - g.0 >= RECHECK_TIP_SECS {
         let next = crate::chain_db::local_chain_height().saturating_add(1);
         let mut names = crate::chain_db::rota_members(next).unwrap_or_default();
-        names.extend(crate::chain_db::rota_members(next.saturating_sub(crate::chain_db::DRS_EPOCH)).unwrap_or_default());
+        let previous = crate::drs::epoch_start(crate::drs::epoch_of(next).saturating_sub(1));
+        names.extend(crate::chain_db::rota_members(previous).unwrap_or_default());
         names.sort();
         names.dedup();
         *g = (now, names);
@@ -4943,6 +4944,82 @@ fn live_peers() -> &'static Mutex<std::collections::HashSet<PeerId>> {
     LIVE_PEERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
+const FOREIGN_PEERS_MAX: usize = 4_096;
+
+static FOREIGN_PEERS: OnceLock<Mutex<ForeignPeers>> = OnceLock::new();
+static DIRECT_PEERS: OnceLock<Mutex<std::collections::HashSet<PeerId>>> = OnceLock::new();
+
+#[derive(Default)]
+struct ForeignPeers {
+    seen: std::collections::HashSet<PeerId>,
+    order: std::collections::VecDeque<PeerId>,
+}
+
+impl ForeignPeers {
+    fn insert(&mut self, peer: PeerId) {
+        if !self.seen.insert(peer) {
+            return;
+        }
+        self.order.push_back(peer);
+        while self.order.len() > FOREIGN_PEERS_MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+    }
+
+    fn contains(&self, peer: &PeerId) -> bool {
+        self.seen.contains(peer)
+    }
+}
+
+fn foreign_peers() -> &'static Mutex<ForeignPeers> {
+    FOREIGN_PEERS.get_or_init(|| Mutex::new(ForeignPeers::default()))
+}
+
+fn is_foreign(peer: &PeerId) -> bool {
+    foreign_peers().lock().unwrap_or_else(|e| e.into_inner()).contains(peer)
+}
+
+fn speaks_ego(protocol_version: &str) -> bool {
+    protocol_version.starts_with("/ego/")
+}
+
+fn direct_peer_changed(peer: PeerId, connected: bool) -> usize {
+    let mut set = DIRECT_PEERS
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if connected {
+        set.insert(peer);
+    } else {
+        set.remove(&peer);
+    }
+    DIRECT_PEER_COUNT.store(set.len(), Ordering::Relaxed);
+    set.len()
+}
+
+fn forget_cached_peer(pid: &str) -> bool {
+    let mut peers = load_peer_cache();
+    let before = peers.len();
+    peers.retain(|p| p.address != pid && !p.endpoint.contains(pid));
+    let changed = peers.len() < before;
+    if changed {
+        save_peer_cache(&peers);
+    }
+    changed
+}
+
+fn drop_foreign_peer(swarm: &mut libp2p::Swarm<EgoBehaviour>, peer: PeerId, protocol_version: &str) {
+    foreign_peers().lock().unwrap_or_else(|e| e.into_inner()).insert(peer);
+    live_peers().lock().unwrap_or_else(|e| e.into_inner()).remove(&peer);
+    direct_peer_changed(peer, false);
+    swarm.behaviour_mut().kad.remove_peer(&peer);
+    forget_cached_peer(&peer.to_string());
+    let _ = swarm.disconnect_peer_id(peer);
+    eprintln!("[P2P] {peer} is not an Ego node ({protocol_version}), disconnected and forgotten");
+}
+
 async fn read_frame<S: futures::AsyncRead + Unpin>(stream: &mut S, max: usize) -> Result<Vec<u8>, String> {
     let mut len_buf = [0u8; 4];
     AsyncReadExt::read_exact(stream, &mut len_buf).await.map_err(|e| e.to_string())?;
@@ -8216,6 +8293,16 @@ async fn handle_event(
         }
 
         SwarmEvent::ConnectionEstablished { peer_id, endpoint: conn_endpoint, .. } => {
+            if is_foreign(&peer_id) {
+                let _ = swarm.disconnect_peer_id(peer_id);
+                for (_, reply) in pending_sends.remove(&peer_id).unwrap_or_default() {
+                    let _ = reply.send(Err("Not an Ego node".into()));
+                }
+                for w in pending_dials.remove(&peer_id).unwrap_or_default() {
+                    let _ = w.send(Err("Not an Ego node".into()));
+                }
+                return;
+            }
             eprintln!("[P2P] Connected to {}", peer_id);
             live_peers().lock().unwrap_or_else(|e| e.into_inner()).insert(peer_id);
 
@@ -8224,8 +8311,9 @@ async fn handle_event(
             }
 
             if !relay_addrs.contains_key(&peer_id) {
-                let n = DIRECT_PEER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == MIN_DIRECT_PEERS_RELAY_OPTIONAL {
+                let before = DIRECT_PEER_COUNT.load(Ordering::Relaxed);
+                let n = direct_peer_changed(peer_id, true);
+                if before < MIN_DIRECT_PEERS_RELAY_OPTIONAL && n >= MIN_DIRECT_PEERS_RELAY_OPTIONAL {
                     tracing::info!("{} direct peers — relay no longer required for bootstrap", n);
                 }
             }
@@ -8328,10 +8416,7 @@ async fn handle_event(
                 live_peers().lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id);
             }
             if !relay_addrs.contains_key(&peer_id) && num_established == 0 {
-                let _ = DIRECT_PEER_COUNT.fetch_update(
-                    Ordering::Relaxed, Ordering::Relaxed,
-                    |v| Some(v.saturating_sub(1)),
-                );
+                direct_peer_changed(peer_id, false);
                 if let Ok(peers_env) = std::env::var("EGO_DIRECT_PEERS") {
                     for addr_str in peers_env.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                         if let Ok(addr) = addr_str.parse::<Multiaddr>() {
@@ -8388,11 +8473,7 @@ async fn handle_event(
             if let Some(pid) = peer_id {
                 if err_str.contains("WrongPeerId") || err_str.contains("Unexpected peer") {
                     let pid_str = pid.to_string();
-                    let mut peers = load_peer_cache();
-                    let before = peers.len();
-                    peers.retain(|p| !p.endpoint.contains(&pid_str));
-                    if peers.len() < before {
-                        save_peer_cache(&peers);
+                    if forget_cached_peer(&pid_str) {
                         eprintln!("[P2P] Evicted stale peer cache entries for old peer ID {}", pid_str);
                     }
                 }
@@ -8417,6 +8498,10 @@ async fn handle_event(
         SwarmEvent::Behaviour(EgoBehaviourEvent::Identify(
             identify::Event::Received { peer_id: remote_peer_id, info, .. },
         )) => {
+            if !speaks_ego(&info.protocol_version) {
+                drop_foreign_peer(swarm, remote_peer_id, &info.protocol_version);
+                return;
+            }
             let observed = without_trailing_peer(&info.observed_addr);
             swarm.add_external_address(observed.clone());
             if !external_addrs.contains(&observed) {
@@ -9391,6 +9476,10 @@ async fn handle_event(
         SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
             kad::Event::RoutingUpdated { peer, addresses, .. },
         )) => {
+            if is_foreign(&peer) {
+                swarm.behaviour_mut().kad.remove_peer(&peer);
+                return;
+            }
             eprintln!("[DHT] Routing updated: {} ({} addrs)", peer, addresses.len());
 
             if let Some(addr) = addresses.iter().next() {
@@ -12665,7 +12754,7 @@ pub fn maybe_send_uptime_checkin() {
     }
     let next_height = tip.saturating_add(1);
     let epoch = crate::drs::epoch_of(next_height);
-    if next_height - epoch * crate::drs::EPOCH <= crate::drs::READY_DEADLINE
+    if crate::drs::ready_open(next_height)
         && now - LAST_READY.load(Ordering::Relaxed) >= 120
     {
         if let Some((pos, seed, false)) = crate::chain_db::drs_rota_position(epoch + 1, &addr) {
@@ -18304,6 +18393,34 @@ mod member_queue_tests {
         }
         assert!(stuck_after(&mut timeouts, peer, true), "the eighth timeout in a row drops the connection");
         assert!(timeouts.is_empty(), "and the count starts over");
+    }
+
+    #[test]
+    fn only_ego_nodes_count_as_peers_and_the_foreign_list_stays_bounded() {
+        assert!(speaks_ego("/ego/identify/1.0.0"));
+        assert!(speaks_ego("/ego/relay/1.0.0"), "the relay is ours");
+        assert!(speaks_ego("/ego/1.0.0"));
+        assert!(!speaks_ego("/noid/mainnet/1.0.0"));
+        assert!(!speaks_ego("ipfs/0.1.0"));
+        assert!(!speaks_ego(""));
+
+        let mut foreign = ForeignPeers::default();
+        let first = PeerId::random();
+        foreign.insert(first);
+        foreign.insert(first);
+        assert_eq!(foreign.order.len(), 1, "a peer is listed once");
+        for _ in 0..FOREIGN_PEERS_MAX {
+            foreign.insert(PeerId::random());
+        }
+        assert_eq!(foreign.seen.len(), FOREIGN_PEERS_MAX);
+        assert_eq!(foreign.order.len(), FOREIGN_PEERS_MAX);
+        assert!(!foreign.contains(&first), "the oldest entry makes room");
+
+        let a = PeerId::random();
+        let base = direct_peer_changed(a, true);
+        assert_eq!(direct_peer_changed(a, true), base, "a second connection to the same peer is not a new peer");
+        assert_eq!(direct_peer_changed(a, false), base - 1);
+        assert_eq!(direct_peer_changed(a, false), base - 1, "closing twice cannot push the count below the real number");
     }
 
     #[test]
