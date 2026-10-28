@@ -37,6 +37,8 @@ pub const SKIP_FROM_HEIGHT: u64 = 39_523;
 pub const WIDEN_FROM_HEIGHT: u64 = 42_292;
 pub const WIDEN_FROM_ATTEMPT: u32 = 2;
 pub const WIDEN_ANCHORED_ATTEMPTS: u32 = 32;
+pub const WIDEN_V2_FROM_HEIGHT: u64 = 42_311;
+pub const WIDEN_V2_ANCHORED_ATTEMPTS: u32 = 8;
 const WIDEN_READY_EPOCHS: u64 = 8;
 const WIDEN_MAX_OUTSIDERS: usize = 512;
 pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT];
@@ -1384,13 +1386,26 @@ pub fn widened(height: u64, attempt: u32) -> bool {
     height >= WIDEN_FROM_HEIGHT && attempt >= WIDEN_FROM_ATTEMPT
 }
 
-fn anchored(attempt: u32) -> bool {
-    attempt.saturating_sub(WIDEN_FROM_ATTEMPT) < WIDEN_ANCHORED_ATTEMPTS
+pub fn anchored_attempts(height: u64) -> u32 {
+    if height >= WIDEN_V2_FROM_HEIGHT { WIDEN_V2_ANCHORED_ATTEMPTS } else { WIDEN_ANCHORED_ATTEMPTS }
+}
+
+fn anchored(height: u64, attempt: u32) -> bool {
+    attempt.saturating_sub(WIDEN_FROM_ATTEMPT) < anchored_attempts(height)
 }
 
 pub fn extra_seats(base: usize) -> usize {
     let minority = base.saturating_sub(1) / 2;
     (3 * minority + 1).saturating_sub(base).max(1)
+}
+
+fn tolerates_minority(base: usize) -> bool {
+    let minority = base.saturating_sub(1) / 2;
+    crate::chain_db::quorum_of(base) <= base - minority
+}
+
+pub fn extra_seats_at(height: u64, base: usize) -> usize {
+    if height >= WIDEN_V2_FROM_HEIGHT && tolerates_minority(base) { 0 } else { extra_seats(base) }
 }
 
 fn can_vote(ov: &Ov, addr: &str) -> bool {
@@ -1449,8 +1464,12 @@ fn draw_from(ov: &Ov, height: u64, attempt: u32, seed: &str, from: Vec<String>, 
 }
 
 fn widened_committee(ov: &Ov, height: u64, attempt: u32, seed: &str, pool: &[String], base: Vec<String>) -> Vec<String> {
-    if anchored(attempt) {
-        let extra = draw_from(ov, height, attempt, seed, outsiders(ov, height, &base), extra_seats(base.len()));
+    if anchored(height, attempt) {
+        let seats = extra_seats_at(height, base.len());
+        if seats == 0 {
+            return base;
+        }
+        let extra = draw_from(ov, height, attempt, seed, outsiders(ov, height, &base), seats);
         if extra.is_empty() {
             return base;
         }
@@ -2129,9 +2148,12 @@ mod tests {
     }
 
     fn stuck_pool_network_with(outside: usize) -> (Ov<'static>, Vec<String>, Vec<String>, u64) {
-        let h = WIDEN_FROM_HEIGHT;
+        widen_network(WIDEN_FROM_HEIGHT, &["egot1pooldead", "egot1poolm", "egot1poolp"], outside)
+    }
+
+    fn widen_network(h: u64, pool: &[&str], outside: usize) -> (Ov<'static>, Vec<String>, Vec<String>, u64) {
         let e = epoch_of(h);
-        let pool: Vec<String> = ["egot1pooldead", "egot1poolm", "egot1poolp"].iter().map(|s| s.to_string()).collect();
+        let pool: Vec<String> = pool.iter().map(|s| s.to_string()).collect();
         let others: Vec<String> = (0..outside).map(|i| format!("egot1outside{i}")).collect();
         let mut members = pool.clone();
         members.extend(others.iter().cloned());
@@ -2238,6 +2260,40 @@ mod tests {
         }
         let at = finished_at.expect("three answering nodes make the block without the two that stopped");
         assert!(at >= WIDEN_FROM_ATTEMPT + WIDEN_ANCHORED_ATTEMPTS, "only whole new committees can leave both out (finished at {at})");
+    }
+
+    #[test]
+    fn from_the_second_rule_four_seat_committees_get_no_outside_seat_and_fresh_ones_come_sooner() {
+        let v1 = WIDEN_V2_FROM_HEIGHT - 1;
+        let v2 = WIDEN_V2_FROM_HEIGHT;
+        assert_eq!((extra_seats_at(v1, 4), extra_seats_at(v2, 4)), (1, 0), "a seat added to four only makes finishing harder");
+        assert_eq!((extra_seats_at(v2, 3), extra_seats_at(v2, 5), extra_seats_at(v2, 8)), (1, 2, 2));
+        assert_eq!((anchored_attempts(v1), anchored_attempts(v2)), (WIDEN_ANCHORED_ATTEMPTS, WIDEN_V2_ANCHORED_ATTEMPTS));
+        assert!(WIDEN_V2_FROM_HEIGHT > WIDEN_FROM_HEIGHT);
+
+        let (ov, pool, others, h) = widen_network(v2, &["egot1me", "egot1tc5p", "egot1tzz8", "egot1a8x4"], 1);
+        let base = skip_committee(&ov, h, 1);
+        for attempt in WIDEN_FROM_ATTEMPT..WIDEN_FROM_ATTEMPT + WIDEN_V2_ANCHORED_ATTEMPTS {
+            let mut c = skip_committee(&ov, h, attempt);
+            c.sort();
+            let mut p = pool.clone();
+            p.sort();
+            assert_eq!(c, p, "a pool of four redraws itself without an outside seat");
+        }
+        assert_eq!(base.len(), 4);
+        let able: BTreeSet<String> = ["egot1me".to_string(), "egot1tc5p".to_string(), others[0].clone()].into_iter().collect();
+        let mut finished_at = None;
+        for attempt in 1..WIDEN_FROM_ATTEMPT + WIDEN_V2_ANCHORED_ATTEMPTS + 200 {
+            let c = skip_committee(&ov, h, attempt);
+            let answering = c.iter().filter(|a| able.contains(*a)).count();
+            if answering >= crate::chain_db::quorum_of(c.len()) {
+                finished_at = Some(attempt);
+                break;
+            }
+            assert!(answering >= crate::chain_db::skip_threshold_of(c.len()), "attempt {attempt} can be passed on: {c:?}");
+        }
+        let at = finished_at.expect("the three that answer make the block");
+        assert!(at < WIDEN_FROM_ATTEMPT + WIDEN_V2_ANCHORED_ATTEMPTS + 60, "fresh committees start after eight anchored attempts (finished at {at})");
     }
 
     #[test]

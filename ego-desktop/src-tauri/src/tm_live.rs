@@ -22,13 +22,14 @@ const GIVE_UP_AFTER_MS: u64 = 30_000;
 const GIVE_UP_STEP_MS: u64 = 10_000;
 const GIVE_UP_CAP_MS: u64 = 90_000;
 const ABSENT_GIVE_UP_MS: u64 = 10_000;
+const WIDENED_ABSENT_GIVE_UP_MS: u64 = 3_000;
 const SILENT_AFTER_MS: u64 = 20_000;
 const HEARD_WITHIN_MS: u64 = 60_000;
 const ANNOUNCED_WITHIN_SECS: i64 = 100;
 const LAST_HEARD_MAX: usize = 1_024;
 const SILENT_KEEP_MS: u64 = 600_000;
 const SKIPS_RESEND_MS: u64 = 10_000;
-const REPLACEMENT_VERSION: &str = "0.3.661";
+const REPLACEMENT_VERSION: &str = "0.3.662";
 const LIVE_WITHIN_SECS: i64 = 900;
 const LOOKAHEAD: u32 = 6;
 
@@ -648,7 +649,8 @@ impl Driver {
             return false;
         }
         let waited = now.saturating_sub(self.attempt_started);
-        waited >= give_up_after(self.attempt) || (waited >= ABSENT_GIVE_UP_MS && self.short_of_quorum(now))
+        let absent_wait = if crate::drs::widened(self.height, self.attempt) { WIDENED_ABSENT_GIVE_UP_MS } else { ABSENT_GIVE_UP_MS };
+        waited >= give_up_after(self.attempt) || (waited >= absent_wait && self.short_of_quorum(now))
     }
 
     fn maybe_give_up(&mut self, now: u64, plan: Option<&[Vec<String>]>, out: &mut Out) {
