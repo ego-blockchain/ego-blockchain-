@@ -39,6 +39,8 @@ pub const WIDEN_FROM_ATTEMPT: u32 = 2;
 pub const WIDEN_ANCHORED_ATTEMPTS: u32 = 32;
 pub const WIDEN_V2_FROM_HEIGHT: u64 = 42_311;
 pub const WIDEN_V2_ANCHORED_ATTEMPTS: u32 = 8;
+pub const TM_CARRY_FROM_HEIGHT: u64 = 42_397;
+const TM_CARRY_EPOCHS: u64 = 16;
 const WIDEN_READY_EPOCHS: u64 = 8;
 const WIDEN_MAX_OUTSIDERS: usize = 512;
 pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT];
@@ -1254,9 +1256,15 @@ pub fn tm_ready_members(ov: &Ov, height: u64) -> Vec<String> {
     if ready.len() >= MIN_COMMITTEE || epoch <= SHORT_EPOCH_FIRST {
         return ready;
     }
-    for a in tm_ready_in(ov, epoch - 1) {
-        if !ready.contains(&a) {
-            ready.push(a);
+    let reach = if height >= TM_CARRY_FROM_HEIGHT { TM_CARRY_EPOCHS } else { 1 };
+    for e in (epoch.saturating_sub(reach)..epoch).rev().filter(|e| *e >= SHORT_EPOCH_FIRST) {
+        for a in tm_ready_in(ov, e) {
+            if !ready.contains(&a) {
+                ready.push(a);
+            }
+        }
+        if ready.len() >= MIN_COMMITTEE {
+            break;
         }
     }
     ready
@@ -2320,6 +2328,36 @@ mod tests {
         assert_eq!(carried, vec!["egot1carry5", "egot1carry0", "egot1carry1", "egot1carry2", "egot1carry3"]);
         assert!(tendermint_active(&ov, epoch_start(e0 + 2)), "one thin epoch does not drop back to the old engine");
         assert_eq!(tm_ready_members(&ov, epoch_start(e0 + 3)), vec!["egot1carry1", "egot1carry2", "egot1carry5"], "with three ready, only they are drawn");
+    }
+
+    #[test]
+    fn from_the_carry_rule_thin_epochs_reach_back_until_three_have_been_ready() {
+        let mut ov = Ov::memory();
+        let e = epoch_of(TM_CARRY_FROM_HEIGHT);
+        let names: Vec<String> = (0..5).map(|i| format!("egot1thin{i}")).collect();
+        let seat = |ov: &mut Ov, e: u64, ready: &[usize]| {
+            ov.put(rota_key(e), serde_json::to_vec(&Rota { seed: "s".into(), members: names.clone() }).unwrap());
+            let mut bits = Vec::new();
+            for i in ready {
+                set_bit(&mut bits, *i);
+            }
+            ov.put(tm_ready_key(e), bits);
+        };
+        seat(&mut ov, e, &[0, 1]);
+        seat(&mut ov, e - 1, &[0, 1]);
+        seat(&mut ov, e - 2, &[]);
+        seat(&mut ov, e - 3, &[0, 2, 3]);
+        seat(&mut ov, e - 4, &[4]);
+        ov.commit_memory();
+        let h = epoch_start(e).max(TM_CARRY_FROM_HEIGHT);
+        assert_eq!(tm_ready_members(&ov, h), vec!["egot1thin0", "egot1thin1", "egot1thin2", "egot1thin3"], "it stops at the first epoch that makes three");
+        assert!(tendermint_active(&ov, h), "two thin epochs in a row no longer drop back to the old engine");
+        assert_eq!(tm_ready_members(&ov, TM_CARRY_FROM_HEIGHT - 1).len(), 2, "before the rule only one epoch back counts");
+
+        let mut empty = Ov::memory();
+        empty.put(rota_key(e), serde_json::to_vec(&Rota { seed: "s".into(), members: names.clone() }).unwrap());
+        empty.commit_memory();
+        assert!(tm_ready_members(&empty, h).is_empty(), "nothing ready anywhere stays nothing");
     }
 
     #[test]
