@@ -29,7 +29,6 @@ const ANNOUNCED_WITHIN_SECS: i64 = 100;
 const LAST_HEARD_MAX: usize = 1_024;
 const SILENT_KEEP_MS: u64 = 600_000;
 const SKIPS_RESEND_MS: u64 = 10_000;
-const REPLACEMENT_VERSION: &str = "0.3.662";
 const LIVE_WITHIN_SECS: i64 = 900;
 const LOOKAHEAD: u32 = 6;
 
@@ -290,8 +289,18 @@ fn seat(members: &[(String, Vec<u8>)], me_addr: &str, kp: &Option<Arc<ego_core::
     Some(i)
 }
 
-fn able(addr: &str, me: &str) -> bool {
-    addr == me || crate::commands::updates::runs_at_least(addr, REPLACEMENT_VERSION, LIVE_WITHIN_SECS)
+fn required_version(height: u64) -> &'static str {
+    if height >= crate::drs::WIDEN_V2_FROM_HEIGHT {
+        "0.3.662"
+    } else if height >= crate::drs::WIDEN_FROM_HEIGHT {
+        "0.3.661"
+    } else {
+        "0.3.646"
+    }
+}
+
+fn able(addr: &str, me: &str, height: u64) -> bool {
+    addr == me || crate::commands::updates::runs_at_least(addr, required_version(height), LIVE_WITHIN_SECS)
 }
 
 fn present_addr(addr: &str, me: &str, now: u64) -> bool {
@@ -300,8 +309,9 @@ fn present_addr(addr: &str, me: &str, now: u64) -> bool {
             && (heard_within(addr, now) || crate::p2p::validator_announced_within(addr, ANNOUNCED_WITHIN_SECS)))
 }
 
-fn replacement_reachable(plan: &[Vec<String>], me: &str) -> bool {
-    replacement_reachable_by(plan, |a| able(a, me))
+#[cfg(test)]
+fn replacement_reachable(plan: &[Vec<String>], me: &str, height: u64) -> bool {
+    replacement_reachable_by(plan, |a| able(a, me, height))
 }
 
 fn replacement_reachable_by(plan: &[Vec<String>], ok: impl Fn(&str) -> bool) -> bool {
@@ -632,7 +642,7 @@ impl Driver {
 
     fn short_of_quorum(&self, now: u64) -> bool {
         let present = if crate::drs::widened(self.height, self.attempt) {
-            self.members.iter().filter(|(a, _)| able(a, &self.me_addr) && present_addr(a, &self.me_addr, now)).count()
+            self.members.iter().filter(|(a, _)| able(a, &self.me_addr, self.height) && present_addr(a, &self.me_addr, now)).count()
         } else {
             self.present_members(now)
         };
@@ -659,12 +669,15 @@ impl Driver {
         }
         let Some(plan) = plan else { return };
         let me = self.me_addr.clone();
-        if !replacement_reachable_by(plan, |a| able(a, &me) && present_addr(a, &me, now)) {
+        let height = self.height;
+        if !replacement_reachable_by(plan, |a| able(a, &me, height) && present_addr(a, &me, now)) {
             if !self.said_no_replacement {
                 self.said_no_replacement = true;
                 eprintln!(
-                    "[Consensus] h={} attempt {}: not giving up yet, a committee ahead has too few members present on {REPLACEMENT_VERSION} or later to finish the block or pass it on, so this node waits here",
-                    self.height, self.attempt
+                    "[Consensus] h={} attempt {}: not giving up yet, a committee ahead has too few members present on {} or later to finish the block or pass it on, so this node waits here",
+                    self.height,
+                    self.attempt,
+                    required_version(self.height)
                 );
             }
             return;
@@ -1667,21 +1680,37 @@ mod tests {
     #[test]
     fn a_node_gives_up_only_toward_committees_that_can_finish_the_block() {
         let me = "egot1me";
+        let h = crate::drs::WIDEN_V2_FROM_HEIGHT;
         let c = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<String>>();
-        assert!(!replacement_reachable(&[], me));
-        assert!(!replacement_reachable(&[c(&[me, "egot1old1", "egot1old2", "egot1old3"])], me), "one able member cannot give up or finish");
-        crate::commands::updates::note_peer_version("egot1new1", REPLACEMENT_VERSION);
+        assert!(!replacement_reachable(&[], me, h));
+        assert!(!replacement_reachable(&[c(&[me, "egot1old1", "egot1old2", "egot1old3"])], me, h), "one able member cannot give up or finish");
+        crate::commands::updates::note_peer_version("egot1new1", required_version(h));
         crate::commands::updates::note_peer_version("egot1new2", "0.3.700");
         crate::commands::updates::note_peer_version("egot1stale", "0.3.645");
-        assert!(replacement_reachable(&[c(&[me, "egot1new1", "egot1new2", "egot1old1"])], me), "three able members can finish");
+        assert!(replacement_reachable(&[c(&[me, "egot1new1", "egot1new2", "egot1old1"])], me, h), "three able members can finish");
         assert!(
-            replacement_reachable(&[c(&[me, "egot1new1", "egot1old1", "egot1old2"]), c(&[me, "egot1new1", "egot1new2", "egot1old3"])], me),
+            replacement_reachable(&[c(&[me, "egot1new1", "egot1old1", "egot1old2"]), c(&[me, "egot1new1", "egot1new2", "egot1old3"])], me, h),
             "two able members can pass a committee on to one that finishes"
         );
         assert!(
-            !replacement_reachable(&[c(&[me, "egot1stale", "egot1old1", "egot1old2"]), c(&[me, "egot1new1", "egot1new2", "egot1old3"])], me),
+            !replacement_reachable(&[c(&[me, "egot1stale", "egot1old1", "egot1old2"]), c(&[me, "egot1new1", "egot1new2", "egot1old3"])], me, h),
             "a committee with one able member is a dead end"
         );
+    }
+
+    #[test]
+    fn a_peer_counts_as_able_wherever_its_version_draws_the_same_committees() {
+        let me = "egot1me";
+        crate::commands::updates::note_peer_version("egot1on661", "0.3.661");
+        crate::commands::updates::note_peer_version("egot1on660", "0.3.660");
+        let before = crate::drs::WIDEN_V2_FROM_HEIGHT - 1;
+        let after = crate::drs::WIDEN_V2_FROM_HEIGHT;
+        assert!(able("egot1on661", me, before), "0.3.661 draws the same committees until the second rule");
+        assert!(!able("egot1on661", me, after), "from the second rule it draws other ones");
+        assert!(!able("egot1on660", me, crate::drs::WIDEN_FROM_HEIGHT), "0.3.660 never widens");
+        assert!(able("egot1on660", me, crate::drs::WIDEN_FROM_HEIGHT - 1));
+        assert!(able(me, me, after), "a node always counts itself");
+        assert_eq!(required_version(after), "0.3.662");
     }
 
     #[test]
