@@ -28,7 +28,7 @@ const ANNOUNCED_WITHIN_SECS: i64 = 100;
 const LAST_HEARD_MAX: usize = 1_024;
 const SILENT_KEEP_MS: u64 = 600_000;
 const SKIPS_RESEND_MS: u64 = 10_000;
-const REPLACEMENT_VERSION: &str = "0.3.646";
+const REPLACEMENT_VERSION: &str = "0.3.661";
 const LIVE_WITHIN_SECS: i64 = 900;
 const LOOKAHEAD: u32 = 6;
 
@@ -314,7 +314,7 @@ fn replacement_reachable_by(plan: &[Vec<String>], ok: impl Fn(&str) -> bool) -> 
             return false;
         }
     }
-    false
+    !plan.is_empty()
 }
 
 fn msg_attempt(msg: &P2PMessage) -> u32 {
@@ -630,7 +630,12 @@ impl Driver {
     }
 
     fn short_of_quorum(&self, now: u64) -> bool {
-        self.present_members(now) < quorum_of(self.members.len())
+        let present = if crate::drs::widened(self.height, self.attempt) {
+            self.members.iter().filter(|(a, _)| able(a, &self.me_addr) && present_addr(a, &self.me_addr, now)).count()
+        } else {
+            self.present_members(now)
+        };
+        present < quorum_of(self.members.len())
     }
 
     fn give_up_due(&self, now: u64) -> bool {
@@ -656,7 +661,7 @@ impl Driver {
             if !self.said_no_replacement {
                 self.said_no_replacement = true;
                 eprintln!(
-                    "[Consensus] h={} attempt {}: not giving up yet, none of the next committees has enough members present on {REPLACEMENT_VERSION} or later to finish the block, so this node keeps waiting here instead of using up attempts",
+                    "[Consensus] h={} attempt {}: not giving up yet, a committee ahead has too few members present on {REPLACEMENT_VERSION} or later to finish the block or pass it on, so this node waits here",
                     self.height, self.attempt
                 );
             }
@@ -1642,7 +1647,14 @@ mod tests {
             c(&["egot1me", "egot1tzz8", "egot1tc5p", "egot1cczr"]),
             c(&["egot1me", "egot1y2dm", "egot1tc5p", "egot1cczr"]),
         ];
-        assert!(!replacement_reachable_by(&plan, here), "with two of four away in every next committee, giving up only burns attempts");
+        assert!(replacement_reachable_by(&plan, here), "while every next committee can still be passed on, a node moves on instead of waiting for absent members");
+        let plan = vec![
+            c(&["egot1me", "egot1tzz8", "egot1tc5p", "egot1cczr"]),
+            c(&["egot1me", "egot1tc5p", "egot1cczr", "egot1gone"]),
+            c(&["egot1me", "egot1tzz8", "egot1y2dm", "egot1new1"]),
+        ];
+        let here_now = |a: &str| here(a) && a != "egot1gone";
+        assert!(!replacement_reachable_by(&plan, here_now), "a committee too few present can pass on is a dead end, so the node waits before it");
         let plan = vec![
             c(&["egot1me", "egot1tzz8", "egot1tc5p", "egot1cczr"]),
             c(&["egot1me", "egot1tzz8", "egot1y2dm", "egot1tc5p"]),

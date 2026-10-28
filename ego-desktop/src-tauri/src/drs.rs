@@ -34,6 +34,11 @@ pub const LAST_MAKERS_KEEP: usize = 16;
 pub const SPLIT_FROM_HEIGHT: u64 = 32_901;
 pub const TENDERMINT_FROM_HEIGHT: u64 = 33_101;
 pub const SKIP_FROM_HEIGHT: u64 = 39_523;
+pub const WIDEN_FROM_HEIGHT: u64 = 42_292;
+pub const WIDEN_FROM_ATTEMPT: u32 = 2;
+pub const WIDEN_ANCHORED_ATTEMPTS: u32 = 32;
+const WIDEN_READY_EPOCHS: u64 = 8;
+const WIDEN_MAX_OUTSIDERS: usize = 512;
 pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT];
 const KEY_STORAGE_TOTAL: &[u8] = b"n2swt";
 const KEY_LAST_MAKERS: &[u8] = b"n2last";
@@ -1363,12 +1368,103 @@ fn weighted_committee(ov: &Ov, height: u64, attempt: i64, seed: &str, pool: Vec<
         };
         order.push(remaining.remove(idx).0);
     }
+    seat_in_turn(height, order)
+}
+
+fn seat_in_turn(height: u64, order: Vec<String>) -> Vec<String> {
     let n = order.len();
     let mut rotated = vec![String::new(); n];
     for (k, a) in order.into_iter().enumerate() {
         rotated[(height as usize).wrapping_add(k) % n] = a;
     }
     rotated
+}
+
+pub fn widened(height: u64, attempt: u32) -> bool {
+    height >= WIDEN_FROM_HEIGHT && attempt >= WIDEN_FROM_ATTEMPT
+}
+
+fn anchored(attempt: u32) -> bool {
+    attempt.saturating_sub(WIDEN_FROM_ATTEMPT) < WIDEN_ANCHORED_ATTEMPTS
+}
+
+pub fn extra_seats(base: usize) -> usize {
+    let minority = base.saturating_sub(1) / 2;
+    (3 * minority + 1).saturating_sub(base).max(1)
+}
+
+fn can_vote(ov: &Ov, addr: &str) -> bool {
+    crate::genesis::dilithium_pubkey_for(addr).is_some()
+        || ov.get(&crate::chain_db::val_dil_key(addr)).map_or(false, |k| !k.is_empty())
+}
+
+fn outsiders(ov: &Ov, height: u64, inside: &[String]) -> Vec<String> {
+    let epoch = epoch_of(height);
+    let mut seen: BTreeSet<String> = inside.iter().cloned().collect();
+    let earlier: Vec<String> = (1..=WIDEN_READY_EPOCHS)
+        .filter_map(|back| epoch.checked_sub(back))
+        .flat_map(|e| tm_ready_in(ov, e))
+        .collect();
+    let rota = load_rota(ov, epoch).map(|r| r.members).unwrap_or_default();
+    let mut out = Vec::new();
+    for a in earlier.into_iter().chain(last_makers(ov)).chain(rota) {
+        if out.len() >= WIDEN_MAX_OUTSIDERS {
+            break;
+        }
+        if seen.insert(a.clone()) && can_vote(ov, &a) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+fn widen_hash(seed: &str, height: u64, attempt: u32, pick: usize) -> u128 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"ego/committee-widen/v1:");
+    h.update(seed.as_bytes());
+    h.update(&height.to_le_bytes());
+    h.update(&attempt.to_le_bytes());
+    h.update(&(pick as u64).to_le_bytes());
+    u128::from_le_bytes(h.finalize().as_bytes()[..16].try_into().unwrap())
+}
+
+fn draw_from(ov: &Ov, height: u64, attempt: u32, seed: &str, from: Vec<String>, count: usize) -> Vec<String> {
+    let period = period_of(height);
+    let mut remaining: Vec<(String, u64)> = from
+        .into_iter()
+        .map(|a| {
+            let w = load_rec(ov, &a).map_or(0, |r| r.weight.at(period));
+            (a, w.max(1))
+        })
+        .collect();
+    let mut picked = Vec::with_capacity(count);
+    for pick in 0..count {
+        if remaining.is_empty() {
+            break;
+        }
+        let idx = weighted_pick(&remaining, widen_hash(seed, height, attempt, pick));
+        picked.push(remaining.remove(idx).0);
+    }
+    picked
+}
+
+fn widened_committee(ov: &Ov, height: u64, attempt: u32, seed: &str, pool: &[String], base: Vec<String>) -> Vec<String> {
+    if anchored(attempt) {
+        let extra = draw_from(ov, height, attempt, seed, outsiders(ov, height, &base), extra_seats(base.len()));
+        if extra.is_empty() {
+            return base;
+        }
+        let mut order = base;
+        order.extend(extra);
+        return seat_in_turn(height, order);
+    }
+    let mut everyone = pool.to_vec();
+    everyone.extend(outsiders(ov, height, pool));
+    let fresh = draw_from(ov, height, attempt, seed, everyone, MIN_COMMITTEE);
+    if fresh.len() < MIN_COMMITTEE {
+        return base;
+    }
+    seat_in_turn(height, fresh)
 }
 
 pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
@@ -1409,11 +1505,15 @@ pub fn committee(ov: &Ov, height: u64, attempt: i64) -> Vec<String> {
 
 pub fn skip_committee(ov: &Ov, height: u64, attempt: u32) -> Vec<String> {
     let rota = load_rota(ov, epoch_of(height)).unwrap_or_default();
-    let pool = draw_pool(ov, height);
+    let full = draw_pool(ov, height);
     let recent = last_makers(ov);
-    let answering: Vec<String> = pool.iter().filter(|a| recent.contains(a)).cloned().collect();
-    let pool = if answering.len() >= MIN_COMMITTEE { answering } else { pool };
-    weighted_committee(ov, height, i64::from(attempt), &rota.seed, pool)
+    let answering: Vec<String> = full.iter().filter(|a| recent.contains(a)).cloned().collect();
+    let pool = if answering.len() >= MIN_COMMITTEE { answering } else { full.clone() };
+    let base = weighted_committee(ov, height, i64::from(attempt), &rota.seed, pool);
+    if !widened(height, attempt) || base.is_empty() {
+        return base;
+    }
+    widened_committee(ov, height, attempt, &rota.seed, &full, base)
 }
 
 pub fn rota_position(ov: &Ov, epoch: u64, addr: &str) -> Option<(usize, String)> {
@@ -2022,6 +2122,122 @@ mod tests {
         seed_rota_for_tests(&mut small, e, &members[..10], &(0..10).collect::<Vec<_>>());
         small.commit_memory();
         assert_eq!(committee(&small, h, 0).len(), BLOCK_COMMITTEE);
+    }
+
+    fn stuck_pool_network() -> (Ov<'static>, Vec<String>, Vec<String>, u64) {
+        stuck_pool_network_with(10)
+    }
+
+    fn stuck_pool_network_with(outside: usize) -> (Ov<'static>, Vec<String>, Vec<String>, u64) {
+        let h = WIDEN_FROM_HEIGHT;
+        let e = epoch_of(h);
+        let pool: Vec<String> = ["egot1pooldead", "egot1poolm", "egot1poolp"].iter().map(|s| s.to_string()).collect();
+        let others: Vec<String> = (0..outside).map(|i| format!("egot1outside{i}")).collect();
+        let mut members = pool.clone();
+        members.extend(others.iter().cloned());
+        members.push("egot1nokey".into());
+        let mut ov = Ov::memory();
+        ov.put(rota_key(e), serde_json::to_vec(&Rota { seed: "s".into(), members: members.clone() }).unwrap());
+        let mut bits = Vec::new();
+        for i in 0..pool.len() {
+            set_bit(&mut bits, i);
+        }
+        ov.put(tm_ready_key(e), bits);
+        for m in &members {
+            seed_weight_for_tests(&mut ov, m, 50);
+            if m != "egot1nokey" {
+                ov.put(crate::chain_db::val_dil_key(m), vec![1u8; 8]);
+            }
+        }
+        ov.commit_memory();
+        (ov, pool, others, h)
+    }
+
+    #[test]
+    fn extra_seats_keep_a_minority_of_dead_members_passable() {
+        assert_eq!(extra_seats(3), 1);
+        assert_eq!(extra_seats(4), 1);
+        assert_eq!(extra_seats(5), 2);
+        assert_eq!(extra_seats(8), 2);
+        for c in 3..=16usize {
+            let n = c + extra_seats(c);
+            let dead = (c - 1) / 2;
+            let q = crate::chain_db::quorum_of(n);
+            let t = crate::chain_db::skip_threshold_of(n);
+            assert!(t <= c - dead, "with {dead} of {c} away the rest can still pass a widened committee on");
+            assert!(q <= n - dead, "with {dead} of {c} away a widened committee can still finish once its new seats answer");
+        }
+    }
+
+    #[test]
+    fn a_stuck_three_node_pool_hands_the_block_to_nodes_outside_it() {
+        let (ov, pool, others, h) = stuck_pool_network();
+        assert_eq!(draw_pool(&ov, h), pool);
+        let mut c1 = skip_committee(&ov, h, 1);
+        c1.sort();
+        let mut sorted_pool = pool.clone();
+        sorted_pool.sort();
+        assert_eq!(c1, sorted_pool, "the first redraw still comes from the pool");
+
+        let mut outside_seen = BTreeSet::new();
+        for attempt in WIDEN_FROM_ATTEMPT..WIDEN_FROM_ATTEMPT + WIDEN_ANCHORED_ATTEMPTS {
+            let c = skip_committee(&ov, h, attempt);
+            assert_eq!(c, skip_committee(&ov, h, attempt), "every node draws the same widened committee");
+            assert_eq!(c.len(), pool.len() + 1);
+            assert!(pool.iter().all(|p| c.contains(p)), "the nodes still answering keep their seats");
+            let extra: Vec<&String> = c.iter().filter(|a| !pool.contains(a)).collect();
+            assert_eq!(extra.len(), 1);
+            assert!(others.contains(extra[0]), "the new seat goes to a node that can sign: {extra:?}");
+            outside_seen.insert(extra[0].clone());
+        }
+        assert!(outside_seen.len() >= others.len() / 2, "attempts keep drawing other outside nodes: {outside_seen:?}");
+
+        let mut fresh_without_dead = false;
+        for attempt in WIDEN_FROM_ATTEMPT + WIDEN_ANCHORED_ATTEMPTS..WIDEN_FROM_ATTEMPT + WIDEN_ANCHORED_ATTEMPTS + 40 {
+            let c = skip_committee(&ov, h, attempt);
+            assert_eq!(c.len(), MIN_COMMITTEE);
+            assert!(!c.iter().any(|a| a == "egot1nokey"));
+            fresh_without_dead |= !c.contains(&pool[0]) && c.iter().any(|a| others.contains(a));
+        }
+        assert!(fresh_without_dead, "after the anchored attempts whole new committees are drawn");
+
+        let before = WIDEN_FROM_HEIGHT - 1;
+        assert!(!widened(before, 5) && !widened(h, 1) && widened(h, 2));
+    }
+
+    #[test]
+    fn with_one_pool_member_gone_every_widened_committee_can_be_passed_on_until_one_finishes() {
+        let (ov, pool, others, h) = stuck_pool_network();
+        let live: BTreeSet<String> = [pool[1].clone(), pool[2].clone(), others[3].clone(), others[7].clone()].into_iter().collect();
+        let mut finished_at = None;
+        for attempt in WIDEN_FROM_ATTEMPT..WIDEN_FROM_ATTEMPT + WIDEN_ANCHORED_ATTEMPTS {
+            let c = skip_committee(&ov, h, attempt);
+            let present = c.iter().filter(|a| live.contains(*a)).count();
+            assert!(present >= crate::chain_db::skip_threshold_of(c.len()), "attempt {attempt} can be passed on: {c:?}");
+            if present >= crate::chain_db::quorum_of(c.len()) {
+                finished_at = Some(attempt);
+                break;
+            }
+        }
+        assert!(finished_at.is_some(), "an outside node that answers finishes the block");
+    }
+
+    #[test]
+    fn two_of_three_pool_members_unable_still_end_in_a_committee_of_three_that_answer() {
+        let (ov, pool, others, h) = stuck_pool_network_with(2);
+        let able: BTreeSet<String> = [pool[1].clone(), others[0].clone(), others[1].clone()].into_iter().collect();
+        let mut finished_at = None;
+        for attempt in 1..WIDEN_FROM_ATTEMPT + WIDEN_ANCHORED_ATTEMPTS + 200 {
+            let c = skip_committee(&ov, h, attempt);
+            let answering = c.iter().filter(|a| able.contains(*a)).count();
+            if answering >= crate::chain_db::quorum_of(c.len()) {
+                finished_at = Some(attempt);
+                break;
+            }
+            assert!(answering >= crate::chain_db::skip_threshold_of(c.len()), "attempt {attempt} can be passed on: {c:?}");
+        }
+        let at = finished_at.expect("three answering nodes make the block without the two that stopped");
+        assert!(at >= WIDEN_FROM_ATTEMPT + WIDEN_ANCHORED_ATTEMPTS, "only whole new committees can leave both out (finished at {at})");
     }
 
     #[test]

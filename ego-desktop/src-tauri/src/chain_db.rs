@@ -11343,6 +11343,10 @@ mod history_tests {
                 );
             }
             eprintln!("tm_ready {:?}", crate::drs::tm_ready_members(&ov, h));
+            for back in 1..=12u64 {
+                let Some(e) = epoch.checked_sub(back) else { break };
+                eprintln!("tm_ready epoch {e}: {:?}", crate::drs::tm_ready_members(&ov, crate::drs::epoch_start(e)));
+            }
             eprintln!("last_makers {:?}", crate::drs::last_makers(&ov));
             if let Some(cf) = db.cf_handle(CF_META) {
                 let mut registered = 0usize;
