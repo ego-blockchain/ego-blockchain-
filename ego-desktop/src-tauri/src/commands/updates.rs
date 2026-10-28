@@ -186,6 +186,68 @@ pub async fn refresh_published_state_cert() -> Option<(u64, String)> {
     g.1.clone()
 }
 
+const ANCHOR_FIRST_CHECK_SECS: u64 = 120;
+const ANCHOR_CHECK_SECS: u64 = 600;
+const ANCHOR_RESYNC_MARKER: &str = ".anchor_resync";
+const ANCHOR_RESYNC_SPACING_SECS: i64 = 6 * 60 * 60;
+
+fn chain_anchor_in(manifest: &serde_json::Value) -> Option<(u64, String)> {
+    let height = manifest["chain_anchor"]["height"].as_u64().filter(|h| *h > 0)?;
+    let hash = manifest["chain_anchor"]["hash"].as_str()?.trim().trim_start_matches("0x").to_ascii_lowercase();
+    crate::state_cert::is_anchor_hash(&hash).then_some((height, hash))
+}
+
+pub fn off_the_anchored_chain(anchor: &(u64, String), tip: u64, local_hash: Option<String>) -> bool {
+    if tip < anchor.0 {
+        return false;
+    }
+    local_hash.map_or(false, |h| h.trim().trim_start_matches("0x").to_ascii_lowercase() != anchor.1)
+}
+
+fn started_over_recently(now: i64) -> bool {
+    std::fs::read_to_string(crate::ledger::base_data_dir().join(ANCHOR_RESYNC_MARKER))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map_or(false, |at| now - at < ANCHOR_RESYNC_SPACING_SECS)
+}
+
+pub fn spawn_chain_anchor_watch(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(ANCHOR_FIRST_CHECK_SECS)).await;
+        loop {
+            let anchor = if crate::p2p::offline_mode() { None } else { fetch_manifest().await.as_ref().and_then(chain_anchor_in) };
+            if let Some(anchor) = anchor {
+                let a = anchor.clone();
+                let off = tokio::task::spawn_blocking(move || {
+                    let tip = crate::chain_db::latest_block_info().0;
+                    off_the_anchored_chain(&a, tip, crate::chain_db::get_block_hash_at(a.0))
+                })
+                .await
+                .unwrap_or(false);
+                let now = chrono::Utc::now().timestamp();
+                if off && started_over_recently(now) {
+                    eprintln!("[Anchor] block {} here is still not the one egoblockchain.com names, but this node already started over recently, so it waits", anchor.0);
+                } else if off {
+                    eprintln!(
+                        "[Anchor] block {} here is not the one egoblockchain.com names, so this node is on an abandoned chain; downloading the current chain again (wallets are not touched)",
+                        anchor.0
+                    );
+                    let _ = std::fs::write(crate::ledger::base_data_dir().join(ANCHOR_RESYNC_MARKER), now.to_string());
+                    crate::commands::notifications::notify(
+                        &app,
+                        "Switching to the current chain",
+                        "This node was following an old copy of the chain. It is downloading the current one now. Your wallet is not affected.",
+                    );
+                    if crate::chain_db::request_resync().is_ok() {
+                        app.restart();
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(ANCHOR_CHECK_SECS)).await;
+        }
+    });
+}
+
 const NOTIFY_MARKER: &str = ".update_notified";
 const FIRST_CHECK_SECS: u64 = 90;
 const RECHECK_SECS: u64 = 6 * 60 * 60;
@@ -270,6 +332,22 @@ mod tests {
         assert!(!is_required(&m, "0.3.640"));
         assert!(!is_required(&serde_json::json!({ "version": "0.3.633" }), "0.3.600"), "no required_version means nothing is required");
         assert!(!is_required(&serde_json::json!({ "required_version": "<html>" }), "0.3.600"), "garbage never forces anything");
+    }
+
+    #[test]
+    fn only_a_node_holding_another_block_at_the_official_height_is_off_the_chain() {
+        let h = "cd".repeat(32);
+        let m = serde_json::json!({ "chain_anchor": { "height": 42_400, "hash": format!("0x{}", h.to_uppercase()) } });
+        let anchor = chain_anchor_in(&m).expect("a well formed anchor is read");
+        assert_eq!(anchor, (42_400, h.clone()));
+        assert!(chain_anchor_in(&serde_json::json!({ "chain_anchor": { "height": 0, "hash": h } })).is_none());
+        assert!(chain_anchor_in(&serde_json::json!({ "chain_anchor": { "height": 5, "hash": "short" } })).is_none());
+        assert!(chain_anchor_in(&serde_json::json!({ "version": "0.3.666" })).is_none(), "no anchor means nothing is checked");
+        assert!(!off_the_anchored_chain(&anchor, 42_600, Some(h.clone())), "the same block is the current chain");
+        assert!(!off_the_anchored_chain(&anchor, 42_600, Some(format!("0x{}", h.to_uppercase()))));
+        assert!(off_the_anchored_chain(&anchor, 47_096, Some("ef".repeat(32))), "another block at that height is an abandoned chain");
+        assert!(!off_the_anchored_chain(&anchor, 42_399, Some("ef".repeat(32))), "a node behind the anchor is only behind");
+        assert!(!off_the_anchored_chain(&anchor, 47_096, None), "a node without that block is never started over");
     }
 
     #[test]

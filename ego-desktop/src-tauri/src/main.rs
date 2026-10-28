@@ -1336,6 +1336,7 @@ fn main() {
             }
 
             crate::commands::updates::spawn_update_notifier(app.handle());
+            crate::commands::updates::spawn_chain_anchor_watch(app.handle());
 
             // Runtime freeze detector. A task on the async runtime bumps a counter every
             // second; this plain OS thread, which a frozen runtime cannot stop, reports when
