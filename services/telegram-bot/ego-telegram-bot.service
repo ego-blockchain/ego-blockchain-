@@ -1,0 +1,14 @@
+[Unit]
+Description=Ego Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+EnvironmentFile=/etc/ego-telegram-bot.env
+ExecStart=/usr/bin/python3 /opt/ego-telegram-bot/ego_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
