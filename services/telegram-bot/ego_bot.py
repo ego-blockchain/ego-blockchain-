@@ -8,6 +8,7 @@ import urllib.request
 
 SITE = "https://egoblockchain.com"
 RPC = "https://rpc.egoblockchain.com"
+PAY = "https://pay.egoblockchain.com"
 ALLOWED_HOSTS = ("egoblockchain.com",)
 ALLOWED_PREFIXES = ("https://github.com/ego-blockchain",)
 STRIKES_TO_MUTE = 3
@@ -36,6 +37,7 @@ WELCOME = (
     "🚫 No scams, spam or harmful messages\n"
     "🚫 No asking for or sharing private keys or recovery phrases\n\n"
     "⚠️ Our team will never DM you first or ask for your recovery phrase. Anyone who does is a scammer.\n\n"
+    "💎 The EGOC pre-sale is live. Type /presale for the price and how to buy.\n\n"
     "📥 Download: " + SITE + "/download\n"
     "📖 Docs: " + SITE + "/docs\n\n"
     "Type /help to see what I can tell you."
@@ -43,6 +45,7 @@ WELCOME = (
 
 HELP = (
     "<b>What I can do</b>\n"
+    "/presale: the EGOC pre-sale price and how to buy\n"
     "/version: the latest Ego Desktop version\n"
     "/stats: block height, nodes online and price\n"
     "/download: where to get Ego Desktop\n"
@@ -50,6 +53,7 @@ HELP = (
 )
 
 COMMANDS = [
+    {"command": "presale", "description": "EGOC pre-sale price and how to buy"},
     {"command": "version", "description": "Latest Ego Desktop version"},
     {"command": "stats", "description": "Block height, nodes online and price"},
     {"command": "download", "description": "Where to get Ego Desktop"},
@@ -122,7 +126,11 @@ def display_name(user):
     return html.escape(name)
 
 
-def format_stats(health, nodes, gateways, egoc):
+def usd(value):
+    return "${:g}".format(float(value))
+
+
+def format_stats(health, nodes, gateways, presale):
     lines = ["<b>Ego network</b>"]
     if health:
         lines.append("⛓ Block height: {:,}".format(int(health.get("block_height", 0))))
@@ -130,10 +138,39 @@ def format_stats(health, nodes, gateways, egoc):
         lines.append("🖥 Nodes online: {:,}".format(nodes))
     if gateways is not None:
         lines.append("🌐 Public gateways: {:,}".format(gateways))
-    if egoc and egoc.get("usd") is not None:
-        lines.append("💰 EGOC price: ${:g}".format(float(egoc["usd"])))
+    if presale and presale.get("price_usd") is not None:
+        tier = html.escape(str(presale.get("tier_label") or "current"))
+        lines.append("💰 EGOC pre-sale price: " + usd(presale["price_usd"]) + " (" + tier + " round)")
+        if presale.get("launch_usd") is not None:
+            lines.append("🚀 Launch price: " + usd(presale["launch_usd"]))
     if len(lines) == 1:
         lines.append("The network data is not available right now. Try again in a minute.")
+    return "\n".join(lines)
+
+
+def format_presale(presale):
+    if not presale or presale.get("price_usd") is None:
+        return "I couldn't reach the pre-sale right now. Try again in a minute, or see " + SITE + "/docs#presale"
+    tier = html.escape(str(presale.get("tier_label") or "Current"))
+    lines = ["<b>EGOC pre-sale: " + tier + " round</b>", "💰 Price now: " + usd(presale["price_usd"]) + " per EGOC"]
+    if presale.get("launch_usd") is not None:
+        line = "🚀 Launch price: " + usd(presale["launch_usd"])
+        if presale.get("discount_pct"):
+            line += " (" + str(presale["discount_pct"]) + "% off now)"
+        lines.append(line)
+    tiers = presale.get("tiers") or []
+    if tiers:
+        lines.append("")
+        for t in tiers:
+            lines.append("• " + html.escape(str(t.get("label"))) + ": " + usd(t.get("price", 0)) + ", up to {:,} EGOC".format(int(t.get("cap", 0))))
+    lines.append("")
+    lines.append("<b>How to buy</b>")
+    lines.append("1. Install Ego Desktop: " + SITE + "/download")
+    lines.append("2. Open the Wallet tab and choose Pre-sale.")
+    lines.append("3. Pay with BTC, ETH, USDT, USDC, BNB, ADA, SOL, TRX or a card. Minimum $10.")
+    lines.append("")
+    lines.append("⚠️ Only buy inside Ego Desktop. Nobody from the team will DM you an address to send money to.")
+    lines.append("📖 Details: " + SITE + "/docs#presale")
     return "\n".join(lines)
 
 
@@ -287,16 +324,17 @@ class Bot:
             text = "📥 Ego Desktop for Windows, macOS and Linux:\n" + SITE + "/download"
         elif command == "version":
             text = format_version(self.fetch(SITE + "/version.json"))
+        elif command == "presale":
+            text = format_presale(self.fetch(PAY + "/presale/config"))
         elif command == "stats":
             health = self.fetch(RPC + "/health")
             nodes = self.fetch(RPC + "/nodes")
             gateways = self.fetch(RPC + "/gateways")
-            egoc = self.fetch(RPC + "/egoc")
             text = format_stats(
                 health,
                 len(nodes.get("nodes", [])) if isinstance(nodes, dict) else None,
                 len(gateways.get("gateways", [])) if isinstance(gateways, dict) else None,
-                egoc,
+                self.fetch(PAY + "/presale/config"),
             )
         else:
             return
