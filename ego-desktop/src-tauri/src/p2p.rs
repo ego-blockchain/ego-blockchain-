@@ -231,10 +231,70 @@ pub static DHT_CMD_TX: OnceLock<mpsc::Sender<DhtCommand>> = OnceLock::new();
 
 pub static APP_HANDLE: OnceLock<tauri::AppHandle<tauri::Wry>> = OnceLock::new();
 
-pub static NETWORK_BEST_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const TIP_CLAIM_TTL_SECS: i64 = 600;
+const TIP_CLAIMS_MAX: usize = 1_024;
+const NEAR_TIP_LEAD: u64 = 8;
+
+struct TipClaims {
+    by: std::collections::BTreeMap<String, (u64, i64)>,
+    near: (u64, i64),
+}
+
+impl TipClaims {
+    const fn new() -> Self {
+        Self { by: std::collections::BTreeMap::new(), near: (0, 0) }
+    }
+
+    fn prune(&mut self, now: i64) {
+        self.by.retain(|_, (_, at)| now - *at < TIP_CLAIM_TTL_SECS);
+        if now - self.near.1 >= TIP_CLAIM_TTL_SECS {
+            self.near = (0, 0);
+        }
+    }
+
+    fn claim(&mut self, source: &str, height: u64, now: i64) {
+        self.prune(now);
+        if !self.by.contains_key(source) && self.by.len() >= TIP_CLAIMS_MAX {
+            if let Some(oldest) = self.by.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k.clone()) {
+                self.by.remove(&oldest);
+            }
+        }
+        let entry = self.by.entry(source.to_string()).or_insert((0, now));
+        entry.0 = entry.0.max(height);
+        entry.1 = now;
+    }
+
+    fn near_claim(&mut self, height: u64, local: u64, now: i64) {
+        self.prune(now);
+        if height <= local.saturating_add(NEAR_TIP_LEAD) {
+            self.near = (self.near.0.max(height), now);
+        }
+    }
+
+    fn tip(&mut self, now: i64) -> u64 {
+        self.prune(now);
+        let mut heights: Vec<u64> = self.by.values().map(|(h, _)| *h).collect();
+        heights.sort_unstable_by(|a, b| b.cmp(a));
+        heights.get(1).copied().unwrap_or(0).max(self.near.0)
+    }
+}
+
+static TIP_CLAIMS: Mutex<TipClaims> = Mutex::new(TipClaims::new());
+
+fn tip_claims() -> std::sync::MutexGuard<'static, TipClaims> {
+    TIP_CLAIMS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub fn note_network_height(height: u64) {
-    NETWORK_BEST_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
+    let local = crate::chain_db::latest_block_info().0;
+    tip_claims().near_claim(height, local, Utc::now().timestamp());
+}
+
+fn note_network_height_by(source: &str, height: u64) {
+    if source.is_empty() {
+        return note_network_height(height);
+    }
+    tip_claims().claim(source, height, Utc::now().timestamp());
 }
 
 /// Record how far ahead the network is, but only on the word of a validator this build
@@ -243,7 +303,7 @@ pub fn note_network_height(height: u64) {
 /// reporting that it is catching up to something it will never reach.
 pub fn note_network_height_from(height: u64, claimant: &str) {
     if crate::genesis::addresses().is_empty() || vouches_for_height(claimant) {
-        note_network_height(height);
+        note_network_height_by(claimant, height);
     }
 }
 
@@ -290,8 +350,8 @@ fn note_network_height_from_blocks(blocks: &[LedgerBlock]) {
     if !blocks_are_from_our_network(blocks) {
         return;
     }
-    if let Some(h) = blocks.iter().map(|b| b.height).max() {
-        note_network_height(h);
+    if let Some(top) = blocks.iter().max_by_key(|b| b.height) {
+        note_network_height_by(&top.miner, top.height);
     }
 }
 
@@ -2102,7 +2162,7 @@ pub async fn shadow_on_proposal(
         crate::genesis::addresses().is_empty() || crate::genesis::is_engine_member(&header.proposer)
     };
     if vouched {
-        note_network_height(header.height);
+        note_network_height_by(&header.proposer.to_hex(), header.height);
     }
     if v2_engine_height() == Some(header.height) {
         reconcile_proposal_round(peer_round, &header.proposer).await;
@@ -6129,7 +6189,7 @@ pub async fn sync_chain_from_peers() {
     // stuck-rounds fallback below does get there, but only after five sync rounds at the
     // same height, which is minutes, and as a request peers may turn down.
     static LAST_FAR_SNAPSHOT_ASK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-    let network_best = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed);
+    let network_best = network_tip();
     if network_best > my_height.saturating_add(crate::chain_db::SNAPSHOT_BLOCK_WINDOW as u64)
         && now - LAST_FAR_SNAPSHOT_ASK.load(Ordering::Relaxed) >= 30_000
     {
@@ -11789,7 +11849,7 @@ pub async fn heal_unservable_heights() {
         .await
         .unwrap_or(0);
     crate::block_heal::forget_below(local_tip.saturating_add(1));
-    let network_tip = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed);
+    let network_tip = network_tip();
     let now = Utc::now().timestamp();
     // A node that follows the chain without proposing cannot produce a replacement block,
     // so for it the only way past an unservable height is a snapshot. Telling it to redo
@@ -12605,7 +12665,7 @@ fn attach_local_qc_if_missing(block: &mut crate::ledger::LedgerBlock) {
 pub const OBSERVER_LAG_BLOCKS: u64 = 50;
 
 pub fn network_tip() -> u64 {
-    NETWORK_BEST_HEIGHT.load(Ordering::Relaxed)
+    tip_claims().tip(Utc::now().timestamp())
 }
 
 pub fn observer_by_lag(local_height: u64, network_tip: u64) -> bool {
@@ -16067,7 +16127,7 @@ pub async fn run_sync_status_watcher() {
         last_tick = now;
 
         let local = crate::chain_db::latest_block_info().0;
-        let best = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed).max(local);
+        let best = network_tip().max(local);
         let behind = best.saturating_sub(local);
 
         if woke {
@@ -17510,6 +17570,27 @@ mod proposer_election_tests {
     }
 
     fn quorum_of(n: usize) -> usize { (2 * n) / 3 + 1 }
+
+    #[test]
+    fn one_node_alone_cannot_make_the_network_look_far_ahead() {
+        let mut c = super::TipClaims::new();
+        let t = 1_800_000_000i64;
+        c.claim("egot1fork", 47_095, t);
+        assert_eq!(c.tip(t), 0, "a single source is not enough");
+        c.claim("egot1honest", 42_400, t);
+        assert_eq!(c.tip(t), 42_400, "the second highest source sets the height");
+        c.claim("egot1other", 42_410, t + 1);
+        assert_eq!(c.tip(t + 1), 42_410);
+        assert_eq!(c.tip(t + super::TIP_CLAIM_TTL_SECS), 0, "claims nobody repeats expire");
+        c.near_claim(42_405, 42_400, t + 1);
+        assert_eq!(c.tip(t + 2), 42_405, "a height next to ours counts on one word");
+        c.near_claim(42_500, 42_400, t + 2);
+        assert_eq!(c.tip(t + 3), 42_405, "but not one far beyond it");
+        for i in 0..super::TIP_CLAIMS_MAX + 10 {
+            c.claim(&format!("egot1many{i}"), 1, t + 4 + i as i64);
+        }
+        assert!(c.by.len() <= super::TIP_CLAIMS_MAX);
+    }
 
     #[test]
     fn a_committee_drawn_from_the_whole_registry_would_be_unreachable() {
