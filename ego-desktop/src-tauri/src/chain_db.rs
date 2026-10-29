@@ -3943,6 +3943,9 @@ pub fn servable_blocks_with_txs(blocks: Vec<LedgerBlock>) -> (Vec<LedgerBlock>, 
     for b in blocks {
         let txs = get_txs_for_block(b.height);
         if (txs.len() as u32) < b.tx_count {
+            if out_blocks.is_empty() {
+                continue;
+            }
             tracing::debug!(
                 "[Sync] not serving block #{} onwards: it says it carries {} transaction(s) and this node can read {}",
                 b.height, b.tx_count, txs.len()
@@ -9086,12 +9089,16 @@ mod servable_blocks_tests {
     }
 
     #[test]
-    fn nothing_is_served_when_the_very_first_block_is_short() {
-        let (blocks, txs) = servable_blocks_with_txs(vec![blk(9, 3), blk(10, 0)]);
-        assert!(
-            blocks.is_empty() && txs.is_empty(),
-            "serving a block every peer must refuse is what spread the stall between nodes",
+    fn short_blocks_at_the_start_are_skipped_and_the_whole_ones_after_them_served() {
+        let (blocks, _) = servable_blocks_with_txs(vec![blk(9, 3), blk(10, 3), blk(11, 0), blk(12, 0)]);
+        assert_eq!(
+            blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            vec![11, 12],
+            "a node that joined from a checkpoint holds the blocks before it without their transactions; \
+             a peer asking from there already has them and needs what follows, and the short ones are never sent",
         );
+        let (none, txs) = servable_blocks_with_txs(vec![blk(9, 3), blk(10, 3)]);
+        assert!(none.is_empty() && txs.is_empty(), "a block every peer must refuse is never sent");
     }
 }
 
