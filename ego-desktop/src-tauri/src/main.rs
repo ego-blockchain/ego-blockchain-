@@ -660,6 +660,14 @@ fn main() {
         const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4;
         let log_path = crate::ledger::base_data_dir().join("ego.log");
         let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
+        trim_log(&log_path, LOG_LIMIT_BYTES, LOG_KEEP_BYTES);
+        {
+            let path = log_path.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(LOG_TRIM_EVERY_SECS));
+                trim_log(&path, LOG_LIMIT_BYTES, LOG_KEEP_BYTES);
+            });
+        }
         if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
             use std::os::windows::io::IntoRawHandle;
             let handle = file.into_raw_handle() as isize;
@@ -1758,6 +1766,54 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const LOG_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const LOG_KEEP_BYTES: u64 = 10 * 1024 * 1024;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const LOG_TRIM_EVERY_SECS: u64 = 600;
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn trim_log(path: &std::path::Path, limit: u64, keep: u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else { return };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len <= limit {
+        return;
+    }
+    let keep = keep.min(len);
+    let mut tail = Vec::with_capacity(keep as usize);
+    if file.seek(SeekFrom::Start(len - keep)).is_ok() {
+        let _ = file.by_ref().take(keep).read_to_end(&mut tail);
+    }
+    let _ = std::fs::write(path.with_extension("log.old"), &tail);
+    let _ = file.set_len(0);
+}
+
+#[cfg(test)]
+mod log_trim_tests {
+    use super::trim_log;
+
+    #[test]
+    fn a_log_over_the_limit_keeps_its_tail_aside_and_starts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ego.log");
+        std::fs::write(&path, b"0123456789abcdefghij").unwrap();
+        trim_log(&path, 32, 4);
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789abcdefghij", "a log under the limit is left alone");
+        assert!(!dir.path().join("ego.log.old").exists());
+
+        trim_log(&path, 8, 4);
+        assert_eq!(std::fs::read(&path).unwrap(), b"", "the live log starts empty");
+        assert_eq!(std::fs::read(dir.path().join("ego.log.old")).unwrap(), b"ghij", "the last lines are kept aside");
+
+        let mut appender = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut appender, b"next").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"next", "a writer in append mode carries on at the new end");
+        trim_log(&dir.path().join("missing.log"), 1, 1);
+    }
 }
 
 #[cfg(test)]
