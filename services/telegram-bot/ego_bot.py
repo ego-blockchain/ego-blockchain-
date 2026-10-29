@@ -15,6 +15,7 @@ STRIKES_TO_MUTE = 3
 STRIKE_WINDOW_SECS = 24 * 3600
 MUTE_SECS = 24 * 3600
 NOTICE_SECS = 30
+WELCOME_SECS = 30 * 60
 ADMIN_CACHE_SECS = 600
 STATS_CACHE_SECS = 30
 COMMAND_COOLDOWN_SECS = 10
@@ -275,7 +276,7 @@ class Bot:
         previous = self.last_welcome.get(chat_id)
         if previous:
             self.delete(chat_id, previous)
-        sent = self.send(chat_id, WELCOME.format(names=names), message.get("message_thread_id"))
+        sent = self.send(chat_id, WELCOME.format(names=names), message.get("message_thread_id"), WELCOME_SECS)
         if sent:
             self.last_welcome[chat_id] = sent["message_id"]
 
