@@ -351,7 +351,7 @@ fn note_network_height_from_blocks(blocks: &[LedgerBlock]) {
         return;
     }
     if let Some(top) = blocks.iter().max_by_key(|b| b.height) {
-        note_network_height_by(&top.miner, top.height);
+        note_network_height_from(top.height, &top.miner);
     }
 }
 
@@ -8187,7 +8187,11 @@ fn handle_send(
         outbound.send(swarm, peer_id, msg, reply);
     } else {
         pending_sends.entry(peer_id).or_default().push((msg, reply));
-        let _ = swarm.dial(peer_addr);
+        let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+            .addresses(vec![peer_addr])
+            .extend_addresses_through_behaviour()
+            .build();
+        let _ = swarm.dial(opts);
     }
 }
 

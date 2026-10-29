@@ -279,8 +279,20 @@ fn future() -> MutexGuard<'static, BTreeMap<u64, Vec<P2PMessage>>> {
     FUTURE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn too_far_behind_to_vote(height: u64, network_tip: u64) -> bool {
+    crate::p2p::observer_by_lag(height.saturating_sub(1), network_tip)
+}
+
 fn seat(members: &[(String, Vec<u8>)], me_addr: &str, kp: &Option<Arc<ego_core::KeyPair>>, height: u64) -> Option<usize> {
     let i = members.iter().position(|(a, _)| a == me_addr)?;
+    let network = crate::p2p::network_tip();
+    if too_far_behind_to_vote(height, network) {
+        static TOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if TOLD.swap(height, std::sync::atomic::Ordering::Relaxed) != height {
+            eprintln!("[Consensus] h={height}: this node sits on the committee but the network is already at {network}, so it only follows until it has caught up");
+        }
+        return None;
+    }
     let matches = kp.as_ref().map_or(false, |k| k.dilithium_public_key().key_data == members[i].1);
     if !matches {
         eprintln!("[Consensus] h={height}: this node is on the committee but its signing key is not the one registered on chain, so it only follows");
@@ -1698,6 +1710,14 @@ mod tests {
             !replacement_reachable(&[c(&[me, "egot1stale", "egot1old1", "egot1old2"]), c(&[me, "egot1new1", "egot1new2", "egot1old3"])], me, h),
             "a committee with one able member is a dead end"
         );
+    }
+
+    #[test]
+    fn a_node_far_behind_the_network_never_votes_on_old_heights() {
+        assert!(too_far_behind_to_vote(39_865, 42_534), "a rejoining node must not finish a block the chain already has");
+        assert!(!too_far_behind_to_vote(42_535, 42_534), "a node at the tip votes");
+        assert!(!too_far_behind_to_vote(42_500, 42_534), "a few blocks behind still takes part");
+        assert!(!too_far_behind_to_vote(39_865, 0), "with no word of the network a node is not held back");
     }
 
     #[test]
