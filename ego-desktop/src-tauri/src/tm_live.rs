@@ -31,6 +31,7 @@ const SILENT_KEEP_MS: u64 = 600_000;
 const SKIPS_RESEND_MS: u64 = 10_000;
 const LIVE_WITHIN_SECS: i64 = 900;
 const LOOKAHEAD: u32 = 6;
+const AHEAD_ATTEMPTS_KEPT: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Via {
@@ -251,6 +252,7 @@ struct Driver {
     committing: bool,
     gave_up: Option<TmSkipVote>,
     give_ups: BTreeMap<String, TmSkipVote>,
+    ahead: BTreeMap<u32, BTreeMap<String, TmSkipVote>>,
     lock_pol: Option<TmLock>,
     advancing: bool,
     later: Vec<P2PMessage>,
@@ -437,6 +439,7 @@ impl Driver {
             committing: false,
             gave_up: gave_up.clone().filter(|_| me.is_some()),
             give_ups: gave_up.filter(|_| me.is_some()).map(|v| (v.voter.clone(), v)).into_iter().collect(),
+            ahead: BTreeMap::new(),
             lock_pol,
             advancing: false,
             later: Vec::new(),
@@ -743,6 +746,36 @@ impl Driver {
         self.give_ups.insert(vote.voter.clone(), vote);
     }
 
+    fn collect_ahead(
+        &mut self,
+        attempt: u32,
+        vote: TmSkipVote,
+        committee: &[(String, Vec<u8>)],
+        earlier: &dyn Fn(u32) -> Option<Vec<(String, Vec<u8>)>>,
+    ) -> Option<Vec<TmSkipCert>> {
+        if let Err(e) = vote.verify_with(self.height, attempt, committee, earlier) {
+            eprintln!("[Consensus] h={}: ignoring a give-up for committee {attempt}: {e}", self.height);
+            return None;
+        }
+        let votes = self.ahead.entry(attempt).or_default();
+        votes.insert(vote.voter.clone(), vote);
+        let cert = (votes.len() >= skip_threshold_of(committee.len()))
+            .then(|| TmSkipCert { attempt, votes: votes.values().cloned().collect() });
+        while self.ahead.len() > AHEAD_ATTEMPTS_KEPT {
+            let Some(lowest) = self.ahead.keys().next().copied() else { break };
+            self.ahead.remove(&lowest);
+        }
+        if cert.is_some() {
+            eprintln!(
+                "[Consensus] h={}: committee {attempt} was given up while this node was still on committee {}; joining committee {} directly",
+                self.height,
+                self.attempt,
+                attempt.saturating_add(1)
+            );
+        }
+        cert.map(|c| vec![c])
+    }
+
     fn may_move_on(&self) -> bool {
         self.attempt < TM_MAX_ATTEMPT || extended_attempts_at(self.height)
     }
@@ -807,6 +840,7 @@ impl Driver {
         self.pending_propose = None;
         self.gave_up = None;
         self.give_ups.clear();
+        self.ahead.retain(|a, _| *a >= attempt);
         self.lock_pol = None;
         self.advancing = false;
         self.said_cannot_give_up = false;
@@ -1349,20 +1383,33 @@ async fn on_give_up(height: u64, attempt: u32, vote: TmSkipVote, block: Option<L
         Some(a) => tokio::task::spawn_blocking(move || crate::chain_db::committee_for_attempt(height, a)).await.ok().flatten(),
         None => None,
     };
-    let ready = {
+    let jumps = compact_skip(attempt) && driver().as_ref().map_or(false, |d| d.height == height && attempt > d.attempt);
+    let ahead_committee = if jumps {
+        tokio::task::spawn_blocking(move || crate::chain_db::committee_for_attempt(height, attempt)).await.ok().flatten()
+    } else {
+        None
+    };
+    let mut jump = None;
+    let ready = 'give_up: {
         let mut g = driver();
         let Some(d) = g.as_mut() else { return };
         if d.height != height || d.decided.is_some() {
             return;
         }
+        let earlier = |a: u32| if Some(a) == backing_attempt { backing.clone() } else { None };
         match gate(d, attempt, &full) {
             Gate::Current => {}
-            _ => return,
+            Gate::Behind => {
+                if let Some(committee) = &ahead_committee {
+                    jump = d.collect_ahead(attempt, vote, committee, &earlier);
+                }
+                break 'give_up None;
+            }
+            Gate::Stale => return,
         }
         if d.give_ups.contains_key(&vote.voter) {
             return;
         }
-        let earlier = |a: u32| if Some(a) == backing_attempt { backing.clone() } else { None };
         if let Err(e) = vote.verify_with(height, attempt, &d.members, &earlier) {
             eprintln!("[Consensus] h={height}: ignoring a give-up: {e}");
             return;
@@ -1386,7 +1433,7 @@ async fn on_give_up(height: u64, attempt: u32, vote: TmSkipVote, block: Option<L
         d.give_ups.insert(vote.voter.clone(), vote);
         d.ready_skips()
     };
-    if let Some(skips) = ready {
+    if let Some(skips) = jump.or(ready) {
         advance(height, skips).await;
     }
 }
