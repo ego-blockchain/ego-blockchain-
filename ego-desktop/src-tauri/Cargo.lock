@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "ego-desktop"
-version = "0.3.670"
+version = "0.3.671"
 dependencies = [
  "aes-gcm",
  "anyhow",
