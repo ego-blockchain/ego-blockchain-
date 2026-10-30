@@ -150,6 +150,7 @@ pub fn get_db() -> DbWrapper {
 }
 
 const RESYNC_FLAG: &str = "resync_chain.flag";
+const PREVIOUS_CHAIN_DIR: &str = "chain_rocksdb.previous";
 
 fn resync_requested() -> bool {
     base_data_dir().join(RESYNC_FLAG).exists()
@@ -161,8 +162,18 @@ pub fn request_resync() -> Result<(), String> {
 
 fn wipe_local_chain(db_path: &std::path::Path) {
     if db_path.exists() {
-        if let Err(e) = std::fs::remove_dir_all(db_path) {
-            eprintln!("[ChainDB] could not remove {:?}: {e}", db_path);
+        let previous = db_path.with_file_name(PREVIOUS_CHAIN_DIR);
+        if previous.exists() {
+            let _ = std::fs::remove_dir_all(&previous);
+        }
+        match std::fs::rename(db_path, &previous) {
+            Ok(()) => eprintln!("[ChainDB] the old chain copy is kept in {:?} until the next start-over", previous),
+            Err(e) => {
+                eprintln!("[ChainDB] could not keep the old chain copy ({e}); removing it");
+                if let Err(e) = std::fs::remove_dir_all(db_path) {
+                    eprintln!("[ChainDB] could not remove {:?}: {e}", db_path);
+                }
+            }
         }
     }
     let stamp = chrono::Utc::now().timestamp();

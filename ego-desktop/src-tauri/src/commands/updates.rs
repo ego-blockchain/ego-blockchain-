@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// than anything server-side.
 const VERSION_MANIFEST_URL: &str = "https://egoblockchain.com/version.json";
 const DOWNLOAD_PAGE_URL:    &str = "https://egoblockchain.com/download";
+const MANIFEST_SIGNING_KEY: &str = "cc758a32abb0c1b76ff3403b836e3930431b98a287849dac8f5c79c03645acaf";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpdateInfo {
@@ -90,7 +91,7 @@ pub async fn check_for_update() -> Result<UpdateInfo, EgoDesktopError> {
         required: is_required(&manifest, &current),
         current,
         latest,
-        download_url: manifest["url"].as_str().unwrap_or(DOWNLOAD_PAGE_URL).to_string(),
+        download_url: download_url_in(&manifest),
         notes: manifest["notes"].as_str().unwrap_or("").to_string(),
     })
 }
@@ -156,6 +157,56 @@ async fn fetch_manifest() -> Option<serde_json::Value> {
     resp.json().await.ok()
 }
 
+fn download_url_in(manifest: &serde_json::Value) -> String {
+    manifest["url"]
+        .as_str()
+        .map(str::trim)
+        .filter(|u| u.starts_with("https://egoblockchain.com/") && !u.contains(['@', '\\']))
+        .unwrap_or(DOWNLOAD_PAGE_URL)
+        .to_string()
+}
+
+fn manifest_message(manifest: &serde_json::Value) -> String {
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or("").trim().to_ascii_lowercase();
+    let cert = &manifest["state_cert"];
+    let anchor = &manifest["chain_anchor"];
+    let mut anchor_hash = text(&anchor["hash"]);
+    while let Some(rest) = anchor_hash.strip_prefix("0x") {
+        anchor_hash = rest.to_string();
+    }
+    format!(
+        "ego-version-manifest-v1|state_cert:{}:{}:{}|chain_anchor:{}:{}",
+        cert["index"].as_u64().unwrap_or(0),
+        cert["height"].as_u64().unwrap_or(0),
+        text(&cert["hash"]),
+        anchor["height"].as_u64().unwrap_or(0),
+        anchor_hash,
+    )
+}
+
+fn signed_with(manifest: &serde_json::Value, key_hex: &str) -> bool {
+    let Some(key) = hex::decode(key_hex).ok().and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok()) else { return false };
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&key) else { return false };
+    let Some(sig) = manifest["signature"].as_str().and_then(|s| hex::decode(s.trim()).ok()) else { return false };
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(&sig) else { return false };
+    key.verify_strict(manifest_message(manifest).as_bytes(), &sig).is_ok()
+}
+
+async fn fetch_signed_manifest() -> Option<serde_json::Value> {
+    let manifest = fetch_manifest().await?;
+    if signed_with(&manifest, MANIFEST_SIGNING_KEY) {
+        return Some(manifest);
+    }
+    if manifest.get("chain_anchor").is_some() || manifest.get("state_cert").is_some() {
+        static SAID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let now = chrono::Utc::now().timestamp();
+        if now - SAID.swap(now, std::sync::atomic::Ordering::Relaxed) > 6 * 3600 {
+            eprintln!("[Manifest] egoblockchain.com/version.json names a checkpoint or chain anchor without a valid signature; ignoring both");
+        }
+    }
+    None
+}
+
 const PUBLISHED_CERT_RECHECK_SECS: i64 = 600;
 static PUBLISHED_CERT: std::sync::Mutex<(i64, Option<(u64, String)>)> = std::sync::Mutex::new((0, None));
 
@@ -177,7 +228,7 @@ pub async fn refresh_published_state_cert() -> Option<(u64, String)> {
             return g.1.clone();
         }
     }
-    let fetched = if crate::p2p::offline_mode() { None } else { fetch_manifest().await.as_ref().and_then(published_cert_in) };
+    let fetched = if crate::p2p::offline_mode() { None } else { fetch_signed_manifest().await.as_ref().and_then(published_cert_in) };
     let mut g = PUBLISHED_CERT.lock().unwrap_or_else(|e| e.into_inner());
     g.0 = now;
     if fetched.is_some() {
@@ -215,7 +266,7 @@ pub fn spawn_chain_anchor_watch(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(ANCHOR_FIRST_CHECK_SECS)).await;
         loop {
-            let anchor = if crate::p2p::offline_mode() { None } else { fetch_manifest().await.as_ref().and_then(chain_anchor_in) };
+            let anchor = if crate::p2p::offline_mode() { None } else { fetch_signed_manifest().await.as_ref().and_then(chain_anchor_in) };
             if let Some(anchor) = anchor {
                 let a = anchor.clone();
                 let off = tokio::task::spawn_blocking(move || {
@@ -400,5 +451,75 @@ mod tests {
         assert!(!is_newer("", "0.3.33"));
         assert!(!is_newer("<!doctype html>", "0.3.33"));
         assert!(!is_newer("not.a.version", "0.3.33"));
+    }
+
+    fn sign_with_test_key(m: &mut serde_json::Value, seed: u8) -> String {
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        m["signature"] = serde_json::json!(hex::encode(key.sign(manifest_message(m).as_bytes()).to_bytes()));
+        hex::encode(key.verifying_key().to_bytes())
+    }
+
+    #[test]
+    fn only_a_signed_manifest_can_name_a_checkpoint_or_an_anchor() {
+        let mut m = serde_json::json!({
+            "version": "0.3.671",
+            "state_cert": { "index": 2, "height": 39864, "hash": "cf".repeat(32) },
+            "chain_anchor": { "height": 42400, "hash": "09".repeat(32) }
+        });
+        assert!(!signed_with(&m, MANIFEST_SIGNING_KEY), "an unsigned manifest is not trusted");
+        let key = sign_with_test_key(&mut m, 7);
+        assert!(signed_with(&m, &key));
+        assert!(!signed_with(&m, MANIFEST_SIGNING_KEY), "a key other than the built-in one is not trusted");
+        let mut moved = m.clone();
+        moved["chain_anchor"]["hash"] = serde_json::json!("ee".repeat(32));
+        assert!(!signed_with(&moved, &key), "changing the anchor breaks the signature");
+        let mut lowered = m.clone();
+        lowered["chain_anchor"]["height"] = serde_json::json!(100);
+        assert!(!signed_with(&lowered, &key), "moving the anchor height breaks the signature");
+        let mut recert = m.clone();
+        recert["state_cert"]["hash"] = serde_json::json!("dd".repeat(32));
+        assert!(!signed_with(&recert, &key), "changing the checkpoint breaks the signature");
+        let mut noted = m.clone();
+        noted["notes"] = serde_json::json!("new text");
+        noted["version"] = serde_json::json!("0.3.672");
+        assert!(signed_with(&noted, &key), "release notes and versions can change without signing again");
+        for bad in ["", "zz", "00"] {
+            let mut garbage = m.clone();
+            garbage["signature"] = serde_json::json!(bad);
+            assert!(!signed_with(&garbage, &key));
+        }
+    }
+
+    #[test]
+    fn the_published_manifest_is_signed_by_the_built_in_key() {
+        let live = serde_json::json!({
+            "version": "0.3.670",
+            "state_cert": { "index": 2, "height": 39864, "hash": "cffc024048f1b24c2a3dcdb61f9cf763b38ef1f5c5d1548de3b550998ef50785" },
+            "chain_anchor": { "height": 42400, "hash": "092ebf89ddcf506465e14a0a86e69cdb5ff6961f7a6a97042c8af87456671721" },
+            "signature": "a39a753053aaf2df441e7b3a9e9ba2269803cb9af20a7e011eb71b1dc120b581c6b79c0b089b838eabc0d286ccf0214c0bc3e736c6a847950dbafe28ee1dbc01"
+        });
+        assert!(signed_with(&live, MANIFEST_SIGNING_KEY), "scripts/sign-version-json.mjs and the node must sign the same words");
+    }
+
+    #[test]
+    fn the_signed_words_ignore_case_spaces_and_0x() {
+        let m = serde_json::json!({
+            "state_cert": { "index": 2, "height": 39864, "hash": " CFFC " },
+            "chain_anchor": { "height": 42400, "hash": "0x0x092E" }
+        });
+        assert_eq!(manifest_message(&m), "ego-version-manifest-v1|state_cert:2:39864:cffc|chain_anchor:42400:092e");
+        assert_eq!(manifest_message(&serde_json::json!({})), "ego-version-manifest-v1|state_cert:0:0:|chain_anchor:0:");
+    }
+
+    #[test]
+    fn the_update_link_always_points_at_egoblockchain_com() {
+        let url = |u: &str| download_url_in(&serde_json::json!({ "url": u }));
+        assert_eq!(url("https://egoblockchain.com/download"), "https://egoblockchain.com/download");
+        assert_eq!(url("https://evil.example/download"), DOWNLOAD_PAGE_URL);
+        assert_eq!(url("https://egoblockchain.com.evil.example/x"), DOWNLOAD_PAGE_URL);
+        assert_eq!(url("https://egoblockchain.com/@evil.example"), DOWNLOAD_PAGE_URL);
+        assert_eq!(url("http://egoblockchain.com/download"), DOWNLOAD_PAGE_URL);
+        assert_eq!(download_url_in(&serde_json::json!({})), DOWNLOAD_PAGE_URL);
     }
 }
