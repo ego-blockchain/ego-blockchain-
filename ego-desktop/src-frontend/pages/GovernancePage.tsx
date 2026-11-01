@@ -14,6 +14,7 @@ interface DaoProposal {
   stake_vote_count: number; knowledge_vote_count: number;
   questions: TestQuestion[] | null;
   my_stake_vote: number | null; my_knowledge_vote: number | null; my_test_score: number | null;
+  on_chain?: boolean; answers_revealed?: boolean;
 }
 
 interface OptionResult { option: string; stake_power: number; knowledge_power: number; combined_power: number; }
@@ -271,6 +272,9 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
   const [delConfirm, setDelConfirm]   = useState(false);
   const [busy, setBusy]   = useState('');
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const onChain = !!proposal.on_chain;
+  const pendingNotice = 'Sent. Your vote counts once it is in a block, usually within a minute.';
 
   const isActive = proposal.status === 'active' && Math.floor(Date.now() / 1000) <= proposal.voting_ends_at;
   const isOwnProposal = proposal.creator === myAddress;
@@ -314,6 +318,7 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
       await invoke('cast_stake_vote', { proposalId: proposal.id, optionIndex: stakeOption });
       const r = await invoke<ProposalResults>('get_proposal_results', { proposalId: proposal.id });
       setResults(r);
+      if (onChain) setNotice(pendingNotice);
       onVoted();
     } catch (e: any) { setError(String(e)); }
     finally { setBusy(''); }
@@ -327,10 +332,11 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
         proposalId: proposal.id, optionIndex: knowOption,
         answers: answers.map(a => a ?? 0),
       });
-      setTestScore(score);
+      setTestScore(score >= 0 ? score : null);
       setTestSubmitted(true);
       const r = await invoke<ProposalResults>('get_proposal_results', { proposalId: proposal.id });
       setResults(r);
+      if (onChain) setNotice(pendingNotice);
       onVoted();
     } catch (e: any) { setError(String(e)); }
     finally { setBusy(''); }
@@ -406,10 +412,14 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
               <div className="mt-2">
                 {delConfirm ? (
                   <span className="flex items-center gap-1.5">
-                    <span className="text-[10px] text-yellow-400">Delete your proposal? This removes it and its votes permanently.</span>
+                    <span className="text-[10px] text-yellow-400">
+                      {onChain
+                        ? 'Withdraw your proposal? Voting stops, and the record stays on the chain.'
+                        : 'Delete your proposal? This removes it and its votes permanently.'}
+                    </span>
                     <button onClick={deleteProposal} disabled={delBusy}
                       className="text-[10px] px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white disabled:opacity-50 transition">
-                      {delBusy ? '…' : 'Delete'}
+                      {delBusy ? '…' : onChain ? 'Withdraw' : 'Delete'}
                     </button>
                     <button onClick={() => setDelConfirm(false)} className="text-[10px] text-gray-500 hover:text-gray-300">Cancel</button>
                   </span>
@@ -427,6 +437,7 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
 
         <div className="overflow-y-auto flex-1 px-6 py-5 space-y-6">
           {error && <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm">{error}</div>}
+          {notice && <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-xl text-green-400 text-sm">{notice}</div>}
 
           <p className="text-sm text-gray-300 leading-relaxed">{proposal.description}</p>
 
@@ -434,7 +445,9 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
           <div className="border border-gray-700 rounded-xl p-4 space-y-3">
             <div className="flex items-center gap-2">
               <span className="text-sm font-medium text-white">Stake Vote</span>
-              <span className="text-xs text-gray-500">power = your balance / total voting balance</span>
+              <span className="text-xs text-gray-500">
+                {onChain ? 'power = your staked EGOC, locked until the vote ends' : 'power = your balance / total voting balance'}
+              </span>
               {proposal.my_stake_vote !== null && (
                 <span className="ml-auto text-xs text-green-400">✓ Voted: {proposal.options[proposal.my_stake_vote]}</span>
               )}
@@ -470,6 +483,11 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
                     Score: {(testScore * 100).toFixed(0)}%
                   </span>
                 )}
+                {testScore === null && onChain && testSubmitted && (
+                  <span className="ml-auto text-xs text-gray-500">
+                    {proposal.answers_revealed ? 'Score pending' : 'Score shown after the answers are revealed'}
+                  </span>
+                )}
               </div>
               {proposal.questions.map((q, qi) => (
                 <div key={q.id} className="space-y-2">
@@ -502,10 +520,12 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
                     </select>
                   </div>
                   <div className="flex gap-2">
-                    <button onClick={previewScore} disabled={answers.some(a => a === null) || busy === 'preview'}
-                      className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 rounded-xl text-xs text-white transition-colors">
-                      {busy === 'preview' ? 'Grading…' : 'Preview Score'}
-                    </button>
+                    {!onChain && (
+                      <button onClick={previewScore} disabled={answers.some(a => a === null) || busy === 'preview'}
+                        className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 rounded-xl text-xs text-white transition-colors">
+                        {busy === 'preview' ? 'Grading…' : 'Preview Score'}
+                      </button>
+                    )}
                     <button onClick={submitKnowledgeVote}
                       disabled={answers.some(a => a === null) || knowOption === null || busy === 'know'}
                       className="flex-1 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-xl text-xs font-medium text-white transition-colors">

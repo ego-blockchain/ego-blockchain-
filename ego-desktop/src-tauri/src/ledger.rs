@@ -1814,6 +1814,7 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     let _ = block_miner;
 
     check_contract_commitment(tx)?;
+    crate::dao_chain::admit(tx)?;
 
     let dilithium_disabled = crate::chain_db::is_feature_disabled(
         crate::chain_db::FEATURE_DILITHIUM_DISABLED,

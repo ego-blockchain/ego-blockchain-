@@ -593,6 +593,7 @@ pub async fn get_reward_history() -> Result<RewardHistory, EgoDesktopError> {
 pub async fn get_transaction_history(
     _state: State<'_, AppState>,
 ) -> Result<Vec<LedgerTx>, EgoDesktopError> {
+    tauri::async_runtime::spawn(crate::p2p::wallet_history_tick(true));
     tokio::task::spawn_blocking(|| {
         let ledger  = Ledger::load();
         let my_addr = ledger.address.clone();

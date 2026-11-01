@@ -17,6 +17,7 @@ pub const TAG_CONTRACT: u8 = 3;
 pub const STATE_CERT_ANCHORS: &[(u64, &str)] = &[
     (1, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c"),
     (2, "cffc024048f1b24c2a3dcdb61f9cf763b38ef1f5c5d1548de3b550998ef50785"),
+    (3, "40221698858e16745ba554397803beb32bab9e2f5c3e019b4c1933b10e50dbfa"),
 ];
 const KEY_DAY: &[u8] = b"sc:day";
 const KEY_OPEN: &[u8] = b"sc:open";
@@ -48,6 +49,7 @@ const STATE_META_PREFIXES: &[&[u8]] = &[
     b"price_rep:",
     b"storage_proven:",
     b"poc_proof:",
+    b"dao:",
 ];
 const NOT_STATE: &[&[u8]] = &[b"n2migrated"];
 
@@ -625,9 +627,13 @@ mod tests {
         let built_in = vec![
             (1u64, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c".to_string()),
             (2u64, "cffc024048f1b24c2a3dcdb61f9cf763b38ef1f5c5d1548de3b550998ef50785".to_string()),
+            (3u64, "40221698858e16745ba554397803beb32bab9e2f5c3e019b4c1933b10e50dbfa".to_string()),
         ];
-        assert_eq!(anchors_with(None), built_in, "this release names checkpoints 1 and 2 itself");
-        assert_eq!(anchors_with(Some((4, h.clone()))), vec![built_in[0].clone(), built_in[1].clone(), (4, h.clone())]);
+        assert_eq!(anchors_with(None), built_in, "this release names checkpoints 1, 2 and 3 itself");
+        assert_eq!(
+            anchors_with(Some((4, h.clone()))),
+            built_in.iter().cloned().chain([(4, h.clone())]).collect::<Vec<_>>()
+        );
         assert_eq!(anchors_with(Some((1, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c".into()))), built_in, "the website naming the same one adds nothing");
         assert_eq!(anchors_with(Some((0, h.clone()))), built_in);
         assert_eq!(anchors_with(Some((4, "AB".repeat(32)))), built_in);

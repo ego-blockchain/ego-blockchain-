@@ -32,6 +32,7 @@ mod state_sync;
 mod storage_pay;
 mod contract_exec;
 mod dao_chat;
+mod dao_chain;
 mod gateway;
 mod webrtc_gateway;
 mod phone_storage;
@@ -1697,6 +1698,7 @@ fn main() {
                     bounded!(15, crate::p2p::dht_publish_shard_assignments(&ledger_addr, &ep3));
                     bounded!(15, crate::p2p::broadcast_vacancy_notices());
                     bounded!(120, crate::p2p::history_tick());
+                    bounded!(60, crate::p2p::wallet_history_tick(false));
                 }
             });
 

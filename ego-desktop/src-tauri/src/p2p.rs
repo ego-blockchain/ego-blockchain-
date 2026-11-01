@@ -4195,6 +4195,18 @@ pub enum P2PMessage {
         holder: String,
         pieces: Vec<crate::history::HistoryPiece>,
     },
+    AddrHistoryRequest {
+        nonce: String,
+        address: String,
+        before: i64,
+        reply_to: String,
+    },
+    AddrHistoryResponse {
+        nonce: String,
+        address: String,
+        entries: Vec<(u64, String, i64)>,
+        more: bool,
+    },
     SnapshotRequest {
         requester_endpoint: String,
         #[serde(default)]
@@ -9726,7 +9738,17 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             serve_history_fetch(nonce, from, count, reply_to).await;
         }
         P2PMessage::HistoryPieces { nonce, pieces, .. } => {
-            receive_history_pieces(nonce, pieces).await;
+            if is_wallet_fetch(&nonce) {
+                receive_wallet_pieces(nonce, pieces).await;
+            } else {
+                receive_history_pieces(nonce, pieces).await;
+            }
+        }
+        P2PMessage::AddrHistoryRequest { nonce, address, before, reply_to } => {
+            serve_addr_history(nonce, address, before, reply_to).await;
+        }
+        P2PMessage::AddrHistoryResponse { nonce, address, entries, more } => {
+            receive_addr_history(nonce, address, entries, more).await;
         }
 
         P2PMessage::MarketChat { trade_id, from, kind, body, ts, id, pubkey, sig } => {
@@ -13538,6 +13560,227 @@ async fn receive_history_pieces(nonce: String, pieces: Vec<crate::history::Histo
     tokio::spawn(history_backfill_next());
 }
 
+const WALLET_HISTORY_PAGE: usize = 256;
+const WALLET_HISTORY_MAX_PAGES: u32 = 40;
+const WALLET_HISTORY_ASK: usize = 3;
+const WALLET_HISTORY_REFRESH_SECS: i64 = 6 * 3600;
+const WALLET_HISTORY_KICK_SECS: i64 = 60;
+const WALLET_FETCH_INFLIGHT: usize = 8;
+const WALLET_FETCH_SCAN: usize = 64;
+const WALLET_FETCH_TIMEOUT_SECS: i64 = 60;
+const WALLET_FETCH_TRIES: u32 = 6;
+const WALLET_WANT_CAP: usize = 20_000;
+
+#[derive(Default)]
+struct WalletHistory {
+    asked: HashMap<String, (String, String, u32, i64)>,
+    want: std::collections::BTreeMap<u64, Vec<String>>,
+    tries: HashMap<u64, u32>,
+    inflight: HashMap<String, (u64, i64)>,
+    scanned: HashMap<String, i64>,
+}
+
+static WALLET_HISTORY: Mutex<Option<WalletHistory>> = Mutex::new(None);
+
+fn with_wallet_history<T>(f: impl FnOnce(&mut WalletHistory) -> T) -> T {
+    let mut guard = WALLET_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(WalletHistory::default))
+}
+
+fn is_wallet_fetch(nonce: &str) -> bool {
+    with_wallet_history(|st| st.inflight.contains_key(nonce))
+}
+
+async fn wallet_history_servers(limit: usize) -> Vec<String> {
+    let me = crate::ledger::Ledger::load().address;
+    let (shards, at) = tokio::task::spawn_blocking(crate::chain_db::history_shards_now).await.unwrap_or((1, 0));
+    let shards = shards.max(1);
+    let rotate = rand::random::<u64>();
+    let mut out: Vec<String> = Vec::new();
+    for i in 0..shards.min(4) {
+        let shard = rotate.wrapping_add(i) % shards;
+        let skip = vec![me.clone()];
+        let holders = tokio::task::spawn_blocking(move || {
+            crate::chain_db::history_holders(shard, shards, at, rotate, crate::history::PROBE_CANDIDATES, skip)
+        })
+        .await
+        .unwrap_or_default();
+        for holder in holders {
+            if out.len() >= limit {
+                return out;
+            }
+            match get_relay_endpoint(&holder).await {
+                Some(ep) if !out.contains(&ep) => out.push(ep),
+                Some(_) => {}
+                None => lookup_dht_endpoint(&holder),
+            }
+        }
+    }
+    out
+}
+
+pub async fn wallet_history_tick(kick: bool) {
+    let now = Utc::now().timestamp();
+    let gap = if kick { WALLET_HISTORY_KICK_SECS } else { WALLET_HISTORY_REFRESH_SECS };
+    let addrs = tokio::task::spawn_blocking(own_addresses).await.unwrap_or_default();
+    let due: Vec<String> = with_wallet_history(|st| {
+        st.asked.retain(|_, a| now - a.3 < WALLET_FETCH_TIMEOUT_SECS);
+        addrs.into_iter().filter(|a| now - st.scanned.get(a).copied().unwrap_or(0) >= gap).collect()
+    });
+    if !due.is_empty() {
+        let reply_to = get_public_endpoint().await;
+        let servers = if reply_to.is_empty() { Vec::new() } else { wallet_history_servers(WALLET_HISTORY_ASK).await };
+        if !servers.is_empty() {
+            let sends: Vec<(String, P2PMessage)> = with_wallet_history(|st| {
+                let mut sends = Vec::new();
+                for address in &due {
+                    st.scanned.insert(address.clone(), now);
+                    for ep in &servers {
+                        let nonce = history_nonce();
+                        st.asked.insert(nonce.clone(), (address.clone(), ep.clone(), 1, now));
+                        sends.push((
+                            ep.clone(),
+                            P2PMessage::AddrHistoryRequest { nonce, address: address.clone(), before: i64::MAX, reply_to: reply_to.clone() },
+                        ));
+                    }
+                }
+                sends
+            });
+            for (ep, msg) in sends {
+                let _ = send_message(&ep, &msg).await;
+            }
+        }
+    }
+    pump_wallet_fetches().await;
+}
+
+async fn serve_addr_history(nonce: String, address: String, before: i64, reply_to: String) {
+    if nonce.is_empty() || nonce.len() > 64 || address.is_empty() || address.len() > 128 || reply_to.is_empty() {
+        return;
+    }
+    if !history_serve_allowed(&reply_to, false) {
+        return;
+    }
+    let addr = address.clone();
+    let (entries, more) = tokio::task::spawn_blocking(move || crate::chain_db::addr_history_page(&addr, before, WALLET_HISTORY_PAGE))
+        .await
+        .unwrap_or_default();
+    let _ = send_message(&reply_to, &P2PMessage::AddrHistoryResponse { nonce, address, entries, more }).await;
+}
+
+async fn receive_addr_history(nonce: String, address: String, entries: Vec<(u64, String, i64)>, more: bool) {
+    let Some((asked, ep, page, _)) = with_wallet_history(|st| st.asked.remove(&nonce)) else { return };
+    if asked != address || entries.len() > WALLET_HISTORY_PAGE || entries.iter().any(|(_, h, _)| h.is_empty() || h.len() > 130) {
+        return;
+    }
+    let hashes: Vec<String> = entries.iter().map(|(_, h, _)| h.clone()).collect();
+    let known: Vec<bool> = tokio::task::spawn_blocking(move || hashes.iter().map(|h| crate::chain_db::index_known_tx(h)).collect())
+        .await
+        .unwrap_or_default();
+    with_wallet_history(|st| {
+        for (i, (height, _, _)) in entries.iter().enumerate() {
+            if known.get(i).copied().unwrap_or(false) || *height == 0 {
+                continue;
+            }
+            if st.want.len() >= WALLET_WANT_CAP && !st.want.contains_key(height) {
+                continue;
+            }
+            let eps = st.want.entry(*height).or_default();
+            if !eps.contains(&ep) {
+                eps.push(ep.clone());
+            }
+        }
+    });
+    if more && page < WALLET_HISTORY_MAX_PAGES {
+        let before = entries.iter().map(|e| e.2).min().unwrap_or(0).saturating_add(1);
+        let reply_to = get_public_endpoint().await;
+        if before > 1 && !reply_to.is_empty() {
+            let nonce = history_nonce();
+            with_wallet_history(|st| st.asked.insert(nonce.clone(), (address.clone(), ep.clone(), page + 1, Utc::now().timestamp())));
+            let _ = send_message(&ep, &P2PMessage::AddrHistoryRequest { nonce, address, before, reply_to }).await;
+        }
+    }
+    pump_wallet_fetches().await;
+}
+
+async fn pump_wallet_fetches() {
+    let now = Utc::now().timestamp();
+    let candidates: Vec<(u64, Vec<String>, u32)> = with_wallet_history(|st| {
+        let expired: Vec<u64> = st.inflight.values().filter(|(_, t)| now - *t >= WALLET_FETCH_TIMEOUT_SECS).map(|(h, _)| *h).collect();
+        st.inflight.retain(|_, (_, t)| now - *t < WALLET_FETCH_TIMEOUT_SECS);
+        for h in expired {
+            let n = st.tries.entry(h).or_insert(0);
+            *n += 1;
+            if *n >= WALLET_FETCH_TRIES {
+                st.want.remove(&h);
+                st.tries.remove(&h);
+            }
+        }
+        let busy: std::collections::HashSet<u64> = st.inflight.values().map(|(h, _)| *h).collect();
+        st.want
+            .iter()
+            .filter(|(h, _)| !busy.contains(h))
+            .take(WALLET_FETCH_SCAN)
+            .map(|(h, eps)| (*h, eps.clone(), st.tries.get(h).copied().unwrap_or(0)))
+            .collect()
+    });
+    if candidates.is_empty() {
+        return;
+    }
+    let reply_to = get_public_endpoint().await;
+    if reply_to.is_empty() {
+        return;
+    }
+    let ready: Vec<(u64, Vec<String>, u32)> = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter(|(h, _, _)| crate::chain_db::history_root(crate::history::chunk_of(*h)).is_some())
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    let sends: Vec<(String, P2PMessage)> = with_wallet_history(|st| {
+        let room = WALLET_FETCH_INFLIGHT.saturating_sub(st.inflight.len());
+        ready
+            .into_iter()
+            .take(room)
+            .filter_map(|(h, eps, tries)| {
+                let ep = eps.get(tries as usize % eps.len().max(1))?.clone();
+                let nonce = history_nonce();
+                st.inflight.insert(nonce.clone(), (h, now));
+                Some((ep, P2PMessage::HistoryFetch { nonce, from: h, count: 1, reply_to: reply_to.clone() }))
+            })
+            .collect()
+    });
+    for (ep, msg) in sends {
+        let _ = send_message(&ep, &msg).await;
+    }
+}
+
+async fn receive_wallet_pieces(nonce: String, pieces: Vec<crate::history::HistoryPiece>) {
+    let Some((height, _)) = with_wallet_history(|st| st.inflight.remove(&nonce)) else { return };
+    let Some(piece) = pieces.into_iter().find(|p| p.height == height) else { return };
+    let chunk = crate::history::chunk_of(height);
+    let stored = tokio::task::spawn_blocking(move || {
+        let root = crate::chain_db::history_root(chunk).ok_or_else(|| "this part of the chain has no root yet".to_string())?;
+        crate::history::verify_piece(&piece, &root)?;
+        Ok::<_, String>(crate::chain_db::history_store(std::slice::from_ref(&piece)))
+    })
+    .await;
+    match stored {
+        Ok(Ok(_)) => with_wallet_history(|st| {
+            st.want.remove(&height);
+            st.tries.remove(&height);
+        }),
+        Ok(Err(e)) => {
+            eprintln!("[History] block {height} holding a wallet transaction did not check out: {e}");
+            with_wallet_history(|st| *st.tries.entry(height).or_insert(0) += 1);
+        }
+        Err(_) => {}
+    }
+    tokio::spawn(pump_wallet_fetches());
+}
+
 const STATE_SYNC_INFLIGHT: usize = 8;
 const STATE_SYNC_TIMEOUT_SECS: i64 = 15;
 const STATE_TIP_RETRY_SECS: i64 = 8;
@@ -15928,6 +16171,7 @@ pub async fn run_view_change_monitor() {
             continue;
         }
         if !pipeline && now - last < VIEW_CHANGE_TIMEOUT_SECS { continue; }
+        if tokio::task::spawn_blocking(is_observer).await.unwrap_or(true) { continue; }
 
         let view_init = tokio::task::spawn_blocking(|| {
             let chain_next = crate::chain_db::latest_block_info().0 + 1;
