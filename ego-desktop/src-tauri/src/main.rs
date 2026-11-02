@@ -38,6 +38,7 @@ mod hold_chain;
 mod gateway;
 mod webrtc_gateway;
 mod phone_storage;
+mod phone_dao;
 mod file_delete;
 mod commands;
 mod compute_admission;

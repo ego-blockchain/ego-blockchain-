@@ -392,6 +392,11 @@ fn get_stake_meta(db: &DB, addr: &str) -> Option<(i64, u32)> {
     Some((start_ts, lock_days))
 }
 
+/// When an address's current stake started and how many days it is locked for.
+pub fn stake_meta(addr: &str) -> Option<(i64, u32)> {
+    get_stake_meta(global_db(), addr)
+}
+
 /// Deterministic accrued staking reward owed when `tx` (an unstake) commits.
 /// Computed purely from on-chain data — the staker's recorded stake start +
 /// lock days and the unstake timestamp — so every node derives the same value.

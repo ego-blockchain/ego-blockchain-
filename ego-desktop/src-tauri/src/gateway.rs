@@ -39,7 +39,7 @@ const REFILL_PER_SEC: f64 = 6.0;
 pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
 /// /storage takes a whole encrypted block, base64-encoded, in one request.
 pub(crate) const MAX_STORAGE_BODY_BYTES: usize = 512 * 1024;
-const NOT_HERE: &str = "That method isn't available on this gateway.";
+pub(crate) const NOT_HERE: &str = "That method isn't available on this gateway.";
 const NOT_OWNER: &str = "Only the owner of this computer can see its earnings.";
 pub const EARNINGS_DOMAIN: &str = "ego/node-earnings/v1";
 const SELF_CHECK_FIRST_SECS: i64 = 30 * 60;
@@ -308,6 +308,7 @@ fn cost(method: &str) -> f64 {
         "tx.submit" | "chat.submit" => 20.0,
         "chat.feed" | "chat.member" | "node.earnings" => 4.0,
         "wallet.getRewards" | "vault.status" => 2.0,
+        "dao.list" | "dao.proposal" | "staking.status" => 2.0,
         "wallet.getCredits" => 1.0,
         "shielded.lookup" => 2.0,
         "shielded.leaves" => 4.0,
@@ -634,6 +635,9 @@ pub(crate) async fn answer(ip: IpAddr, body: Value) -> Result<Value, Value> {
         "node.earnings" => node_earnings(&params).await,
         "gateway.list" => Ok(json!({ "gateways": share(chrono::Utc::now().timestamp()) })),
         m if crate::phone_storage::METHODS.contains(&m) => crate::phone_storage::dispatch(m, &params)
+            .await
+            .unwrap_or_else(|| Err((-32601, NOT_HERE.to_string()))),
+        m if crate::phone_dao::METHODS.contains(&m) => crate::phone_dao::dispatch(m, &params)
             .await
             .unwrap_or_else(|| Err((-32601, NOT_HERE.to_string()))),
         _ => Err((-32601, NOT_HERE.to_string())),
