@@ -5142,11 +5142,11 @@ where
     write_frame(&mut stream, &data).await
 }
 
-async fn dao_chat_sync_from(peer: PeerId, since: i64) -> Result<crate::dao_chat::SyncResponse, String> {
+async fn dao_chat_sync_from(peer: PeerId, req: crate::dao_chat::SyncRequest) -> Result<crate::dao_chat::SyncResponse, String> {
     let mut control = DAO_CHAT_CONTROL.get().ok_or("P2P not started")?.clone();
     let exchange = async {
         let mut stream = control.open_stream(peer, DAO_CHAT_PROTOCOL).await.map_err(|e| e.to_string())?;
-        let req = serde_json::to_vec(&crate::dao_chat::SyncRequest { since }).map_err(|e| e.to_string())?;
+        let req = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
         write_frame(&mut stream, &req).await?;
         let body = read_frame(&mut stream, crate::dao_chat::SYNC_MAX_RESPONSE_BYTES).await?;
         serde_json::from_slice(&body).map_err(|e| e.to_string())
@@ -5154,6 +5154,42 @@ async fn dao_chat_sync_from(peer: PeerId, since: i64) -> Result<crate::dao_chat:
     tokio::time::timeout(Duration::from_secs(20), exchange)
         .await
         .map_err(|_| "chat sync timed out".to_string())?
+}
+
+/// Fetches the chat history this node is missing, oldest last, one page of 500 posts
+/// at a time from one peer, so a fresh install or a cleared chain shows the whole
+/// conversation and not only its newest posts. Stops at a peer that ignores paging.
+pub async fn dao_chat_backfill(app: Option<tauri::AppHandle>) -> usize {
+    let peers: Vec<PeerId> = live_peers().lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+    let since = chrono::Utc::now().timestamp() - crate::dao_chat::keep_secs();
+    let max_pages = crate::dao_chat::MAX_KEPT_POSTS / crate::dao_chat::SYNC_MAX_POSTS;
+    let mut fresh = 0usize;
+    'peers: for peer in peers.into_iter().take(DAO_CHAT_SYNC_PEERS) {
+        for _ in 0..max_pages {
+            let before = tokio::task::spawn_blocking(crate::dao_chat::oldest_post_ts)
+                .await.ok().flatten()
+                .unwrap_or_else(|| chrono::Utc::now().timestamp() + 1);
+            if before <= since {
+                break 'peers;
+            }
+            let Ok(resp) = dao_chat_sync_from(peer, crate::dao_chat::SyncRequest { since, before: Some(before) }).await else {
+                continue 'peers;
+            };
+            let full = resp.posts.len() >= crate::dao_chat::SYNC_MAX_POSTS;
+            if resp.posts.iter().all(|p| p.ts >= before) {
+                continue 'peers;
+            }
+            let now = chrono::Utc::now().timestamp();
+            fresh += tokio::task::spawn_blocking(move || crate::dao_chat::ingest(resp, now)).await.unwrap_or(0);
+            if !full {
+                break 'peers;
+            }
+        }
+    }
+    if fresh > 0 {
+        crate::dao_chat::notify(app.as_ref());
+    }
+    fresh
 }
 
 pub async fn dao_chat_sync_now(app: Option<tauri::AppHandle>) -> usize {
@@ -5173,7 +5209,7 @@ pub async fn dao_chat_sync_now(app: Option<tauri::AppHandle>) -> usize {
         if answered >= DAO_CHAT_SYNC_PEERS {
             break;
         }
-        match dao_chat_sync_from(peer, since).await {
+        match dao_chat_sync_from(peer, crate::dao_chat::SyncRequest { since, before: None }).await {
             Ok(resp) => {
                 answered += 1;
                 let now = chrono::Utc::now().timestamp();
@@ -7331,6 +7367,8 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
         let sync_app = app.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(20)).await;
+            dao_chat_sync_now(sync_app.clone()).await;
+            dao_chat_backfill(sync_app.clone()).await;
             loop {
                 dao_chat_sync_now(sync_app.clone()).await;
                 tokio::time::sleep(Duration::from_secs(300)).await;
@@ -18521,7 +18559,7 @@ mod dao_chat_wire_tests {
         let (server, client) = tokio::io::duplex(1 << 20);
         let serving = tokio::spawn(serve_dao_chat_stream(peer, server.compat()));
         let mut client = client.compat();
-        write_frame(&mut client, &serde_json::to_vec(&SyncRequest { since: now - 60 }).unwrap()).await.unwrap();
+        write_frame(&mut client, &serde_json::to_vec(&SyncRequest { since: now - 60, before: None }).unwrap()).await.unwrap();
         let body = read_frame(&mut client, dao_chat::SYNC_MAX_RESPONSE_BYTES).await.unwrap();
         serving.await.unwrap().unwrap();
         let resp: SyncResponse = serde_json::from_slice(&body).unwrap();
@@ -18530,7 +18568,7 @@ mod dao_chat_wire_tests {
         let (server, client) = tokio::io::duplex(1 << 20);
         let again = tokio::spawn(serve_dao_chat_stream(peer, server.compat()));
         let mut client = client.compat();
-        let _ = write_frame(&mut client, &serde_json::to_vec(&SyncRequest { since: now - 60 }).unwrap()).await;
+        let _ = write_frame(&mut client, &serde_json::to_vec(&SyncRequest { since: now - 60, before: None }).unwrap()).await;
         assert!(again.await.unwrap().is_err(), "a second ask within seconds is refused");
     }
 

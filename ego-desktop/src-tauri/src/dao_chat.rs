@@ -22,9 +22,9 @@ pub const MAX_AVATAR_CHARS: usize = 400;
 
 const MAX_LINES: usize = 80;
 const LATE_GOSSIP_SECS: i64 = 600;
-const KEEP_POSTS_SECS: i64 = 30 * 86_400;
+const KEEP_POSTS_SECS: i64 = 365 * 86_400;
 const KEEP_VOTES_SECS: i64 = KEEP_POSTS_SECS + VOTE_WINDOW_SECS;
-const MAX_KEPT_POSTS: usize = 20_000;
+pub const MAX_KEPT_POSTS: usize = 100_000;
 const FUTURE_SKEW_SECS: i64 = 300;
 const BURST_WINDOW_SECS: i64 = 600;
 const BURST_MAX: usize = 30;
@@ -134,6 +134,11 @@ pub enum Wire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub since: i64,
+    /// Asks for the page of history just before this time, so a node that starts
+    /// fresh can fetch everything kept, 500 posts at a time. Older nodes ignore it
+    /// and answer with their newest posts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -505,6 +510,17 @@ fn scan_since<T: for<'de> Deserialize<'de>>(prefix: &str, since: i64, limit: usi
         .collect()
 }
 
+/// Records keyed by post time with lo <= time < hi.
+fn scan_between<T: for<'de> Deserialize<'de>>(prefix: &str, lo: i64, hi: i64, limit: usize) -> Vec<T> {
+    let from = format!("{prefix}{:020}", lo.max(0)).into_bytes();
+    let end = format!("{prefix}{:020}", hi.max(0)).into_bytes();
+    crate::chain_db::dao_scan(prefix.as_bytes(), &from, false, limit)
+        .into_iter()
+        .take_while(|(k, _)| k.as_slice() < end.as_slice())
+        .filter_map(|(_, v)| decode(&v))
+        .collect()
+}
+
 fn react_key(post_ts: i64, post_id: &str, from: &str) -> Vec<u8> {
     format!("{REACTS}{:020}/{}/{}", post_ts.max(0), post_id, from).into_bytes()
 }
@@ -808,6 +824,9 @@ pub fn accept(wire: &Wire, now: i64, source: Source) -> Result<bool, &'static st
 
 pub fn sync_response(req: &SyncRequest, now: i64) -> SyncResponse {
     let since = req.since.max(now - KEEP_POSTS_SECS);
+    if let Some(before) = req.before {
+        return history_page(since, before);
+    }
     let posts = posts_since(since, SYNC_MAX_POSTS);
     let vote_floor = since.min(now - BAN_SECS - VOTE_WINDOW_SECS);
     let votes = votes_since(vote_floor, SYNC_MAX_VOTES);
@@ -820,6 +839,39 @@ pub fn sync_response(req: &SyncRequest, now: i64) -> SyncResponse {
     let deletes = scan_since(DELETES, since, SYNC_MAX_POSTS);
     let reacts = scan_since(REACTS, since, SYNC_MAX_VOTES);
     SyncResponse { posts, votes, names, edits, deletes, reacts, avatars }
+}
+
+/// The posts just before `before`, with the edits, deletions and reactions on them and
+/// their authors' names and pictures. Votes are not paged: the first sync has them.
+fn history_page(since: i64, before: i64) -> SyncResponse {
+    let posts: Vec<Post> = recent_posts(Some(before), SYNC_MAX_POSTS).into_iter().filter(|p| p.ts >= since).collect();
+    let lo = posts.first().map(|p| p.ts).unwrap_or(before);
+    let mut authors: Vec<&str> = posts.iter().map(|p| p.from.as_str()).collect();
+    authors.sort();
+    authors.dedup();
+    let names = authors.iter().copied().filter_map(name_of).collect();
+    let avatars = authors.into_iter().filter_map(avatar_of).collect();
+    SyncResponse {
+        edits: scan_between(EDITS, lo, before, SYNC_MAX_POSTS),
+        deletes: scan_between(DELETES, lo, before, SYNC_MAX_POSTS),
+        reacts: scan_between(REACTS, lo, before, SYNC_MAX_VOTES),
+        posts,
+        votes: Vec::new(),
+        names,
+        avatars,
+    }
+}
+
+pub fn oldest_post_ts() -> Option<i64> {
+    crate::chain_db::dao_scan(POSTS.as_bytes(), POSTS.as_bytes(), false, 1)
+        .into_iter()
+        .filter_map(|(_, v)| decode::<Post>(&v))
+        .map(|p| p.ts)
+        .next()
+}
+
+pub fn keep_secs() -> i64 {
+    KEEP_POSTS_SECS
 }
 
 pub fn ingest(resp: SyncResponse, now: i64) -> usize {
@@ -1000,7 +1052,8 @@ mod tests {
         let kp = key();
         let now = 1_800_000_000;
         assert_eq!(check_post(&sign_post(&kp, "", "hi", now + 3_600), now), Err("time"));
-        assert_eq!(check_post(&sign_post(&kp, "", "hi", now - 40 * DAY), now), Err("time"));
+        assert_eq!(check_post(&sign_post(&kp, "", "hi", now - 366 * DAY), now), Err("time"));
+        assert_eq!(check_post(&sign_post(&kp, "", "hi", now - 300 * DAY), now), Ok(()));
     }
 
     #[test]
@@ -1154,7 +1207,7 @@ mod tests {
         assert!(post_by_id(p.ts, &p.id()).is_none());
         assert_eq!(accept(&Wire::Post(p.clone()), now, Source::Sync), Ok(false));
         assert!(post_by_id(p.ts, &p.id()).is_none());
-        let resp = sync_response(&SyncRequest { since: now - 3_600 }, now);
+        let resp = sync_response(&SyncRequest { since: now - 3_600, before: None }, now);
         assert!(resp.deletes.iter().any(|d| d.post_id == p.id() && d.from == p.from));
     }
 
@@ -1179,13 +1232,38 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_node_can_page_back_through_the_whole_history() {
+        let now = chrono::Utc::now().timestamp();
+        let kp = key();
+        let old = sign_post(&kp, "Archive", "from months ago", now - 200 * 86_400);
+        let older = sign_post(&kp, "Archive", "even older", now - 300 * 86_400);
+        let gone = sign_post(&kp, "Archive", "deleted later", now - 250 * 86_400);
+        for p in [&old, &older, &gone] {
+            assert_eq!(accept(&Wire::Post(p.clone()), now, Source::Sync), Ok(true));
+        }
+        accept(&Wire::Delete(sign_delete(&kp, &gone, gone.ts + 1)), now, Source::Sync).unwrap();
+
+        let page = sync_response(&SyncRequest { since: now - KEEP_POSTS_SECS, before: Some(old.ts) }, now);
+        assert!(page.posts.iter().all(|p| p.ts < old.ts));
+        assert!(page.posts.contains(&older));
+        assert!(!page.posts.contains(&old));
+        assert!(page.deletes.iter().any(|d| d.post_id == gone.id()));
+        assert!(page.votes.is_empty());
+        assert!(oldest_post_ts().unwrap() <= older.ts);
+
+        let from_an_old_node: SyncRequest = serde_json::from_str(r#"{"since":5}"#).unwrap();
+        assert_eq!(from_an_old_node.before, None);
+        assert!(!serde_json::to_string(&SyncRequest { since: 5, before: None }).unwrap().contains("before"));
+    }
+
+    #[test]
     fn sync_carries_posts_votes_and_names() {
         let now = chrono::Utc::now().timestamp();
         let kp = key();
         let p = sign_post(&kp, "Syncer", "synced message", now - 5);
         accept(&Wire::Name(sign_name(&kp, "Syncer", now - 6)), now, Source::Local).unwrap();
         accept(&Wire::Post(p.clone()), now, Source::Local).unwrap();
-        let resp = sync_response(&SyncRequest { since: now - 3_600 }, now);
+        let resp = sync_response(&SyncRequest { since: now - 3_600, before: None }, now);
         assert!(resp.posts.contains(&p));
         assert!(resp.names.iter().any(|n| n.from == p.from && n.name == "Syncer"));
         let json = serde_json::to_vec(&resp).unwrap();

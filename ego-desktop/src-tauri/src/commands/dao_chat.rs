@@ -149,7 +149,7 @@ pub struct MemberView {
     pub address: String,
     pub name: String,
     pub avatar: String,
-    /// Messages kept by the network (it keeps the last 30 days), and the oldest of them.
+    /// Messages kept by the network (it keeps the last year), and the oldest of them.
     pub posts: usize,
     pub first_post: Option<i64>,
     pub last_post: Option<i64>,
