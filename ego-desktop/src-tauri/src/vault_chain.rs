@@ -24,6 +24,11 @@ pub const MAX_DELAY_SECS: i64 = 30 * DAY_SECS;
 pub const MAX_GUARDIANS: usize = 5;
 pub const MAX_QUEUED: u64 = 32;
 pub const FEE_ALLOWANCE_UEGOC: u64 = 100_000;
+/// From this block the allowance covers a normal fee (0.5 EGOC at most), so a vault
+/// with a zero limit can still freeze, cancel, vote and stake, and EGOC put into
+/// staking no longer counts as leaving: an unstake can only return it to this wallet.
+pub const FEES_V2_FROM_HEIGHT: u64 = 71_000;
+pub const FEE_ALLOWANCE_V2_UEGOC: u64 = crate::tokenomics::TRANSFER_FEE_UEGOC;
 pub const MAX_BODY_BYTES: usize = 4_096;
 pub const LIST_LIMIT: usize = 256;
 
@@ -395,9 +400,12 @@ fn cosigned(v: &Vault, tx: &LedgerTx) -> bool {
     !v.settings.second_key.is_empty() && cosign_signer(tx).as_deref() == Some(v.settings.second_key.as_str())
 }
 
-pub fn outflow(tx: &LedgerTx) -> u64 {
-    let fee = tx.fee_uegoc.saturating_sub(FEE_ALLOWANCE_UEGOC);
-    if crate::chain_db::is_unstake_tx(tx) || tx.to == tx.from {
+pub fn outflow(tx: &LedgerTx, height: u64) -> u64 {
+    let v2 = height >= FEES_V2_FROM_HEIGHT;
+    let allowance = if v2 { FEE_ALLOWANCE_V2_UEGOC } else { FEE_ALLOWANCE_UEGOC };
+    let fee = tx.fee_uegoc.saturating_sub(allowance);
+    let stays = crate::chain_db::is_unstake_tx(tx) || (v2 && crate::chain_db::is_stake_tx(tx));
+    if stays || tx.to == tx.from {
         fee
     } else {
         tx.amount.saturating_add(fee)
@@ -460,10 +468,10 @@ pub enum Gate {
     Refused(String, bool),
 }
 
-pub fn gate(v: &Vault, ov: &Ov, tx: &LedgerTx, now: i64) -> Gate {
+pub fn gate(v: &Vault, ov: &Ov, tx: &LedgerTx, now: i64, height: u64) -> Gate {
     let owner = tx.from.as_str();
     if is_vault_op(tx) {
-        return Gate::Counted(outflow(tx));
+        return Gate::Counted(outflow(tx, height));
     }
     if tx.memo.as_deref() == Some(SWEEP_MEMO) && !v.settings.recovery.is_empty() && tx.to == v.settings.recovery {
         return Gate::Free;
@@ -486,7 +494,7 @@ pub fn gate(v: &Vault, ov: &Ov, tx: &LedgerTx, now: i64) -> Gate {
     if cosigned(v, tx) {
         return Gate::Free;
     }
-    Gate::Counted(outflow(tx))
+    Gate::Counted(outflow(tx, height))
 }
 
 fn fits_limit(v: &Vault, already: u64, more: u64) -> bool {
@@ -535,7 +543,7 @@ impl Planner {
         let now = self.now;
         let v = self.vaults.entry(tx.from.clone()).or_insert_with(|| load_vault(ov, &tx.from, now)).clone();
         let Some(v) = v else { return Fit::Yes };
-        match gate(&v, ov, tx, now) {
+        match gate(&v, ov, tx, now, self.height) {
             Gate::Free => Fit::Yes,
             Gate::Exec(id) => {
                 if self.execs.insert((tx.from.clone(), id.clone())) {
@@ -718,7 +726,7 @@ pub(crate) fn apply_effects(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx])
     for tx in txs.iter().filter(|t| subject(t)) {
         let v = cache.entry(tx.from.clone()).or_insert_with(|| load_vault(ov, &tx.from, now)).clone();
         let Some(v) = v else { continue };
-        match gate(&v, ov, tx, now) {
+        match gate(&v, ov, tx, now, block.height) {
             Gate::Counted(n) if n > 0 => *counted.entry(tx.from.clone()).or_insert(0) += n,
             Gate::Exec(id) => execs.push((tx.from.clone(), id)),
             _ => {}
@@ -756,8 +764,9 @@ pub fn admit(tx: &LedgerTx) -> Result<(), String> {
     let db = crate::chain_db::global_db();
     let ov = Ov::new(db);
     let now = chrono::Utc::now().timestamp();
+    let height = crate::chain_db::local_chain_height().saturating_add(1);
     let Some(v) = load_vault(&ov, &tx.from, now) else { return Ok(()) };
-    match gate(&v, &ov, tx, now) {
+    match gate(&v, &ov, tx, now, height) {
         Gate::Free | Gate::Exec(_) => Ok(()),
         Gate::Counted(more) => {
             let already = spent_today(&ov, &tx.from, now);
@@ -968,6 +977,34 @@ mod tests {
         let mut tx = send(OWNER, OWNER, 0, None, 2);
         tx.fee_uegoc = 500 * EGOC;
         assert!(check(&ov, &[tx], 2_000).is_err());
+    }
+
+    #[test]
+    fn a_zero_limit_vault_can_still_freeze_and_stake_with_a_normal_fee() {
+        let mut ov = Ov::memory();
+        let mut s = settings("");
+        s.limit = 0;
+        setup(&mut ov, s);
+        let fee = crate::tokenomics::TRANSFER_FEE_UEGOC;
+        let mut freeze = op(OWNER, TX_FREEZE, &OwnerBody { owner: OWNER.into() }, 2);
+        freeze.fee_uegoc = fee;
+        let mut stake = send(OWNER, crate::chain_db::STAKING_ADDR, 50 * EGOC, Some("stake:30"), 3);
+        stake.tx_type = "stake".into();
+        stake.fee_uegoc = fee;
+        let judge = |tx: &LedgerTx, height: u64| {
+            let mut plan = Planner::new(height, 2_000);
+            matches!(plan.judge(&ov, tx), Fit::Yes)
+        };
+        assert!(!judge(&freeze, FEES_V2_FROM_HEIGHT - 1), "the old rule counted most of the fee");
+        assert!(!judge(&stake, FEES_V2_FROM_HEIGHT - 1));
+        assert!(judge(&freeze, FEES_V2_FROM_HEIGHT));
+        assert!(judge(&stake, FEES_V2_FROM_HEIGHT));
+        let mut out = send(OWNER, THIEF, 1, None, 4);
+        out.fee_uegoc = fee;
+        assert!(!judge(&out, FEES_V2_FROM_HEIGHT), "a send out still needs the limit");
+        let mut big_fee = send(OWNER, OWNER, 0, None, 5);
+        big_fee.fee_uegoc = fee + 1;
+        assert!(!judge(&big_fee, FEES_V2_FROM_HEIGHT), "a fee above normal still counts");
     }
 
     #[test]

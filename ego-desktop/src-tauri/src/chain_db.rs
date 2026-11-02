@@ -412,7 +412,7 @@ pub struct EquivocationProofPayload {
     pub reporter: String,
 }
 
-fn is_stake_tx(tx: &LedgerTx) -> bool {
+pub(crate) fn is_stake_tx(tx: &LedgerTx) -> bool {
     tx.tx_type == "stake" && tx.to == STAKING_ADDR && !tx.from.is_empty()
 }
 
