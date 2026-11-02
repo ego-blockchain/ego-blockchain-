@@ -197,12 +197,20 @@ function SettingsForm({ initial, owner, onSaved, existing }: { initial: VaultSet
       const made = await invoke<{ path: string; address: string }>('vault_create_key_file', { folder, password: pw });
       second = made.address;
     }
+    const limitU = Math.round(parseFloat(limit || '0') * EGOC);
+    const delayHours = parseFloat(delayH || '0');
     const hl = highLimit.trim() ? Math.round(parseFloat(highLimit) * EGOC) : 0;
+    const highHours = parseFloat(highDelayH || '0');
+    if (!(delayHours >= 1 && delayHours <= 720)) throw new Error('The delay is between 1 and 720 hours (30 days).');
+    if (highLimit.trim() && !(hl > 0)) throw new Error('The higher limit must be a number of EGOC, or leave it empty.');
+    if (hl > 0 && hl <= limitU) throw new Error(`The higher limit must be more than the daily limit (${limit} EGOC), or leave it empty.`);
+    if (hl > 0 && !highDelayH.trim()) throw new Error('Enter the delay above the higher limit, for example 72 hours, or leave the higher limit empty.');
+    if (hl > 0 && !(highHours > delayHours && highHours <= 720)) throw new Error(`The delay above the higher limit must be longer than ${delayH} hours and at most 720 hours (30 days).`);
     return {
-      limit: Math.round(parseFloat(limit || '0') * EGOC),
-      delay: Math.round(parseFloat(delayH || '0') * HOUR),
+      limit: limitU,
+      delay: Math.round(delayHours * HOUR),
       high_limit: hl,
-      high_delay: hl ? Math.round(parseFloat(highDelayH || '0') * HOUR) : 0,
+      high_delay: hl ? Math.round(highHours * HOUR) : 0,
       recovery: recovery.trim(),
       second_key: second,
       guardians: guardians.split(/[\s,]+/).map(g => g.trim()).filter(Boolean),
