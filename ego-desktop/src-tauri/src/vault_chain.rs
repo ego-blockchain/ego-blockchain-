@@ -709,7 +709,7 @@ pub fn apply_block(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx]) {
     }
 }
 
-fn apply_effects(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx]) {
+pub(crate) fn apply_effects(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx]) {
     let now = block.timestamp;
     let day = now.div_euclid(DAY_SECS);
     let mut counted: BTreeMap<String, u64> = BTreeMap::new();

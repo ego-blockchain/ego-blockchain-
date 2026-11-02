@@ -145,8 +145,68 @@ pub fn get_db() -> DbWrapper {
         migrate_faucet_totals(&db);
         rebuild_derived_state_once(&db);
         migrate_history_index(&db);
+        rebuild_vault_state_once(&db);
         db
     }))
+}
+
+const META_VAULT_REBUILT: &[u8] = b"vault_rebuilt_v1";
+
+fn rebuild_vault_state_once(db: &DB) {
+    if drs_meta(db, META_VAULT_REBUILT).is_some() {
+        return;
+    }
+    let Some(from) = crate::vault_chain::ACTIVATION_HEIGHT else { return };
+    match rebuild_feature_state(db, from, b"vault:", crate::vault_chain::apply_block) {
+        Ok(blocks) => {
+            if blocks > 0 {
+                eprintln!("[ChainDB] vault records rebuilt from the {blocks} blocks since block {from}");
+            }
+            if let Some(cf) = db.cf_handle(CF_META) {
+                let _ = db.put_cf(cf, META_VAULT_REBUILT, b"1");
+            }
+        }
+        Err(e) => eprintln!("[ChainDB] vault records not rebuilt yet: {e}"),
+    }
+}
+
+fn rebuild_feature_state(
+    db: &DB,
+    from: u64,
+    prefix: &[u8],
+    apply: impl Fn(&mut crate::drs::Ov, &LedgerBlock, &[&LedgerTx]),
+) -> Result<u64, String> {
+    let tip = local_chain_height_in(db);
+    if tip < from {
+        return Ok(0);
+    }
+    for h in from..=tip {
+        if history_piece_in(db, h).is_none() {
+            return Err(format!("block {h} is not complete on this node"));
+        }
+    }
+    let cf_meta = db.cf_handle(CF_META).ok_or("meta is missing")?;
+    let mut ov = crate::drs::Ov::new(db);
+    let mut stale = Vec::new();
+    for item in db.prefix_iterator_cf(cf_meta, prefix) {
+        let Ok((k, _)) = item else { break };
+        if !k.starts_with(prefix) {
+            break;
+        }
+        stale.push(k.to_vec());
+    }
+    for k in stale {
+        ov.del(k);
+    }
+    for h in from..=tip {
+        let (block, txs) = history_piece_in(db, h).ok_or_else(|| format!("block {h} went missing"))?;
+        let refs: Vec<&LedgerTx> = txs.iter().collect();
+        apply(&mut ov, &block, &refs);
+    }
+    let mut batch = WriteBatch::default();
+    ov.flush(&mut batch);
+    db.write(batch).map_err(|e| e.to_string())?;
+    Ok(tip - from + 1)
 }
 
 const RESYNC_FLAG: &str = "resync_chain.flag";
@@ -11864,6 +11924,55 @@ mod history_tests {
             "the restored block is the one that was dropped"
         );
         assert_eq!(history_store_in(&db, &served), 0, "storing again changes nothing");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_node_that_updated_late_rebuilds_the_vaults_it_missed() {
+        let (db, dir) = scratch_db("vaultrebuild");
+        let owner = "egot1vaultownervaultownervaultownervaultowner";
+        let settings = crate::vault_chain::Settings {
+            limit: 5_000_000,
+            delay: 86_400,
+            high_limit: 0,
+            high_delay: 0,
+            recovery: String::new(),
+            second_key: String::new(),
+            guardians: vec![],
+        };
+        let call_args = serde_json::to_string(&crate::vault_chain::SetBody { settings: settings.clone() }).unwrap();
+        let op = LedgerTx {
+            hash: "0xvaultset".into(),
+            from: owner.into(),
+            to: owner.into(),
+            memo: crate::vault_chain::memo_for(crate::vault_chain::TX_SET, &call_args),
+            tx_type: crate::vault_chain::TX_SET.into(),
+            call_args,
+            nonce: 1,
+            signature: "ab".into(),
+            ..LedgerTx::default()
+        };
+        for h in 1..=6 {
+            let txs = if h == 3 { vec![op.clone()] } else { vec![] };
+            commit(&db, h, &txs);
+        }
+        let ov = crate::drs::Ov::new(&db);
+        assert!(crate::vault_chain::raw_vault(&ov, owner).is_none(), "the block was applied while the vault was off here");
+        drop(ov);
+        if let Some(cf) = db.cf_handle(CF_META) {
+            db.put_cf(cf, b"vault:v:egot1ghost", b"{}").unwrap();
+        }
+        assert_eq!(rebuild_feature_state(&db, 2, b"vault:", crate::vault_chain::apply_effects).unwrap(), 5);
+        let ov = crate::drs::Ov::new(&db);
+        assert_eq!(crate::vault_chain::raw_vault(&ov, owner).map(|v| v.settings), Some(settings.clone()));
+        assert!(ov.get(b"vault:v:egot1ghost").is_none(), "records no block made are dropped");
+        drop(ov);
+        let before: Vec<Vec<u8>> = db.prefix_iterator_cf(db.cf_handle(CF_META).unwrap(), b"vault:").filter_map(|i| i.ok()).map(|(k, v)| [k.to_vec(), v.to_vec()].concat()).collect();
+        rebuild_feature_state(&db, 2, b"vault:", crate::vault_chain::apply_effects).unwrap();
+        let after: Vec<Vec<u8>> = db.prefix_iterator_cf(db.cf_handle(CF_META).unwrap(), b"vault:").filter_map(|i| i.ok()).map(|(k, v)| [k.to_vec(), v.to_vec()].concat()).collect();
+        assert_eq!(before, after, "a second rebuild changes nothing");
+        assert!(rebuild_feature_state(&db, 9, b"vault:", crate::vault_chain::apply_effects).unwrap() == 0, "nothing to do below the switch");
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
