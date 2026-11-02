@@ -58,7 +58,12 @@ pub struct HoldsStatus {
 }
 
 fn status_now() -> HoldsStatus {
-    let me = Ledger::load().address;
+    status_for(Ledger::load().address)
+}
+
+/// The holds as `me` sees them: its own votes, stake and locked funds. The gateway
+/// serves it to phones, which have no ledger here.
+pub fn status_for(me: String) -> HoldsStatus {
     let ov = Ov::new(crate::chain_db::global_db());
     let at = now();
     let mut holds: Vec<HoldView> = hc::live(&ov)

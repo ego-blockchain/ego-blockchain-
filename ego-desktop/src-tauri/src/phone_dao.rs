@@ -8,7 +8,7 @@ use crate::drs::Ov;
 
 type RpcResult = Result<Value, (i32, String)>;
 
-pub const METHODS: &[&str] = &["staking.status", "dao.list", "dao.proposal", "dao.banStatus", "dao.limits"];
+pub const METHODS: &[&str] = &["staking.status", "dao.list", "dao.proposal", "dao.banStatus", "dao.limits", "holds.status"];
 
 pub async fn dispatch(method: &str, params: &Value) -> Option<RpcResult> {
     let params = params.clone();
@@ -19,6 +19,7 @@ pub async fn dispatch(method: &str, params: &Value) -> Option<RpcResult> {
         "dao.proposal" => dao_proposal(&params),
         "dao.banStatus" => dao_ban_status(&params),
         "dao.limits" => dao_limits(&params),
+        "holds.status" => holds_status(&params),
         _ => Err((-32601, crate::gateway::NOT_HERE.to_string())),
     };
     Some(tokio::task::spawn_blocking(run).await.unwrap_or_else(|e| Err((-32603, e.to_string()))))
@@ -170,6 +171,13 @@ fn dao_limits(params: &Value) -> RpcResult {
     }))
 }
 
+/// Theft holds as an address sees them: each hold, its tallies and this address's
+/// votes. Holds stay off until the network switches them on; `active` says so.
+fn holds_status(params: &Value) -> RpcResult {
+    let addr = address(params, "address")?;
+    to_value(crate::commands::holds::status_for(addr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +217,20 @@ mod tests {
         let reveal = format!(r#"{{"answers":[0,1,2],"id":"dao0123456789abcdef","salt":"{}"}}"#, "c".repeat(64));
         let parsed: d::RevealBody = serde_json::from_str(&reveal).unwrap();
         assert_eq!(parsed.answers, vec![0, 1, 2]);
+        let hold_vote = r#"{"id":"hold0123456789abcdef","phase":"confirm","yes":true}"#;
+        assert!(serde_json::from_str::<crate::hold_chain::VoteBody>(hold_vote).is_ok());
+        assert_eq!(
+            crate::hold_chain::memo_for(crate::hold_chain::TX_VOTE, hold_vote).unwrap(),
+            "hold:vote:b1345742d18521913f54d3a1bc0302c71d10471f8bbcaa67b30a03b4abfca2e0"
+        );
+    }
+
+    #[test]
+    fn holds_answer_even_while_switched_off() {
+        let h = holds_status(&json!({ "address": ADDR })).unwrap();
+        assert_eq!(h["me"], ADDR);
+        assert!(h["holds"].is_array());
+        assert_eq!(h["min_bond"], crate::hold_chain::MIN_BOND_UEGOC);
     }
 
     #[test]
