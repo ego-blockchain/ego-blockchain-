@@ -17192,7 +17192,7 @@ fn ensure_firewall_rule() {
     // program covers the P2P port, mDNS, and any future ports in one rule.
     if let Ok(exe) = std::env::current_exe() {
         let exe_str = exe.to_string_lossy().to_string();
-        let name = "Ego Desktop (allow app)";
+        let name = &format!("Ego Desktop app {}", &blake3::hash(exe_str.to_lowercase().as_bytes()).to_hex()[..8]);
         let exists = std::process::Command::new("netsh")
             .args(["advfirewall", "firewall", "show", "rule", &format!("name={}", name)])
             .creation_flags(CREATE_NO_WINDOW)
@@ -17218,6 +17218,7 @@ fn ensure_firewall_rule() {
         (format!("Ego Desktop P2P UDP {}", p2p_port()), "UDP", p2p_port()),
         // mDNS multicast — required for zero-config same-LAN peer discovery.
         ("Ego Desktop mDNS UDP 5353".to_string(), "UDP", 5353),
+        (phones_rule_name(), "TCP", crate::gateway::port()),
     ] {
         let check = std::process::Command::new("netsh")
             .args(["advfirewall", "firewall", "show", "rule", &format!("name={}", name)])
@@ -17242,6 +17243,58 @@ fn ensure_firewall_rule() {
 
 #[cfg(not(target_os = "windows"))]
 fn ensure_firewall_rule() {}
+
+pub fn phones_rule_name() -> String {
+    format!("Ego Desktop phones TCP {}", crate::gateway::port())
+}
+
+#[cfg(target_os = "windows")]
+pub fn phones_allowed() -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    std::process::Command::new("netsh")
+        .args(["advfirewall", "firewall", "show", "rule", &format!("name={}", phones_rule_name())])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&phones_rule_name()))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn phones_allowed() -> bool {
+    true
+}
+
+#[cfg(target_os = "windows")]
+pub fn allow_phones_elevated() -> Result<(), String> {
+    use base64::Engine as _;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let port = crate::gateway::port();
+    let script = format!(
+        "Start-Process -FilePath netsh -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList 'advfirewall firewall add rule name=\"{}\" dir=in action=allow protocol=TCP localport={port} enable=yes profile=any'",
+        phones_rule_name()
+    );
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", &encoded])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if phones_allowed() {
+        Ok(())
+    } else if out.status.success() {
+        Err("Windows did not add the rule".into())
+    } else {
+        Err("Windows did not allow the change".into())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn allow_phones_elevated() -> Result<(), String> {
+    Ok(())
+}
 
 pub async fn run_porep_challenge_loop() {
     // Wait for p2p to fully start before issuing challenges.

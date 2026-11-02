@@ -14,6 +14,7 @@ pub mod outbox;
 pub mod tx_pending;
 pub mod vault;
 pub mod holds;
+pub mod phone_access;
 pub mod tx_transport;
 pub mod consensus;
 pub mod contracts;

@@ -117,7 +117,9 @@
         "wix": {
           "language": "en-US",
           "bannerPath": "installer/banner.bmp",
-          "dialogImagePath": "installer/dialog.bmp"
+          "dialogImagePath": "installer/dialog.bmp",
+          "fragmentPaths": ["installer/firewall.wxs"],
+          "componentRefs": ["EgoFirewallRules"]
         },
         "nsis": {
           "languages": [

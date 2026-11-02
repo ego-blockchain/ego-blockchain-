@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="EgoFirewallRules" Guid="6E1E5C4B-6A0F-4F7B-9C33-1E6E0C2B47A8">
+        <RegistryValue Root="HKLM" Key="Software\Ego Blockchain\Ego Desktop" Name="FirewallRules" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <CustomAction Id="EgoFirewallDropApp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no" Return="ignore"
+      ExeCommand='"[System64Folder]netsh.exe" advfirewall firewall delete rule name="Ego Desktop (installed app)"' />
+    <CustomAction Id="EgoFirewallAddApp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no" Return="ignore"
+      ExeCommand='"[System64Folder]netsh.exe" advfirewall firewall add rule name="Ego Desktop (installed app)" dir=in action=allow program="[INSTALLDIR]Ego Desktop.exe" enable=yes profile=any' />
+    <CustomAction Id="EgoFirewallDropPhones" Directory="INSTALLDIR" Execute="deferred" Impersonate="no" Return="ignore"
+      ExeCommand='"[System64Folder]netsh.exe" advfirewall firewall delete rule name="Ego Desktop phones TCP 47398"' />
+    <CustomAction Id="EgoFirewallAddPhones" Directory="INSTALLDIR" Execute="deferred" Impersonate="no" Return="ignore"
+      ExeCommand='"[System64Folder]netsh.exe" advfirewall firewall add rule name="Ego Desktop phones TCP 47398" dir=in action=allow protocol=TCP localport=47398 enable=yes profile=any' />
+    <CustomAction Id="EgoFirewallRemoveApp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no" Return="ignore"
+      ExeCommand='"[System64Folder]netsh.exe" advfirewall firewall delete rule name="Ego Desktop (installed app)"' />
+    <CustomAction Id="EgoFirewallRemovePhones" Directory="INSTALLDIR" Execute="deferred" Impersonate="no" Return="ignore"
+      ExeCommand='"[System64Folder]netsh.exe" advfirewall firewall delete rule name="Ego Desktop phones TCP 47398"' />
+
+    <InstallExecuteSequence>
+      <Custom Action="EgoFirewallDropApp" After="InstallFiles">NOT REMOVE~="ALL"</Custom>
+      <Custom Action="EgoFirewallAddApp" After="EgoFirewallDropApp">NOT REMOVE~="ALL"</Custom>
+      <Custom Action="EgoFirewallDropPhones" After="EgoFirewallAddApp">NOT REMOVE~="ALL"</Custom>
+      <Custom Action="EgoFirewallAddPhones" After="EgoFirewallDropPhones">NOT REMOVE~="ALL"</Custom>
+      <Custom Action="EgoFirewallRemoveApp" Before="RemoveFiles">REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="EgoFirewallRemovePhones" After="EgoFirewallRemoveApp">REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

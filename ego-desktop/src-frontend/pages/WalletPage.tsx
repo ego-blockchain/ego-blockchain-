@@ -5,6 +5,7 @@ import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 import Pagination from '../components/Pagination';
 import VaultPanel, { VaultSendChoice } from '../components/Vault';
+import PhoneAccessBanner from '../components/PhoneAccessBanner';
 import { txDisplayAmount, EGOC_PRICE_USD } from '../constants';
 
 import { RPC_URL } from '../config';
@@ -1474,6 +1475,7 @@ const WalletPage: React.FC = () => {
         `}</style>
       </div>
 
+      <PhoneAccessBanner />
       <VaultPanel />
 
       {}

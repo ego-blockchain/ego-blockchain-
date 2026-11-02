@@ -1226,6 +1226,8 @@ fn main() {
             commands::vault::vault_create_key_file,
             commands::vault::vault_use_key_file,
             commands::holds::get_holds,
+            commands::phone_access::get_phone_access,
+            commands::phone_access::allow_phone_access,
             commands::holds::hold_request,
             commands::holds::hold_vote,
             commands::holds::hold_appeal,
