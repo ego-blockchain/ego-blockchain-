@@ -806,7 +806,8 @@ pub fn is_batch_tx(tx: &LedgerTx) -> bool {
         || tx.tx_type == TX_READY_BATCH
         || tx.tx_type == TX_TM_READY_BATCH
         || tx.tx_type == TX_COVERAGE_BATCH
-        || tx.tx_type == crate::state_cert::TX_STATE_CERT)
+        || tx.tx_type == crate::state_cert::TX_STATE_CERT
+        || tx.tx_type == crate::hold_chain::TX_CERT)
         && tx.from.is_empty()
         && tx.to == NODE_POOL_ADDR
         && tx.amount == 0

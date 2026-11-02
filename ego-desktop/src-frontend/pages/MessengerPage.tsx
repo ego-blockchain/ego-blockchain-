@@ -333,12 +333,36 @@ const AI_STARTERS: { heading: string; questions: string[] }[] = [
       'How does staking work?',
     ],
   },
+  {
+    heading: 'Safety & developers',
+    questions: [
+      'What is the wallet vault?',
+      'What happens if my coins are stolen?',
+      'Where is the developer API?',
+    ],
+  },
 ];
 
 // Follow-ups offered under each answer, picked from what was just asked so the
 // next step is related rather than random. First matching topic wins; anything
 // unmatched falls back to the starter list.
 const AI_FOLLOW_UPS: { topic: RegExp; questions: string[] }[] = [
+  {
+    topic: /vault|stolen|theft|steal|hack|guardian|second key|freeze/i,
+    questions: [
+      'What is the wallet vault?',
+      'What happens if my coins are stolen?',
+      'How does DAO voting work?',
+    ],
+  },
+  {
+    topic: /\bapi\b|rpc|json|endpoint|window\.ego|gateway/i,
+    questions: [
+      'Where is the developer API?',
+      'How do I run a node?',
+      'How do I deploy a contract?',
+    ],
+  },
   {
     topic: /dapp|decentrali[sz]ed app|web3 app/i,
     questions: [

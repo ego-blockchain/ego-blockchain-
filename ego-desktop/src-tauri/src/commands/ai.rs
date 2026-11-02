@@ -210,15 +210,28 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - Auto-refresh every 10s preserves current page.
 
 ## DAO Governance
-- Ego DAO is fully decentralized — community-submitted proposals, community-submitted knowledge tests, no admin override.
-- **Two-type voting per proposal** (both required to reach quorum):
-  1. **Stake Vote**: power = your_staked_egoc / total_staked_egoc. Reflects economic stake.
-  2. **Knowledge Vote**: voter answers an attached multiple-choice test; score = correct/total × 10 knowledge points. Combined = (stake_power + knowledge_power) / 2. Rewards informed participation over pure capital.
-- **Proposal types**: ParameterChange (e.g. APR, block reward split), FeatureFlag (enable/disable a protocol feature), TextResolution (signal/DAO statement).
-- **Proposal flow**: Any community member creates proposal → optional knowledge test attached → 7-day voting period (default) → 5% quorum required → passes if combined winning option > 50%.
-- **Knowledge test**: 1–10 questions, each with 2–4 options. Creator marks correct answers (stored server-side, not revealed to voters until after voting ends).
-- **Results**: per-option stake_power, knowledge_power, and combined_power shown after voting closes. Results stored on-chain in RocksDB CF_DAO.
-- Governance page: proposal list (Active/All/Passed/Failed/Expired tabs), create proposal modal, proposal detail modal with stake vote + knowledge test + results bars.
+- On chain since v0.3.672 (block 65,103): proposals and votes are transactions and every node computes the same result. No admin override.
+- **Stake Vote**: power = your staked EGOC / staked EGOC of all voters. The stake is locked until the vote ends, so coins can't vote twice.
+- **Knowledge Vote**: only a hash of the voter's answers goes on chain during the vote; after it ends the creator reveals the correct answers and voters' apps reveal theirs automatically. Unrevealed votes score nothing. Combined = (stake_power + knowledge_power) / 2; winner needs > 50%.
+- **Quorum**: at least 3 stake voters holding at least 1% of all staked EGOC. Voting 1–30 days (7 default). 5 proposals per address per 30 days; the creator can withdraw an open proposal.
+- **Reporting a spam proposer**: staked EGOC only, the report locks that stake for 30 days; a proposer is blocked while 3+ reporters holding 1%+ of all staked EGOC have reported them.
+- Governance page: proposals (Active/All/Passed/Failed/Expired), Theft holds tab, community chat.
+
+## Wallet Vault (v0.3.673, active from block 67,922)
+- Daily limit sent at once; above it a send waits (e.g. 24 h, longer above a higher limit) or needs the second key. Second key = a wallet on another device, an encrypted key file in a chosen folder, or a password-derived key. Recovery address + sweep (works while frozen). Up to 5 guardians who can cancel and freeze but never move coins.
+- Tightening applies at once; loosening (limit up, new recovery address, different second key, removing a guardian, unfreeze, turning off) waits the delay unless the second key approves. Alerts when anything starts waiting.
+- The Chrome extension and iPhone app can't approve with a second key yet.
+
+## Theft Holds (built, switched off until an outside security review and 64+ nodes)
+- Anyone requests a hold listing the theft and hop transactions: 10 EGOC fee burned, bond ≥ 100 EGOC locked. A DRS-drawn committee checks on-chain facts, computes the traced amount and must sign 2/3+1 within one hour, else nothing is frozen.
+- Only the traced amount is held; coins above it move; nodes keep earning; a hold never takes coins. Tracing: listed transactions only, own coins spent first, never more than the lowest balance since the theft, total ≤ stolen.
+- 72-hour vote: stake and node votes separately, each ≥ 3 voters, stake ≥ 1% of staked EGOC, nodes ≥ 5% of node weight, 2/3 yes in both. Confirmed = 90 days. Rejected = bond to the held address. Missed quorum = bond refunded. Returning coins needs a second vote. One free appeal; 30-day cool-down.
+- Can't reach coins moved to another chain, the shielded pool, a contract or escrow, and doesn't stop exchange break-ins like Binance's.
+
+## Developer API (https://api.egoblockchain.com)
+- Browser: Ego Wallet extension `window.ego.request` (ego_requestAccounts, ego_sendTransaction, ego_callContract, ego_signMessage). Server: own node, JSON-RPC POST http://127.0.0.1:47395/ (EGO_HEADLESS=1), WS /ws.
+- Public read-only routes (open CORS, GET, rate limited): /health, /chain/blocks, /chain/transactions, /egoc, /prices, /price/:symbol, /nodes, /gateways, /hosting/nodes/:domain. Also on rpc.egoblockchain.com.
+- Gateways: HTTPS on port 47398 (/rpc, /storage), self-signed certs pinned via cert_sha256 from /gateways; 120 credits per IP refilling 6/s, tx.submit costs 20.
 
 ### Shielded Transactions (Privacy)
 - **How it works**: Move EGOC into the shielded pool with a `shield` deposit; the wallet keeps a secret note. Later `unshield` to any address. The withdrawal's `from` is the pool address, identical on every withdrawal, so the sender is not on the chain and nothing links the withdrawal to the deposit that funded it.
@@ -341,6 +354,85 @@ pub async fn ask_ego_ai(
         "Hello! I am Ego AI. How can I help you with Ego Blockchain today?"
     } else if q.contains("who made you") || q.contains("creator") {
         "I'm Ego AI, built by the Ego Blockchain team."
+
+    } else if q.contains("vault") || q.contains("second key") || has_any_word(&q, &["guardian", "guardians", "sweep"])
+        || q.contains("recovery address") || q.contains("freeze my wallet") || q.contains("self-freeze") || q.contains("self freeze") {
+        r#"The **wallet vault** protects a wallet even after someone has copied its key. It is in Ego Desktop (Wallet page → **Vault**) and switches on at block 67,922 with v0.3.673; before that the panel says it is not active yet.
+
+### What you set
+- **Daily limit** — sends up to this amount go out at once, as today.
+- **Delay** — anything above the limit waits, for example 24 hours. A **higher limit** can wait longer, for example 72 hours.
+- **Second key** — a wallet on another device (a second computer), an encrypted key file in a folder you choose, or a key made from a password. A large send it approves goes out at once. The key file is useless without its password, but a USB stick is safer than a folder on the same computer.
+- **Recovery address** — a wallet you keep somewhere else. **Sweep** sends everything there in one step, even while the wallet is frozen.
+- **Guardians** — up to 5 addresses you trust. They can cancel a waiting send and freeze the wallet, but never move coins anywhere.
+
+### Why a thief can't switch it off
+Tightening applies at once. **Loosening waits out the delay**: raising the limit, a new recovery address, a different second key, removing a guardian, unfreezing or turning the vault off. You get an alert as soon as anything starts waiting, and you, your second key or a guardian can cancel it. Only your second key can make a loosening apply at once.
+
+### Why a key and not a password
+Someone who steals your key doesn't need the Ego app — they can sign a transaction with their own software. Every node has to check the approval, and nodes can check a signature but not a password: a password inside the transaction could be copied, and a password hash on chain could be guessed offline. Keep the second key on a different device, so malware on one computer can't take both.
+
+### Limits
+- The Chrome extension and iPhone app can't approve with the second key yet; their large sends from a vaulted wallet are refused.
+- A thief can still move up to your daily limit each day until you freeze — keep the limit modest."#
+
+    } else if q.contains("theft") || q.contains("stolen") || has_any_word(&q, &["steal", "hacked", "hack", "hacker", "hackers", "binance"])
+        || q.contains("hold request") || q.contains("freeze an address") || q.contains("freeze a thief") || q.contains("freeze someone") {
+        r#"Ego can stop stolen coins **without anyone having the power to freeze accounts** — not the founding team, not a company. Two layers do it.
+
+### 1. Wallet vault (your own wallet)
+Large sends wait or need your second key, so a stolen key can't empty the wallet at once. Ask me "what is the wallet vault" for the details.
+
+### 2. Theft holds (the thief's address)
+1. **Request** — anyone files a request listing the theft transactions and the hops the coins took, with a short case. It burns a **10 EGOC** fee and locks a **bond of at least 100 EGOC** in the requester's wallet.
+2. **Random committee** — a committee of online nodes drawn by verifiable randomness (nobody picks them) checks only facts anyone can verify on chain, computes the stolen amount, and must sign with **2/3 + 1 within one hour**. If not, nothing is frozen.
+3. **Hold** — only the **traced stolen amount** stays put on each address. Coins above it move freely, incoming coins arrive, and the node keeps running and earning. A hold never takes coins.
+4. **Vote, 72 hours** — staked EGOC and nodes (weighted by DRS) vote separately. Each group needs at least 3 voters, the stake vote 1% of all staked EGOC, the node vote 5% of all node weight, and **2/3 yes in both**. Large holders alone, or someone running many nodes, can't decide it.
+5. **Outcome** — confirmed: held for 90 days. Rejected: released, and the bond goes to the held address. Missed quorum: released, bond refunded (the fee stays burned).
+6. **Return** — sending coins back to the victim needs a **second vote** with the same rules.
+
+The held address gets one free appeal, and an address can't be held again for 30 days after a hold ends unconfirmed.
+
+### How the stolen amount is counted
+Coins are followed only along the listed transactions. When stolen coins mix with other money, other sends spend the owner's own coins first, and an address is never held for more than its lowest balance since the theft — so coins that arrive later are never treated as stolen. The total held never exceeds what was stolen.
+
+### What it can't do
+- It can't reach coins already moved to another blockchain, into the shielded pool, a contract or an escrow.
+- It wouldn't have stopped a break-in like the one at Binance, where an exchange's own systems were compromised. It limits what a stolen key can do and catches coins still on Ego.
+
+### Status
+Theft holds are built into Ego Desktop (Governance → **Theft holds**) but **switched off**. They switch on only after an outside security review and once at least 64 nodes are in the pool."#
+
+    } else if q.contains("api.egoblockchain") || has_any_word(&q, &["api", "apis", "rpc", "jsonrpc"]) || q.contains("json-rpc")
+        || q.contains("developer api") || q.contains("window.ego") || q.contains("integrate ego") {
+        r#"The developer docs are at **https://api.egoblockchain.com**. Ego speaks **JSON-RPC 2.0** plus a few plain HTTP routes (no GraphQL).
+
+### Three ways in
+- **In the browser** — the Ego Wallet extension injects `window.ego`. Call `window.ego.request({ method, params })`: `ego_requestAccounts`, `ego_accounts`, `ego_chainId` (`0x1`), `ego_sendTransaction` (`[{ to, amount_egoc, memo? }]`), `ego_callContract`, `ego_signMessage`. The user approves each one in the popup; the key never reaches the page.
+- **On your server** — run your own node (`EGO_HEADLESS=1`) and call `POST http://127.0.0.1:47395/`. WebSocket at `/ws` (`eth_subscribe` → `newHeads`, `newPendingTransactions`).
+- **Public, read-only** — `https://api.egoblockchain.com` (also on `rpc.egoblockchain.com`): `GET /health`, `/chain/blocks`, `/chain/transactions`, `/egoc`, `/prices`, `/price/:symbol`, `/nodes`, `/gateways`, `/hosting/nodes/:domain`. Open CORS, GET only, rate limited per IP. Good for stats, not the source of truth.
+
+### Main node methods
+- Wallet: `wallet.getBalance`, `wallet.getNonce` (gives `next`, `fee_uegoc`, `chain_id`, `tx_version`), `wallet.getTransactionHistory`, `wallet.getTransaction`, `tx.submit`.
+- Chain: `chain.getFinalizedHeight`, `chain.getBlocks`, `chain.getBlockHeaders`, `chain.getNetworkStats`, `chain.getEgocPrice`, `chain.getTxProof`, `chain.verifyTxProof`.
+- Contracts: `contract.listDeployed`, `contract.getState`, `contract.getActivity`, `contract.query` (read-only call).
+- Also `market.*`, `shielded.*`, `p2p.getPeers`, `ego_getValidators`, `ego_getMempoolStats`.
+
+Amounts are integers in uEGOC (1 EGOC = 1,000,000 uEGOC).
+
+### Confirming a payment
+Poll `wallet.getTransaction` until `block_height` is set, then compare with `chain.getFinalizedHeight`. At or below the finalized height it's final and never reverted. To tie a payment to an order, use a memo like `myapp:order:42` — it's signed, so it can't be changed in transit.
+
+### Sign-in
+Have the page sign a one-time challenge with `ego_signMessage` and check the Ed25519 signature on your server. The wallet signs `"\x19Ego Signed Message:\n" + byteLength + "\n" + message`.
+
+### Gateways (phones and servers without a node)
+Every node serves an HTTPS gateway on port **47398** (`/rpc`, and `/storage` for file blocks). Public ones are listed at `GET /gateways` with a `cert_sha256` to pin, since they use self-signed certificates. Each IP gets 120 request credits refilling at 6 per second; `tx.submit` costs 20.
+
+### Watch out
+- A node's API has no login or rate limit — keep it on localhost or put nginx in front.
+- A node only answers browser calls from localhost and extensions, so web pages go through your backend.
+- Some `eth_*` methods answer with placeholders and `eth_sendRawTransaction` isn't supported; use the native methods."#
 
     // ── Smart contracts, Urego and the dApp IDE ──────────────────────────────
     // Ordered specific → general: "urego example" and "dapp ide" both contain
@@ -1123,7 +1215,20 @@ No validator may hold more than half of what every other validator holds combine
     } else if q.contains("host") || q.contains("website") || q.contains("domain") || q.contains(".eo") {
         "Ego offers decentralized Web3 hosting for static sites and Python Flask apps. Sites are accessible via `.eo` domains (e.g., `mysite.eo`) using the local HTTPS gateway and TLS certificates."
     } else if q.contains("dao") || q.contains("govern") || q.contains("vote") {
-        "Ego's DAO uses a unique two-factor voting system: Stake Power (economic weight) and Knowledge Power (score from a proposal-specific quiz). This ensures voters are both invested and informed."
+        r#"Ego's DAO is **on chain since v0.3.672 (block 65,103)**: proposals and votes are transactions, so every node counts the same result and nobody can override it.
+
+### Two kinds of vote
+- **Stake vote** — power = your **staked** EGOC ÷ the staked EGOC of everyone who voted. Your stake stays **locked until the vote ends**, so the same coins can't vote twice.
+- **Knowledge vote** — answer the proposal's quiz. Only a **hash of your answers** goes on chain during the vote, so nobody can copy them. After voting ends the creator reveals the correct answers and your app reveals yours automatically; a vote whose answers are never revealed scores nothing.
+- Combined power = (stake power + knowledge power) ÷ 2. The winning option needs more than 50%.
+
+### Rules
+- **Quorum**: at least 3 stake voters holding together at least 1% of all staked EGOC.
+- Voting runs 1–30 days (7 by default). Each address may create **5 proposals per 30 days**, and the creator can withdraw a proposal while it's open.
+- **Report a spam proposer**: only staked EGOC can report, and the report locks that stake for 30 days. A proposer is blocked while at least 3 reporters holding at least 1% of all staked EGOC have reported them; reports last 30 days.
+
+### Where
+Ego Desktop → **Governance**. The same page has the community chat and the **Theft holds** tab."#
     } else if q.contains("coverage") || q.contains("poc") || q.contains("beacon") {
         "Proof-of-Coverage (PoC) rewards nodes for maintaining high network uptime and reachability. Nodes ping the network, mapping their location to H3 cells, to build a resilient decentralized mesh."
     } else if q.contains("privacy") || q.contains("shielded") || q.contains("private") || q.contains("mask") {
@@ -1181,6 +1286,9 @@ tokenomics · EGOC & EGUSD · DEX & AMM · oracle price feed · cross-chain brid
 ### Run it
 run a node · node types · testnet deployment · Ego Devices · mobile wallet · Messenger · EgoSafe
 
+### Safety & integration
+**wallet vault** · **theft holds** · **developer API** (api.egoblockchain.com)
+
 New here? Try **"what is Ego"**, **"what is a dApp"**, or **"show me a contract example"**."#
     };
 
@@ -1207,6 +1315,16 @@ mod ai_routing_tests {
 
     async fn ask(question: &str) -> String {
         ask_ego_ai(question.to_string(), Vec::new()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn safety_and_api_questions_reach_their_answers() {
+        assert!(ask("how do i set up the wallet vault").await.contains("Loosening waits"));
+        assert!(ask("what happens if my coins are stolen").await.contains("Random committee"));
+        assert!(ask("what are you doing after the binance hack").await.contains("Theft holds"));
+        assert!(ask("where is the developer api").await.contains("api.egoblockchain.com"));
+        assert!(ask("how does dao voting work").await.contains("block 65,103"));
+        assert!(!ask("what is the evm integration").await.contains("api.egoblockchain.com"));
     }
 
     /// The reason has_word exists: substring matching on short topic keywords
@@ -1270,6 +1388,9 @@ mod ai_routing_tests {
             ("What is Ego?",                                                           "quantum-safe Layer-1"),
             ("How do I earn EGOC?",                                                    "DePIN"),
             ("How does staking work?",                                                 "1,000 EGOC"),
+            ("What is the wallet vault?",                                              "Loosening waits"),
+            ("What happens if my coins are stolen?",                                   "Random committee"),
+            ("Where is the developer API?",                                            "api.egoblockchain.com"),
         ];
         for (question, expected) in starters {
             let answer = ask(question).await;
@@ -1288,6 +1409,10 @@ mod ai_routing_tests {
     #[tokio::test]
     async fn every_follow_up_question_reaches_a_real_answer() {
         let follow_ups = [
+            "What is the wallet vault?",
+            "What happens if my coins are stolen?",
+            "How does DAO voting work?",
+            "Where is the developer API?",
             "Show me a smart contract example",
             "How do I build an app with a smart contract and launch it on my website?",
             "What is the dApp IDE?",

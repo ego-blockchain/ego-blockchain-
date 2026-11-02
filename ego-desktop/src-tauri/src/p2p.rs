@@ -4144,6 +4144,11 @@ pub enum P2PMessage {
         signer: String,
         sig: String,
     },
+    HoldVote {
+        body: crate::hold_chain::HoldBody,
+        signer: String,
+        sig: String,
+    },
     StateCertsRequest {
         from: u64,
         reply_to: String,
@@ -8846,7 +8851,7 @@ async fn handle_event(
                 let data = message.data.clone();
                 tokio::spawn(crate::gateway::receive_gossip(data));
             } else if topic == DRS_TOPIC {
-                if let Ok(msg @ (P2PMessage::DrsCheckin { .. } | P2PMessage::DrsReady { .. } | P2PMessage::DrsReadyTm { .. } | P2PMessage::DrsCoverage { .. } | P2PMessage::DrsStateVote { .. })) =
+                if let Ok(msg @ (P2PMessage::DrsCheckin { .. } | P2PMessage::DrsReady { .. } | P2PMessage::DrsReadyTm { .. } | P2PMessage::DrsCoverage { .. } | P2PMessage::DrsStateVote { .. } | P2PMessage::HoldVote { .. })) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     let app2 = app.cloned();
@@ -9709,6 +9714,9 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         }
         P2PMessage::DrsStateVote { body, signer, sig } => {
             receive_state_vote(body, signer, sig).await;
+        }
+        P2PMessage::HoldVote { body, signer, sig } => {
+            receive_hold_vote(body, signer, sig).await;
         }
         P2PMessage::StateCertsRequest { from, reply_to } => {
             serve_state_certs(from, reply_to).await;
@@ -12932,6 +12940,8 @@ pub fn drs_batches_for(height: u64, now: i64) -> Vec<LedgerTx> {
     if let Some(tx) = crate::chain_db::state_cert_tx_for(height, now, state_cert_votes_for_block()) {
         out.push(tx);
     }
+    out.extend(crate::chain_db::hold_cert_txs_for(height, now, hold_votes_for_block()));
+    out.extend(crate::chain_db::hold_settle_txs(height, now));
     out
 }
 
@@ -14572,7 +14582,7 @@ async fn handle_block_proposal(
     for tx in &transactions {
         // Skip coinbase (system reward tx) — its amount is validated below.
         if Some(&tx.hash) == block.coinbase_tx.as_ref() { continue; }
-        if crate::ledger::is_protocol_system_tx(tx) || crate::drs::is_batch_tx(tx) || crate::chain_db::is_contributor_fee_tx(tx) { continue; }
+        if crate::ledger::is_protocol_system_tx(tx) || crate::drs::is_batch_tx(tx) || crate::chain_db::is_contributor_fee_tx(tx) || crate::hold_chain::settle_is_well_formed(tx) { continue; }
         if let Err(reason) = crate::ledger::verify_incoming_tx_with_miner(tx, &proposer) {
             eprintln!("[TX] {:.12} Rejected — {} (in proposal #{} from {:.16})",
                 tx.hash, reason, block.height, proposer);
@@ -18847,5 +18857,93 @@ mod member_queue_tests {
         assert_eq!(batch.len(), MEMBER_QUEUE_MAX);
         assert!(matches!(&batch[MEMBER_QUEUE_MAX - 1], P2PMessage::ValidatorLeaving { timestamp, .. } if *timestamp == MEMBER_QUEUE_MAX as i64 + 9));
         assert!(next_member_batch(ep).is_none());
+    }
+}
+
+type HoldVotePool = HashMap<[u8; 32], (crate::hold_chain::HoldBody, Vec<(String, String)>, i64)>;
+static HOLD_VOTES: OnceLock<Mutex<HoldVotePool>> = OnceLock::new();
+
+fn hold_votes() -> std::sync::MutexGuard<'static, HoldVotePool> {
+    HOLD_VOTES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn hold_body_id(body: &crate::hold_chain::HoldBody) -> [u8; 32] {
+    *blake3::hash(&body.message()).as_bytes()
+}
+
+fn pool_hold_vote(body: crate::hold_chain::HoldBody, signer: String, sig: String, now: i64) {
+    let mut pool = hold_votes();
+    let id = hold_body_id(&body);
+    if pool.len() >= 256 && !pool.contains_key(&id) {
+        if let Some(oldest) = pool.iter().min_by_key(|(_, (_, _, t))| *t).map(|(k, _)| *k) {
+            pool.remove(&oldest);
+        }
+    }
+    let entry = pool.entry(id).or_insert_with(|| (body, Vec::new(), now));
+    if !entry.1.iter().any(|(s, _)| s == &signer) && entry.1.len() < 4 * crate::state_cert::CERT_COMMITTEE {
+        entry.1.push((signer, sig));
+    }
+    entry.2 = now;
+}
+
+fn hold_votes_for_block() -> Vec<(crate::hold_chain::HoldBody, Vec<(String, String)>)> {
+    let mut v: Vec<_> = hold_votes().values().map(|(b, s, _)| (b.clone(), s.clone())).collect();
+    v.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    v
+}
+
+pub fn maybe_send_hold_votes() {
+    static SENT: Mutex<Option<std::collections::BTreeSet<String>>> = Mutex::new(None);
+    if !crate::hold_chain::rule_active_at_tip() {
+        return;
+    }
+    let Some(sk) = BLS_SECRET_KEY.get() else { return };
+    let me = hex::encode(crate::bls_agg::bls_pubkey(sk));
+    let now = Utc::now().timestamp();
+    for h in crate::chain_db::holds_waiting_for(&me, now) {
+        {
+            let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
+            let set = sent.get_or_insert_with(Default::default);
+            if !set.insert(h.id.clone()) {
+                continue;
+            }
+            if set.len() > 4096 {
+                set.clear();
+            }
+        }
+        let amounts = match crate::chain_db::hold_trace(&h) {
+            Ok(a) if !a.is_empty() => a,
+            Ok(_) => {
+                eprintln!("[Hold] {} traces to nothing still held; not signing", h.id);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("[Hold] cannot check {}: {e}; not signing", h.id);
+                continue;
+            }
+        };
+        let body = crate::hold_chain::HoldBody { id: h.id.clone(), amounts };
+        let sig = hex::encode(crate::bls_agg::sign_shared(sk, &body.message()));
+        pool_hold_vote(body.clone(), me.clone(), sig.clone(), now);
+        eprintln!("[Hold] signed {} over {} address(es)", h.id, body.amounts.len());
+        let msg = P2PMessage::HoldVote { body, signer: me.clone(), sig };
+        tauri::async_runtime::spawn(async move { send_drs_message(msg).await; });
+    }
+}
+
+async fn receive_hold_vote(body: crate::hold_chain::HoldBody, signer: String, sig: String) {
+    if signer.len() > 200 || sig.len() > 400 || body.amounts.len() > crate::hold_chain::MAX_HELD || body.id.len() > 40 {
+        return;
+    }
+    let b2 = body.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        let h = crate::chain_db::hold_for_vote(&b2.id, Utc::now().timestamp())?;
+        crate::hold_chain::vote_ok(&b2, &signer, &sig, &h.keys).then_some((signer, sig))
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some((signer, sig)) = checked {
+        pool_hold_vote(body, signer, sig, Utc::now().timestamp());
     }
 }

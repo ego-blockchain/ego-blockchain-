@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { useWallet } from '../App';
 import CommunityChat from './governance/CommunityChat';
+import TheftHolds from './governance/TheftHolds';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -690,6 +691,7 @@ const TABS = [
   { key: 'passed',  label: 'Passed' },
   { key: 'failed',  label: 'Failed' },
   { key: 'expired', label: 'Expired' },
+  { key: 'holds',   label: 'Theft holds' },
 ];
 
 interface RateLimit { used: number; max: number; window_days: number; resets_in_secs: number; }
@@ -818,7 +820,9 @@ export default function GovernancePage() {
           </div>
 
           <div className="flex-1 overflow-y-auto px-6 py-5">
-            {loading ? (
+            {tab === 'holds' ? (
+              <TheftHolds />
+            ) : loading ? (
               <div className="flex items-center justify-center h-40 text-gray-500 text-sm">Loading proposals…</div>
             ) : proposals.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-40 text-center space-y-3">

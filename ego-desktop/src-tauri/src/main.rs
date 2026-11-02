@@ -33,6 +33,8 @@ mod storage_pay;
 mod contract_exec;
 mod dao_chat;
 mod dao_chain;
+mod vault_chain;
+mod hold_chain;
 mod gateway;
 mod webrtc_gateway;
 mod phone_storage;
@@ -1207,6 +1209,26 @@ fn main() {
             commands::governance::get_governance_proposals,
             commands::governance::is_feature_active,
             commands::governance::create_dao_proposal,
+            commands::vault::get_vault_status,
+            commands::vault::vault_password_address,
+            commands::vault::vault_save_settings,
+            commands::vault::vault_freeze,
+            commands::vault::vault_unfreeze,
+            commands::vault::vault_turn_off,
+            commands::vault::vault_cancel,
+            commands::vault::vault_queue_send,
+            commands::vault::vault_sweep,
+            commands::vault::vault_request_code,
+            commands::vault::vault_preview_request,
+            commands::vault::vault_approve_request,
+            commands::vault::vault_submit_approved,
+            commands::vault::vault_create_key_file,
+            commands::vault::vault_use_key_file,
+            commands::holds::get_holds,
+            commands::holds::hold_request,
+            commands::holds::hold_vote,
+            commands::holds::hold_appeal,
+            commands::holds::hold_open_return,
             commands::governance::delete_dao_proposal,
             commands::governance::get_dao_proposals,
             commands::governance::get_dao_proposal,
@@ -1546,6 +1568,7 @@ fn main() {
                         tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
                         tokio::task::spawn_blocking(crate::p2p::maybe_send_uptime_checkin).await.ok();
                         tokio::task::spawn_blocking(crate::p2p::maybe_send_state_vote).await.ok();
+                        tokio::task::spawn_blocking(crate::p2p::maybe_send_hold_votes).await.ok();
                         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                     }
                 });
@@ -1699,6 +1722,8 @@ fn main() {
                     bounded!(15, crate::p2p::broadcast_vacancy_notices());
                     bounded!(120, crate::p2p::history_tick());
                     bounded!(60, crate::p2p::wallet_history_tick(false));
+                    bounded!(30, crate::commands::vault::vault_tick());
+                    bounded!(60, crate::commands::governance::dao_reveal_tick());
                 }
             });
 

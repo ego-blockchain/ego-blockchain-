@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const ACTIVATION_HEIGHT: Option<u64> = Some(65103);
+#[cfg(not(test))]
+pub const KNOW_TALLY_FROM: Option<u64> = Some(67922);
+#[cfg(test)]
+pub const KNOW_TALLY_FROM: Option<u64> = Some(1_000);
 
 pub const TX_PROPOSE: &str = "dao_propose";
 pub const TX_VOTE: &str = "dao_vote";
@@ -119,6 +123,8 @@ pub struct Proposal {
     pub answers: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub withdrawn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revealed_at: Option<i64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -145,6 +151,10 @@ pub fn rule_active(height: u64) -> bool {
 
 pub fn rule_active_at_tip() -> bool {
     rule_active(crate::chain_db::local_chain_height().saturating_add(1))
+}
+
+pub fn tally_active(height: u64) -> bool {
+    KNOW_TALLY_FROM.is_some_and(|h| height >= h)
 }
 
 pub fn is_dao_tx(tx: &LedgerTx) -> bool {
@@ -338,6 +348,17 @@ fn know_count_key(id: &str) -> Vec<u8> {
     key(format_args!("kc:{id}"))
 }
 
+fn know_tally_key(id: &str) -> Vec<u8> {
+    key(format_args!("kt:{id}"))
+}
+
+fn right_answers(questions: &[Question], key: &[u8], answers: &[u8]) -> u64 {
+    if questions.is_empty() || !answers_shape_ok(questions, answers) {
+        return 0;
+    }
+    key.iter().zip(answers).filter(|(a, b)| a == b).count() as u64
+}
+
 fn created_key(creator: &str) -> Vec<u8> {
     key(format_args!("pc:{creator}"))
 }
@@ -476,6 +497,7 @@ fn propose(ov: &mut Ov, block: &LedgerBlock, tx: &LedgerTx, network_stake: u64) 
         answers_commit: b.answers_commit,
         answers: None,
         withdrawn: false,
+        revealed_at: None,
     };
     save(ov, tally_key(&id), &vec![0u64; p.options.len()]);
     ov.put(idx_key(p.created_at, &id), Vec::new());
@@ -539,11 +561,25 @@ fn know_reveal(ov: &mut Ov, block: &LedgerBlock, tx: &LedgerTx) -> Result<(), St
     if v.answers.is_some() {
         return Err("already revealed".into());
     }
-    if block.timestamp < p.ends_at || block.timestamp >= p.ends_at + REVEAL_WINDOW_SECS {
-        return Err("answers are revealed in the 7 days after voting ends".into());
+    let closes = match (tally_active(p.height), p.revealed_at) {
+        (false, _) => p.ends_at + REVEAL_WINDOW_SECS,
+        (true, Some(at)) => at + REVEAL_WINDOW_SECS,
+        (true, None) => return Err("voters reveal after the creator has revealed the correct answers".into()),
+    };
+    if block.timestamp < p.ends_at || block.timestamp >= closes {
+        return Err("answers are revealed in the 7 days after the correct answers are out".into());
     }
     if !answers_shape_ok(&p.questions, &b.answers) || vote_commit(&p.id, &tx.from, &b.salt, &b.answers) != v.commit {
         return Err("the answers do not match the vote".into());
+    }
+    if tally_active(p.height) {
+        let key = p.answers.as_deref().unwrap_or_default();
+        let mut tally: Vec<u64> = load(ov, &know_tally_key(&p.id)).unwrap_or_default();
+        tally.resize(p.options.len(), 0);
+        if let Some(slot) = tally.get_mut(v.option as usize) {
+            *slot += right_answers(&p.questions, key, &b.answers);
+        }
+        save(ov, know_tally_key(&p.id), &tally);
     }
     v.answers = Some(b.answers);
     save(ov, know_vote_key(&p.id, &tx.from), &v);
@@ -566,6 +602,9 @@ fn reveal(ov: &mut Ov, block: &LedgerBlock, tx: &LedgerTx) -> Result<(), String>
         return Err("the answers do not match the commitment".into());
     }
     p.answers = Some(b.answers);
+    if tally_active(p.height) {
+        p.revealed_at = Some(block.timestamp);
+    }
     save(ov, p_key(&p.id), &p);
     Ok(())
 }
@@ -760,7 +799,13 @@ pub fn results(ov: &Ov, p: &Proposal, now: i64, network_stake: u64) -> DaoPropos
     let total_stake: u64 = stake_by_opt.iter().sum();
     let stake_voters = u64_at(ov, &stake_count_key(&p.id));
     let mut know_by_opt = vec![0f64; n];
-    if let Some(key) = &p.answers {
+    if tally_active(p.height) {
+        let tally: Vec<u64> = load(ov, &know_tally_key(&p.id)).unwrap_or_default();
+        let per = DAO_BASE_KNOWLEDGE_POWER / p.questions.len().max(1) as f64;
+        for (slot, right) in know_by_opt.iter_mut().zip(tally) {
+            *slot = right as f64 * per;
+        }
+    } else if let Some(key) = &p.answers {
         for v in knowledge_votes(ov, &p.id) {
             let (Some(slot), Some(answers)) = (know_by_opt.get_mut(v.option as usize), v.answers.as_ref()) else { continue };
             *slot += score(&p.questions, key, answers) * DAO_BASE_KNOWLEDGE_POWER;
@@ -972,6 +1017,31 @@ mod tests {
         let r = results(&ov, &p, ends, 1);
         assert_eq!(r.total_knowledge_voters, 1);
         assert_eq!(r.winning_option_index, Some(0));
+    }
+
+    #[test]
+    fn knowledge_results_come_from_a_running_count_after_the_switch() {
+        let mut ov = Ov::memory();
+        let salt = "5".repeat(64);
+        let key = vec![1u8, 1];
+        let pt = tx(ALICE, TX_PROPOSE, &body(quiz(), answers_commit(&salt, &key)), 1);
+        run(&mut ov, &block(2_000, 1_000), &pt).unwrap();
+        let id = proposal_id(&pt.hash);
+        let bob_salt = "6".repeat(64);
+        let vote = tx(BOB, TX_KNOW, &KnowBody { id: id.clone(), option: 1, commit: vote_commit(&id, BOB, &bob_salt, &[1, 0]) }, 1);
+        run(&mut ov, &block(2_001, 1_100), &vote).unwrap();
+        let ends = load_proposal(&ov, &id).unwrap().ends_at;
+        let bob_reveal = tx(BOB, TX_KNOW_REVEAL, &RevealBody { id: id.clone(), salt: bob_salt.clone(), answers: vec![1, 0] }, 2);
+        assert!(run(&mut ov, &block(2_002, ends + 1), &bob_reveal).is_err(), "voters wait for the correct answers");
+        let late = ends + REVEAL_WINDOW_SECS - 10;
+        run(&mut ov, &block(2_003, late), &tx(ALICE, TX_REVEAL, &RevealBody { id: id.clone(), salt, answers: key }, 2)).unwrap();
+        run(&mut ov, &block(2_004, late + 100), &bob_reveal).unwrap();
+        ov.commit_memory();
+        let p = load_proposal(&ov, &id).unwrap();
+        assert_eq!(load::<Vec<u64>>(&ov, &know_tally_key(&id)), Some(vec![0, 1]));
+        let r = results(&ov, &p, late + 200, 1);
+        assert_eq!(r.winning_option_index, Some(1));
+        assert!(r.options[1].knowledge_power > 0.99);
     }
 
     #[test]

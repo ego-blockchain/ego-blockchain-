@@ -611,6 +611,9 @@ pub struct LedgerTx {
 
     #[serde(default)]
     pub compliance_proof: String,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vault_cosig: String,
 }
 
 fn default_tx_type() -> String { "transfer".to_string() }
@@ -1767,7 +1770,10 @@ pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
     if is_protocol_system_tx(tx) || crate::drs::is_batch_tx(tx) || crate::chain_db::is_contributor_fee_tx(tx) {
         return Ok(());
     }
-    if crate::shielded_chain::unshield_is_well_formed(tx) || crate::market_chain::settle_is_well_formed(tx) {
+    if crate::shielded_chain::unshield_is_well_formed(tx)
+        || crate::market_chain::settle_is_well_formed(tx)
+        || crate::hold_chain::settle_is_well_formed(tx)
+    {
         return Ok(());
     }
     if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
@@ -1815,6 +1821,8 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
 
     check_contract_commitment(tx)?;
     crate::dao_chain::admit(tx)?;
+    crate::vault_chain::admit(tx)?;
+    crate::hold_chain::admit(tx)?;
 
     let dilithium_disabled = crate::chain_db::is_feature_disabled(
         crate::chain_db::FEATURE_DILITHIUM_DISABLED,

@@ -650,11 +650,17 @@ async fn send_due_vote_reveals(state: &AppState, now: i64, me: &str) {
         let (p, vote) = with_chain(|ov| (crate::dao_chain::load_proposal(ov, id), crate::dao_chain::know_vote(ov, id, me)));
         let Some(p) = p else { continue };
         let done = vote.as_ref().map_or(false, |v| v.answers.is_some());
-        if done || now >= p.ends_at + crate::dao_chain::REVEAL_WINDOW_SECS {
+        let tallied = crate::dao_chain::tally_active(p.height);
+        let closes = match (tallied, p.revealed_at) {
+            (true, Some(at)) => at,
+            _ => p.ends_at,
+        } + crate::dao_chain::REVEAL_WINDOW_SECS;
+        let creator_gave_up = tallied && p.answers.is_none() && now >= p.ends_at + crate::dao_chain::REVEAL_WINDOW_SECS;
+        if done || now >= closes || creator_gave_up {
             crate::chain_db::dao_delete(&[k]);
             continue;
         }
-        if vote.is_none() || now < p.ends_at || !reveal_due(&format!("vote/{id}"), now) {
+        if vote.is_none() || now < p.ends_at || (tallied && p.answers.is_none()) || !reveal_due(&format!("vote/{id}"), now) {
             continue;
         }
         let body = crate::dao_chain::RevealBody { id: id.to_string(), salt: secret.salt, answers: secret.answers };
@@ -724,4 +730,14 @@ async fn send_due_reveals(state: &AppState) {
         }
     }
     send_due_vote_reveals(state, now, &me).await;
+}
+
+pub async fn dao_reveal_tick() {
+    if !crate::dao_chain::rule_active_at_tip() {
+        return;
+    }
+    let Some(app) = crate::p2p::APP_HANDLE.get() else { return };
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    send_due_reveals(&state).await;
 }

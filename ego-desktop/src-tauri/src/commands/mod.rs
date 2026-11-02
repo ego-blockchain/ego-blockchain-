@@ -12,6 +12,8 @@ pub mod notifications;
 pub mod messenger;
 pub mod outbox;
 pub mod tx_pending;
+pub mod vault;
+pub mod holds;
 pub mod tx_transport;
 pub mod consensus;
 pub mod contracts;

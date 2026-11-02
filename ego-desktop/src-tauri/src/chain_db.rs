@@ -1892,6 +1892,7 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             is_private:          false,
             compliance_proof:    String::new(),
             transport:           String::new(),
+            vault_cosig:         String::new(),
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -2666,6 +2667,8 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     }
     let staked_total = db.get_cf(cf_balances, STAKING_ADDR.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     crate::dao_chain::apply_block(&mut drs_ov, block, &confirmed_txs, staked_total);
+    crate::vault_chain::apply_block(&mut drs_ov, block, &confirmed_txs);
+    crate::hold_chain::apply_block(&mut drs_ov, block, &confirmed_txs, staked_total);
     let opened_checkpoint = crate::state_cert::apply_block(&mut drs_ov, block, &confirmed_txs, &rota_seed_in(db, block));
     crate::history::push(&mut drs_ov, block.height, &block.hash);
     batch.put_cf(cf_meta, crate::history::undo_key(block.height), drs_ov.undo_record());
@@ -3288,6 +3291,9 @@ pub fn recent_transactions(limit: usize) -> Vec<LedgerTx> {
 pub fn is_protocol_tx(tx: &LedgerTx) -> bool {
     if tx.from == NODE_POOL_ADDR
         && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward") {
+        return true;
+    }
+    if tx.from.is_empty() && tx.to == NODE_POOL_ADDR && tx.signature == "coinbase" {
         return true;
     }
     if matches!(tx.tx_type.as_str(),
@@ -4231,6 +4237,9 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     let dao_ov = crate::drs::Ov::new(db);
     let dao_unstakers: std::collections::BTreeSet<String> =
         sorted_txs.iter().filter(|t| is_unstake_tx(t)).map(|t| t.from.clone()).collect();
+    let mut vault_plan = crate::vault_chain::Planner::new(height, timestamp);
+    let mut hold_plan = crate::hold_chain::Planner::new(height, timestamp);
+    let hold_bal = |a: &str| db.get_cf(cf_bal, a.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     let valid_txs: Vec<&LedgerTx> = sorted_txs.iter().filter(|tx| {
         if tx.hash.is_empty() {
             eprintln!("[TX] Rejected — empty hash (from={:.16})", tx.from);
@@ -4291,6 +4300,36 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             }
         }
         match crate::dao_chain::proposal_fit(&dao_ov, tx, height, timestamp, &dao_unstakers) {
+            crate::dao_chain::Fit::Yes => {}
+            crate::dao_chain::Fit::Later(e) => {
+                eprintln!("[TX] {:.12} held back from this proposal — {e}", tx.hash);
+                if tx.nonce > 0 {
+                    blocked_senders.insert(tx.from.clone());
+                }
+                held_back.push((*tx).clone());
+                return false;
+            }
+            crate::dao_chain::Fit::Never(e) => {
+                eprintln!("[TX] {:.12} Rejected — {e}", tx.hash);
+                return false;
+            }
+        }
+        match hold_plan.fit(&dao_ov, tx, &hold_bal) {
+            crate::dao_chain::Fit::Yes => {}
+            crate::dao_chain::Fit::Later(e) => {
+                eprintln!("[TX] {:.12} held back from this proposal — {e}", tx.hash);
+                if tx.nonce > 0 {
+                    blocked_senders.insert(tx.from.clone());
+                }
+                held_back.push((*tx).clone());
+                return false;
+            }
+            crate::dao_chain::Fit::Never(e) => {
+                eprintln!("[TX] {:.12} Rejected — {e}", tx.hash);
+                return false;
+            }
+        }
+        match vault_plan.fit(&dao_ov, tx) {
             crate::dao_chain::Fit::Yes => {}
             crate::dao_chain::Fit::Later(e) => {
                 eprintln!("[TX] {:.12} held back from this proposal — {e}", tx.hash);
@@ -5166,6 +5205,12 @@ fn validate_peer_block_checked(
         crate::drs::validate_batches(&crate::drs::Ov::new(db), block, txs, |h| block_hash_at_in(db, h))?;
         crate::state_cert::validate(&crate::drs::Ov::new(db), block, txs)?;
         crate::dao_chain::validate(&crate::drs::Ov::new(db), block, txs)?;
+        crate::vault_chain::validate(&crate::drs::Ov::new(db), block, txs)?;
+        {
+            let cf_hold_bal = db.cf_handle(CF_BALANCES).ok_or_else(|| "balances column family missing".to_string())?;
+            let bal = |a: &str| db.get_cf(cf_hold_bal, a.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            crate::hold_chain::validate(&crate::drs::Ov::new(db), block, txs, &bal)?;
+        }
         if block.height >= CHECKIN_FROM_HEIGHT {
             if let Some(tx) = txs.iter().find(|t| t.tx_type == crate::coverage_proof::POC_PROOF_TX) {
                 return Err(format!("coverage proof {} refused: coverage is proven in coverage batches now", tx.hash));
@@ -8799,6 +8844,19 @@ mod wallet_notification_tests {
     }
 
     #[test]
+    fn system_records_stay_out_of_the_explorer_list() {
+        for kind in [crate::drs::TX_CHECKIN_BATCH, crate::drs::TX_READY_BATCH, crate::drs::TX_COVERAGE_BATCH, crate::state_cert::TX_STATE_CERT] {
+            let rec = crate::drs::batch_tx(kind, 9, 1, "{}".into());
+            assert!(is_protocol_tx(&rec), "{kind}");
+        }
+        let mut share = tx("fee_distribution", "", NODE_POOL_ADDR, 5);
+        share.signature = "coinbase".into();
+        assert!(is_protocol_tx(&share));
+        assert!(!is_protocol_tx(&tx("transfer", THEM, ME, 5)));
+        assert!(!is_protocol_tx(&tx("transfer", "", NODE_POOL_ADDR, 5)));
+    }
+
+    #[test]
     fn amounts_render_without_trailing_zeros() {
         assert_eq!(format_egoc(1_000_000), "1 EGOC");
         assert_eq!(format_egoc(1_500_000), "1.5 EGOC");
@@ -12380,4 +12438,168 @@ mod faucet_closed_tests {
         let e = validate_tm_block(&block, &[faucet_tx()], 0).unwrap_err();
         assert!(e.contains("faucet is closed"), "{e}");
     }
+}
+
+fn hold_stops(a: &str) -> bool {
+    crate::ledger::is_reserved_system_source(a)
+        || a == STAKING_ADDR
+        || a == crate::market_chain::MARKET_ESCROW_ADDR
+        || a == crate::shielded_chain::SHIELDED_POOL_ADDR
+}
+
+fn hold_event_delta(e: &crate::hold_chain::Event, addr: &str) -> i128 {
+    let mut d: i128 = 0;
+    if e.to == addr && !e.unstake {
+        d += e.amount as i128;
+    }
+    if e.from == addr {
+        d -= if e.unstake { e.fee as i128 - e.amount as i128 } else { e.amount as i128 + e.fee as i128 };
+    }
+    d
+}
+
+const HOLD_EVENTS_PER_ADDR: usize = 20_000;
+
+pub fn hold_trace(h: &crate::hold_chain::Hold) -> Result<Vec<(String, u64)>, String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    hold_trace_in(&db, h)
+}
+
+fn hold_trace_in(db: &DB, h: &crate::hold_chain::Hold) -> Result<Vec<(String, u64)>, String> {
+    let cf_txs = db.cf_handle(CF_TXS).ok_or("transactions are missing")?;
+    let cf_addr = db.cf_handle(CF_ADDR_TXS).ok_or("the address index is missing")?;
+    let cf_block_txs = db.cf_handle(CF_BLOCK_TXS).ok_or("the block index is missing")?;
+    let cf_bal = db.cf_handle(CF_BALANCES).ok_or("balances are missing")?;
+    let cf_meta = db.cf_handle(CF_META).ok_or("meta is missing")?;
+    let floor = db.get_cf(cf_meta, META_PRUNE_BELOW).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(1);
+    let load_tx = |hash: &str| db.get_cf(cf_txs, hash.as_bytes()).ok().flatten().and_then(|v| decode::<LedgerTx>(&v));
+    let to_event = |tx: &LedgerTx| -> Option<crate::hold_chain::Event> {
+        let height = tx.block_height?;
+        let pos = db
+            .get_cf(cf_block_txs, block_txs_key(height, &tx.hash))
+            .ok()
+            .flatten()
+            .and_then(|v| v.get(..4).and_then(|b| b.try_into().ok()).map(u32::from_be_bytes))
+            .unwrap_or(0);
+        Some(crate::hold_chain::Event {
+            height,
+            pos,
+            hash: tx.hash.clone(),
+            from: tx.from.clone(),
+            to: tx.to.clone(),
+            amount: tx.amount,
+            fee: tx.fee_uegoc,
+            unstake: is_unstake_tx(tx),
+        })
+    };
+    let req = &h.request;
+    let mut events: std::collections::BTreeMap<String, crate::hold_chain::Event> = Default::default();
+    let mut first_height = u64::MAX;
+    let mut tracked: std::collections::BTreeSet<String> = Default::default();
+    for hash in req.theft.iter().chain(&req.hops) {
+        let tx = load_tx(hash).ok_or_else(|| format!("transaction {hash} is not on this node"))?;
+        let e = to_event(&tx).ok_or_else(|| format!("transaction {hash} is not in a block"))?;
+        if e.height > h.height {
+            return Err(format!("transaction {hash} came after the request"));
+        }
+        if req.theft.contains(hash) {
+            if tx.timestamp < h.created.saturating_sub(crate::hold_chain::FILE_WINDOW_SECS) {
+                return Err(format!("theft transaction {hash} is older than 30 days"));
+            }
+            first_height = first_height.min(e.height);
+        }
+        if e.to != req.victim && !hold_stops(&e.to) {
+            tracked.insert(e.to.clone());
+        }
+        events.insert(e.hash.clone(), e);
+    }
+    if first_height == u64::MAX || first_height < floor {
+        return Err("this node no longer holds the blocks around the theft".into());
+    }
+    for addr in &tracked {
+        let mut prefix = addr.as_bytes().to_vec();
+        prefix.push(b':');
+        let mut n = 0usize;
+        for item in db.prefix_iterator_cf(cf_addr, &prefix) {
+            let Ok((k, _)) = item else { break };
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            n += 1;
+            if n > HOLD_EVENTS_PER_ADDR {
+                return Err(format!("{addr} has too much history to trace"));
+            }
+            let Some(hash) = k.get(prefix.len() + 8..).and_then(|b| std::str::from_utf8(b).ok()) else { continue };
+            if events.contains_key(hash) {
+                continue;
+            }
+            let Some(tx) = load_tx(hash) else { continue };
+            if let Some(e) = to_event(&tx).filter(|e| e.height >= first_height) {
+                events.insert(e.hash.clone(), e);
+            }
+        }
+    }
+    let all: Vec<crate::hold_chain::Event> = events.into_values().collect();
+    let later: Vec<&crate::hold_chain::Event> = all.iter().filter(|e| e.height > h.height).collect();
+    let at_request = |a: &str| -> u64 {
+        let now = db.get_cf(cf_bal, a.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0) as i128;
+        let after: i128 = later.iter().map(|e| hold_event_delta(e, a)).sum();
+        (now - after).max(0) as u64
+    };
+    let upto: Vec<crate::hold_chain::Event> = all.iter().filter(|e| e.height <= h.height).cloned().collect();
+    crate::hold_chain::trace(&req.victim, &req.theft, &req.hops, &upto, &at_request, &hold_stops)
+}
+
+pub fn holds_waiting_for(key: &str, now: i64) -> Vec<crate::hold_chain::Hold> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    crate::hold_chain::live(&ov)
+        .iter()
+        .filter_map(|id| crate::hold_chain::load_hold(&ov, id))
+        .filter(|h| h.keys.iter().any(|k| k == key) && crate::hold_chain::phase(&ov, h, now) == crate::hold_chain::Phase::Signing)
+        .collect()
+}
+
+pub fn hold_for_vote(id: &str, now: i64) -> Option<crate::hold_chain::Hold> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    crate::hold_chain::load_hold(&ov, id).filter(|h| crate::hold_chain::phase(&ov, h, now) == crate::hold_chain::Phase::Signing)
+}
+
+pub fn hold_cert_txs_for(height: u64, now: i64, pool: Vec<(crate::hold_chain::HoldBody, Vec<(String, String)>)>) -> Vec<LedgerTx> {
+    if !crate::hold_chain::rule_active(height) {
+        return Vec::new();
+    }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let mut done = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for (body, votes) in pool {
+        if done.contains(&body.id) {
+            continue;
+        }
+        let Some(h) = crate::hold_chain::load_hold(&ov, &body.id) else { continue };
+        if crate::hold_chain::phase(&ov, &h, now) != crate::hold_chain::Phase::Signing
+            || votes.len() < crate::state_cert::quorum(h.keys.len())
+            || crate::hold_chain::check_amounts(&h, &body.amounts).is_err()
+        {
+            continue;
+        }
+        let Some(cert) = crate::hold_chain::assemble(&body, &votes, &h.keys) else { continue };
+        let Ok(args) = serde_json::to_string(&cert) else { continue };
+        done.insert(body.id.clone());
+        out.push(crate::drs::batch_tx(crate::hold_chain::TX_CERT, height, now, args));
+    }
+    out
+}
+
+pub fn hold_settle_txs(height: u64, now: i64) -> Vec<LedgerTx> {
+    if !crate::hold_chain::rule_active(height) {
+        return Vec::new();
+    }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf_bal) = db.cf_handle(CF_BALANCES) else { return Vec::new() };
+    let bal = |a: &str| db.get_cf(cf_bal, a.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let ov = crate::drs::Ov::new(db);
+    crate::hold_chain::settle_txs(&ov, height, now, &bal)
 }
