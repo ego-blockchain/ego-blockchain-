@@ -35,6 +35,7 @@ mod dao_chat;
 mod dao_chain;
 mod vault_chain;
 mod hold_chain;
+mod pq_chain;
 mod gateway;
 mod webrtc_gateway;
 mod phone_storage;

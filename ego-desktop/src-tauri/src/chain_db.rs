@@ -146,11 +146,31 @@ pub fn get_db() -> DbWrapper {
         rebuild_derived_state_once(&db);
         migrate_history_index(&db);
         rebuild_vault_state_once(&db);
+        rebuild_pq_pins_once(&db);
         db
     }))
 }
 
 const META_VAULT_REBUILT: &[u8] = b"vault_rebuilt_v1";
+const META_PQ_REBUILT: &[u8] = b"pq_rebuilt_v1";
+
+fn rebuild_pq_pins_once(db: &DB) {
+    if drs_meta(db, META_PQ_REBUILT).is_some() {
+        return;
+    }
+    let Some(from) = crate::pq_chain::PIN_FROM else { return };
+    match rebuild_feature_state(db, from, b"pq:", crate::pq_chain::apply_block) {
+        Ok(blocks) => {
+            if blocks > 0 {
+                eprintln!("[ChainDB] post-quantum key pins rebuilt from the {blocks} blocks since block {from}");
+            }
+            if let Some(cf) = db.cf_handle(CF_META) {
+                let _ = db.put_cf(cf, META_PQ_REBUILT, b"1");
+            }
+        }
+        Err(e) => eprintln!("[ChainDB] post-quantum key pins not rebuilt yet: {e}"),
+    }
+}
 
 fn rebuild_vault_state_once(db: &DB) {
     if drs_meta(db, META_VAULT_REBUILT).is_some() {
@@ -2734,6 +2754,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     crate::dao_chain::apply_block(&mut drs_ov, block, &confirmed_txs, staked_total);
     crate::vault_chain::apply_block(&mut drs_ov, block, &confirmed_txs);
     crate::hold_chain::apply_block(&mut drs_ov, block, &confirmed_txs, staked_total);
+    crate::pq_chain::apply_block(&mut drs_ov, block, &confirmed_txs);
     let opened_checkpoint = crate::state_cert::apply_block(&mut drs_ov, block, &confirmed_txs, &rota_seed_in(db, block));
     crate::history::push(&mut drs_ov, block.height, &block.hash);
     batch.put_cf(cf_meta, crate::history::undo_key(block.height), drs_ov.undo_record());
@@ -4304,6 +4325,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         sorted_txs.iter().filter(|t| is_unstake_tx(t)).map(|t| t.from.clone()).collect();
     let mut vault_plan = crate::vault_chain::Planner::new(height, timestamp);
     let mut hold_plan = crate::hold_chain::Planner::new(height, timestamp);
+    let mut pq_plan = crate::pq_chain::Planner::new(height);
     let hold_bal = |a: &str| db.get_cf(cf_bal, a.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     let valid_txs: Vec<&LedgerTx> = sorted_txs.iter().filter(|tx| {
         if tx.hash.is_empty() {
@@ -4378,6 +4400,10 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
                 eprintln!("[TX] {:.12} Rejected — {e}", tx.hash);
                 return false;
             }
+        }
+        if let crate::dao_chain::Fit::Never(e) | crate::dao_chain::Fit::Later(e) = pq_plan.fit(&dao_ov, tx) {
+            eprintln!("[TX] {:.12} Rejected — {e}", tx.hash);
+            return false;
         }
         match hold_plan.fit(&dao_ov, tx, &hold_bal) {
             crate::dao_chain::Fit::Yes => {}
@@ -5276,6 +5302,7 @@ fn validate_peer_block_checked(
             let bal = |a: &str| db.get_cf(cf_hold_bal, a.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
             crate::hold_chain::validate(&crate::drs::Ov::new(db), block, txs, &bal)?;
         }
+        crate::pq_chain::validate(&crate::drs::Ov::new(db), block, txs)?;
         if block.height >= CHECKIN_FROM_HEIGHT {
             if let Some(tx) = txs.iter().find(|t| t.tx_type == crate::coverage_proof::POC_PROOF_TX) {
                 return Err(format!("coverage proof {} refused: coverage is proven in coverage batches now", tx.hash));

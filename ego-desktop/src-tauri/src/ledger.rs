@@ -1823,6 +1823,7 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     crate::dao_chain::admit(tx)?;
     crate::vault_chain::admit(tx)?;
     crate::hold_chain::admit(tx)?;
+    crate::pq_chain::admit(tx)?;
 
     let dilithium_disabled = crate::chain_db::is_feature_disabled(
         crate::chain_db::FEATURE_DILITHIUM_DISABLED,

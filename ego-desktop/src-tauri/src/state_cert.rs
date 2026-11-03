@@ -52,6 +52,7 @@ const STATE_META_PREFIXES: &[&[u8]] = &[
     b"dao:",
     b"vault:",
     b"hold:",
+    b"pq:",
 ];
 const NOT_STATE: &[&[u8]] = &[b"n2migrated"];
 
