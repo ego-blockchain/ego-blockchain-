@@ -240,3 +240,62 @@ mod tests {
         assert!(check(pinned(&ov, &stranger.from), &stranger, 1_000).is_ok(), "an unpinned wallet still may sign with Ed25519 alone");
     }
 }
+
+#[cfg(test)]
+mod wallet_core_agreement {
+    use super::*;
+
+    /// The iPhone makes and uses its Dilithium key with ego-wallet-core. It
+    /// must be this wallet's key byte for byte, or the same 24 words would pin
+    /// one key from the phone and be refused from Ego Desktop, or the other way round.
+    #[test]
+    fn ego_wallet_core_makes_the_same_dilithium_key() {
+        for seed in [[0u8; 32], [1u8; 32], [11u8; 32], [0xa5u8; 32], [0xffu8; 32]] {
+            let desktop = ego_core::KeyPair::from_bytes(&seed).unwrap();
+            assert_eq!(ego_wallet_core::dilithium::public_key(&seed).unwrap(), desktop.dilithium_public_key().key_data);
+            let msg = b"ego/tx/v3:agreement";
+            assert_eq!(ego_wallet_core::dilithium::sign(&seed, msg).unwrap(), desktop.sign_dilithium(msg).signature_data);
+        }
+        // The iPhone's EgoKit tests check their key against this same hash.
+        let desktop = ego_core::KeyPair::from_bytes(&[11u8; 32]).unwrap();
+        assert_eq!(
+            blake3::hash(&desktop.dilithium_public_key().key_data).to_hex().as_str(),
+            "da70065386cada8dfecebdc1f42b450bdb0564fef379d2bf724e761f8731ed51"
+        );
+    }
+
+    /// A transaction signed the way the phone signs it: Ed25519 plus a
+    /// Dilithium signature from ego-wallet-core over the same v3 bytes.
+    #[test]
+    fn a_phone_signed_transaction_is_accepted_and_pins_the_desktop_key() {
+        let seed = [11u8; 32];
+        let desktop = ego_core::KeyPair::from_bytes(&seed).unwrap();
+        let from = crate::vault_chain::address_of(desktop.ed25519_public_key().as_bytes().try_into().unwrap(), 1);
+        let mut tx = LedgerTx {
+            from,
+            to: "egot1someoneelsesomeoneelsesomeoneelsesomeone".into(),
+            amount: 5,
+            nonce: 1,
+            timestamp: crate::clock::now(),
+            fee_uegoc: 1_000,
+            chain_id: 1,
+            tx_type: "transfer".into(),
+            tx_version: 3,
+            ..LedgerTx::default()
+        };
+        crate::ledger::seal_tx(&mut tx, &desktop, false);
+        let msg = crate::ledger::tx_signing_bytes_v3(&tx);
+        tx.dilithium_pubkey = hex::encode(ego_wallet_core::dilithium::public_key(&seed).unwrap());
+        tx.dilithium_signature = hex::encode(ego_wallet_core::dilithium::sign(&seed, &msg).unwrap());
+
+        assert!(crate::ledger::verify_confirmed_tx_sig(&tx).is_ok());
+        assert_eq!(check(None, &tx, 10), Ok(key_hash(&hex::encode(&desktop.dilithium_public_key().key_data))));
+        let mut ov = Ov::memory();
+        apply_effects(&mut ov, &LedgerBlock { height: 10, ..LedgerBlock::default() }, &[&tx]);
+        ov.commit_memory();
+
+        let mut from_desktop = LedgerTx { nonce: 2, ..tx.clone() };
+        crate::ledger::seal_tx(&mut from_desktop, &desktop, true);
+        assert!(check(pinned(&ov, &tx.from), &from_desktop, 10).is_ok(), "the same words keep working from Ego Desktop");
+    }
+}

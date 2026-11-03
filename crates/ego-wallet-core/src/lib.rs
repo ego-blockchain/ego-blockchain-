@@ -6,6 +6,7 @@
 
 pub mod cardano;
 pub mod derive;
+pub mod dilithium;
 pub mod evm;
 pub mod ffi;
 pub mod presale;

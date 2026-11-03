@@ -2624,6 +2624,7 @@ dependencies = [
  "hex",
  "hmac",
  "k256",
+ "ml-dsa",
  "ripemd",
  "serde",
  "serde_json",

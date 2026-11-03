@@ -446,6 +446,52 @@ pub unsafe extern "C" fn ego_wallet_shielded(kind: *const c_char, seed: *const u
     }
 }
 
+/// The wallet's Dilithium (ML-DSA-44) public key for a 32-byte Ego seed, the
+/// same key Ego Desktop makes from it: {"public_key": hex}.
+///
+/// # Safety
+/// `seed` must point to `seed_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ego_wallet_dilithium_public_key(seed: *const u8, seed_len: usize) -> *mut c_char {
+    let Some(seed) = seed_from(seed, seed_len) else {
+        return error("The seed must be 32 bytes.");
+    };
+    match crate::dilithium::public_key(seed) {
+        Ok(pk) => to_c(serde_json::json!({ "public_key": hex::encode(pk) })),
+        Err(e) => error(&e),
+    }
+}
+
+/// Signs `message` (a transaction's signing bytes) with the wallet's Dilithium
+/// key, deterministically and with an empty context as Ego Desktop does:
+/// {"signature": hex}.
+///
+/// # Safety
+/// `seed` must point to `seed_len` readable bytes and `message` to
+/// `message_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ego_wallet_dilithium_sign(
+    seed: *const u8,
+    seed_len: usize,
+    message: *const u8,
+    message_len: usize,
+) -> *mut c_char {
+    let Some(seed) = seed_from(seed, seed_len) else {
+        return error("The seed must be 32 bytes.");
+    };
+    let message = if message_len == 0 {
+        &[][..]
+    } else if message.is_null() {
+        return error("No message.");
+    } else {
+        std::slice::from_raw_parts(message, message_len)
+    };
+    match crate::dilithium::sign(seed, message) {
+        Ok(sig) => to_c(serde_json::json!({ "signature": hex::encode(sig) })),
+        Err(e) => error(&e),
+    }
+}
+
 /// Frees a string returned by this library.
 ///
 /// # Safety

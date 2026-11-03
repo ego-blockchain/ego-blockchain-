@@ -48,6 +48,14 @@ char *ego_wallet_presale_open(const char *iou, const char *password);
    answer. Proving a withdrawal takes a second or more. Nothing is sent. */
 char *ego_wallet_shielded(const char *kind, const uint8_t *seed, size_t seed_len, const char *request);
 
+/* The wallet's Dilithium (ML-DSA-44) public key, the same one Ego Desktop
+   makes from this seed: {"public_key": hex}. */
+char *ego_wallet_dilithium_public_key(const uint8_t *seed, size_t seed_len);
+
+/* Signs message (a transaction's signing bytes) with the wallet's Dilithium
+   key, deterministically with an empty context: {"signature": hex}. */
+char *ego_wallet_dilithium_sign(const uint8_t *seed, size_t seed_len, const uint8_t *message, size_t message_len);
+
 void ego_wallet_string_free(char *s);
 
 #endif
