@@ -2,6 +2,7 @@ import nacl from 'tweetnacl';
 import { blake2s } from 'blakejs';
 import { blake3 } from '@noble/hashes/blake3';
 import { bech32m } from 'bech32';
+import { ml_dsa44 } from '@noble/post-quantum/ml-dsa.js';
 
 import { WORDLIST } from './wordlist';
 
@@ -246,6 +247,22 @@ function txSigningBytes(
   return txSigningBytesV2(from, to, BigInt(amountUegoc), BigInt(nonce), BigInt(timestamp), chainId, memo);
 }
 
+const ML_DSA_WALLET_TAG = new TextEncoder().encode('ego/ml-dsa-44/wallet/v1');
+
+export function dilithiumKeys(seed: Uint8Array): { publicKey: Uint8Array; secretKey: Uint8Array } {
+  const input = new Uint8Array(ML_DSA_WALLET_TAG.length + seed.length);
+  input.set(ML_DSA_WALLET_TAG);
+  input.set(seed, ML_DSA_WALLET_TAG.length);
+  return ml_dsa44.keygen(blake2s(input, undefined, 32));
+}
+
+function dilithiumFields(seed: Uint8Array, signBytes: Uint8Array): { dilithium_pubkey: string; dilithium_signature: string } {
+  const { publicKey, secretKey } = dilithiumKeys(seed);
+  const sig = ml_dsa44.sign(signBytes, secretKey, { extraEntropy: false });
+  secretKey.fill(0);
+  return { dilithium_pubkey: toHex(publicKey), dilithium_signature: toHex(sig) };
+}
+
 export interface SignedEgoTx {
   hash: string;
   from: string;
@@ -261,6 +278,8 @@ export interface SignedEgoTx {
   tx_type: string;
   tx_version: number;
   chain_id: number;
+  dilithium_pubkey?: string;
+  dilithium_signature?: string;
 }
 
 // Builds a fully-formed, chain-valid transfer exactly like Ego Desktop's
@@ -301,6 +320,7 @@ export function buildSignedEgoTx(
     tx_type: txType,
     tx_version: txVersion,
     chain_id: chainId,
+    ...dilithiumFields(seed, signBytes),
   };
 }
 
@@ -351,6 +371,7 @@ export function buildSignedContractCallTx(
     tx_type: 'call',
     tx_version: txVersion,
     chain_id: chainId,
+    ...dilithiumFields(seed, signBytes),
     contract_addr: contractAddr,
     entrypoint,
     call_args: argsHex,
