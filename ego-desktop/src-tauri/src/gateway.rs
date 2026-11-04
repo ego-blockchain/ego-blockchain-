@@ -309,7 +309,7 @@ fn cost(method: &str) -> f64 {
     match method {
         "tx.submit" | "chat.submit" => 20.0,
         "chat.feed" | "chat.member" | "node.earnings" => 4.0,
-        "wallet.getRewards" | "vault.status" => 2.0,
+        "wallet.getRewards" => 2.0,
         "dao.list" | "dao.proposal" | "staking.status" => 2.0,
         "wallet.getCredits" => 1.0,
         "shielded.lookup" => 2.0,
@@ -508,17 +508,6 @@ async fn shielded_leaves(params: &Value) -> Result<Value, (i32, String)> {
 
 /// EGUSD credits held by an address. One credit is one cent. Anyone may ask:
 /// the mints and payments behind it are public transactions.
-async fn vault_status(params: &Value) -> Result<Value, (i32, String)> {
-    let address = params["address"].as_str().unwrap_or_default().trim().to_string();
-    if !crate::dao_chat::is_address(&address) {
-        return Err((-32602, "That isn't an Ego address.".to_string()));
-    }
-    let status = tokio::task::spawn_blocking(move || crate::commands::vault::public_status(&address))
-        .await
-        .map_err(|e| (-32603, e.to_string()))?;
-    serde_json::to_value(status).map_err(|e| (-32603, e.to_string()))
-}
-
 async fn wallet_credits(params: &Value) -> Result<Value, (i32, String)> {
     let address = params["address"].as_str().unwrap_or_default().trim().to_string();
     if !crate::dao_chat::is_address(&address) {
@@ -659,7 +648,6 @@ pub(crate) async fn answer(ip: IpAddr, body: Value) -> Result<Value, Value> {
         "storage.capacity" => storage_capacity().await,
         "wallet.getRewards" => wallet_rewards(&params).await,
         "wallet.getCredits" => wallet_credits(&params).await,
-        "vault.status" => vault_status(&params).await,
         "shielded.lookup" => shielded_lookup(&params).await,
         "shielded.leaves" => shielded_leaves(&params).await,
         "node.earnings" => node_earnings(&params).await,

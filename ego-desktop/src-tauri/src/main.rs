@@ -1211,21 +1211,6 @@ fn main() {
             commands::governance::get_governance_proposals,
             commands::governance::is_feature_active,
             commands::governance::create_dao_proposal,
-            commands::vault::get_vault_status,
-            commands::vault::vault_password_address,
-            commands::vault::vault_save_settings,
-            commands::vault::vault_freeze,
-            commands::vault::vault_unfreeze,
-            commands::vault::vault_turn_off,
-            commands::vault::vault_cancel,
-            commands::vault::vault_queue_send,
-            commands::vault::vault_sweep,
-            commands::vault::vault_request_code,
-            commands::vault::vault_preview_request,
-            commands::vault::vault_approve_request,
-            commands::vault::vault_submit_approved,
-            commands::vault::vault_create_key_file,
-            commands::vault::vault_use_key_file,
             commands::holds::get_holds,
             commands::phone_access::get_phone_access,
             commands::phone_access::allow_phone_access,
@@ -1726,7 +1711,6 @@ fn main() {
                     bounded!(15, crate::p2p::broadcast_vacancy_notices());
                     bounded!(120, crate::p2p::history_tick());
                     bounded!(60, crate::p2p::wallet_history_tick(false));
-                    bounded!(30, crate::commands::vault::vault_tick());
                     bounded!(60, crate::commands::governance::dao_reveal_tick());
                 }
             });

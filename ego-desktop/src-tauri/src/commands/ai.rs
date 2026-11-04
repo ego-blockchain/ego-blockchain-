@@ -217,10 +217,8 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - **Reporting a spam proposer**: staked EGOC only, the report locks that stake for 30 days; a proposer is blocked while 3+ reporters holding 1%+ of all staked EGOC have reported them.
 - Governance page: proposals (Active/All/Passed/Failed/Expired), Theft holds tab, community chat.
 
-## Wallet Vault (v0.3.673, active from block 67,922)
-- Daily limit sent at once; above it a send waits (e.g. 24 h, longer above a higher limit) or needs the second key. Second key = a wallet on another device, an encrypted key file in a chosen folder, or a password-derived key. Recovery address + sweep (works while frozen). Up to 5 guardians who can cancel and freeze but never move coins.
-- Tightening applies at once; loosening (limit up, new recovery address, different second key, removing a guardian, unfreeze, turning off) waits the delay unless the second key approves. Alerts when anything starts waiting.
-- The Chrome extension and iPhone app can't approve with a second key yet.
+## Wallet Vault (removed)
+- Removed in v0.3.680. From block 72,580 no wallet has a vault: no daily limit, no delays, no second key. Coins were never locked by it.
 
 ## Theft Holds (built, switched off until an outside security review and 64+ nodes)
 - Anyone requests a hold listing the theft and hop transactions: 10 EGOC fee burned, bond ≥ 100 EGOC locked. A DRS-drawn committee checks on-chain facts, computes the traced amount and must sign 2/3+1 within one hour, else nothing is frozen.
@@ -357,33 +355,15 @@ pub async fn ask_ego_ai(
 
     } else if q.contains("vault") || q.contains("second key") || has_any_word(&q, &["guardian", "guardians", "sweep"])
         || q.contains("recovery address") || q.contains("freeze my wallet") || q.contains("self-freeze") || q.contains("self freeze") {
-        r#"The **wallet vault** protects a wallet even after someone has copied its key. It is in Ego Desktop (Wallet page → **Vault**) and switches on at block 67,922 with v0.3.673; before that the panel says it is not active yet.
+        r#"The **wallet vault** was removed in Ego Desktop v0.3.680. From block **72,580** no wallet has a vault any more: no daily limit, no delays, no vault password or second key, and no guardians.
 
-### What you set
-- **Daily limit** — sends up to this amount go out at once, as today.
-- **Delay** — anything above the limit waits, for example 24 hours. A **higher limit** can wait longer, for example 72 hours.
-- **Second key** — a wallet on another device (a second computer), an encrypted key file in a folder you choose, or a key made from a password. A large send it approves goes out at once. The key file is useless without its password, but a USB stick is safer than a folder on the same computer.
-- **Recovery address** — a wallet you keep somewhere else. **Sweep** sends everything there in one step, even while the wallet is frozen.
-- **Guardians** — up to 5 addresses you trust. They can cancel a waiting send and freeze the wallet, but never move coins anywhere.
-
-### Why a thief can't switch it off
-Tightening applies at once. **Loosening waits out the delay**: raising the limit, a new recovery address, a different second key, removing a guardian, unfreezing or turning the vault off. You get an alert as soon as anything starts waiting, and you, your second key or a guardian can cancel it. Only your second key can make a loosening apply at once.
-
-### Why a key and not a password
-Someone who steals your key doesn't need the Ego app — they can sign a transaction with their own software. Every node has to check the approval, and nodes can check a signature but not a password: a password inside the transaction could be copied, and a password hash on chain could be guessed offline. Keep the second key on a different device, so malware on one computer can't take both.
-
-### Limits
-- The Chrome extension and iPhone app can't approve with the second key yet; their large sends from a vaulted wallet are refused.
-- A thief can still move up to your daily limit each day until you freeze — keep the limit modest."#
+Your coins were never locked by it. A send that was waiting can simply be sent again as a normal send. To keep a wallet safe, keep its 24 words offline and set a PIN in Settings."#
 
     } else if q.contains("theft") || q.contains("stolen") || has_any_word(&q, &["steal", "hacked", "hack", "hacker", "hackers", "binance"])
         || q.contains("hold request") || q.contains("freeze an address") || q.contains("freeze a thief") || q.contains("freeze someone") {
-        r#"Ego can stop stolen coins **without anyone having the power to freeze accounts** — not the founding team, not a company. Two layers do it.
+        r#"Ego can stop stolen coins **without anyone having the power to freeze accounts** — not the founding team, not a company. Theft holds do it.
 
-### 1. Wallet vault (your own wallet)
-Large sends wait or need your second key, so a stolen key can't empty the wallet at once. Ask me "what is the wallet vault" for the details.
-
-### 2. Theft holds (the thief's address)
+### Theft holds (the thief's address)
 1. **Request** — anyone files a request listing the theft transactions and the hops the coins took, with a short case. It burns a **10 EGOC** fee and locks a **bond of at least 100 EGOC** in the requester's wallet.
 2. **Random committee** — a committee of online nodes drawn by verifiable randomness (nobody picks them) checks only facts anyone can verify on chain, computes the stolen amount, and must sign with **2/3 + 1 within one hour**. If not, nothing is frozen.
 3. **Hold** — only the **traced stolen amount** stays put on each address. Coins above it move freely, incoming coins arrive, and the node keeps running and earning. A hold never takes coins.
@@ -1287,7 +1267,7 @@ tokenomics · EGOC & EGUSD · DEX & AMM · oracle price feed · cross-chain brid
 run a node · node types · testnet deployment · Ego Devices · mobile wallet · Messenger · EgoSafe
 
 ### Safety & integration
-**wallet vault** · **theft holds** · **developer API** (api.egoblockchain.com)
+**theft holds** · **developer API** (api.egoblockchain.com)
 
 New here? Try **"what is Ego"**, **"what is a dApp"**, or **"show me a contract example"**."#
     };
@@ -1319,7 +1299,7 @@ mod ai_routing_tests {
 
     #[tokio::test]
     async fn safety_and_api_questions_reach_their_answers() {
-        assert!(ask("how do i set up the wallet vault").await.contains("Loosening waits"));
+        assert!(ask("how do i set up the wallet vault").await.contains("was removed"));
         assert!(ask("what happens if my coins are stolen").await.contains("Random committee"));
         assert!(ask("what are you doing after the binance hack").await.contains("Theft holds"));
         assert!(ask("where is the developer api").await.contains("api.egoblockchain.com"));
@@ -1388,7 +1368,6 @@ mod ai_routing_tests {
             ("What is Ego?",                                                           "quantum-safe Layer-1"),
             ("How do I earn EGOC?",                                                    "DePIN"),
             ("How does staking work?",                                                 "1,000 EGOC"),
-            ("What is the wallet vault?",                                              "Loosening waits"),
             ("What happens if my coins are stolen?",                                   "Random committee"),
             ("Where is the developer API?",                                            "api.egoblockchain.com"),
         ];
@@ -1409,7 +1388,6 @@ mod ai_routing_tests {
     #[tokio::test]
     async fn every_follow_up_question_reaches_a_real_answer() {
         let follow_ups = [
-            "What is the wallet vault?",
             "What happens if my coins are stolen?",
             "How does DAO voting work?",
             "Where is the developer API?",

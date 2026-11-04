@@ -78,8 +78,6 @@ pub struct SendTransactionRequest {
     /// time, which wastes a link measured in hundreds of bytes per second.
     #[serde(default)]
     pub via_radio: Option<bool>,
-    #[serde(default)]
-    pub vault_password: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -235,14 +233,6 @@ pub async fn send_transaction(
         ..LedgerTx::default()
     };
     crate::ledger::seal_tx(&mut tx, &kp, true);
-    if let Some(pw) = request.vault_password.clone().filter(|p| !p.is_empty()) {
-        let owner = from.clone();
-        let key = tokio::task::spawn_blocking(move || crate::commands::vault::second_key(&owner, &pw))
-            .await
-            .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?
-            .map_err(EgoDesktopError::InvalidInput)?;
-        tx.vault_cosig = crate::vault_chain::cosign_with(&tx, &key);
-    }
     crate::vault_chain::admit(&tx).map_err(EgoDesktopError::InvalidInput)?;
     let tx_hash = tx.hash.clone();
 

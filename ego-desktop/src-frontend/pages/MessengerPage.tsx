@@ -336,7 +336,6 @@ const AI_STARTERS: { heading: string; questions: string[] }[] = [
   {
     heading: 'Safety & developers',
     questions: [
-      'What is the wallet vault?',
       'What happens if my coins are stolen?',
       'Where is the developer API?',
     ],
@@ -348,9 +347,8 @@ const AI_STARTERS: { heading: string; questions: string[] }[] = [
 // unmatched falls back to the starter list.
 const AI_FOLLOW_UPS: { topic: RegExp; questions: string[] }[] = [
   {
-    topic: /vault|stolen|theft|steal|hack|guardian|second key|freeze/i,
+    topic: /stolen|theft|steal|hack|freeze/i,
     questions: [
-      'What is the wallet vault?',
       'What happens if my coins are stolen?',
       'How does DAO voting work?',
     ],

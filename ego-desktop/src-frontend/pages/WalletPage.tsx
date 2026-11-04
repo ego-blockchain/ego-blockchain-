@@ -4,7 +4,6 @@ import { listen } from '@tauri-apps/api/event';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 import Pagination from '../components/Pagination';
-import VaultPanel, { VaultSendChoice } from '../components/Vault';
 import PhoneAccessBanner from '../components/PhoneAccessBanner';
 import { txDisplayAmount, EGOC_PRICE_USD } from '../constants';
 
@@ -444,7 +443,6 @@ const WalletPage: React.FC = () => {
   useEffect(() => { cachedBalance  = balance;  }, [balance]);
   useEffect(() => { cachedTxs      = txs;      }, [txs]);
   const [tab, setTab]               = useState<'all' | 'sent' | 'received' | 'rewards'>('all');
-  const [vaultHold, setVaultHold]   = useState<{ to: string; amount: number; memo: string | null; message: string } | null>(null);
   const [rewards, setRewards]       = useState<RewardHistory | null>(null);
   const [rewardKind, setRewardKind] = useState<RewardKind>('all');
   const [txPage, setTxPage]         = useState(1);
@@ -719,10 +717,6 @@ const WalletPage: React.FC = () => {
     } catch (e: any) {
       const msg = String(e).replace(/^.*Error:/, '').trim();
       setEmailStep('idle');
-      if (msg.includes('VAULT_LIMIT')) {
-        setVaultHold({ to: sendForm.to, amount, memo: sendForm.memo || null, message: msg });
-        return;
-      }
       setTxResult({ hash: '', success: false, message: msg });
     }
   }
@@ -792,7 +786,6 @@ const WalletPage: React.FC = () => {
     setSending(false);
     setSendForm({ to: '', amount: '', memo: '', isPrivate: false, viaRadio: false });
     setTxResult(null);
-    setVaultHold(null);
     setTxConfirmedHeight(null);
     setEmailStep('idle');
     setPinInput('');
@@ -1476,7 +1469,6 @@ const WalletPage: React.FC = () => {
       </div>
 
       <PhoneAccessBanner />
-      <VaultPanel />
 
       {}
       <div className="bg-gray-800/60 rounded-2xl border border-gray-700/50 overflow-hidden">
@@ -3473,16 +3465,7 @@ const WalletPage: React.FC = () => {
       {showSend && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-2xl max-h-[88vh] overflow-y-auto border border-gray-700 shadow-2xl">
-            {vaultHold ? (
-              <VaultSendChoice
-                to={vaultHold.to}
-                amount={vaultHold.amount}
-                memo={vaultHold.memo}
-                message={vaultHold.message}
-                onDone={r => { setVaultHold(null); setTxResult(r); load().catch(() => {}); reloadWallet(); }}
-                onCancel={() => setVaultHold(null)}
-              />
-            ) : emailStep === 'review' ? (
+            {emailStep === 'review' ? (
               <div className="space-y-4">
                 <div className="flex justify-between items-center">
                   <h3 className="text-lg font-bold">Review Transaction</h3>

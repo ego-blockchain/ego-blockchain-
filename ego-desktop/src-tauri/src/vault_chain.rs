@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ACTIVATION_HEIGHT: Option<u64> = Some(67922);
+pub const RETIRED_FROM_HEIGHT: u64 = 72580;
+const RETIRED: &str = "the wallet vault was removed from Ego";
 
 pub const TX_SET: &str = "vault_set";
 pub const TX_OFF: &str = "vault_off";
@@ -35,6 +37,7 @@ pub const LIST_LIMIT: usize = 256;
 const BODY_DOMAIN: &[u8] = b"ego/vault/body/v1:";
 const COSIGN_DOMAIN: &[u8] = b"ego/vault/cosign/v1:";
 const QUEUE_DOMAIN: &[u8] = b"ego/vault/queue/v1:";
+#[cfg(test)]
 const PASSWORD_DOMAIN: &str = "ego/vault/password-key/v1:";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +120,7 @@ pub struct QueueBody {
 pub struct EmptyBody {}
 
 pub fn rule_active(height: u64) -> bool {
-    ACTIVATION_HEIGHT.is_some_and(|h| height >= h)
+    ACTIVATION_HEIGHT.is_some_and(|h| height >= h) && height < RETIRED_FROM_HEIGHT
 }
 
 pub fn rule_active_at_tip() -> bool {
@@ -148,6 +151,7 @@ pub fn queue_id(tx_hash: &str) -> String {
     blake3::hash(&m).to_hex()[..16].to_string()
 }
 
+#[cfg(test)]
 pub fn exec_memo(id: &str) -> String {
     format!("{EXEC_PREFIX}{id}")
 }
@@ -169,6 +173,7 @@ pub fn address_of(pk: &[u8; 32], chain_id: u8) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 pub fn cosign_with(tx: &LedgerTx, key: &ed25519_dalek::SigningKey) -> String {
     use ed25519_dalek::Signer;
     let sig = key.sign(&cosign_message(tx));
@@ -185,6 +190,7 @@ pub fn cosign_signer(tx: &LedgerTx) -> Option<String> {
     Some(address_of(&pk, tx.chain_id))
 }
 
+#[cfg(test)]
 pub fn password_key(owner: &str, password: &str) -> Result<ed25519_dalek::SigningKey, String> {
     if password.chars().count() < 10 {
         return Err("use a password of at least 10 characters".into());
@@ -297,10 +303,6 @@ fn spent_key(owner: &str) -> Vec<u8> {
     key(format_args!("sp:{owner}"))
 }
 
-fn helper_prefix(helper: &str) -> Vec<u8> {
-    key(format_args!("h:{helper}:"))
-}
-
 fn helper_key(helper: &str, owner: &str) -> Vec<u8> {
     key(format_args!("h:{helper}:{owner}"))
 }
@@ -351,14 +353,6 @@ pub fn spent_today(ov: &Ov, owner: &str, now: i64) -> u64 {
     } else {
         0
     }
-}
-
-pub fn helped_owners(ov: &Ov, helper: &str) -> Vec<String> {
-    let prefix = helper_prefix(helper);
-    ov.committed_keys(&prefix, LIST_LIMIT, |_| false)
-        .iter()
-        .filter_map(|k| String::from_utf8(k[prefix.len()..].to_vec()).ok())
-        .collect()
 }
 
 fn helpers(s: &Settings) -> BTreeSet<String> {
@@ -523,6 +517,9 @@ impl Planner {
 
     pub fn fit(&mut self, ov: &Ov, tx: &LedgerTx) -> Fit {
         if is_vault_op(tx) {
+            if self.height >= RETIRED_FROM_HEIGHT {
+                return Fit::Never(RETIRED.into());
+            }
             if !rule_active(self.height) {
                 return Fit::Later(format!("vault transactions start at block {:?}", ACTIVATION_HEIGHT));
             }
@@ -754,7 +751,7 @@ pub fn admit(tx: &LedgerTx) -> Result<(), String> {
     let active = rule_active_at_tip();
     if is_vault_op(tx) {
         if !active {
-            return Err(format!("{} refused: the wallet vault is not active yet", tx.tx_type));
+            return Err(format!("{} refused: {RETIRED}", tx.tx_type));
         }
         well_formed(tx)?;
     }
@@ -774,12 +771,12 @@ pub fn admit(tx: &LedgerTx) -> Result<(), String> {
                 Ok(())
             } else {
                 Err(format!(
-                    "VAULT_LIMIT: this wallet's vault lets {} uEGOC out today without the second key; send it with a delay or approve it with the second key",
-                    v.settings.limit.saturating_sub(already)
+                    "this wallet's old vault lets only {} EGOC more out today; the vault switches off for good at block {RETIRED_FROM_HEIGHT}",
+                    v.settings.limit.saturating_sub(already) as f64 / 1_000_000.0
                 ))
             }
         }
-        Gate::Refused(e, _) => Err(format!("VAULT_REFUSED: {e}")),
+        Gate::Refused(e, _) => Err(format!("{e}; the vault switches off for good at block {RETIRED_FROM_HEIGHT}")),
     }
 }
 
@@ -1024,6 +1021,28 @@ mod tests {
         assert!(check_settings(OWNER, &s).is_ok());
         assert_eq!(delay_for(&s, 500 * EGOC), DAY_SECS);
         assert_eq!(delay_for(&s, 2_000 * EGOC), 3 * DAY_SECS);
+    }
+
+    #[test]
+    fn the_vault_stops_at_the_retirement_height() {
+        let mut ov = Ov::memory();
+        let mut s = settings("");
+        s.limit = 0;
+        setup(&mut ov, s);
+        let out = send(OWNER, THIEF, 500 * EGOC, None, 2);
+        let freeze = op(OWNER, TX_FREEZE, &OwnerBody { owner: OWNER.into() }, 3);
+        let at = |h: u64| block(h, 2_000);
+        assert!(rule_active(RETIRED_FROM_HEIGHT - 1));
+        assert!(!rule_active(RETIRED_FROM_HEIGHT));
+        assert!(validate(&ov, &at(RETIRED_FROM_HEIGHT - 1), &[out.clone()]).is_err(), "the limit holds until the switch");
+        assert!(validate(&ov, &at(RETIRED_FROM_HEIGHT), &[out.clone()]).is_ok(), "any send goes through after it");
+        assert!(validate(&ov, &at(RETIRED_FROM_HEIGHT), &[freeze.clone()]).is_err(), "vault transactions are refused");
+        let mut plan = Planner::new(RETIRED_FROM_HEIGHT, 2_000);
+        assert!(matches!(plan.fit(&ov, &freeze), Fit::Never(_)), "block makers drop them instead of keeping them waiting");
+        assert!(matches!(plan.fit(&ov, &out), Fit::Yes));
+        let before = ov.get(&vault_key(OWNER));
+        apply_block(&mut ov, &at(RETIRED_FROM_HEIGHT), &[&freeze]);
+        assert_eq!(ov.get(&vault_key(OWNER)), before, "nothing changes the old records any more");
     }
 
     #[test]
