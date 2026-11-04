@@ -41,6 +41,8 @@ pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_STORAGE_BODY_BYTES: usize = 512 * 1024;
 pub(crate) const NOT_HERE: &str = "That method isn't available on this gateway.";
 const NOT_OWNER: &str = "Only the owner of this computer can see its earnings.";
+const NOT_ONLINE: &str = "No Ego Desktop using this wallet is online right now.";
+const NOT_ANSWERED: &str = "Your Ego Desktop is online but did not answer.";
 pub const EARNINGS_DOMAIN: &str = "ego/node-earnings/v1";
 const SELF_CHECK_FIRST_SECS: i64 = 30 * 60;
 const SELF_CHECK_MAX_SECS: i64 = 24 * 3600;
@@ -563,22 +565,50 @@ fn signed_by(params: &Value, now: i64) -> Result<String, &'static str> {
     Ok(address.to_string())
 }
 
-/// The Earnings page of this computer, for its owner only.
-async fn node_earnings(params: &Value) -> Result<Value, (i32, String)> {
-    let now = chrono::Utc::now().timestamp();
-    let address = signed_by(params, now).map_err(|reason| match reason {
+fn earnings_signer(params: &Value) -> Result<String, (i32, String)> {
+    signed_by(params, chrono::Utc::now().timestamp()).map_err(|reason| match reason {
         "time" => (-32003, "The request's time is off. Check your phone's date and time.".to_string()),
         _ => (-32003, NOT_OWNER.to_string()),
-    })?;
+    })
+}
+
+async fn runs_wallet(address: &str) -> Result<(crate::ledger::Ledger, bool), (i32, String)> {
     let ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
         .await
         .map_err(|e| (-32603, e.to_string()))?;
-    let state = crate::app::global_app_state();
     let owner = (!ledger.address.is_empty() && ledger.address == address)
-        || state.get_keypair().map(|kp| crate::dao_chat::address_of_key(&kp) == address).unwrap_or(false);
+        || crate::app::global_app_state()
+            .get_keypair()
+            .map(|kp| crate::dao_chat::address_of_key(&kp) == address)
+            .unwrap_or(false);
+    Ok((ledger, owner))
+}
+
+async fn node_earnings(params: &Value) -> Result<Value, (i32, String)> {
+    let address = earnings_signer(params)?;
+    if runs_wallet(&address).await?.1 {
+        return own_node_earnings(params).await;
+    }
+    let endpoint = crate::p2p::find_endpoint_of(&address).await.ok_or((-32004, NOT_ONLINE.to_string()))?;
+    let body = crate::p2p::ask_node_earnings(&endpoint, params.to_string())
+        .await
+        .map_err(|e| (-32004, format!("{NOT_ANSWERED} ({e})")))?;
+    serde_json::from_str(&body).map_err(|e| (-32603, e.to_string()))
+}
+
+pub(crate) async fn own_node_earnings_json(params: &str) -> Result<String, String> {
+    let params: Value = serde_json::from_str(params).map_err(|e| e.to_string())?;
+    own_node_earnings(&params).await.map(|v| v.to_string()).map_err(|(_, e)| e)
+}
+
+async fn own_node_earnings(params: &Value) -> Result<Value, (i32, String)> {
+    let now = chrono::Utc::now().timestamp();
+    let address = earnings_signer(params)?;
+    let (ledger, owner) = runs_wallet(&address).await?;
     if !owner {
         return Err((-32003, NOT_OWNER.to_string()));
     }
+    let state = crate::app::global_app_state();
     let earnings = crate::commands::earnings::compute_earnings(&state)
         .await
         .map_err(|e| (-32603, e.to_string()))?;

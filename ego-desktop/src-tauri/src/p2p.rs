@@ -5287,10 +5287,89 @@ pub async fn compute_exec_any(endpoints: &[String], req: &ComputeExecRequest) ->
     Err(last_err)
 }
 
+pub const NODE_EARNINGS_KIND: &str = "NODE_EARNINGS";
+const NODE_EARNINGS_PER_MINUTE: u32 = 30;
+const NODE_EARNINGS_WAIT_SECS: u64 = 6;
+const DHT_LOOKUP_TRIES: u32 = 8;
+const DHT_SELF_REFRESH_SECS: i64 = 20 * 60;
+
+pub async fn find_endpoint_of(address: &str) -> Option<String> {
+    if let Some(endpoint) = get_relay_endpoint(address).await {
+        return Some(endpoint);
+    }
+    lookup_dht_endpoint(address);
+    for _ in 0..DHT_LOOKUP_TRIES {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Some(endpoint) = dht_endpoint(address) {
+            return Some(endpoint);
+        }
+    }
+    None
+}
+
+pub async fn ask_node_earnings(endpoint: &str, params: String) -> Result<String, String> {
+    let req = ComputeExecRequest {
+        reservation_id: String::new(),
+        command: params,
+        timestamp: Utc::now().timestamp(),
+        dilithium_signature: String::new(),
+        dilithium_public_key: String::new(),
+        kind: NODE_EARNINGS_KIND.to_string(),
+        reservation: None,
+        payload: None,
+    };
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(NODE_EARNINGS_WAIT_SECS), compute_exec(endpoint, req))
+        .await
+        .map_err(|_| "it took too long".to_string())??;
+    if resp.ok { Ok(resp.body) } else { Err(resp.body) }
+}
+
+fn node_earnings_allowed(now: i64) -> bool {
+    static WINDOW: Mutex<(i64, u32)> = Mutex::new((0, 0));
+    let mut w = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    if now / 60 != w.0 {
+        *w = (now / 60, 0);
+    }
+    w.1 += 1;
+    w.1 <= NODE_EARNINGS_PER_MINUTE
+}
+
+async fn serve_node_earnings(params: &str) -> ComputeExecResponse {
+    if !node_earnings_allowed(Utc::now().timestamp()) {
+        return ComputeExecResponse { ok: false, status: 429, body: "this computer is answering too many requests".into() };
+    }
+    match crate::gateway::own_node_earnings_json(params).await {
+        Ok(body) => ComputeExecResponse { ok: true, status: 200, body },
+        Err(e) => ComputeExecResponse { ok: false, status: 403, body: e },
+    }
+}
+
+async fn refresh_dht_self(address: &str, endpoint: &str, name: &str) {
+    static LAST: Mutex<Option<(String, String, i64)>> = Mutex::new(None);
+    if address.is_empty() || endpoint.is_empty() {
+        return;
+    }
+    let now = Utc::now().timestamp();
+    let due = {
+        let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let due = g.as_ref().map_or(true, |(a, e, t)| a != address || e != endpoint || now - t >= DHT_SELF_REFRESH_SECS);
+        if due {
+            *g = Some((address.to_string(), endpoint.to_string(), now));
+        }
+        due
+    };
+    if due {
+        dht_publish_self(address, endpoint, name).await;
+    }
+}
+
 /// Provider-side handler: invoked when an inbound libp2p compute-exec request
 /// arrives. Verifies the buyer's signed reservation attestation, then either
 /// runs the command (kind="EXEC") or gathers usage metrics (kind="METRICS").
 async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
+    if req.kind == NODE_EARNINGS_KIND {
+        return serve_node_earnings(&req.command).await;
+    }
     let now = chrono::Utc::now().timestamp();
     if (now - req.timestamp).abs() > 30 {
         return ComputeExecResponse { ok: false, status: 400, body: "Request expired (timestamp mismatch)".into() };
@@ -6376,6 +6455,7 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
         .find(|w| w.id == active_id)
         .map(|w| w.name.clone())
         .unwrap_or_else(|| "Ego Node".to_string());
+    refresh_dht_self(&address, &my_endpoint, &name).await;
     let (my_city, my_country, my_lat, my_lon) = {
         let cache = state.cache.lock().unwrap();
         if let Some(ref cs) = cache.coverage_status {
