@@ -1118,6 +1118,7 @@ fn main() {
             commands::explorer::get_p2p_status,
             commands::explorer::get_blocks,
             commands::explorer::get_all_transactions,
+            commands::explorer::get_activity,
             commands::explorer::get_block_info,
             commands::explorer::get_transaction_info,
             commands::explorer::get_file_events,

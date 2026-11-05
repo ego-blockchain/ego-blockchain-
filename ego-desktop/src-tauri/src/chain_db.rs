@@ -3261,6 +3261,37 @@ pub fn paged_blocks(offset: usize, limit: usize) -> Vec<LedgerBlock> {
     out
 }
 
+pub fn activity_page(before: u64, limit: usize) -> (Vec<LedgerTx>, Option<u64>) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    activity_page_in(&db, before, limit)
+}
+
+fn activity_page_in(db: &DB, before: u64, limit: usize) -> (Vec<LedgerTx>, Option<u64>) {
+    let Some(cf) = db.cf_handle(CF_BLOCKS) else { return (Vec::new(), None) };
+    if before == 0 {
+        return (Vec::new(), None);
+    }
+    let mut iter = db.raw_iterator_cf(cf);
+    iter.seek_for_prev(height_key(before - 1));
+    let mut out = Vec::new();
+    let height_at = |it: &rocksdb::DBRawIteratorWithThreadMode<DB>| -> Option<u64> {
+        it.key().and_then(|k| k.get(..8)).and_then(|k| k.try_into().ok()).map(u64::from_be_bytes).filter(|h| *h > 0)
+    };
+    while iter.valid() {
+        let Some(h) = height_at(&iter) else { break };
+        for mut t in txs_for_block_in(db, h).into_iter().rev() {
+            t.status = "Confirmed".to_string();
+            t.block_height = Some(h);
+            out.push(t);
+        }
+        iter.prev();
+        if out.len() >= limit {
+            return (out, (iter.valid() && height_at(&iter).is_some()).then_some(h));
+        }
+    }
+    (out, None)
+}
+
 pub fn local_block_count() -> usize {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_BLOCKS) else { return 0; };
@@ -11591,6 +11622,74 @@ mod history_tests {
             }
         }
         v
+    }
+
+    #[test]
+    fn all_activity_pages_back_through_every_block_with_transactions() {
+        let (db, dir) = scratch_db("activity");
+        let (cf_blocks, cf_txs, cf_block_txs) = (db.cf_handle(CF_BLOCKS).unwrap(), db.cf_handle(CF_TXS).unwrap(), db.cf_handle(CF_BLOCK_TXS).unwrap());
+        for h in [1u64, 2, 5, 9] {
+            let block = LedgerBlock { height: h, tx_count: 2, ..LedgerBlock::default() };
+            db.put_cf(cf_blocks, height_key(h), encode(&block)).unwrap();
+            for i in 0..2u32 {
+                let tx = LedgerTx { hash: format!("t{h}-{i}"), tx_type: "reward".into(), ..LedgerTx::default() };
+                db.put_cf(cf_txs, tx.hash.as_bytes(), encode(&tx)).unwrap();
+                db.put_cf(cf_block_txs, block_txs_key(h, &tx.hash), i.to_be_bytes()).unwrap();
+            }
+        }
+        let (page, next) = activity_page_in(&db, u64::MAX, 3);
+        assert_eq!(page.iter().map(|t| t.block_height.unwrap()).collect::<Vec<_>>(), vec![9, 9, 5, 5]);
+        assert_eq!(next, Some(5));
+        let (page, next) = activity_page_in(&db, 5, 3);
+        assert_eq!(page.iter().map(|t| t.block_height.unwrap()).collect::<Vec<_>>(), vec![2, 2, 1, 1]);
+        assert_eq!(next, None);
+        assert!(page.iter().all(|t| t.status == "Confirmed"));
+        assert_eq!(activity_page_in(&db, 1, 3).0.len(), 0);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[ignore]
+    fn import_history_from_a_local_copy() {
+        let Ok(src_path) = std::env::var("EGO_IMPORT_FROM") else { return };
+        let dst_path = std::env::var("EGO_IMPORT_INTO").expect("EGO_IMPORT_INTO");
+        let src = DB::open_cf_for_read_only(&Options::default(), &src_path, ALL_CFS.to_vec(), false).expect("open source read-only");
+        let dst = open_chain_db(std::path::Path::new(&dst_path));
+        let tip = local_chain_height_in(&dst);
+        let (mut stored, mut rejected, mut complete) = (0usize, 0usize, Vec::new());
+        for chunk in 0..=crate::history::chunk_of(tip) {
+            let Some(root) = crate::history::chunk_root(&crate::drs::Ov::new(&dst), chunk) else { continue };
+            let range = crate::history::chunk_heights(chunk);
+            let mut h = range.start.max(1);
+            while h < range.end {
+                let pieces = history_serve_in(&src, h, crate::history::FETCH_BATCH);
+                h += crate::history::FETCH_BATCH;
+                let good: Vec<crate::history::HistoryPiece> = pieces
+                    .into_iter()
+                    .filter(|p| {
+                        let ok = crate::history::verify_piece(p, &root).is_ok();
+                        if !ok {
+                            rejected += 1;
+                        }
+                        ok
+                    })
+                    .collect();
+                if !good.is_empty() {
+                    stored += history_store_in(&dst, &good);
+                }
+            }
+            let whole = (range.start.max(1)..range.end).all(|x| history_piece_in(&dst, x).is_some());
+            if whole {
+                if let Some(cf) = dst.cf_handle(CF_META) {
+                    let _ = dst.delete_cf(cf, crate::history::pruned_key(chunk));
+                    let _ = dst.delete_cf(cf, crate::history::gap_key(chunk));
+                }
+                complete.push(chunk);
+            }
+        }
+        let _ = dst.flush();
+        eprintln!("import stored {stored} blocks, rejected {rejected}, complete chunks {complete:?}");
     }
 
     #[test]

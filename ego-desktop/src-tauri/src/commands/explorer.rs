@@ -146,6 +146,29 @@ pub async fn get_all_transactions(offset: Option<u32>, limit: Option<u32>) -> Re
     Ok(txs)
 }
 
+#[derive(serde::Serialize)]
+pub struct ActivityPage {
+    pub txs: Vec<LedgerTx>,
+    pub next_before: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn get_activity(before: Option<u64>, limit: Option<u32>) -> Result<ActivityPage, EgoDesktopError> {
+    let lim = limit.unwrap_or(25).clamp(1, 200) as usize;
+    let before = before.unwrap_or(u64::MAX);
+    let (mut txs, next_before) = tokio::task::spawn_blocking(move || crate::chain_db::activity_page(before, lim))
+        .await
+        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
+    for tx in txs.iter_mut() {
+        if tx.is_private || tx.amount >= SHIELD_THRESHOLD_UEGOC || tx.from == "Shielded" || tx.to == "Shielded" {
+            tx.from = "Shielded".to_string();
+            tx.to   = "Shielded".to_string();
+            tx.memo = Some("Privacy Protected".to_string());
+        }
+    }
+    Ok(ActivityPage { txs, next_before })
+}
+
 #[tauri::command]
 pub async fn get_block_info(height: u64) -> Result<LedgerBlock, EgoDesktopError> {
     tokio::task::spawn_blocking(move || {

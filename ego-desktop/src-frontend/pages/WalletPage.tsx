@@ -7,7 +7,8 @@ import Pagination from '../components/Pagination';
 import PhoneAccessBanner from '../components/PhoneAccessBanner';
 import { txDisplayAmount, EGOC_PRICE_USD } from '../constants';
 
-import { RPC_URL } from '../config';
+import { RPC_URL, txUrl, blockUrl, addressUrl } from '../config';
+import { open as openWebUrl } from '@tauri-apps/api/shell';
 import { useAppVersion, formatVersion } from '../lib/version';
 
 function makeQR(text: string): string {
@@ -3543,7 +3544,13 @@ const WalletPage: React.FC = () => {
                 {txResult.hash && (
                   <div className="bg-gray-900 rounded-xl p-4 text-left">
                     <div className="text-xs text-gray-400 mb-1">Transaction Hash</div>
-                    <div className="text-xs font-mono text-green-400 break-all">{txResult.hash}</div>
+                    <button
+                      onClick={() => openWebUrl(txUrl(txResult.hash!, txConfirmedHeight ?? txResult.block_height)).catch(() => {})}
+                      title="Open on egoblockchain.com"
+                      className="text-xs font-mono text-green-400 break-all text-left hover:underline"
+                    >
+                      {txResult.hash}
+                    </button>
                     <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-gray-400">
                       <div><span className="text-gray-500">Status</span><br />{txConfirmedHeight != null ? <span className="text-green-400">Confirmed</span> : <span className="text-yellow-400">Awaiting Block...</span>}</div>
                       <div><span className="text-gray-500">Block</span><br /><span>#{txConfirmedHeight ?? txResult.block_height ?? '—'}</span></div>
@@ -3797,10 +3804,10 @@ const WalletPage: React.FC = () => {
               </div>
             )}
             <div className="space-y-3">
-              {[
-                { label: 'Hash',      val: selectedTx.hash,       mono: true },
-                { label: 'From',      val: selectedTx.from,       mono: true },
-                { label: 'To',        val: selectedTx.to,         mono: true },
+              {([
+                { label: 'Hash',      val: selectedTx.hash,       mono: true, href: txUrl(selectedTx.hash, selectedTx.block_height) },
+                { label: 'From',      val: selectedTx.from,       mono: true, href: /^ego[a-z0-9]*1/.test(selectedTx.from) ? addressUrl(selectedTx.from) : undefined },
+                { label: 'To',        val: selectedTx.to,         mono: true, href: /^ego[a-z0-9]*1/.test(selectedTx.to) ? addressUrl(selectedTx.to) : undefined },
                 { label: 'Amount',    val: txDisplayAmount(selectedTx) },
                 {
                   label: 'Fee',
@@ -3811,7 +3818,7 @@ const WalletPage: React.FC = () => {
                     return 'Fee not recorded';
                   })(),
                 },
-                { label: 'Block',     val: selectedTx.block_height != null ? `#${selectedTx.block_height.toLocaleString()}` : 'Unconfirmed' },
+                { label: 'Block',     val: selectedTx.block_height != null ? `#${selectedTx.block_height.toLocaleString()}` : 'Unconfirmed', href: selectedTx.block_height != null ? blockUrl(selectedTx.block_height) : undefined },
                 { label: 'Nonce',     val: String(selectedTx.nonce) },
                 { label: 'Timestamp', val: sfTime(selectedTx.timestamp) },
                 { label: 'Signature', val: selectedTx.signature.slice(0, 32) + '…', mono: true },
@@ -3827,12 +3834,22 @@ const WalletPage: React.FC = () => {
                     ? [{ label: 'Sent via', val: 'Radio Frequency' },
                        { label: 'Link', val: selectedTx.transport, mono: true }]
                     : []),
-              ].map(({ label, val, mono }) => (
+              ] as { label: string; val: string; mono?: boolean; href?: string }[]).map(({ label, val, mono, href }) => (
                 <div key={label} className="flex justify-between items-start gap-6 py-1.5 border-b border-gray-700/50 last:border-0">
                   <span className="text-gray-400 text-sm shrink-0">{label}</span>
-                  <span className={`text-right text-sm break-all min-w-0 ${mono ? 'font-mono text-xs text-gray-300' : 'text-white'}`}>
-                    {val}
-                  </span>
+                  {href ? (
+                    <button
+                      onClick={() => openWebUrl(href).catch(() => {})}
+                      title="Open on egoblockchain.com"
+                      className={`text-right text-sm break-all min-w-0 text-blue-400 hover:text-blue-300 hover:underline ${mono ? 'font-mono text-xs' : ''}`}
+                    >
+                      {val}
+                    </button>
+                  ) : (
+                    <span className={`text-right text-sm break-all min-w-0 ${mono ? 'font-mono text-xs text-gray-300' : 'text-white'}`}>
+                      {val}
+                    </span>
+                  )}
                 </div>
               ))}
               {selectedTx.transport && selectedTx.transport !== 'internet' && (

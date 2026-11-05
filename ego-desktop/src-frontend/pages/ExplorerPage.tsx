@@ -3,6 +3,30 @@ import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import Pagination from '../components/Pagination';
 import { txDisplayAmount } from '../constants';
+import { open as openUrl } from '@tauri-apps/api/shell';
+import { txUrl, blockUrl, addressUrl, searchUrl } from '../config';
+
+type DetailRow = { label: string; val: string; mono?: boolean; href?: string };
+
+function openOnWeb(url: string) {
+  return (e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    openUrl(url).catch(() => {});
+  };
+}
+
+function DetailValue({ val, mono, href }: { val: string; mono?: boolean; href?: string }) {
+  if (!href) return <span className={`text-right break-all ${mono ? 'font-mono text-xs text-gray-300' : ''}`}>{val}</span>;
+  return (
+    <button
+      onClick={openOnWeb(href)}
+      title="Open on egoblockchain.com"
+      className={`text-right break-all text-blue-400 hover:text-blue-300 hover:underline ${mono ? 'font-mono text-xs' : ''}`}
+    >
+      {val}
+    </button>
+  );
+}
 
 interface LedgerBlock {
   height: number;
@@ -178,6 +202,18 @@ const ExplorerPage: React.FC = () => {
   const [txPage, setTxPage] = useState(1);
   const [filePage, setFilePage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
+  const [txView, setTxView] = useState<'transfers' | 'all'>('transfers');
+  const [activity, setActivity] = useState<LedgerTx[]>([]);
+  const [activityCursors, setActivityCursors] = useState<(number | null)[]>([null]);
+  const [activityNext, setActivityNext] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (tab !== 'txs' || txView !== 'all') return;
+    const before = activityCursors[activityCursors.length - 1];
+    invoke<{ txs: LedgerTx[]; next_before: number | null }>('get_activity', { before, limit: pageSize })
+      .then(p => { setActivity(p.txs); setActivityNext(p.next_before); })
+      .catch(() => {});
+  }, [tab, txView, activityCursors, pageSize]);
 
   useEffect(() => { setBlockPage(1); setTxPage(1); setFilePage(1); }, [tab]);
 
@@ -240,6 +276,10 @@ const ExplorerPage: React.FC = () => {
       const ev = fileEvents.find(e => e.cid.startsWith(q));
       if (ev) { setSelectedFile(ev); setTab('files'); return; }
     }
+    if (/^ego[a-z0-9]*1[a-z0-9]+$/i.test(q)) {
+      openUrl(addressUrl(q)).catch(() => {});
+      return;
+    }
     try {
       if (q.match(/^\d+$/)) {
         const block = await invoke<LedgerBlock>('get_block_info', { height: parseInt(q) });
@@ -249,7 +289,7 @@ const ExplorerPage: React.FC = () => {
         setSelectedTx(tx); setTab('txs');
       }
     } catch {
-      alert('Not found: ' + q);
+      openUrl(searchUrl(q)).catch(() => {});
     }
   }
 
@@ -375,7 +415,9 @@ const ExplorerPage: React.FC = () => {
                           className="hover:bg-gray-700/40 cursor-pointer transition"
                         >
                           <td className="px-5 py-3 font-mono text-blue-400">#{block.height.toLocaleString()}</td>
-                          <td className="px-5 py-3 font-mono text-xs text-gray-300">{shortHash(block.hash)}</td>
+                          <td className="px-5 py-3 font-mono text-xs text-gray-300">
+                            <button onClick={openOnWeb(blockUrl(block.height))} title="Open on egoblockchain.com" className="hover:text-blue-400 hover:underline">{shortHash(block.hash)}</button>
+                          </td>
                           <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(block.miner)}</td>
                           <td className="px-5 py-3 text-right text-gray-300">{block.tx_count}</td>
                           <td className="px-5 py-3 text-right text-green-400">{(block.reward / 1_000_000).toFixed(3)} EGOC</td>
@@ -391,7 +433,19 @@ const ExplorerPage: React.FC = () => {
           )
 
         ) : tab === 'txs' ? (
-          totalTxs === 0 ? (
+          <>
+          <div className="flex gap-2 px-5 pt-4">
+            {(['transfers', 'all'] as const).map(v => (
+              <button
+                key={v}
+                onClick={() => { setTxView(v); setActivityCursors([null]); }}
+                className={`text-xs px-3 py-1.5 rounded-lg transition ${txView === v ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+              >
+                {v === 'transfers' ? 'Transfers' : 'All activity'}
+              </button>
+            ))}
+          </div>
+          {totalTxs === 0 && txView === 'transfers' ? (
             <div className="py-16 text-center text-gray-500">
               <div className="text-4xl mb-3">↔️</div>
               <div className="text-sm">No transactions yet</div>
@@ -413,12 +467,12 @@ const ExplorerPage: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-700/50">
-                    {txs.length === 0 ? (
+                    {(txView === 'all' ? activity : txs).length === 0 ? (
                       <tr>
                         <td colSpan={7} className="py-12 text-center text-gray-500">No transactions on this page</td>
                       </tr>
                     ) : (
-                      txs.map(tx => {
+                      (txView === 'all' ? activity : txs).map(tx => {
                         const txTypeLabel = tx.is_private                  ? '🛡 Hidden'
                                           : tx.tx_type === 'reward'        ? '🏆 Reward'
                                           : tx.tx_type === 'store_data'    ? '📦 Store'
@@ -437,11 +491,13 @@ const ExplorerPage: React.FC = () => {
                         const toFinal   = tx.to   === 'Shielded' ? <span className="text-yellow-500/70">🛡 Hidden</span> : shortAddr(tx.to);
                         return (
                         <tr
-                          key={tx.hash}
+                          key={`${tx.block_height ?? ''}-${tx.hash}`}
                           onClick={() => setSelectedTx(tx)}
                           className="hover:bg-gray-700/40 cursor-pointer transition"
                         >
-                          <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortHash(tx.hash)}</td>
+                          <td className="px-5 py-3 font-mono text-xs text-blue-400">
+                            <button onClick={openOnWeb(txUrl(tx.hash, tx.block_height))} title="Open on egoblockchain.com" className="hover:underline">{shortHash(tx.hash)}</button>
+                          </td>
                           <td className="px-5 py-3 text-xs text-gray-300">
                             <span className={tx.is_private ? 'text-yellow-400 font-bold' : ''}>{txTypeLabel}</span>
                           </td>
@@ -465,9 +521,30 @@ const ExplorerPage: React.FC = () => {
                   </tbody>
                 </table>
               </div>
-              <Pagination total={localTxs} page={txPage} pageSize={pageSize} onPage={setTxPage} onPageSize={ps => { setPageSize(ps); setTxPage(1); }} />
+              {txView === 'all' ? (
+                <div className="flex items-center justify-between px-5 py-3 border-t border-gray-700 text-xs text-gray-400">
+                  <button
+                    disabled={activityCursors.length <= 1}
+                    onClick={() => setActivityCursors(c => c.slice(0, -1))}
+                    className="px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 transition"
+                  >
+                    ‹ Newer
+                  </button>
+                  <span>Page {activityCursors.length}</span>
+                  <button
+                    disabled={activityNext == null}
+                    onClick={() => activityNext != null && setActivityCursors(c => [...c, activityNext])}
+                    className="px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-40 transition"
+                  >
+                    Older ›
+                  </button>
+                </div>
+              ) : (
+                <Pagination total={localTxs} page={txPage} pageSize={pageSize} onPage={setTxPage} onPageSize={ps => { setPageSize(ps); setTxPage(1); }} />
+              )}
             </>
-          )
+          )}
+          </>
 
         ) : tab === 'tokenomics' ? (
 
@@ -635,20 +712,20 @@ const ExplorerPage: React.FC = () => {
               <button onClick={() => setSelectedBlock(null)} className="text-gray-400 hover:text-white text-xl">✕</button>
             </div>
             <div className="space-y-3 text-sm">
-              {[
-                { label: 'Height',       val: `#${selectedBlock.height.toLocaleString()}` },
-                { label: 'Hash',         val: selectedBlock.hash,      mono: true },
-                { label: 'Prev Hash',    val: selectedBlock.prev_hash, mono: true },
+              {([
+                { label: 'Height',       val: `#${selectedBlock.height.toLocaleString()}`, href: blockUrl(selectedBlock.height) },
+                { label: 'Hash',         val: selectedBlock.hash,      mono: true, href: blockUrl(selectedBlock.height) },
+                { label: 'Prev Hash',    val: selectedBlock.prev_hash, mono: true, href: selectedBlock.height > 0 ? blockUrl(selectedBlock.height - 1) : undefined },
                 { label: 'Timestamp',    val: sfTime(blockTimes.get(selectedBlock.height) ?? Math.min(selectedBlock.timestamp, Math.floor(Date.now() / 1000))) },
-                { label: 'Miner',        val: selectedBlock.miner,     mono: true },
+                { label: 'Miner',        val: selectedBlock.miner,     mono: true, href: selectedBlock.miner ? addressUrl(selectedBlock.miner) : undefined },
                 { label: 'Reward',       val: `${(selectedBlock.reward / 1_000_000).toFixed(3)} EGOC` },
                 { label: 'Transactions', val: String(selectedBlock.tx_count) },
                 { label: 'Size',         val: `${(selectedBlock.size_bytes / 1024).toFixed(1)} KB` },
                 { label: 'Finality',     val: 'Dilithium QC verified ✓' },
-              ].map(({ label, val, mono }) => (
+              ] as DetailRow[]).map(({ label, val, mono, href }) => (
                 <div key={label} className="flex justify-between items-start gap-4 py-1.5 border-b border-gray-700/50 last:border-0">
                   <span className="text-gray-400 shrink-0">{label}</span>
-                  <span className={`text-right break-all ${mono ? 'font-mono text-xs text-gray-300' : ''}`}>{val}</span>
+                  <DetailValue val={val} mono={mono} href={href} />
                 </div>
               ))}
             </div>
@@ -681,21 +758,21 @@ const ExplorerPage: React.FC = () => {
               }`}>{selectedTx.status}</div>
             </div>
             <div className="space-y-3 text-sm">
-              {[
-                { label: 'Hash',      val: selectedTx.hash,                    mono: true },
-                { label: 'Block',     val: selectedTx.block_height != null ? `#${selectedTx.block_height.toLocaleString()}` : 'Unconfirmed' },
-                { label: 'From',      val: selectedTx.from,                    mono: true },
-                { label: 'To',        val: selectedTx.to,                      mono: true },
+              {([
+                { label: 'Hash',      val: selectedTx.hash,                    mono: true, href: txUrl(selectedTx.hash, selectedTx.block_height) },
+                { label: 'Block',     val: selectedTx.block_height != null ? `#${selectedTx.block_height.toLocaleString()}` : 'Unconfirmed', href: selectedTx.block_height != null ? blockUrl(selectedTx.block_height) : undefined },
+                { label: 'From',      val: selectedTx.from,                    mono: true, href: /^ego[a-z0-9]*1/.test(selectedTx.from) ? addressUrl(selectedTx.from) : undefined },
+                { label: 'To',        val: selectedTx.to,                      mono: true, href: /^ego[a-z0-9]*1/.test(selectedTx.to) ? addressUrl(selectedTx.to) : undefined },
                 { label: 'Amount',    val: txDisplayAmount(selectedTx) },
                 { label: 'Fee',       val: selectedTx.fee_uegoc && selectedTx.fee_uegoc > 0 ? `${(selectedTx.fee_uegoc / 1_000_000).toFixed(6)} EGOC` : '0 EGOC' },
                 { label: 'Nonce',     val: String(selectedTx.nonce) },
                 { label: 'Timestamp', val: sfTime(selectedTx.timestamp) },
                 { label: 'Signature', val: selectedTx.signature.slice(0, 32) + '…', mono: true },
                 ...(selectedTx.memo ? [{ label: 'Memo', val: selectedTx.memo }] : []),
-              ].map(({ label, val, mono }) => (
+              ] as DetailRow[]).map(({ label, val, mono, href }) => (
                 <div key={label} className="flex justify-between items-start gap-4 py-1.5 border-b border-gray-700/50 last:border-0">
                   <span className="text-gray-400 shrink-0">{label}</span>
-                  <span className={`text-right break-all ${mono ? 'font-mono text-xs text-gray-300' : ''}`}>{val}</span>
+                  <DetailValue val={val} mono={mono} href={href} />
                 </div>
               ))}
             </div>
