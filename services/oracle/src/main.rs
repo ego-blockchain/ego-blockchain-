@@ -752,6 +752,21 @@ async fn handle_chain_blocks(
         return Json(arc.iter().skip(skip).cloned().collect::<Vec<Value>>());
     }
 
+    if let Some(from) = q.from_height {
+        let below = state.stat_window_from.load(std::sync::atomic::Ordering::Relaxed);
+        if from < below {
+            let have = { state.archive.read().await.buckets.clone() };
+            let dir = archive::dir();
+            let lim = limit.min(1_000);
+            let out = tokio::task::spawn_blocking(move || archive::archived_from(&dir, &have, from, below, lim, "blocks"))
+                .await
+                .unwrap_or_default();
+            if !out.is_empty() {
+                return Json(out);
+            }
+        }
+    }
+
     let chain = state.chain.read().await;
     let mut refs: Vec<&Value> = match q.from_height {
         Some(from) => chain.blocks.iter()
@@ -802,8 +817,20 @@ async fn handle_chain_transactions(
         return Json(arc.iter().take(limit).cloned().collect::<Vec<Value>>());
     }
 
-    let chain = state.chain.read().await;
     let from = q.from_height.unwrap_or(0);
+    let below = state.stat_window_from.load(std::sync::atomic::Ordering::Relaxed);
+    if from < below {
+        let have = { state.archive.read().await.buckets.clone() };
+        let dir = archive::dir();
+        let lim = limit.min(5_000);
+        let out = tokio::task::spawn_blocking(move || archive::archived_from(&dir, &have, from, below, lim, "txs"))
+            .await
+            .unwrap_or_default();
+        if !out.is_empty() {
+            return Json(out);
+        }
+    }
+    let chain = state.chain.read().await;
     let mut refs: Vec<&Value> = chain.transactions.iter()
         .filter(|t| t["block_height"].as_u64().unwrap_or(0) >= from)
         .collect();
@@ -1090,6 +1117,13 @@ async fn handle_find(State(state): State<AppState>, axum::extract::Query(q): axu
         let list: Vec<u64> = buckets.into_iter().rev().collect();
         return Json(json!({ "kind": "address", "address": q, "buckets": list }));
     }
+    let (txs, blocks) = state.archive.read().await.find_hash(&q);
+    if !blocks.is_empty() {
+        return Json(json!({ "kind": "block", "buckets": blocks }));
+    }
+    if !txs.is_empty() {
+        return Json(json!({ "kind": "tx", "buckets": txs }));
+    }
     let live = {
         let chain = state.chain.read().await;
         if let Some(b) = chain.blocks.iter().find(|b| b["hash"].as_str().map_or(false, |h| archive::same_hash(h, &q))) {
@@ -1102,17 +1136,7 @@ async fn handle_find(State(state): State<AppState>, axum::extract::Query(q): axu
                 .map(|t| json!({ "kind": "tx", "height": t["block_height"], "tx": t }))
         }
     };
-    if let Some(v) = live {
-        return Json(v);
-    }
-    let (txs, blocks) = state.archive.read().await.find_hash(&q);
-    if !blocks.is_empty() {
-        return Json(json!({ "kind": "block", "buckets": blocks }));
-    }
-    if !txs.is_empty() {
-        return Json(json!({ "kind": "tx", "buckets": txs }));
-    }
-    Json(json!({ "kind": "none" }))
+    Json(live.unwrap_or_else(|| json!({ "kind": "none" })))
 }
 
 async fn archive_pass(state: &AppState) {
@@ -1179,6 +1203,28 @@ async fn archive_pass(state: &AppState) {
     }
     state.archive.write().await.absorb(fresh);
     info!("Archive: wrote {} bucket(s) from the live window", written.len());
+}
+
+async fn trim_pass(state: &AppState) {
+    use std::sync::atomic::Ordering;
+    let tip = state.stat_tip.load(Ordering::Relaxed);
+    if tip <= archive::WINDOW_KEEP {
+        return;
+    }
+    let archived = { state.archive.read().await.buckets.clone() };
+    let removed = {
+        let mut chain = state.chain.write().await;
+        let n = archive::trim_window(&mut chain, &archived, tip);
+        if n > 0 {
+            state.stat_blocks.store(chain.blocks.len() as u64, Ordering::Relaxed);
+            state.stat_txs.store(chain.transactions.len() as u64, Ordering::Relaxed);
+        }
+        n
+    };
+    if removed > 0 {
+        state.chain_dirty.store(true, Ordering::Relaxed);
+        info!("Archive: {} archived blocks and transactions left memory; the live window keeps the last {} blocks", removed, archive::WINDOW_KEEP);
+    }
 }
 
 async fn handle_chain_gaps(
@@ -1549,6 +1595,7 @@ async fn main() {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             loop {
                 archive_pass(&state).await;
+                trim_pass(&state).await;
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             }
         });

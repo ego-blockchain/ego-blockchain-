@@ -6,6 +6,7 @@ pub const BUCKET: u64 = 100;
 pub const KEEP_RECENT: u64 = 200;
 pub const WRITES_PER_PASS: usize = 10;
 pub const USERS_MAX: usize = 5_000;
+pub const WINDOW_KEEP: u64 = 6_000;
 
 const HEAVY_BLOCK_FIELDS: [&str; 6] = ["commit_cert", "poc_ticket", "randao_reveal", "producer_sig", "agg_bls_sig", "bls_pubkeys"];
 
@@ -97,6 +98,38 @@ pub fn window_bucket(chain: &crate::ChainState, bucket: u64) -> Option<Value> {
     let mut v = bucket_json(bucket, &blocks, &txs);
     v["partial"] = json!(true);
     Some(v)
+}
+
+pub fn trim_window(chain: &mut crate::ChainState, archived: &BTreeSet<u64>, tip: u64) -> usize {
+    let keep_from = tip.saturating_sub(WINDOW_KEEP);
+    let gone = |h: u64| h > 0 && h < keep_from && archived.contains(&bucket_of(h));
+    let before = chain.blocks.len() + chain.transactions.len();
+    chain.blocks.retain(|b| !b["height"].as_u64().map_or(false, gone));
+    chain.transactions.retain(|t| !t["block_height"].as_u64().map_or(false, gone));
+    before - chain.blocks.len() - chain.transactions.len()
+}
+
+pub fn read_bucket(dir: &Path, bucket: u64) -> Option<Value> {
+    let data = std::fs::read(dir.join(file_name(bucket))).ok()?;
+    serde_json::from_slice::<Value>(&data).ok().filter(|v| v["bucket"].as_u64() == Some(bucket))
+}
+
+pub fn archived_from(dir: &Path, have: &BTreeSet<u64>, from: u64, below: u64, limit: usize, key: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for b in have.range(bucket_of(from)..).copied() {
+        if b * BUCKET >= below || out.len() >= limit {
+            break;
+        }
+        let Some(v) = read_bucket(dir, b) else { continue };
+        let field = if key == "blocks" { "height" } else { "block_height" };
+        for x in v[key].as_array().into_iter().flatten() {
+            let h = x[field].as_u64().unwrap_or(0);
+            if h >= from && h < below && out.len() < limit {
+                out.push(x.clone());
+            }
+        }
+    }
+    out
 }
 
 pub fn window_address_buckets(chain: &crate::ChainState, addr: &str) -> BTreeSet<u64> {
@@ -193,11 +226,13 @@ pub fn bucket_json(bucket: u64, blocks: &[&Value], txs: &[&Value]) -> Value {
 
 pub fn ready_buckets(chain: &crate::ChainState, have: &BTreeSet<u64>, skip: &BTreeSet<u64>, tip: u64) -> (Vec<Value>, Vec<u64>) {
     let limit = tip.saturating_sub(KEEP_RECENT);
+    let settled = tip.saturating_sub(WINDOW_KEEP);
     let mut by_bucket: HashMap<u64, Vec<&Value>> = HashMap::new();
     for b in &chain.blocks {
         let Some(h) = b["height"].as_u64() else { continue };
         let bucket = bucket_of(h);
-        if (bucket + 1) * BUCKET > limit || have.contains(&bucket) || skip.contains(&bucket) {
+        let old = (bucket + 1) * BUCKET <= settled;
+        if (bucket + 1) * BUCKET > limit || have.contains(&bucket) || (skip.contains(&bucket) && !old) {
             continue;
         }
         by_bucket.entry(bucket).or_default().push(b);
@@ -208,7 +243,7 @@ pub fn ready_buckets(chain: &crate::ChainState, have: &BTreeSet<u64>, skip: &BTr
             let mut hs: Vec<u64> = blocks.iter().filter_map(|b| b["height"].as_u64()).collect();
             hs.sort_unstable();
             hs.dedup();
-            hs.len() as u64 == BUCKET && hs.first() == Some(&(**bucket * BUCKET))
+            (**bucket + 1) * BUCKET <= settled || (hs.len() as u64 == BUCKET && hs.first() == Some(&(**bucket * BUCKET)))
         })
         .map(|(b, _)| *b)
         .collect();
@@ -235,12 +270,17 @@ pub fn ready_buckets(chain: &crate::ChainState, have: &BTreeSet<u64>, skip: &BTr
         for t in &txs {
             *per_height.entry(t["block_height"].as_u64().unwrap_or(0)).or_insert(0) += 1;
         }
-        let complete = blocks.iter().all(|b| {
-            let h = b["height"].as_u64().unwrap_or(0);
-            per_height.get(&h).copied().unwrap_or(0) >= b["tx_count"].as_u64().unwrap_or(0)
-        });
+        let complete = blocks.len() as u64 == BUCKET
+            && blocks.iter().all(|b| {
+                let h = b["height"].as_u64().unwrap_or(0);
+                per_height.get(&h).copied().unwrap_or(0) >= b["tx_count"].as_u64().unwrap_or(0)
+            });
         if complete {
             out.push(bucket_json(bucket, blocks, &txs));
+        } else if (bucket + 1) * BUCKET <= settled {
+            let mut v = bucket_json(bucket, blocks, &txs);
+            v["partial"] = json!(true);
+            out.push(v);
         } else {
             short.push(bucket);
         }
@@ -318,10 +358,10 @@ mod tests {
     }
 
     #[test]
-    fn a_bucket_with_a_missing_block_waits() {
+    fn a_recent_bucket_with_a_missing_block_waits() {
         let mut c = chain(0..400, None);
         c.blocks.retain(|b| b["height"].as_u64() != Some(150));
-        let (ready, _) = ready_buckets(&c, &BTreeSet::new(), &BTreeSet::new(), 10_000);
+        let (ready, _) = ready_buckets(&c, &BTreeSet::new(), &BTreeSet::new(), 600);
         let ids: Vec<u64> = ready.iter().map(|v| v["bucket"].as_u64().unwrap()).collect();
         assert_eq!(ids, vec![3, 2, 0]);
     }
@@ -375,6 +415,51 @@ mod tests {
         assert_eq!(v["partial"], json!(true));
         assert!(window_bucket(&c, 3).is_none());
         assert_eq!(window_address_buckets(&c, "egot1alice").into_iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn old_buckets_are_archived_even_with_gaps_and_then_leave_memory() {
+        let mut c = chain(0..10_000, Some(1_234));
+        c.blocks.retain(|b| b["height"].as_u64() != Some(2_345));
+        let tip = 9_999;
+        let mut have = BTreeSet::new();
+        for _ in 0..20 {
+            let (ready, _) = ready_buckets(&c, &have, &BTreeSet::new(), tip);
+            if ready.is_empty() {
+                break;
+            }
+            for v in &ready {
+                have.insert(v["bucket"].as_u64().unwrap());
+                if v["bucket"] == json!(12) || v["bucket"] == json!(23) {
+                    assert_eq!(v["partial"], json!(true));
+                }
+            }
+        }
+        assert!(have.contains(&12) && have.contains(&23));
+        assert!(!have.contains(&97));
+        let removed = trim_window(&mut c, &have, tip);
+        assert!(removed > 0);
+        let lowest = c.blocks.iter().filter_map(|b| b["height"].as_u64()).filter(|h| *h > 0).min().unwrap();
+        assert_eq!(lowest, 3_999);
+        assert!(c.blocks.iter().any(|b| b["height"].as_u64() == Some(0)));
+    }
+
+    #[test]
+    fn reading_by_height_continues_from_disk_below_the_window() {
+        let dir = std::env::temp_dir().join(format!("ego-archive-from-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let c = chain(0..400, None);
+        let (ready, _) = ready_buckets(&c, &BTreeSet::new(), &BTreeSet::new(), 10_000);
+        let mut have = BTreeSet::new();
+        for v in &ready {
+            write_bucket(&dir, v).unwrap();
+            have.insert(v["bucket"].as_u64().unwrap());
+        }
+        let blocks = archived_from(&dir, &have, 150, 300, 500, "blocks");
+        assert_eq!(blocks.first().unwrap()["height"], json!(150));
+        assert_eq!(blocks.len(), 150);
+        assert_eq!(archived_from(&dir, &have, 150, 300, 10, "txs").len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
