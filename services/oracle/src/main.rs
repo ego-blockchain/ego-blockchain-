@@ -1115,7 +1115,14 @@ async fn handle_find(State(state): State<AppState>, axum::extract::Query(q): axu
         };
         buckets.extend(state.archive.read().await.address_buckets(&q));
         let list: Vec<u64> = buckets.into_iter().rev().collect();
-        return Json(json!({ "kind": "address", "address": q, "buckets": list }));
+        let (balance, balance_height) = {
+            let snap = state.snapshot.read().await;
+            match snap.as_ref() {
+                Some(s) => (archive::snapshot_balance(s, &q), s["height"].as_u64()),
+                None => (None, None),
+            }
+        };
+        return Json(json!({ "kind": "address", "address": q, "buckets": list, "balance": balance, "balance_height": balance_height }));
     }
     let (txs, blocks) = state.archive.read().await.find_hash(&q);
     if !blocks.is_empty() {
@@ -1633,7 +1640,7 @@ async fn main() {
         .route("/chain/archive",            get(handle_archive_index))
         .route("/chain/archive/:bucket",    get(handle_archive_bucket))
         .route("/chain/find",               get(handle_find))
-        .route("/chain/snapshot",           post(handle_snapshot_submit).get(handle_snapshot_get))
+        .route("/chain/snapshot",           post(handle_snapshot_submit).get(handle_snapshot_get).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)))
         .route("/prices",                   get(handle_prices))
         .route("/price/:symbol",            get(handle_price))
         .route("/egoc",                     get(handle_egoc))

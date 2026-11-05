@@ -132,6 +132,14 @@ pub fn archived_from(dir: &Path, have: &BTreeSet<u64>, from: u64, below: u64, li
     out
 }
 
+pub fn snapshot_balance(snap: &Value, addr: &str) -> Option<u64> {
+    let want = hex::encode(addr.as_bytes());
+    let found = snap["balances"].as_array()?.iter().find(|e| e[0].as_str().map_or(false, |k| k.eq_ignore_ascii_case(&want)))?;
+    let raw = hex::decode(found[1].as_str()?).ok()?;
+    let bytes: [u8; 8] = raw.get(..8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
 pub fn window_address_buckets(chain: &crate::ChainState, addr: &str) -> BTreeSet<u64> {
     chain
         .transactions
@@ -460,6 +468,18 @@ mod tests {
         assert_eq!(blocks.len(), 150);
         assert_eq!(archived_from(&dir, &have, 150, 300, 10, "txs").len(), 10);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_balance_is_read_from_the_snapshot_by_address() {
+        let snap = json!({ "height": 10, "balances": [
+            [hex::encode("egot1alice"), "40420f0000000000"],
+            [hex::encode("egot1bob"), "0100000000000000"],
+        ]});
+        assert_eq!(snapshot_balance(&snap, "egot1alice"), Some(1_000_000));
+        assert_eq!(snapshot_balance(&snap, "egot1bob"), Some(1));
+        assert_eq!(snapshot_balance(&snap, "egot1carol"), None);
+        assert_eq!(snapshot_balance(&json!({}), "egot1alice"), None);
     }
 
     #[test]
