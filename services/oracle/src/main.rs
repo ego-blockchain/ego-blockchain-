@@ -617,6 +617,7 @@ pub struct AppState {
     pub stat_blocks:  Arc<std::sync::atomic::AtomicU64>,
     pub stat_txs:     Arc<std::sync::atomic::AtomicU64>,
     pub stat_tip:     Arc<std::sync::atomic::AtomicU64>,
+    pub stat_window_from: Arc<std::sync::atomic::AtomicU64>,
 }
 
 const EGOC_USD: f64 = 0.01;
@@ -1029,18 +1030,25 @@ fn gap_range(from: Option<u64>, to: Option<u64>, tip: u64) -> Result<(u64, u64),
 }
 
 async fn handle_archive_index(State(state): State<AppState>) -> impl IntoResponse {
-    let a = state.archive.read().await;
+    use std::sync::atomic::Ordering;
+    let mut buckets = { state.archive.read().await.buckets.clone() };
+    let from = state.stat_window_from.load(Ordering::Relaxed);
+    let tip = state.stat_tip.load(Ordering::Relaxed);
+    if from > 0 && tip >= from {
+        buckets.extend(archive::bucket_of(from)..=archive::bucket_of(tip));
+    }
+    let users = state.archive.read().await.users.len();
     Json(json!({
         "bucket_size": archive::BUCKET,
-        "ranges": archive::ranges(&a.buckets),
-        "user_transfers": a.users.len(),
+        "ranges": archive::ranges(&buckets),
+        "user_transfers": users,
     }))
 }
 
-async fn handle_archive_bucket(Path(bucket): Path<u64>) -> axum::response::Response {
+async fn handle_archive_bucket(State(state): State<AppState>, Path(bucket): Path<u64>) -> axum::response::Response {
     let path = archive::dir().join(archive::file_name(bucket));
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
+    if let Ok(bytes) = tokio::fs::read(&path).await {
+        return (
             StatusCode::OK,
             [
                 (axum::http::header::CONTENT_TYPE, "application/json"),
@@ -1048,35 +1056,83 @@ async fn handle_archive_bucket(Path(bucket): Path<u64>) -> axum::response::Respo
             ],
             bytes,
         )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not archived" }))).into_response(),
+            .into_response();
     }
+    let built = {
+        let chain = state.chain.read().await;
+        archive::window_bucket(&chain, bucket)
+    };
+    match built {
+        Some(v) => ([(axum::http::header::CACHE_CONTROL, "no-store")], Json(v)).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({ "error": "not archived" }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FindQuery {
+    q: String,
+}
+
+async fn handle_find(State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<FindQuery>) -> impl IntoResponse {
+    let q = q.q.trim().to_string();
+    if q.is_empty() || q.len() > 130 {
+        return Json(json!({ "kind": "none" }));
+    }
+    if q.bytes().all(|c| c.is_ascii_digit()) {
+        return Json(json!({ "kind": "block", "height": q.parse::<u64>().ok() }));
+    }
+    if archive::is_address(&q) {
+        let mut buckets: std::collections::BTreeSet<u64> = {
+            let chain = state.chain.read().await;
+            archive::window_address_buckets(&chain, &q)
+        };
+        buckets.extend(state.archive.read().await.address_buckets(&q));
+        let list: Vec<u64> = buckets.into_iter().rev().collect();
+        return Json(json!({ "kind": "address", "address": q, "buckets": list }));
+    }
+    let live = {
+        let chain = state.chain.read().await;
+        if let Some(b) = chain.blocks.iter().find(|b| b["hash"].as_str().map_or(false, |h| archive::same_hash(h, &q))) {
+            Some(json!({ "kind": "block", "height": b["height"] }))
+        } else {
+            chain
+                .transactions
+                .iter()
+                .find(|t| t["hash"].as_str().map_or(false, |h| archive::same_hash(h, &q)))
+                .map(|t| json!({ "kind": "tx", "height": t["block_height"], "tx": t }))
+        }
+    };
+    if let Some(v) = live {
+        return Json(v);
+    }
+    let (txs, blocks) = state.archive.read().await.find_hash(&q);
+    if !blocks.is_empty() {
+        return Json(json!({ "kind": "block", "buckets": blocks }));
+    }
+    if !txs.is_empty() {
+        return Json(json!({ "kind": "tx", "buckets": txs }));
+    }
+    Json(json!({ "kind": "none" }))
 }
 
 async fn archive_pass(state: &AppState) {
     use std::sync::atomic::Ordering;
     let dir = archive::dir();
-    let mut fresh = archive::Archive::default();
-    {
-        let a = state.archive.read().await;
-        fresh.buckets = a.buckets.clone();
-    }
+    let known = { state.archive.read().await.buckets.clone() };
     let scan_dir = dir.clone();
     let scanned = tokio::task::spawn_blocking(move || {
+        let mut fresh = archive::Archive::default();
+        fresh.buckets = known.clone();
         let added = archive::rescan_dir(&mut fresh, &scan_dir);
+        fresh.buckets.retain(|b| !known.contains(b));
         (fresh, added)
     })
     .await;
     if let Ok((found, added)) = scanned {
         if added > 0 {
             let mut a = state.archive.write().await;
-            a.buckets.extend(found.buckets.iter().copied());
-            for b in &found.buckets {
-                a.incomplete.remove(b);
-            }
-            let users = std::mem::take(&mut a.users);
-            a.users = archive::merge_users(&found.users, &users, usize::MAX);
-            info!("Archive: {} new bucket file(s) on disk, {} user transfers indexed", added, a.users.len());
+            a.absorb(found);
+            info!("Archive: {} new bucket file(s) on disk, {} user transfers and {} hashes indexed", added, a.users.len(), a.hashes.len());
         }
     }
     let tip = state.stat_tip.load(Ordering::Relaxed);
@@ -1111,18 +1167,17 @@ async fn archive_pass(state: &AppState) {
     if written.is_empty() {
         return;
     }
-    let mut a = state.archive.write().await;
-    let mut users: Vec<Value> = Vec::new();
+    let mut fresh = archive::Archive::default();
     for v in &written {
         if let Some(b) = v["bucket"].as_u64() {
-            a.buckets.insert(b);
+            fresh.buckets.insert(b);
+            fresh.index_bucket(b, v);
         }
         if let Some(txs) = v["txs"].as_array() {
-            users.extend(txs.iter().filter(|t| is_user_tx(t)).cloned());
+            fresh.users.extend(txs.iter().filter(|t| is_user_tx(t)).cloned());
         }
     }
-    let old = std::mem::take(&mut a.users);
-    a.users = archive::merge_users(&users, &old, usize::MAX);
+    state.archive.write().await.absorb(fresh);
     info!("Archive: wrote {} bucket(s) from the live window", written.len());
 }
 
@@ -1426,6 +1481,7 @@ async fn main() {
         stat_blocks:     Arc::new(std::sync::atomic::AtomicU64::new(init_blocks)),
         stat_txs:        Arc::new(std::sync::atomic::AtomicU64::new(init_txs)),
         stat_tip:        Arc::new(std::sync::atomic::AtomicU64::new(init_tip)),
+        stat_window_from: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     if state.submit_token.is_none() {
         error!("SECURITY: ORACLE_SUBMIT_TOKEN is not set — /chain/submit is UNAUTHENTICATED. \
@@ -1451,8 +1507,9 @@ async fn main() {
                 tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 tick = tick.wrapping_add(1);
 
-                let (blocks500, txs500, user500, live_tip) = {
+                let (blocks500, txs500, user500, live_tip, window_from) = {
                     let chain = state.chain.read().await;
+                    let window_from = chain.blocks.iter().filter_map(|b| b["height"].as_u64()).filter(|h| *h > 0).min().unwrap_or(0);
                     // Select by RECENCY (timestamp), not raw height. After a testnet
                     // wipe the abandoned chain's numerically-higher-but-ancient blocks
                     // would otherwise permanently outrank the live chain's lower (but
@@ -1468,8 +1525,9 @@ async fn main() {
                     trefs.sort_by_key(|t| std::cmp::Reverse(t["timestamp"].as_i64().unwrap_or(0)));
                     let txs500: Vec<Value> = trefs.iter().take(500).map(|t| (*t).clone()).collect();
                     let user500: Vec<Value> = trefs.iter().filter(|t| is_user_tx(t)).take(500).map(|t| (*t).clone()).collect();
-                    (blocks500, txs500, user500, live_tip)
+                    (blocks500, txs500, user500, live_tip, window_from)
                 };
+                state.stat_window_from.store(window_from, Ordering::Relaxed);
                 *state.blocks_cache.write().await = Some(Arc::new(blocks500));
                 *state.txs_cache.write().await = Some(Arc::new(txs500));
                 *state.user_txs_cache.write().await = Some(Arc::new(user500));
@@ -1527,6 +1585,7 @@ async fn main() {
         .route("/chain/gaps",               get(handle_chain_gaps))
         .route("/chain/archive",            get(handle_archive_index))
         .route("/chain/archive/:bucket",    get(handle_archive_bucket))
+        .route("/chain/find",               get(handle_find))
         .route("/chain/snapshot",           post(handle_snapshot_submit).get(handle_snapshot_get))
         .route("/prices",                   get(handle_prices))
         .route("/price/:symbol",            get(handle_price))

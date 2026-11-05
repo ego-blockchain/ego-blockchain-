@@ -14,6 +14,99 @@ pub struct Archive {
     pub buckets: BTreeSet<u64>,
     pub users: Vec<Value>,
     pub incomplete: BTreeSet<u64>,
+    pub hashes: Vec<(u64, u32)>,
+    pub addrs: HashMap<String, BTreeSet<u32>>,
+}
+
+pub fn hash_prefix(hash: &str) -> Option<u64> {
+    let h = hash.strip_prefix("0x").or_else(|| hash.strip_prefix("0X")).unwrap_or(hash);
+    u64::from_str_radix(h.get(..16)?, 16).ok()
+}
+
+pub fn same_hash(a: &str, b: &str) -> bool {
+    let strip = |s: &str| s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s).to_ascii_lowercase();
+    !a.is_empty() && strip(a) == strip(b)
+}
+
+pub fn is_address(q: &str) -> bool {
+    (q.starts_with("egot1") || q.starts_with("ego1")) && q.len() <= 90 && q.bytes().all(|c| c.is_ascii_alphanumeric())
+}
+
+impl Archive {
+    pub fn index_bucket(&mut self, bucket: u64, v: &Value) {
+        let b = bucket as u32;
+        for blk in v["blocks"].as_array().into_iter().flatten() {
+            if let Some(p) = blk["hash"].as_str().and_then(hash_prefix) {
+                self.hashes.push((p, b << 1 | 1));
+            }
+        }
+        for t in v["txs"].as_array().into_iter().flatten() {
+            if let Some(p) = t["hash"].as_str().and_then(hash_prefix) {
+                self.hashes.push((p, b << 1));
+            }
+            for k in ["from", "to"] {
+                if let Some(a) = t[k].as_str().filter(|a| is_address(a)) {
+                    self.addrs.entry(a.to_string()).or_default().insert(b);
+                }
+            }
+        }
+    }
+
+    pub fn finish_index(&mut self) {
+        self.hashes.sort_unstable();
+        self.hashes.dedup();
+    }
+
+    pub fn absorb(&mut self, other: Archive) {
+        self.buckets.extend(other.buckets.iter().copied());
+        for b in &other.buckets {
+            self.incomplete.remove(b);
+        }
+        let users = std::mem::take(&mut self.users);
+        self.users = merge_users(&other.users, &users, usize::MAX);
+        self.hashes.extend(other.hashes);
+        self.finish_index();
+        for (a, set) in other.addrs {
+            self.addrs.entry(a).or_default().extend(set);
+        }
+    }
+
+    pub fn find_hash(&self, q: &str) -> (Vec<u64>, Vec<u64>) {
+        let Some(p) = hash_prefix(q) else { return (Vec::new(), Vec::new()) };
+        let start = self.hashes.partition_point(|(x, _)| *x < p);
+        let (mut txs, mut blocks) = (Vec::new(), Vec::new());
+        for (_, v) in self.hashes[start..].iter().take_while(|(x, _)| *x == p) {
+            let bucket = (*v >> 1) as u64;
+            if *v & 1 == 1 { blocks.push(bucket) } else { txs.push(bucket) }
+        }
+        (txs, blocks)
+    }
+
+    pub fn address_buckets(&self, addr: &str) -> Vec<u64> {
+        self.addrs.get(addr).map(|s| s.iter().rev().map(|b| *b as u64).collect()).unwrap_or_default()
+    }
+}
+
+pub fn window_bucket(chain: &crate::ChainState, bucket: u64) -> Option<Value> {
+    let range = bucket * BUCKET..(bucket + 1) * BUCKET;
+    let blocks: Vec<&Value> = chain.blocks.iter().filter(|b| b["height"].as_u64().map_or(false, |h| range.contains(&h))).collect();
+    if blocks.is_empty() {
+        return None;
+    }
+    let txs: Vec<&Value> = chain.transactions.iter().filter(|t| t["block_height"].as_u64().map_or(false, |h| range.contains(&h))).collect();
+    let mut v = bucket_json(bucket, &blocks, &txs);
+    v["partial"] = json!(true);
+    Some(v)
+}
+
+pub fn window_address_buckets(chain: &crate::ChainState, addr: &str) -> BTreeSet<u64> {
+    chain
+        .transactions
+        .iter()
+        .filter(|t| t["from"].as_str() == Some(addr) || t["to"].as_str() == Some(addr))
+        .filter_map(|t| t["block_height"].as_u64())
+        .map(bucket_of)
+        .collect()
 }
 
 pub fn dir() -> PathBuf {
@@ -72,12 +165,14 @@ pub fn rescan_dir(archive: &mut Archive, dir: &Path) -> usize {
         if let Some(txs) = v["txs"].as_array() {
             archive.users.extend(txs.iter().filter(|t| crate::is_user_tx(t)).cloned());
         }
+        archive.index_bucket(b, &v);
         archive.buckets.insert(b);
         archive.incomplete.remove(&b);
         added += 1;
     }
     if added > 0 {
         sort_users(&mut archive.users);
+        archive.finish_index();
     }
     added
 }
@@ -248,6 +343,38 @@ mod tests {
         assert_eq!(a.users[0]["block_height"].as_u64(), Some(294));
         assert_eq!(ranges(&a.buckets), vec![[0, 2]]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hashes_and_addresses_lead_back_to_their_bucket() {
+        let mut c = chain(0..300, None);
+        for (i, b) in c.blocks.iter_mut().enumerate() {
+            b["hash"] = json!(format!("{:016x}{}", 0xab00_0000_0000_0000u64 + i as u64, "0".repeat(48)));
+        }
+        let (ready, _) = ready_buckets(&c, &BTreeSet::new(), &BTreeSet::new(), 10_000);
+        let mut a = Archive::default();
+        for v in &ready {
+            a.index_bucket(v["bucket"].as_u64().unwrap(), v);
+        }
+        a.finish_index();
+        let block_hash = format!("{:016x}{}", 0xab00_0000_0000_0000u64 + 150, "0".repeat(48));
+        assert_eq!(a.find_hash(&block_hash), (vec![], vec![1]));
+        assert_eq!(a.find_hash("zz"), (vec![], vec![]));
+        assert_eq!(a.address_buckets("egot1alice"), vec![2, 1, 0]);
+        assert!(a.address_buckets("egot1nobody").is_empty());
+        assert!(same_hash("0xABcd", "abcd"));
+        assert!(!same_hash("", ""));
+        assert!(is_address("egot1alice") && !is_address("egot1a/../x"));
+    }
+
+    #[test]
+    fn a_window_bucket_is_built_from_live_blocks_and_marked_partial() {
+        let c = chain(0..250, None);
+        let v = window_bucket(&c, 2).unwrap();
+        assert_eq!(v["blocks"].as_array().unwrap().len(), 50);
+        assert_eq!(v["partial"], json!(true));
+        assert!(window_bucket(&c, 3).is_none());
+        assert_eq!(window_address_buckets(&c, "egot1alice").into_iter().collect::<Vec<_>>(), vec![0, 1, 2]);
     }
 
     #[test]
