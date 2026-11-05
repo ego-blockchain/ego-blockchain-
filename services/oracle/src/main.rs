@@ -1,4 +1,5 @@
 mod acme;
+mod archive;
 mod comments;
 mod dns;
 mod gateways;
@@ -150,6 +151,22 @@ struct ChainQuery {
     #[serde(rename = "fromHeight")]
     from_height: Option<u64>,
     limit: Option<usize>,
+    kind: Option<String>,
+}
+
+const PROTOCOL_TX_TYPES: &[&str] = &[
+    "reward", "coinbase", "fee_distribution", "post_reward", "validator_register", "governance",
+    "stake", "unstake", "staking", "slash", "slash_storage", "post_proof", "equivocation_proof",
+    "ready_batch", "tm_ready_batch", "price_report", "checkin_batch", "coverage_batch", "state_cert",
+];
+
+fn is_user_tx(t: &Value) -> bool {
+    let field = |k: &str| t[k].as_str().unwrap_or("");
+    let from = field("from");
+    if field("signature") == "coinbase" || from.is_empty() || from.starts_with("egot1nodepool") || from == field("to") {
+        return false;
+    }
+    !PROTOCOL_TX_TYPES.contains(&field("tx_type"))
 }
 
 const MAX_BLOCKS: usize       = 50_000;
@@ -590,6 +607,8 @@ pub struct AppState {
     pub snapshot:     Arc<RwLock<Option<serde_json::Value>>>,
     pub blocks_cache: Arc<RwLock<Option<Arc<Vec<Value>>>>>,
     pub txs_cache:    Arc<RwLock<Option<Arc<Vec<Value>>>>>,
+    pub user_txs_cache: Arc<RwLock<Option<Arc<Vec<Value>>>>>,
+    pub archive:      Arc<RwLock<archive::Archive>>,
     /// Set on every submit; a background task debounces the expensive full-chain
     /// clone+save to disk so it never runs under the request's write lock.
     pub chain_dirty:  Arc<std::sync::atomic::AtomicBool>,
@@ -755,6 +774,13 @@ async fn handle_chain_transactions(
     axum::extract::Query(q): axum::extract::Query<ChainQuery>
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(500);
+
+    if q.kind.as_deref() == Some("user") {
+        let cached = { let c = state.user_txs_cache.read().await; c.as_ref().cloned() };
+        let recent: Vec<Value> = cached.map(|a| a.iter().cloned().collect()).unwrap_or_default();
+        let a = state.archive.read().await;
+        return Json(archive::merge_users(&recent, &a.users, limit.min(archive::USERS_MAX)));
+    }
 
     if q.from_height.is_none() && limit <= 500 {
         let cached = { let c = state.txs_cache.read().await; c.as_ref().cloned() };
@@ -1000,6 +1026,104 @@ fn gap_range(from: Option<u64>, to: Option<u64>, tip: u64) -> Result<(u64, u64),
         return Err(format!("range wider than {} heights", MAX_GAP_SCAN));
     }
     Ok((from, to))
+}
+
+async fn handle_archive_index(State(state): State<AppState>) -> impl IntoResponse {
+    let a = state.archive.read().await;
+    Json(json!({
+        "bucket_size": archive::BUCKET,
+        "ranges": archive::ranges(&a.buckets),
+        "user_transfers": a.users.len(),
+    }))
+}
+
+async fn handle_archive_bucket(Path(bucket): Path<u64>) -> axum::response::Response {
+    let path = archive::dir().join(archive::file_name(bucket));
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, "application/json"),
+                (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not archived" }))).into_response(),
+    }
+}
+
+async fn archive_pass(state: &AppState) {
+    use std::sync::atomic::Ordering;
+    let dir = archive::dir();
+    let mut fresh = archive::Archive::default();
+    {
+        let a = state.archive.read().await;
+        fresh.buckets = a.buckets.clone();
+    }
+    let scan_dir = dir.clone();
+    let scanned = tokio::task::spawn_blocking(move || {
+        let added = archive::rescan_dir(&mut fresh, &scan_dir);
+        (fresh, added)
+    })
+    .await;
+    if let Ok((found, added)) = scanned {
+        if added > 0 {
+            let mut a = state.archive.write().await;
+            a.buckets.extend(found.buckets.iter().copied());
+            for b in &found.buckets {
+                a.incomplete.remove(b);
+            }
+            let users = std::mem::take(&mut a.users);
+            a.users = archive::merge_users(&found.users, &users, usize::MAX);
+            info!("Archive: {} new bucket file(s) on disk, {} user transfers indexed", added, a.users.len());
+        }
+    }
+    let tip = state.stat_tip.load(Ordering::Relaxed);
+    let (have, skip) = {
+        let a = state.archive.read().await;
+        (a.buckets.clone(), a.incomplete.clone())
+    };
+    let (ready, short) = {
+        let chain = state.chain.read().await;
+        archive::ready_buckets(&chain, &have, &skip, tip)
+    };
+    if !short.is_empty() {
+        let mut a = state.archive.write().await;
+        a.incomplete.extend(short.iter().copied());
+    }
+    if ready.is_empty() {
+        return;
+    }
+    let write_dir = dir.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        let mut ok = Vec::new();
+        for v in ready {
+            match archive::write_bucket(&write_dir, &v) {
+                Ok(()) => ok.push(v),
+                Err(e) => error!("Archive write failed in {}: {}", write_dir.display(), e),
+            }
+        }
+        ok
+    })
+    .await
+    .unwrap_or_default();
+    if written.is_empty() {
+        return;
+    }
+    let mut a = state.archive.write().await;
+    let mut users: Vec<Value> = Vec::new();
+    for v in &written {
+        if let Some(b) = v["bucket"].as_u64() {
+            a.buckets.insert(b);
+        }
+        if let Some(txs) = v["txs"].as_array() {
+            users.extend(txs.iter().filter(|t| is_user_tx(t)).cloned());
+        }
+    }
+    let old = std::mem::take(&mut a.users);
+    a.users = archive::merge_users(&users, &old, usize::MAX);
+    info!("Archive: wrote {} bucket(s) from the live window", written.len());
 }
 
 async fn handle_chain_gaps(
@@ -1296,6 +1420,8 @@ async fn main() {
         snapshot:        Arc::new(RwLock::new(load_snapshot())),
         blocks_cache:    Arc::new(RwLock::new(None)),
         txs_cache:       Arc::new(RwLock::new(None)),
+        user_txs_cache:  Arc::new(RwLock::new(None)),
+        archive:         Arc::new(RwLock::new(archive::Archive::default())),
         chain_dirty:     Arc::new(std::sync::atomic::AtomicBool::new(false)),
         stat_blocks:     Arc::new(std::sync::atomic::AtomicU64::new(init_blocks)),
         stat_txs:        Arc::new(std::sync::atomic::AtomicU64::new(init_txs)),
@@ -1325,7 +1451,7 @@ async fn main() {
                 tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 tick = tick.wrapping_add(1);
 
-                let (blocks500, txs500, live_tip) = {
+                let (blocks500, txs500, user500, live_tip) = {
                     let chain = state.chain.read().await;
                     // Select by RECENCY (timestamp), not raw height. After a testnet
                     // wipe the abandoned chain's numerically-higher-but-ancient blocks
@@ -1341,10 +1467,12 @@ async fn main() {
                     let mut trefs: Vec<&Value> = chain.transactions.iter().collect();
                     trefs.sort_by_key(|t| std::cmp::Reverse(t["timestamp"].as_i64().unwrap_or(0)));
                     let txs500: Vec<Value> = trefs.iter().take(500).map(|t| (*t).clone()).collect();
-                    (blocks500, txs500, live_tip)
+                    let user500: Vec<Value> = trefs.iter().filter(|t| is_user_tx(t)).take(500).map(|t| (*t).clone()).collect();
+                    (blocks500, txs500, user500, live_tip)
                 };
                 *state.blocks_cache.write().await = Some(Arc::new(blocks500));
                 *state.txs_cache.write().await = Some(Arc::new(txs500));
+                *state.user_txs_cache.write().await = Some(Arc::new(user500));
                 if live_tip > 0 {
                     state.stat_tip.store(live_tip, Ordering::Relaxed);
                 }
@@ -1353,6 +1481,17 @@ async fn main() {
                     let snapshot = { state.chain.read().await.clone() };
                     let _ = tokio::task::spawn_blocking(move || save_chain(&snapshot)).await;
                 }
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            loop {
+                archive_pass(&state).await;
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             }
         });
     }
@@ -1386,6 +1525,8 @@ async fn main() {
         .route("/chain/transactions",       get(handle_chain_transactions))
         .route("/chain/submit",             post(handle_chain_submit))
         .route("/chain/gaps",               get(handle_chain_gaps))
+        .route("/chain/archive",            get(handle_archive_index))
+        .route("/chain/archive/:bucket",    get(handle_archive_bucket))
         .route("/chain/snapshot",           post(handle_snapshot_submit).get(handle_snapshot_get))
         .route("/prices",                   get(handle_prices))
         .route("/price/:symbol",            get(handle_price))
@@ -1416,6 +1557,31 @@ async fn main() {
 
     info!("Listening on http://0.0.0.0:{}", port);
     axum::serve(listener, app).await.expect("server error");
+}
+
+#[cfg(test)]
+mod user_tx_tests {
+    use super::is_user_tx;
+    use serde_json::json;
+
+    #[test]
+    fn a_transfer_between_two_wallets_is_a_user_tx() {
+        assert!(is_user_tx(&json!({"tx_type": "transfer", "from": "egot1ypxx", "to": "egot1yqp3", "signature": "ab12", "amount": 30000000})));
+        assert!(is_user_tx(&json!({"tx_type": "", "from": "egot1ypxx", "to": "egot1yzsk", "signature": "ab12"})));
+    }
+
+    #[test]
+    fn protocol_traffic_is_not() {
+        for t in [
+            json!({"tx_type": "ready_batch", "from": "", "to": "egot1nodepool000000000000000000000000000000000", "signature": "coinbase"}),
+            json!({"tx_type": "tm_ready_batch", "from": "", "to": "egot1nodepool000000000000000000000000000000000", "signature": "coinbase"}),
+            json!({"tx_type": "reward", "from": "egot1nodepool000000000000000000000000000000000", "to": "egot1ypxx", "signature": "coinbase"}),
+            json!({"tx_type": "price_report", "from": "egot1ypxx", "to": "egot1ypxx", "signature": "ab12"}),
+            json!({"tx_type": "validator_register", "from": "egot1ypxx", "to": "egot1yqp3", "signature": "ab12"}),
+        ] {
+            assert!(!is_user_tx(&t), "{t}");
+        }
+    }
 }
 
 #[cfg(test)]
