@@ -221,6 +221,7 @@ const StoragePage: React.FC = () => {
   useEffect(() => { loadData(); }, []);
   const pendingSubRef = useRef<{ sub: ActiveSubscription; until: number } | null>(null);
   const [renewProblem, setRenewProblem] = useState<string | null>(null);
+  const [renewWarning, setRenewWarning] = useState<string | null>(null);
 
   async function refreshPlan() {
     try {
@@ -228,8 +229,10 @@ const StoragePage: React.FC = () => {
         plan: { name: string; billing: 'monthly' | 'annual'; gb: number; expires_at: number } | null;
         auto_renew: boolean;
         renew_problem: string | null;
+        renew_warning: string | null;
       }>('get_storage_plan');
       setRenewProblem(status.renew_problem);
+      setRenewWarning(status.renew_warning);
       const pending = pendingSubRef.current;
       const now = Math.floor(Date.now() / 1000);
       const fromChain: ActiveSubscription | null = status.plan ? {
@@ -714,6 +717,9 @@ const StoragePage: React.FC = () => {
                       style={{ width: `${usedPct}%` }}
                     />
                   </div>
+                  {renewWarning && !renewProblem && subscription && !subscription.cancelled && (
+                    <div className="text-xs text-yellow-400">{renewWarning}</div>
+                  )}
                   {renewProblem && subscription && !subscription.cancelled && (
                     <div className="text-xs text-red-400">
                       {renewProblem}. Add EGUSD before {new Date((subscription.expiresAt + 30 * 86400) * 1000).toLocaleDateString()} to keep your plan.

@@ -257,6 +257,7 @@ pub(crate) fn paid_plan(memo: &str, amount_uegoc: u64, egoc_usd: f64) -> Option<
 pub const PLAN_GRACE_SECS: i64 = 30 * 86_400;
 const RENEW_BEFORE_SECS: i64 = 86_400;
 const RENEW_RETRY_SECS: i64 = 6 * 3_600;
+const LOW_BALANCE_WARN_SECS: i64 = 10 * 86_400;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ActivePlan {
@@ -342,6 +343,7 @@ pub struct StoragePlanStatus {
     pub plan: Option<ActivePlan>,
     pub auto_renew: bool,
     pub renew_problem: Option<String>,
+    pub renew_warning: Option<String>,
 }
 
 static RENEW_STATE: std::sync::Mutex<(i64, Option<String>)> = std::sync::Mutex::new((0, None));
@@ -350,10 +352,16 @@ static RENEW_STATE: std::sync::Mutex<(i64, Option<String>)> = std::sync::Mutex::
 pub async fn get_storage_plan() -> Result<StoragePlanStatus, EgoDesktopError> {
     tokio::task::spawn_blocking(|| {
         let ledger = Ledger::load();
+        let plan = storage_plan_of(&ledger.address);
+        let auto_renew = !ledger.storage_renew_off;
+        let renew_warning = plan.as_ref().and_then(|p| {
+            low_balance_warning(p, chrono::Utc::now().timestamp(), auto_renew, crate::chain_db::credits_balance(&ledger.address))
+        });
         StoragePlanStatus {
-            plan: storage_plan_of(&ledger.address),
-            auto_renew: !ledger.storage_renew_off,
+            plan,
+            auto_renew,
             renew_problem: RENEW_STATE.lock().unwrap_or_else(|e| e.into_inner()).1.clone(),
+            renew_warning,
         }
     })
     .await
@@ -366,6 +374,42 @@ pub async fn set_storage_auto_renew(on: bool) -> Result<bool, EgoDesktopError> {
     ledger.storage_renew_off = !on;
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;
     Ok(on)
+}
+
+fn low_balance_warning(plan: &ActivePlan, now: i64, auto_renew: bool, have: u64) -> Option<String> {
+    if !auto_renew || now >= plan.expires_at || plan.expires_at - now > LOW_BALANCE_WARN_SECS {
+        return None;
+    }
+    let (_, price_usd, _) = plan_price_usd(&plan.name, &plan.billing)?;
+    let price = crate::chain_db::usd_to_credits(price_usd);
+    if have >= price {
+        return None;
+    }
+    let date = chrono::DateTime::from_timestamp(plan.expires_at, 0).map(|d| d.format("%d %b %Y").to_string()).unwrap_or_default();
+    Some(format!(
+        "Your {} plan ({}) renews on {date} for {:.2} EGUSD and you have {:.2} EGUSD. Convert some EGOC to EGUSD in the Wallet before then.",
+        plan.name,
+        plan.billing,
+        price as f64 / 100.0,
+        have as f64 / 100.0
+    ))
+}
+
+fn warn_low_balance_once() {
+    let mut ledger = Ledger::load();
+    if ledger.address.is_empty() {
+        return;
+    }
+    let Some(plan) = storage_plan_of(&ledger.address) else { return };
+    if ledger.storage_low_warned_for == plan.expires_at {
+        return;
+    }
+    let have = crate::chain_db::credits_balance(&ledger.address);
+    let Some(body) = low_balance_warning(&plan, chrono::Utc::now().timestamp(), !ledger.storage_renew_off, have) else { return };
+    let Some(app) = crate::p2p::APP_HANDLE.get() else { return };
+    crate::commands::notifications::notify(app, "Not enough EGUSD to renew Storage", &body);
+    ledger.storage_low_warned_for = plan.expires_at;
+    let _ = ledger.save();
 }
 
 fn renewal_due(plan: &ActivePlan, now: i64) -> bool {
@@ -408,6 +452,7 @@ async fn renew_once(state: &AppState) {
 
 pub async fn renew_loop() {
     loop {
+        let _ = tokio::task::spawn_blocking(warn_low_balance_once).await;
         let state = crate::app::global_app_state();
         if state.get_keypair().is_some() {
             renew_once(&state).await;
@@ -1750,7 +1795,7 @@ mod free_share_tests {
 
 #[cfg(test)]
 mod renewal_tests {
-    use super::{plan_after, renewal_due, ActivePlan, PlanPayment};
+    use super::{low_balance_warning, plan_after, renewal_due, ActivePlan, PlanPayment};
 
     const DAY: i64 = 86_400;
 
@@ -1775,6 +1820,19 @@ mod renewal_tests {
         let plan = plan_after(vec![pay("Basic", 50, 0), pay("Max", 1024, 10 * DAY)]).unwrap();
         assert_eq!((plan.name.as_str(), plan.gb), ("Max", 1024));
         assert_eq!(plan_after(vec![]), None);
+    }
+
+    #[test]
+    fn a_short_balance_is_flagged_only_in_the_last_ten_days_with_auto_renew_on() {
+        let plan = ActivePlan { name: "Pro".into(), billing: "monthly".into(), gb: 200, expires_at: 30 * DAY };
+        let (_, usd, _) = super::plan_price_usd("Pro", "monthly").unwrap();
+        let price = crate::chain_db::usd_to_credits(usd);
+        assert!(low_balance_warning(&plan, 19 * DAY, true, 0).is_none(), "more than 10 days left");
+        let w = low_balance_warning(&plan, 21 * DAY, true, price - 1).unwrap();
+        assert!(w.contains("Pro plan (monthly)") && w.contains("EGUSD"), "{w}");
+        assert!(low_balance_warning(&plan, 21 * DAY, true, price).is_none(), "enough to renew");
+        assert!(low_balance_warning(&plan, 21 * DAY, false, 0).is_none(), "auto-renew off");
+        assert!(low_balance_warning(&plan, 30 * DAY, true, 0).is_none(), "the plan has ended");
     }
 
     #[test]
