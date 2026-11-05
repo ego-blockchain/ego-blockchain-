@@ -13256,6 +13256,11 @@ const HISTORY_PROBES_PER_PEER_MINUTE: u32 = 30;
 const HISTORY_FETCHES_PER_MINUTE: u32 = 60;
 const HISTORY_FETCHES_PER_PEER_MINUTE: u32 = 12;
 const HISTORY_BACKFILL_STALE_SECS: i64 = 600;
+const HISTORY_ASK_TIMEOUT_SECS: u64 = 30;
+const HISTORY_ASK_SPACING_MS: i64 = 5_500;
+const HISTORY_RETRY_SECS: i64 = 6 * 3600;
+const HISTORY_SILENT_AFTER: u32 = 2;
+const HISTORY_LOG_EVERY: u64 = 512;
 
 struct HistoryProbeSent {
     holder: String,
@@ -13270,15 +13275,22 @@ struct HistoryBackfill {
     at: i64,
     me: String,
     from: u64,
-    asked: HashMap<String, (String, String)>,
-    got: Vec<(String, String, Vec<crate::history::HistoryPiece>)>,
+    asked: Option<(String, String)>,
     tried: Vec<String>,
+    silent: HashMap<String, u32>,
+    good: Option<String>,
+    window_hit: bool,
+    empty_windows: u32,
+    skipped: u64,
+    stored: u64,
     touched: i64,
 }
 
 static HISTORY_PROBES: OnceLock<Mutex<HashMap<String, HistoryProbeSent>>> = OnceLock::new();
 static HISTORY_VERIFIED: OnceLock<Mutex<HashMap<u64, Vec<(String, i64)>>>> = OnceLock::new();
 static HISTORY_BACKFILL: Mutex<Option<HistoryBackfill>> = Mutex::new(None);
+static HISTORY_RETRY_AT: Mutex<Option<HashMap<u64, i64>>> = Mutex::new(None);
+static HISTORY_LAST_ASK: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
 static DHT_ENDPOINTS: OnceLock<Mutex<HashMap<String, (String, i64)>>> = OnceLock::new();
 
 fn remember_dht_endpoint(address: &str, endpoint: &str) {
@@ -13376,15 +13388,53 @@ pub async fn history_tick() {
         return;
     }
     LAST.store(now, Ordering::Relaxed);
+    history_run().await;
+}
+
+fn history_run_kick() {
+    let f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(history_run());
+    tokio::spawn(f);
+}
+
+fn history_backfill_kick() {
+    let f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(history_backfill_next());
+    tokio::spawn(f);
+}
+
+fn history_waiting_chunks(now: i64) -> std::collections::HashSet<u64> {
+    let mut guard = HISTORY_RETRY_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.retain(|_, t| *t > now);
+    map.keys().copied().collect()
+}
+
+fn history_retry_later(chunk: u64) {
+    let at = Utc::now().timestamp() + HISTORY_RETRY_SECS;
+    HISTORY_RETRY_AT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(chunk, at);
+}
+
+fn history_ask_wait(holder: &str) -> u64 {
+    let now = Utc::now().timestamp_millis();
+    let mut guard = HISTORY_LAST_ASK.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.retain(|_, t| now - *t < 60_000);
+    let at = map.get(holder).map_or(now, |t| (*t + HISTORY_ASK_SPACING_MS).max(now));
+    map.insert(holder.to_string(), at);
+    (at - now) as u64
+}
+
+async fn history_run() {
+    let now = Utc::now().timestamp();
     let me = crate::ledger::Ledger::load().address;
     if me.is_empty() {
         return;
     }
     let archive = history_archive_mode(&me);
     let me2 = me.clone();
+    let waiting = history_waiting_chunks(now);
     let Ok(plan) = tokio::task::spawn_blocking(move || {
         let contracts = crate::chain_db::contract_exec_height();
-        crate::chain_db::history_plan(&me2, archive, contracts)
+        crate::chain_db::history_plan(&me2, archive, contracts, &waiting)
     })
     .await
     else {
@@ -13520,7 +13570,7 @@ async fn start_history_backfill(chunk: u64, shards: u64, at: i64, me: String) {
         let now = Utc::now().timestamp();
         let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(b) = st.as_ref() {
-            if b.chunk == chunk && now - b.touched < HISTORY_BACKFILL_STALE_SECS {
+            if now - b.touched < HISTORY_BACKFILL_STALE_SECS {
                 return;
             }
         }
@@ -13530,68 +13580,155 @@ async fn start_history_backfill(chunk: u64, shards: u64, at: i64, me: String) {
             at,
             me,
             from: crate::history::chunk_heights(chunk).start,
-            asked: HashMap::new(),
-            got: Vec::new(),
+            asked: None,
             tried: Vec::new(),
+            silent: HashMap::new(),
+            good: None,
+            window_hit: false,
+            empty_windows: 0,
+            skipped: 0,
+            stored: 0,
             touched: now,
         });
     }
+    let range = crate::history::chunk_heights(chunk);
+    eprintln!("[History] fetching blocks {}..{} from other nodes", range.start.max(1), range.end - 1);
     history_backfill_next().await;
 }
 
+async fn history_backfill_finish(chunk: u64) {
+    let done = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let (stored, skipped) = done.map_or((0, 0), |b| (b.stored, b.skipped));
+    let range = crate::history::chunk_heights(chunk);
+    history_retry_later(chunk);
+    if skipped == 0 {
+        let _ = tokio::task::spawn_blocking(move || crate::chain_db::history_mark_held(chunk)).await;
+        eprintln!("[History] this node now keeps blocks {}..{} for the network", range.start.max(1), range.end - 1);
+    } else {
+        let _ = tokio::task::spawn_blocking(move || crate::chain_db::history_mark_gap(chunk)).await;
+        eprintln!(
+            "[History] blocks {}..{}: fetched {stored}, about {skipped} no node could send yet; trying again in {} hours",
+            range.start.max(1),
+            range.end - 1,
+            HISTORY_RETRY_SECS / 3600
+        );
+    }
+    history_run_kick();
+}
+
+fn history_backfill_skip(chunk: u64, next: u64) {
+    {
+        let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(b) = st.as_mut() else { return };
+        if b.chunk != chunk || b.asked.is_some() {
+            return;
+        }
+        let end = crate::history::chunk_heights(chunk).end;
+        let step = if b.window_hit {
+            1
+        } else {
+            b.empty_windows = b.empty_windows.saturating_add(1);
+            crate::history::FETCH_BATCH << b.empty_windows.saturating_sub(1).min(8)
+        };
+        let to = next.saturating_add(step).min(end);
+        b.skipped += to - next;
+        b.from = to;
+        b.tried.clear();
+        b.window_hit = false;
+        b.touched = Utc::now().timestamp();
+    }
+    history_backfill_kick();
+}
+
 async fn history_backfill_next() {
-    let (chunk, shards, at, from, me, tried) = {
+    let (chunk, shards, at, from, me, mut skip, good) = {
         let st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
         let Some(b) = st.as_ref() else { return };
-        (b.chunk, b.shards, b.at, b.from, b.me.clone(), b.tried.clone())
+        if b.asked.is_some() {
+            return;
+        }
+        let mut skip = b.tried.clone();
+        skip.extend(b.silent.iter().filter(|(_, n)| **n >= HISTORY_SILENT_AFTER).map(|(h, _)| h.clone()));
+        (b.chunk, b.shards, b.at, b.from, b.me.clone(), skip, b.good.clone())
     };
     let next = tokio::task::spawn_blocking(move || crate::chain_db::history_first_missing(chunk, from)).await.ok().flatten();
     let Some(next) = next else {
-        let _ = tokio::task::spawn_blocking(move || crate::chain_db::history_mark_held(chunk)).await;
-        *HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        let range = crate::history::chunk_heights(chunk);
-        eprintln!("[History] this node now keeps blocks {}..{} for the network", range.start, range.end - 1);
+        history_backfill_finish(chunk).await;
         return;
     };
-    let mut skip = tried;
     skip.push(me);
     let shard = crate::history::shard_of_chunk(chunk, shards);
     let rotate = rand::random::<u64>();
-    let holders = tokio::task::spawn_blocking(move || {
-        crate::chain_db::history_holders(shard, shards, at, rotate, crate::history::PROBE_CANDIDATES, skip)
+    let skip2 = skip.clone();
+    let drs = tokio::task::spawn_blocking(move || {
+        crate::chain_db::history_holders(shard, shards, at, rotate, crate::history::PROBE_CANDIDATES, skip2)
     })
     .await
     .unwrap_or_default();
-    let mut asks: Vec<(String, String, String)> = Vec::new();
-    for holder in holders {
-        if asks.len() >= 2 {
-            break;
+    let mut candidates: Vec<String> = Vec::new();
+    for holder in good.into_iter().chain(drs).chain(crate::genesis::addresses()) {
+        if !skip.contains(&holder) && !candidates.contains(&holder) {
+            candidates.push(holder);
         }
+    }
+    let mut pick = None;
+    for holder in candidates {
         match get_relay_endpoint(&holder).await {
-            Some(ep) if !asks.iter().any(|(_, _, e)| e == &ep) => asks.push((history_nonce(), holder, ep)),
-            Some(_) => {}
+            Some(ep) => {
+                pick = Some((holder, ep));
+                break;
+            }
             None => lookup_dht_endpoint(&holder),
         }
     }
-    if asks.len() < 2 {
+    let Some((holder, ep)) = pick else {
+        history_backfill_skip(chunk, next);
         return;
-    }
+    };
     let reply_to = get_public_endpoint().await;
     if reply_to.is_empty() {
         return;
     }
+    let wait = history_ask_wait(&holder);
+    if wait > 0 {
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+    }
+    let nonce = history_nonce();
     {
         let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
         let Some(b) = st.as_mut() else { return };
+        if b.chunk != chunk || b.asked.is_some() || b.from > next {
+            return;
+        }
         b.from = next;
-        b.asked = asks.iter().map(|(n, h, e)| (n.clone(), (h.clone(), e.clone()))).collect();
-        b.got.clear();
+        b.asked = Some((nonce.clone(), holder.clone()));
         b.touched = Utc::now().timestamp();
     }
-    for (nonce, _, ep) in asks {
-        let msg = P2PMessage::HistoryFetch { nonce, from: next, count: crate::history::FETCH_BATCH, reply_to: reply_to.clone() };
-        let _ = send_message(&ep, &msg).await;
-    }
+    let msg = P2PMessage::HistoryFetch { nonce: nonce.clone(), from: next, count: crate::history::FETCH_BATCH, reply_to };
+    let _ = send_message(&ep, &msg).await;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(HISTORY_ASK_TIMEOUT_SECS)).await;
+        let timed_out = {
+            let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
+            match st.as_mut() {
+                Some(b) if b.asked.as_ref().map_or(false, |(n, _)| *n == nonce) => {
+                    b.asked = None;
+                    *b.silent.entry(holder.clone()).or_insert(0) += 1;
+                    if !b.tried.contains(&holder) {
+                        b.tried.push(holder.clone());
+                    }
+                    if b.good.as_deref() == Some(holder.as_str()) {
+                        b.good = None;
+                    }
+                    true
+                }
+                _ => false,
+            }
+        };
+        if timed_out {
+            history_backfill_kick();
+        }
+    });
 }
 
 async fn serve_history_fetch(nonce: String, from: u64, count: u64, reply_to: String) {
@@ -13603,89 +13740,91 @@ async fn serve_history_fetch(nonce: String, from: u64, count: u64, reply_to: Str
     }
     let me = crate::ledger::Ledger::load().address;
     let pieces = tokio::task::spawn_blocking(move || crate::chain_db::history_serve(from, count)).await.unwrap_or_default();
-    if pieces.is_empty() {
-        return;
-    }
     let _ = send_message(&reply_to, &P2PMessage::HistoryPieces { nonce, holder: me, pieces }).await;
-}
-
-fn history_backfill_reject(holder: &str) {
-    let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(b) = st.as_mut() {
-        if !b.tried.iter().any(|t| t == holder) {
-            b.tried.push(holder.to_string());
-        }
-    }
 }
 
 async fn receive_history_pieces(nonce: String, pieces: Vec<crate::history::HistoryPiece>) {
     let (chunk, from, holder) = {
-        let st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(b) = st.as_ref() else { return };
-        let Some((holder, _)) = b.asked.get(&nonce) else { return };
-        (b.chunk, b.from, holder.clone())
-    };
-    let end = from.saturating_add(crate::history::FETCH_BATCH);
-    if pieces.is_empty()
-        || pieces.len() as u64 > crate::history::FETCH_BATCH
-        || pieces.iter().any(|p| p.height < from || p.height >= end || crate::history::chunk_of(p.height) != chunk)
-    {
-        history_backfill_reject(&holder);
-        return;
-    }
-    let Some(root) = tokio::task::spawn_blocking(move || crate::chain_db::history_root(chunk)).await.ok().flatten() else { return };
-    let checked = tokio::task::spawn_blocking(move || {
-        for p in &pieces {
-            crate::history::verify_piece(p, &root)?;
-        }
-        Ok::<_, String>(pieces)
-    })
-    .await;
-    let pieces = match checked {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            eprintln!("[History] {:.16} served history that does not check out: {e}", holder);
-            history_backfill_reject(&holder);
-            return;
-        }
-        Err(_) => return,
-    };
-    let ready = {
         let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
         let Some(b) = st.as_mut() else { return };
-        let Some((h, ep)) = b.asked.remove(&nonce) else { return };
-        b.got.push((h, ep, pieces));
+        let Some((n, holder)) = b.asked.clone() else { return };
+        if n != nonce {
+            return;
+        }
+        b.asked = None;
         b.touched = Utc::now().timestamp();
-        if b.got.len() < 2 { None } else { Some(std::mem::take(&mut b.got)) }
+        (b.chunk, b.from, holder)
     };
-    let Some(got) = ready else { return };
-    let theirs: HashMap<u64, [u8; 32]> = got[1]
-        .2
-        .iter()
-        .map(|p| (p.height, crate::history::piece_digest(&p.block, &p.txs)))
-        .collect();
-    let agreed: Vec<crate::history::HistoryPiece> = got[0]
-        .2
-        .iter()
-        .filter(|p| theirs.get(&p.height) == Some(&crate::history::piece_digest(&p.block, &p.txs)))
-        .cloned()
-        .collect();
-    let stored = if agreed.is_empty() {
-        0
-    } else {
-        tokio::task::spawn_blocking(move || crate::chain_db::history_store(&agreed)).await.unwrap_or(0)
+    let end = from.saturating_add(crate::history::FETCH_BATCH);
+    let fits = pieces.len() as u64 <= crate::history::FETCH_BATCH
+        && pieces.iter().all(|p| p.height >= from && p.height < end && crate::history::chunk_of(p.height) == chunk);
+    let root = tokio::task::spawn_blocking(move || crate::chain_db::history_root(chunk)).await.ok().flatten();
+    let checked = match (fits, root) {
+        (true, Some(root)) => tokio::task::spawn_blocking(move || {
+            let mut bad = None;
+            let good: Vec<crate::history::HistoryPiece> = pieces
+                .into_iter()
+                .filter(|p| match crate::history::verify_piece(p, &root) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        bad.get_or_insert(e);
+                        false
+                    }
+                })
+                .collect();
+            let stored = if good.is_empty() { 0 } else { crate::chain_db::history_store(&good) };
+            (good.len(), stored, bad)
+        })
+        .await
+        .unwrap_or((0, 0, None)),
+        (false, _) => (0, 0, Some("pieces outside the range asked for".to_string())),
+        (true, None) => (0, 0, None),
     };
+    let (valid, stored, bad) = checked;
+    if let Some(e) = &bad {
+        eprintln!("[History] {:.16} served history that does not check out: {e}", holder);
+    }
     let progressed = tokio::task::spawn_blocking(move || crate::chain_db::history_first_missing(chunk, from))
         .await
         .ok()
         .flatten()
         .map_or(true, |next| next > from);
-    if stored == 0 && !progressed {
-        history_backfill_reject(&got[0].0);
-        history_backfill_reject(&got[1].0);
-        return;
+    let report = {
+        let mut st = HISTORY_BACKFILL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(b) = st.as_mut() else { return };
+        if b.chunk != chunk {
+            return;
+        }
+        let before = b.stored;
+        b.stored += stored as u64;
+        if bad.is_some() {
+            b.silent.insert(holder.clone(), HISTORY_SILENT_AFTER);
+        } else if valid > 0 {
+            b.silent.remove(&holder);
+        }
+        if valid > 0 {
+            b.window_hit = true;
+            b.empty_windows = 0;
+        }
+        if progressed && bad.is_none() {
+            b.tried.clear();
+            b.window_hit = false;
+            b.good = Some(holder);
+        } else {
+            if !b.tried.contains(&holder) {
+                b.tried.push(holder.clone());
+            }
+            if b.good.as_deref() == Some(holder.as_str()) {
+                b.good = None;
+            }
+        }
+        (b.stored / HISTORY_LOG_EVERY > before / HISTORY_LOG_EVERY).then_some(b.stored)
+    };
+    if let Some(n) = report {
+        let range = crate::history::chunk_heights(chunk);
+        eprintln!("[History] fetched {n} blocks of {}..{} so far", range.start.max(1), range.end - 1);
     }
-    tokio::spawn(history_backfill_next());
+    history_backfill_kick();
 }
 
 const WALLET_HISTORY_PAGE: usize = 256;

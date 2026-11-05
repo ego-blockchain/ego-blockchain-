@@ -26,6 +26,10 @@ pub fn pruned_key(chunk: u64) -> Vec<u8> {
     format!("hpr:{chunk:012}").into_bytes()
 }
 
+pub fn gap_key(chunk: u64) -> Vec<u8> {
+    format!("hgp:{chunk:012}").into_bytes()
+}
+
 pub fn undo_key(height: u64) -> Vec<u8> {
     format!("hu:{height:016x}").into_bytes()
 }

@@ -11373,12 +11373,13 @@ pub fn history_shards_now() -> (u64, i64) {
 }
 
 fn history_store_in(db: &DB, pieces: &[crate::history::HistoryPiece]) -> usize {
-    let (Some(cf_blocks), Some(cf_hdrs), Some(cf_txs), Some(cf_block_txs), Some(cf_addr)) = (
+    let (Some(cf_blocks), Some(cf_hdrs), Some(cf_txs), Some(cf_block_txs), Some(cf_addr), Some(cf_recent)) = (
         db.cf_handle(CF_BLOCKS),
         db.cf_handle(CF_HEADERS),
         db.cf_handle(CF_TXS),
         db.cf_handle(CF_BLOCK_TXS),
         db.cf_handle(CF_ADDR_TXS),
+        db.cf_handle(CF_RECENT_TXS),
     ) else {
         return 0;
     };
@@ -11399,6 +11400,9 @@ fn history_store_in(db: &DB, pieces: &[crate::history::HistoryPiece]) -> usize {
                 for (k, v) in addr_index_entries(&t) {
                     batch.put_cf(cf_addr, k, v);
                 }
+                if !is_protocol_tx(&t) {
+                    batch.put_cf(cf_recent, recent_txs_key(t.timestamp, &t.hash), b"");
+                }
             }
             batch.put_cf(cf_block_txs, block_txs_key(p.height, &tx.hash), (i as u32).to_be_bytes());
         }
@@ -11414,6 +11418,14 @@ pub fn history_mark_held(chunk: u64) {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cf) = db.cf_handle(CF_META) {
         let _ = db.delete_cf(cf, crate::history::pruned_key(chunk));
+        let _ = db.delete_cf(cf, crate::history::gap_key(chunk));
+    }
+}
+
+pub fn history_mark_gap(chunk: u64) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cf) = db.cf_handle(CF_META) {
+        let _ = db.put_cf(cf, crate::history::gap_key(chunk), b"1");
     }
 }
 
@@ -11483,7 +11495,7 @@ pub struct HistoryPlan {
     pub backfill: Option<u64>,
 }
 
-pub fn history_plan(me: &str, archive: bool, contract_height: Option<u64>) -> HistoryPlan {
+pub fn history_plan(me: &str, archive: bool, contract_height: Option<u64>, skip: &std::collections::HashSet<u64>) -> HistoryPlan {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf_meta) = db.cf_handle(CF_META) else { return HistoryPlan::default() };
     let tip = local_chain_height_in(&db);
@@ -11501,8 +11513,10 @@ pub fn history_plan(me: &str, archive: bool, contract_height: Option<u64>) -> Hi
         let pruned = db.get_cf(cf_meta, crate::history::pruned_key(chunk)).ok().flatten().is_some();
         let mine = archive || home == Some(crate::history::shard_of_chunk(chunk, shards));
         if mine {
+            let gap = db.get_cf(cf_meta, crate::history::gap_key(chunk)).ok().flatten().is_some();
             if plan.backfill.is_none()
-                && (pruned || !history_chunk_present_in(&db, chunk))
+                && !skip.contains(&chunk)
+                && (pruned || gap || !history_chunk_present_in(&db, chunk))
                 && crate::history::chunk_root(&ov, chunk).is_some()
             {
                 plan.backfill = Some(chunk);
@@ -11549,6 +11563,144 @@ mod history_tests {
         migrate_history_index(&db);
         migrate_drs_v2(&db);
         (db, dir)
+    }
+
+    fn slim_block_json(b: &LedgerBlock) -> serde_json::Value {
+        let mut v = serde_json::to_value(b).unwrap_or_default();
+        if let Some(o) = v.as_object_mut() {
+            for k in ["commit_cert", "poc_ticket", "randao_reveal", "producer_sig", "agg_bls_sig", "bls_pubkeys"] {
+                o.remove(k);
+            }
+        }
+        v
+    }
+
+    fn slim_tx_json(t: &LedgerTx) -> serde_json::Value {
+        let mut v = serde_json::to_value(t).unwrap_or_default();
+        if let Some(o) = v.as_object_mut() {
+            for k in ["signed_summary", "is_private"] {
+                o.remove(k);
+            }
+            for k in ["dilithium_signature", "dilithium_pubkey", "public_key_ed25519", "wasm_code", "compliance_proof"] {
+                if o.contains_key(k) {
+                    o.insert(k.to_string(), serde_json::Value::String(String::new()));
+                }
+            }
+            if o.get("signature").and_then(|x| x.as_str()) != Some("coinbase") {
+                o.insert("signature".to_string(), serde_json::Value::String(String::new()));
+            }
+        }
+        v
+    }
+
+    #[test]
+    #[ignore]
+    fn export_history_buckets_read_only() {
+        const BUCKET: u64 = 100;
+        let Ok(src_path) = std::env::var("EGO_EXPORT_DB") else { return };
+        let out = std::path::PathBuf::from(std::env::var("EGO_EXPORT_OUT").expect("EGO_EXPORT_OUT"));
+        let trust_path = std::env::var("EGO_EXPORT_TRUST").unwrap_or_else(|_| src_path.clone());
+        let own = trust_path == src_path;
+        let src = DB::open_cf_for_read_only(&Options::default(), &src_path, ALL_CFS.to_vec(), false).expect("open source read-only");
+        let trust = if own {
+            None
+        } else {
+            Some(DB::open_cf_for_read_only(&Options::default(), &trust_path, ALL_CFS.to_vec(), false).expect("open trusted read-only"))
+        };
+        let tdb = trust.as_ref().unwrap_or(&src);
+        let tip = local_chain_height_in(&src);
+        let from: u64 = std::env::var("EGO_EXPORT_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let to: u64 = std::env::var("EGO_EXPORT_TO").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX).min(tip.saturating_sub(200));
+        std::fs::create_dir_all(&out).expect("create out dir");
+        let mut roots: std::collections::HashMap<u64, Option<[u8; 32]>> = std::collections::HashMap::new();
+        let mut hashes: std::collections::HashMap<u64, Option<Vec<String>>> = std::collections::HashMap::new();
+        let (mut written, mut existing, mut short, mut unproven) = (Vec::new(), 0u64, Vec::new(), Vec::new());
+        let mut user_txs = 0usize;
+        let mut b = from / BUCKET;
+        while (b + 1) * BUCKET - 1 <= to {
+            let file = out.join(format!("b{b:07}.json"));
+            if file.exists() {
+                existing += 1;
+                b += 1;
+                continue;
+            }
+            let mut blocks = Vec::new();
+            let mut txs = Vec::new();
+            let mut fail: Option<String> = None;
+            for h in b * BUCKET..(b + 1) * BUCKET {
+                if h == 0 {
+                    if let Some(g) = src.cf_handle(CF_BLOCKS).and_then(|cf| src.get_cf(cf, height_key(0)).ok().flatten()).and_then(|v| decode::<LedgerBlock>(&v)) {
+                        blocks.push(slim_block_json(&g));
+                    }
+                    continue;
+                }
+                let Some((block, btxs)) = history_piece_in(&src, h) else {
+                    fail = Some(format!("missing {h}"));
+                    break;
+                };
+                let chunk = crate::history::chunk_of(h);
+                let root = *roots.entry(chunk).or_insert_with(|| crate::history::chunk_root(&crate::drs::Ov::new(tdb), chunk));
+                let list = hashes.entry(chunk).or_insert_with(|| history_chunk_hashes_in(&src, chunk)).clone();
+                let proven = match (root, list) {
+                    (Some(root), Some(list)) => crate::history::path_for(&list, h % crate::history::CHUNK)
+                        .map(|path| crate::history::HistoryPiece { height: h, block: block.clone(), txs: btxs.clone(), path })
+                        .map_or(false, |piece| crate::history::verify_piece(&piece, &root).is_ok()),
+                    _ => false,
+                };
+                let self_checked = own
+                    && block.height == h
+                    && verify_block_hash(&block, &btxs)
+                    && crate::history::txs_root_ok(&block, &btxs);
+                if !proven && !self_checked {
+                    fail = Some(format!("unproven {h}"));
+                    break;
+                }
+                blocks.push(slim_block_json(&block));
+                for t in &btxs {
+                    let mut t = t.clone();
+                    t.block_height = Some(h);
+                    t.status = "Confirmed".to_string();
+                    if !is_protocol_tx(&t) && !t.from.is_empty() && t.from != t.to {
+                        user_txs += 1;
+                    }
+                    txs.push(slim_tx_json(&t));
+                }
+            }
+            match fail {
+                Some(why) if why.starts_with("missing") => short.push(b),
+                Some(_) => unproven.push(b),
+                None => {
+                    let v = serde_json::json!({
+                        "bucket": b,
+                        "from": b * BUCKET,
+                        "to": b * BUCKET + BUCKET - 1,
+                        "blocks": blocks,
+                        "txs": txs,
+                    });
+                    let tmp = file.with_extension("json.tmp");
+                    std::fs::write(&tmp, serde_json::to_vec(&v).expect("encode")).expect("write");
+                    std::fs::rename(&tmp, &file).expect("rename");
+                    written.push(b);
+                }
+            }
+            b += 1;
+        }
+        let spans = |v: &[u64]| -> String {
+            let mut out: Vec<(u64, u64)> = Vec::new();
+            for &x in v {
+                match out.last_mut() {
+                    Some(r) if r.1 + 1 == x => r.1 = x,
+                    _ => out.push((x, x)),
+                }
+            }
+            out.iter().map(|(a, b)| format!("{}..{}", a * BUCKET, b * BUCKET + BUCKET - 1)).collect::<Vec<_>>().join(", ")
+        };
+        eprintln!("export tip {tip} range {from}..{to} own {own}");
+        eprintln!("written {} buckets: {}", written.len(), spans(&written));
+        eprintln!("already there {existing}");
+        eprintln!("missing blocks in {} buckets: {}", short.len(), spans(&short));
+        eprintln!("not provable in {} buckets: {}", unproven.len(), spans(&unproven));
+        eprintln!("user transfers in written buckets {user_txs}");
     }
 
     #[test]
