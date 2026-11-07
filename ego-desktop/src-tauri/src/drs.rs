@@ -41,6 +41,8 @@ pub const WIDEN_V2_FROM_HEIGHT: u64 = 42_311;
 pub const WIDEN_V2_ANCHORED_ATTEMPTS: u32 = 8;
 pub const TM_CARRY_FROM_HEIGHT: u64 = 42_397;
 const TM_CARRY_EPOCHS: u64 = 16;
+pub const LIVE_SEATS_FROM_HEIGHT: u64 = 79_841;
+const LIVE_SEAT_EPOCHS: u64 = 3;
 const WIDEN_READY_EPOCHS: u64 = 8;
 const WIDEN_MAX_OUTSIDERS: usize = 512;
 pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT];
@@ -1422,7 +1424,31 @@ fn can_vote(ov: &Ov, addr: &str) -> bool {
         || ov.get(&crate::chain_db::val_dil_key(addr)).map_or(false, |k| !k.is_empty())
 }
 
+fn recently_live(ov: &Ov, height: u64) -> BTreeSet<String> {
+    let epoch = epoch_of(height);
+    let mut live: BTreeSet<String> = last_makers(ov).into_iter().collect();
+    for back in 0..=LIVE_SEAT_EPOCHS {
+        if let Some(e) = epoch.checked_sub(back) {
+            live.extend(tm_ready_in(ov, e));
+        }
+    }
+    live
+}
+
 fn outsiders(ov: &Ov, height: u64, inside: &[String]) -> Vec<String> {
+    let all = any_outsiders(ov, height, inside);
+    if height < LIVE_SEATS_FROM_HEIGHT {
+        return all;
+    }
+    let live = recently_live(ov, height);
+    let kept: Vec<String> = all.iter().filter(|a| live.contains(*a)).cloned().collect();
+    if kept.is_empty() || inside.len() + kept.len() < MIN_COMMITTEE {
+        return all;
+    }
+    kept
+}
+
+fn any_outsiders(ov: &Ov, height: u64, inside: &[String]) -> Vec<String> {
     let epoch = epoch_of(height);
     let mut seen: BTreeSet<String> = inside.iter().cloned().collect();
     let earlier: Vec<String> = (1..=WIDEN_READY_EPOCHS)
@@ -2182,6 +2208,48 @@ mod tests {
         }
         ov.commit_memory();
         (ov, pool, others, h)
+    }
+
+    fn live_seats_network(h: u64) -> (Ov<'static>, Vec<String>, Vec<String>, Vec<String>) {
+        let (mut ov, pool, others, _) = widen_network(h, &["egot1pooldead", "egot1poolm", "egot1poolp"], 6);
+        let recent: Vec<String> = others[..2].to_vec();
+        let gone: Vec<String> = others[2..].to_vec();
+        let makers: Vec<String> = pool.iter().chain(recent.iter()).cloned().collect();
+        ov.put(KEY_LAST_MAKERS.to_vec(), serde_json::to_vec(&makers).unwrap());
+        ov.commit_memory();
+        (ov, pool, recent, gone)
+    }
+
+    #[test]
+    fn extra_seats_and_fresh_committees_go_only_to_nodes_seen_lately() {
+        let h = LIVE_SEATS_FROM_HEIGHT;
+        let (ov, pool, recent, gone) = live_seats_network(h);
+        for attempt in WIDEN_FROM_ATTEMPT..WIDEN_FROM_ATTEMPT + 60 {
+            let c = skip_committee(&ov, h, attempt);
+            assert!(c.iter().all(|a| !gone.contains(a)), "attempt {attempt} drew a node not seen lately: {c:?}");
+            assert!(c.len() >= MIN_COMMITTEE);
+        }
+        let seats: BTreeSet<String> = (WIDEN_FROM_ATTEMPT..WIDEN_FROM_ATTEMPT + 60)
+            .flat_map(|a| skip_committee(&ov, h, a))
+            .filter(|a| !pool.contains(a))
+            .collect();
+        assert_eq!(seats, recent.iter().cloned().collect::<BTreeSet<_>>(), "the seats outside the pool rotate among the recent nodes");
+    }
+
+    #[test]
+    fn before_the_switch_any_registered_node_can_take_a_seat() {
+        let h = LIVE_SEATS_FROM_HEIGHT - 1;
+        let (ov, _, _, gone) = live_seats_network(h);
+        let drawn: BTreeSet<String> = (WIDEN_FROM_ATTEMPT..WIDEN_FROM_ATTEMPT + 80).flat_map(|a| skip_committee(&ov, h, a)).collect();
+        assert!(gone.iter().any(|g| drawn.contains(g)), "the old draw is unchanged below the switch");
+    }
+
+    #[test]
+    fn with_nobody_seen_lately_the_old_draw_stays() {
+        let h = LIVE_SEATS_FROM_HEIGHT;
+        let (ov, pool, others, _) = widen_network(h, &["egot1pooldead", "egot1poolm", "egot1poolp"], 6);
+        let out = outsiders(&ov, h, &pool);
+        assert_eq!(out.len(), others.len(), "no node outside the pool was seen lately, so nothing is filtered");
     }
 
     #[test]

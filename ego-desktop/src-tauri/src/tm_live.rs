@@ -305,7 +305,9 @@ fn seat(members: &[(String, Vec<u8>)], me_addr: &str, kp: &Option<Arc<ego_core::
 }
 
 fn required_version(height: u64) -> &'static str {
-    if height >= crate::drs::TM_CARRY_FROM_HEIGHT {
+    if height >= crate::drs::LIVE_SEATS_FROM_HEIGHT {
+        "0.3.682"
+    } else if height >= crate::drs::TM_CARRY_FROM_HEIGHT {
         "0.3.664"
     } else if height >= crate::drs::WIDEN_V2_FROM_HEIGHT {
         "0.3.662"
