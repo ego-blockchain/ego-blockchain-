@@ -332,7 +332,7 @@ const ExplorerPage: React.FC = () => {
           onChange={e => setSearchQuery(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && handleSearch()}
           className="flex-1 bg-gray-800 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
-          placeholder="Search by block height, tx hash, or file CID (egocid1…)…"
+          placeholder="Search by block height, block hash, tx hash, address or file CID (egocid1…)"
         />
         <button
           onClick={handleSearch}
