@@ -5,6 +5,15 @@ name: Deploy Server Gateway
 
 on:
   workflow_dispatch:
+    inputs:
+      host:
+        description: Server address (empty = the oracle server). A new server gets a fresh gateway install.
+        required: false
+        default: ''
+      user:
+        description: SSH user on that server (empty = the oracle server's user)
+        required: false
+        default: ''
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -59,11 +68,11 @@ jobs:
         working-directory: ego-desktop/src-tauri
         run: cargo build --release --bin ego-desktop
 
-      - name: Deploy to oracle server
+      - name: Deploy to the server
         env:
-          SSH_KEY:    ${{ secrets.RELAY_SSH_KEY }}
-          RELAY_HOST: ${{ secrets.RELAY_HOST }}
-          RELAY_USER: ${{ secrets.RELAY_USER }}
+          SSH_KEY:    ${{ secrets.GATEWAY_SSH_KEY || secrets.RELAY_SSH_KEY }}
+          RELAY_HOST: ${{ inputs.host || secrets.RELAY_HOST }}
+          RELAY_USER: ${{ inputs.user || secrets.RELAY_USER }}
         run: |
           echo "$SSH_KEY" > /tmp/oracle_key && chmod 600 /tmp/oracle_key
           scp -i /tmp/oracle_key -o StrictHostKeyChecking=no \
@@ -73,12 +82,15 @@ jobs:
             'sudo bash /tmp/gateway-server.sh /tmp/ego-desktop; s=$?; rm -f /tmp/ego-desktop /tmp/gateway-server.sh; exit $s'
 
       - name: Wait for the bootstrap list
+        env:
+          RELAY_HOST: ${{ inputs.host || secrets.RELAY_HOST }}
         run: |
-          for _ in $(seq 1 20); do
-            if curl -fsS -m 10 https://rpc.egoblockchain.com/gateways | grep -q '"endpoint"'; then
-              echo "The bootstrap list has a gateway."
+          IP=$(getent ahostsv4 "$RELAY_HOST" | awk 'NR==1 { print $1 }')
+          for _ in $(seq 1 40); do
+            if curl -fsS -m 10 https://rpc.egoblockchain.com/gateways | grep -q "https://${IP:-$RELAY_HOST}:"; then
+              echo "The bootstrap list has this gateway."
               exit 0
             fi
             sleep 15
           done
-          echo "::warning::The gateway runs but isn't on the bootstrap list yet. Check the server's logs and that TCP 47398 is allowed in Oracle Cloud's security list."
+          echo "::warning::The gateway runs but isn't on the bootstrap list yet. Check the server's logs (journalctl -u ego-gateway) and that TCP 47393, TCP 47398 and UDP 47398 are allowed in the cloud provider's firewall."
