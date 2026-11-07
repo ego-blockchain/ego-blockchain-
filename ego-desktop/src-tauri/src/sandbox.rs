@@ -36,6 +36,127 @@ fn safe(id: &str) -> String {
     id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
 }
 
+const RENT_NETWORK: &str = "ego-rentnet";
+const GUARD_IMAGE: &str = "ego-netguard:1";
+const GUARD_LABEL: &str = "ego.netguard=1";
+const GUARD_DOCKERFILE: &str = "FROM alpine:3.20\nRUN apk add --no-cache iptables ip6tables\n";
+const BLOCKED_V4: [&str; 9] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "0.0.0.0/8",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+
+pub fn guard_script() -> String {
+    let mut lines = vec![
+        "set -e".to_string(),
+        "iptables -F OUTPUT".to_string(),
+        "iptables -A OUTPUT -o lo -j ACCEPT".to_string(),
+        "iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT".to_string(),
+    ];
+    for net in BLOCKED_V4 {
+        lines.push(format!("iptables -A OUTPUT -d {net} -j REJECT"));
+    }
+    lines.push("ip6tables -F OUTPUT 2>/dev/null || true".to_string());
+    lines.push("ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true".to_string());
+    lines.push("ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true".to_string());
+    lines.push("ip6tables -A OUTPUT -j REJECT 2>/dev/null || true".to_string());
+    lines.push("iptables -S OUTPUT".to_string());
+    lines.join("\n")
+}
+
+pub fn guard_holds(rules: &str) -> bool {
+    BLOCKED_V4.iter().all(|net| rules.lines().any(|l| l.contains(&format!("-d {net}")) && l.contains("REJECT")))
+}
+
+fn ensure_network() -> Result<(), String> {
+    let exists = std::process::Command::new("docker")
+        .args(["network", "inspect", RENT_NETWORK])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if exists {
+        return Ok(());
+    }
+    let out = std::process::Command::new("docker")
+        .args(["network", "create", "--driver", "bridge", "-o", "com.docker.network.bridge.enable_icc=false", RENT_NETWORK])
+        .output()
+        .map_err(|e| format!("docker network create failed to spawn: {e}"))?;
+    if out.status.success() || String::from_utf8_lossy(&out.stderr).contains("already exists") {
+        Ok(())
+    } else {
+        Err(format!("could not create the rental network: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+fn ensure_guard_image() -> Result<(), String> {
+    let present = std::process::Command::new("docker")
+        .args(["image", "inspect", GUARD_IMAGE])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if present {
+        return Ok(());
+    }
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("docker")
+        .args(["build", "-t", GUARD_IMAGE, "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("docker build failed to spawn: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(GUARD_DOCKERFILE.as_bytes()).map_err(|e| format!("docker build: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("docker build: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("could not build the network guard: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+fn lock_down_network(name: &str) -> Result<(), String> {
+    ensure_guard_image()?;
+    let target = format!("container:{name}");
+    let script = guard_script();
+    let out = std::process::Command::new("docker")
+        .args([
+            "run", "--rm",
+            "--network", target.as_str(),
+            "--cap-drop", "ALL",
+            "--cap-add", "NET_ADMIN",
+            "--cap-add", "NET_RAW",
+            GUARD_IMAGE,
+            "sh", "-c", script.as_str(),
+        ])
+        .output()
+        .map_err(|e| format!("network guard failed to spawn: {e}"))?;
+    let rules = String::from_utf8_lossy(&out.stdout);
+    if out.status.success() && guard_holds(&rules) {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not shut the rental off from this computer's home network: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+fn guarded(name: &str) -> bool {
+    std::process::Command::new("docker")
+        .args(["inspect", "-f", "{{index .Config.Labels \"ego.netguard\"}}", name])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
 fn container_name(reservation_id: &str) -> String { format!("ego-rent-{}", safe(reservation_id)) }
 fn volume_name(reservation_id: &str)    -> String { format!("ego-rent-{}-ws", safe(reservation_id)) }
 
@@ -118,9 +239,10 @@ pub fn prewarm_image() {
 /// rented CPU/RAM/GPU. Idempotent. Returns the container name on success.
 pub fn ensure_container(res: &ComputeReservation) -> Result<String, String> {
     let name = container_name(&res.reservation_id);
-    if container_running(&name) {
+    if container_running(&name) && guarded(&name) {
         return Ok(name);
     }
+    ensure_network()?;
 
     // Clear any stopped leftover with the same name before recreating.
     let _ = std::process::Command::new("docker").args(["rm", "-f", &name]).output();
@@ -138,6 +260,9 @@ pub fn ensure_container(res: &ComputeReservation) -> Result<String, String> {
         "--pids-limit".into(), "2048".into(),                       // fork-bomb guard
         "--security-opt".into(), "no-new-privileges".into(),
         "--cap-drop".into(), "NET_RAW".into(),
+        "--cap-drop".into(), "NET_ADMIN".into(),
+        "--network".into(), RENT_NETWORK.into(),
+        "--label".into(), GUARD_LABEL.into(),
         "-w".into(), "/workspace".into(),
         "-v".into(), vol,
     ];
@@ -164,6 +289,10 @@ pub fn ensure_container(res: &ComputeReservation) -> Result<String, String> {
 
     if !out.status.success() {
         return Err(format!("docker run failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    if let Err(e) = lock_down_network(&name) {
+        let _ = std::process::Command::new("docker").args(["rm", "-f", &name]).output();
+        return Err(e);
     }
     Ok(name)
 }
@@ -397,5 +526,42 @@ pub fn reap_inactive() {
         if !active {
             destroy(res_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod netguard_tests {
+    use super::*;
+
+    #[test]
+    fn the_guard_rejects_every_private_range_and_keeps_loopback() {
+        let script = guard_script();
+        let lines: Vec<&str> = script.lines().collect();
+        let lo = lines.iter().position(|l| *l == "iptables -A OUTPUT -o lo -j ACCEPT").unwrap();
+        for net in BLOCKED_V4 {
+            let at = lines.iter().position(|l| *l == format!("iptables -A OUTPUT -d {net} -j REJECT")).unwrap();
+            assert!(at > lo, "loopback, where the Docker DNS answers, stays open ahead of the block on {net}");
+        }
+        assert!(script.contains("192.168.0.0/16") && script.contains("10.0.0.0/8") && script.contains("172.16.0.0/12"));
+        assert!(script.starts_with("set -e"), "a failed rule stops the guard, so the rental is refused");
+        assert!(script.trim_end().ends_with("iptables -S OUTPUT"));
+    }
+
+    #[test]
+    fn a_rental_starts_only_when_every_block_is_in_place() {
+        let mut full = String::from("-P OUTPUT ACCEPT\n-A OUTPUT -o lo -j ACCEPT\n");
+        for net in BLOCKED_V4 {
+            full.push_str(&format!("-A OUTPUT -d {net} -j REJECT --reject-with icmp-port-unreachable\n"));
+        }
+        assert!(guard_holds(&full));
+        let missing = full.replace("-A OUTPUT -d 192.168.0.0/16 -j REJECT --reject-with icmp-port-unreachable\n", "");
+        assert!(!guard_holds(&missing), "a missing home-network block refuses the rental");
+        assert!(!guard_holds(""));
+    }
+
+    #[test]
+    fn the_guard_image_has_the_firewall_tools() {
+        assert!(GUARD_DOCKERFILE.contains("iptables") && GUARD_DOCKERFILE.contains("ip6tables"));
+        assert!(GUARD_LABEL.ends_with("=1"));
     }
 }
