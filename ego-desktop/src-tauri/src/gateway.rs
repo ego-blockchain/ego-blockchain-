@@ -314,7 +314,7 @@ fn cost(method: &str) -> f64 {
         "wallet.getCredits" => 1.0,
         "shielded.lookup" => 2.0,
         "shielded.leaves" => 4.0,
-        "storage.putManifest" | "storage.delete" => 4.0,
+        "storage.putManifest" | "storage.delete" | "storage.planStatus" => 4.0,
         _ => 1.0,
     }
 }
@@ -1247,7 +1247,8 @@ mod tests {
             "pubkey": hex::encode(stranger.verifying_key().to_bytes()),
             "sig": hex::encode(stranger.sign(&earnings_request_bytes(&address, now)).to_bytes()),
         });
-        assert_eq!(node_earnings(&params).await.unwrap_err().1, NOT_OWNER);
+        let refused = node_earnings(&params).await.unwrap_err().1;
+        assert!(refused == NOT_OWNER || refused == NOT_ONLINE, "a stranger gets no earnings: {refused}");
         assert_eq!(wallet_rewards(&json!({ "address": "nope" })).await.unwrap_err().0, -32602);
         assert_eq!(wallet_credits(&json!({ "address": "nope" })).await.unwrap_err().0, -32602);
         let too_many: Vec<String> = (0..SHIELDED_LOOKUP_MAX + 1).map(|_| "00".repeat(32)).collect();

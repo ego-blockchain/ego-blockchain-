@@ -201,6 +201,7 @@ pub async fn subscribe_storage_plan(
     billing: String,
     state: State<'_, AppState>,
 ) -> Result<String, EgoDesktopError> {
+    crate::commands::totp::consume("send")?;
     let hash = pay_for_plan(&state, plan.trim(), billing.trim()).await?;
     let mut ledger = Ledger::load();
     ledger.storage_renew_off = false;
@@ -410,6 +411,60 @@ fn warn_low_balance_once() {
     crate::commands::notifications::notify(app, "Not enough EGUSD to renew Storage", &body);
     ledger.storage_low_warned_for = plan.expires_at;
     let _ = ledger.save();
+}
+
+pub fn plans_view() -> serde_json::Value {
+    let mut plans = Vec::new();
+    for (name, gb, monthly, annual) in STORAGE_PLANS {
+        for (billing, price_usd, days) in [("monthly", monthly, 30u64), ("annual", annual, 365u64)] {
+            let credits = crate::chain_db::usd_to_credits(price_usd);
+            plans.push(serde_json::json!({
+                "name": name,
+                "billing": billing,
+                "gb": gb,
+                "period_days": days,
+                "price_usd": price_usd,
+                "price_egusd": credits as f64 / 100.0,
+                "credits": credits,
+                "memo": format!("credits_pay:{credits}:plan:{name}:{billing}"),
+            }));
+        }
+    }
+    serde_json::json!({
+        "free_gb": 5,
+        "pay": { "tx_type": "credits_pay", "to": STORAGE_FEE_SINK, "amount_uegoc": 0 },
+        "grace_days": PLAN_GRACE_SECS / 86_400,
+        "renew_from_hours_before_end": RENEW_BEFORE_SECS / 3_600,
+        "plans": plans,
+    })
+}
+
+pub fn plan_status_view(owner: &str, now: i64) -> serde_json::Value {
+    let plan = storage_plan_of(owner);
+    let have = crate::chain_db::credits_balance(owner);
+    let quota = storage_quota_bytes(owner, now);
+    let Some(p) = plan else {
+        return serde_json::json!({
+            "owner": owner,
+            "plan": null,
+            "quota_bytes": quota,
+            "egusd_balance": have as f64 / 100.0,
+        });
+    };
+    let price = plan_price_usd(&p.name, &p.billing).map(|(_, usd, _)| crate::chain_db::usd_to_credits(usd)).unwrap_or(0);
+    serde_json::json!({
+        "owner": owner,
+        "plan": p,
+        "active": now < p.expires_at,
+        "in_grace": now >= p.expires_at && now < p.expires_at + PLAN_GRACE_SECS,
+        "grace_until": p.expires_at + PLAN_GRACE_SECS,
+        "renews_from": p.expires_at - RENEW_BEFORE_SECS,
+        "quota_bytes": quota,
+        "egusd_balance": have as f64 / 100.0,
+        "renewal_price_egusd": price as f64 / 100.0,
+        "can_renew": have >= price,
+        "warning": low_balance_warning(&p, now, true, have),
+    })
 }
 
 fn renewal_due(plan: &ActivePlan, now: i64) -> bool {
@@ -1820,6 +1875,22 @@ mod renewal_tests {
         let plan = plan_after(vec![pay("Basic", 50, 0), pay("Max", 1024, 10 * DAY)]).unwrap();
         assert_eq!((plan.name.as_str(), plan.gb), ("Max", 1024));
         assert_eq!(plan_after(vec![]), None);
+    }
+
+    #[test]
+    fn every_plan_is_listed_with_the_exact_payment_it_needs() {
+        let v = super::plans_view();
+        let plans = v["plans"].as_array().unwrap();
+        assert_eq!(plans.len(), 6, "three plans, monthly and annual");
+        for p in plans {
+            let memo = p["memo"].as_str().unwrap();
+            let (gb, period) = super::plan_paid_in_egusd(memo).expect("the listed memo is one the chain accepts as a plan payment");
+            assert_eq!(gb, p["gb"].as_u64().unwrap());
+            assert_eq!(period, p["period_days"].as_i64().unwrap() * DAY);
+        }
+        assert_eq!(v["pay"]["tx_type"], "credits_pay");
+        assert_eq!(v["pay"]["to"], super::STORAGE_FEE_SINK);
+        assert_eq!(v["free_gb"], 5);
     }
 
     #[test]

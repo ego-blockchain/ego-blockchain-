@@ -328,7 +328,27 @@ async fn usage(params: &Value) -> RpcResult {
     }).await.map_err(|e| (-32603, e.to_string()))
 }
 
-pub const METHODS: &[&str] = &["storage.putBlock", "storage.putManifest", "storage.getBlock", "storage.getManifest", "storage.delete", "storage.usage"];
+async fn plan_status(params: &Value) -> RpcResult {
+    let owner = params["owner"].as_str().unwrap_or_default().to_string();
+    if !owner.starts_with("ego") || owner.len() > 90 || !owner.bytes().all(|c| c.is_ascii_alphanumeric()) {
+        return Err((-32602, "owner must be a wallet address".into()));
+    }
+    let now = chrono::Utc::now().timestamp();
+    tokio::task::spawn_blocking(move || crate::commands::storage::plan_status_view(&owner, now))
+        .await
+        .map_err(|e| (-32603, e.to_string()))
+}
+
+pub const METHODS: &[&str] = &[
+    "storage.putBlock",
+    "storage.putManifest",
+    "storage.getBlock",
+    "storage.getManifest",
+    "storage.delete",
+    "storage.usage",
+    "storage.plans",
+    "storage.planStatus",
+];
 
 pub async fn dispatch(method: &str, params: &Value) -> Option<RpcResult> {
     Some(match method {
@@ -338,6 +358,8 @@ pub async fn dispatch(method: &str, params: &Value) -> Option<RpcResult> {
         "storage.getManifest" => get_manifest(params).await,
         "storage.delete" => delete(params).await,
         "storage.usage" => usage(params).await,
+        "storage.plans" => Ok(crate::commands::storage::plans_view()),
+        "storage.planStatus" => plan_status(params).await,
         _ => return None,
     })
 }
