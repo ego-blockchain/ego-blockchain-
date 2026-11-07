@@ -552,7 +552,9 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
         "wallet.getTransactionHistory" => {
             let addr  = p["address"].as_str().unwrap_or_default();
             let limit = p["limit"].as_u64().unwrap_or(50) as usize;
-            let txs   = crate::chain_db::get_address_txs(addr, limit);
+            // Optional: "sent", "received" or "rewards". Older wallets leave it out and get everything.
+            let kind  = p["kind"].as_str().and_then(crate::chain_db::TxKind::parse);
+            let txs   = crate::chain_db::get_address_txs_of_kind(addr, limit, kind);
             RpcResponse::ok(req.id, json!(txs))
         }
 

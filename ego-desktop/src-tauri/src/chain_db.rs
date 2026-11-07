@@ -6165,7 +6165,48 @@ pub fn get_current_base_fee() -> u64 {
 
 /// Return up to `limit` transactions for `address`, newest first.
 pub fn get_address_txs(address: &str, limit: usize) -> Vec<LedgerTx> {
+    get_address_txs_of_kind(address, limit, None)
+}
+
+/// Which side of a transaction an address is on, for wallets that list
+/// sent, received and rewards apart: a node earning every few seconds would
+/// otherwise bury everything else under its newest rewards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxKind {
+    Sent,
+    Received,
+    Rewards,
+}
+
+impl TxKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "sent" => Some(Self::Sent),
+            "received" => Some(Self::Received),
+            "rewards" => Some(Self::Rewards),
+            _ => None,
+        }
+    }
+
+    /// Paid by the network is a reward; paid by someone else is received;
+    /// anything the address signed, even to itself, is sent.
+    pub fn of(tx: &LedgerTx, address: &str) -> Self {
+        let incoming = tx.to == address && tx.from != address;
+        if !incoming {
+            return Self::Sent;
+        }
+        let reward = tx.from == NODE_POOL_ADDR
+            || matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward" | "uptime_reward" | "storage_reward");
+        if reward { Self::Rewards } else { Self::Received }
+    }
+}
+
+/// The newest `limit` transactions of an address, only those of `kind` when given.
+pub fn get_address_txs_of_kind(address: &str, limit: usize, kind: Option<TxKind>) -> Vec<LedgerTx> {
     let mut txs = get_tx_history_for_addr(address);
+    if let Some(kind) = kind {
+        txs.retain(|t| TxKind::of(t, address) == kind);
+    }
     txs.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
     txs.truncate(limit);
     txs
