@@ -31,6 +31,7 @@ const SILENT_KEEP_MS: u64 = 600_000;
 const SKIPS_RESEND_MS: u64 = 10_000;
 const LIVE_WITHIN_SECS: i64 = 900;
 const LOOKAHEAD: u32 = 6;
+const STUCK_GIVE_UP_MS: u64 = 600_000;
 const AHEAD_ATTEMPTS_KEPT: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -317,6 +318,27 @@ fn required_version(height: u64) -> &'static str {
 
 fn able(addr: &str, me: &str, height: u64) -> bool {
     addr == me || crate::commands::updates::runs_at_least(addr, required_version(height), LIVE_WITHIN_SECS)
+}
+
+fn counts_for_give_up(addr: &str, me: &str, height: u64, now: u64) -> bool {
+    present_addr(addr, me, now) && able_or_heard(addr, me, height, now)
+}
+
+fn able_or_heard(addr: &str, me: &str, height: u64, now: u64) -> bool {
+    able(addr, me, height)
+        || (heard_within(addr, now)
+            && !crate::commands::updates::known_older_than(addr, required_version(height), LIVE_WITHIN_SECS))
+}
+
+fn waited_out(waited_ms: u64) -> bool {
+    waited_ms >= STUCK_GIVE_UP_MS
+}
+
+fn plan_counts(plan: &[Vec<String>], ok: impl Fn(&str) -> bool) -> String {
+    plan.iter()
+        .map(|c| format!("{}/{}", c.iter().filter(|a| ok(a)).count(), c.len()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn present_addr(addr: &str, me: &str, now: u64) -> bool {
@@ -659,7 +681,7 @@ impl Driver {
 
     fn short_of_quorum(&self, now: u64) -> bool {
         let present = if crate::drs::widened(self.height, self.attempt) {
-            self.members.iter().filter(|(a, _)| able(a, &self.me_addr, self.height) && present_addr(a, &self.me_addr, now)).count()
+            self.members.iter().filter(|(a, _)| counts_for_give_up(a, &self.me_addr, self.height, now)).count()
         } else {
             self.present_members(now)
         };
@@ -687,17 +709,28 @@ impl Driver {
         let Some(plan) = plan else { return };
         let me = self.me_addr.clone();
         let height = self.height;
-        if !replacement_reachable_by(plan, |a| able(a, &me, height) && present_addr(a, &me, now)) {
+        let waited = now.saturating_sub(self.attempt_started);
+        if !replacement_reachable_by(plan, |a| counts_for_give_up(a, &me, height, now)) && !waited_out(waited) {
             if !self.said_no_replacement {
                 self.said_no_replacement = true;
                 eprintln!(
-                    "[Consensus] h={} attempt {}: not giving up yet, a committee ahead has too few members present on {} or later to finish the block or pass it on, so this node waits here",
+                    "[Consensus] h={} attempt {}: not giving up yet, a committee ahead has too few members present on {} or later to finish the block or pass it on (present per committee ahead: {}), so this node waits here for up to {} min",
                     self.height,
                     self.attempt,
-                    required_version(self.height)
+                    required_version(self.height),
+                    plan_counts(plan, |a| counts_for_give_up(a, &me, height, now)),
+                    STUCK_GIVE_UP_MS / 60_000
                 );
             }
             return;
+        }
+        if waited_out(waited) && self.said_no_replacement {
+            eprintln!(
+                "[Consensus] h={} attempt {}: waited {} min for a committee ahead that can finish; giving up anyway so the draw moves on",
+                self.height,
+                self.attempt,
+                waited / 60_000
+            );
         }
         let (Some(_), Some(kp)) = (self.me, self.kp.clone()) else { return };
         let locked = match self.engine.locked() {
@@ -1792,6 +1825,30 @@ mod tests {
             P2PMessage::TmCommit { block, .. } => assert_eq!(block.commit_cert, "{}"),
             other => panic!("wrong message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_member_heard_signing_counts_even_before_its_version_arrives() {
+        let me = "egot1me";
+        let h = crate::drs::WIDEN_V2_FROM_HEIGHT;
+        let now = mono_ms();
+        note_heard("egot1quiet_version", now);
+        assert!(!able("egot1quiet_version", me, h), "no version announcement has arrived");
+        assert!(able_or_heard("egot1quiet_version", me, h, now), "its signed consensus messages show it runs this height");
+        crate::commands::updates::note_peer_version("egot1known_old", "0.3.645");
+        note_heard("egot1known_old", now);
+        assert!(!able_or_heard("egot1known_old", me, h, now), "a node known to run older rules still does not count");
+        assert!(!able_or_heard("egot1never_heard", me, h, now));
+    }
+
+    #[test]
+    fn a_node_never_waits_in_place_forever() {
+        assert!(!waited_out(STUCK_GIVE_UP_MS - 1));
+        assert!(waited_out(STUCK_GIVE_UP_MS));
+        assert!(STUCK_GIVE_UP_MS > GIVE_UP_CAP_MS, "the normal give-up rules always get their turn first");
+        let c = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let plan = vec![c(&["egot1a", "egot1b", "egot1c"]), c(&["egot1a", "egot1d"])];
+        assert_eq!(plan_counts(&plan, |a| a == "egot1a" || a == "egot1b"), "2/3 1/2");
     }
 
     #[test]
