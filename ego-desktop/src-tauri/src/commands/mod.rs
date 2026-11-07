@@ -2,6 +2,8 @@ pub mod ai;
 pub mod direct_pay;
 pub mod updates;
 pub mod auth;
+pub mod totp;
+pub mod phrase_lock;
 pub mod wallet;
 pub mod coverage;
 pub mod storage;

@@ -27,6 +27,7 @@ import RegistrationFlow from './components/RegistrationFlow';
 import SyncBanner from './components/SyncBanner';
 import VpnBanner from './components/VpnBanner';
 import { GlobalLockScreen } from './components/GlobalLockScreen';
+import TotpPrompt from './components/TotpPrompt';
 
 type Theme = 'dark' | 'light';
 
@@ -359,6 +360,7 @@ function App() {
         <GlobalLockScreen>
           <Router>
             <div data-theme={theme} className="App min-h-screen bg-gray-900 text-white">
+              <TotpPrompt />
               <SyncBanner />
               <VpnBanner />
               <Routes>

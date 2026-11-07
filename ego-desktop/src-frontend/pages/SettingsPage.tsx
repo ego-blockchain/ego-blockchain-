@@ -6,6 +6,10 @@ import { save as saveDialog, open as openDialog } from '@tauri-apps/api/dialog';
 import { writeBinaryFile, readBinaryFile } from '@tauri-apps/api/fs';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
+import AuthenticatorCard from '../components/AuthenticatorCard';
+import PasswordRules from '../components/PasswordRules';
+import { passwordProblem } from '../lib/password';
+import { requireTotp } from '../lib/totp';
 import { useAppVersion, formatVersion } from '../lib/version';
 
 function makeQR(text: string): string {
@@ -20,6 +24,7 @@ function makeQR(text: string): string {
 
 interface RecoveryInfo {
   recovery_phrase: string[];
+  phrase_protected?: boolean;
   seed_hex: string;
   address: string;
   has_pin: boolean;
@@ -165,9 +170,10 @@ const SettingsPage: React.FC = () => {
   }
 
   async function handleSetPin() {
-    if (pinInput.length < 8) { setPinMsg('Password must be at least 8 characters.'); return; }
+    { const problem = passwordProblem(pinInput); if (problem) { setPinMsg(problem); return; } }
     if (pinInput !== pinConfirm) { setPinMsg('Passwords do not match.'); return; }
     setSettingPin(true); setPinMsg('');
+    if (!(await requireTotp('pin'))) { setSettingPin(false); return; }
     try {
       await invoke('set_password', { password: pinInput });
       setHasPin(true);
@@ -186,10 +192,7 @@ const SettingsPage: React.FC = () => {
       setResetPwdError('Enter all 24 recovery words.');
       return;
     }
-    if (resetNewPwd.length < 8) {
-      setResetPwdError('New password must be at least 8 characters.');
-      return;
-    }
+    { const problem = passwordProblem(resetNewPwd); if (problem) { setResetPwdError(problem); return; } }
     if (resetNewPwd !== resetNewPwd2) {
       setResetPwdError('Passwords do not match.');
       return;
@@ -217,6 +220,7 @@ const SettingsPage: React.FC = () => {
   async function handleExportBackup() {
     setExportingBackup(true); setBackupMsg(''); setBackupError('');
     try {
+      if (!(await requireTotp('export'))) { setExportingBackup(false); return; }
       const b64 = await invoke<string>('export_wallet_backup');
       const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
       const path = await saveDialog({
@@ -252,6 +256,7 @@ const SettingsPage: React.FC = () => {
 
   async function handleViewRecovery() {
     setLoadingRecovery(true); setRecoveryError('');
+    if (!(await requireTotp('reveal'))) { setLoadingRecovery(false); return; }
     try {
       const info = await invoke<RecoveryInfo>('get_recovery_info', { pin: recoveryPin });
       setRecoveryInfo(info);
@@ -493,6 +498,8 @@ const SettingsPage: React.FC = () => {
   )}
 </div>
 
+        <AuthenticatorCard />
+
         {}
         <div className="px-5 py-4 flex items-center justify-between">
           <div>
@@ -641,7 +648,7 @@ const SettingsPage: React.FC = () => {
             If you forget it, you can reset it using your 24-word recovery phrase.
           </div>
         </div>
-        <div className="text-sm text-gray-400">Choose a password (minimum 8 characters).</div>
+        <div className="text-sm text-gray-400">Choose a password: at least 10 characters, with a capital letter, a small letter and a number.</div>
         <input
           type="password"
           value={pinInput}
@@ -650,6 +657,7 @@ const SettingsPage: React.FC = () => {
           className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
           autoFocus
         />
+        <PasswordRules value={pinInput} />
         <input
           type="password"
           value={pinConfirm}
@@ -782,6 +790,11 @@ const SettingsPage: React.FC = () => {
                 </div>
                 <div>
                   <div className="text-sm font-semibold mb-3">24-Word Recovery Phrase</div>
+                  {recoveryInfo.phrase_protected && (
+                    <div className="mb-3 text-xs px-3 py-2 rounded-lg bg-blue-500/10 border border-blue-500/30 text-blue-300">
+                      These words open this wallet only together with its extra password. Keep both, separately: without the extra password the words alone open an empty wallet.
+                    </div>
+                  )}
                   <div className="grid grid-cols-4 gap-2">
                     {recoveryInfo.recovery_phrase.map((word, i) => (
                       <div key={i} className="bg-gray-900 rounded-lg px-2 py-1.5 text-center">

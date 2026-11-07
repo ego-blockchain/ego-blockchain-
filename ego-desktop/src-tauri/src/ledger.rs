@@ -850,6 +850,12 @@ pub struct Ledger {
     pub security_pin_hash: String,
     #[serde(default)]
     pub security_pin_salt: String,
+    #[serde(default)]
+    pub totp_secret_sealed: String,
+    #[serde(default)]
+    pub totp_last_step: i64,
+    #[serde(default)]
+    pub phrase_protected: bool,
     /// Individual stake positions. Each keeps its own start date and lock so a
     /// top-up never inherits interest the earlier coins earned, and an old
     /// position's unlock date is not moved by adding a new one.

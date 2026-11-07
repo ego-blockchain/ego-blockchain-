@@ -136,6 +136,7 @@ pub async fn stake_coins(
     if amount_uegoc == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
     }
+    crate::commands::totp::consume("send")?;
     if lock_days == 0 {
         return Err(EgoDesktopError::InvalidInput("Lock period must be > 0 days".into()));
     }
@@ -248,6 +249,7 @@ pub async fn unstake_coins(
     position_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), EgoDesktopError> {
+    crate::commands::totp::consume("send")?;
     let mut ledger = Ledger::load();
     let from = ledger.address.clone();
     if from.is_empty() {

@@ -148,6 +148,7 @@ pub async fn send_transaction(
     request: SendTransactionRequest,
     state: State<'_, AppState>,
 ) -> Result<TransactionResponse, EgoDesktopError> {
+    crate::commands::totp::consume("send")?;
     let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = Ledger::load();
     let from = ledger.address.clone();

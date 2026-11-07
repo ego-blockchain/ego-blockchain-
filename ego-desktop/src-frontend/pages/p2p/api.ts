@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/tauri';
+import { requireConfirm } from '../../lib/totp';
 
 export type Side = 'sell' | 'buy';
 export type Price = { fixed: number } | { margin_bps: number };
@@ -282,13 +283,19 @@ export const api = {
   closeOffer: (offerId: string) => invoke<string>('market_close_offer', { offerId }),
   openTrade: (offerId: string, amountMicro: number, method: string, payoutAddress?: string) =>
     invoke<string>('market_open_trade', { offerId, amountMicro, method, payoutAddress }),
-  fund: (tradeId: string) => invoke<string>('market_fund', { tradeId }),
+  fund: async (tradeId: string) => {
+    if (!(await requireConfirm('send'))) throw new Error('Cancelled');
+    return invoke<string>('market_fund', { tradeId });
+  },
   cancel: (tradeId: string) => invoke<string>('market_cancel', { tradeId }),
   markPaid: (tradeId: string, payerName: string) => invoke<string>('market_mark_paid', { tradeId, payerName }),
   dispute: (tradeId: string, reason: string) => invoke<string>('market_dispute', { tradeId, reason }),
   feedback: (tradeId: string, rating: Rating, comment: string) =>
     invoke<string>('market_feedback', { tradeId, rating, comment }),
-  settle: (tradeId: string, outcome: 'release' | 'refund') => invoke<string>('market_settle', { tradeId, outcome }),
+  settle: async (tradeId: string, outcome: 'release' | 'refund') => {
+    if (!(await requireConfirm('send'))) throw new Error('Cancelled');
+    return invoke<string>('market_settle', { tradeId, outcome });
+  },
   escrowStatus: (tradeId: string) => invoke<EscrowStatus>('market_escrow_status', { tradeId }),
   chainAddress: (asset: string) => invoke<ChainAddress>('market_chain_address', { asset }),
   publishArbiter: () => invoke<string>('market_publish_arbiter'),

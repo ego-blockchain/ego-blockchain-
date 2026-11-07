@@ -5,6 +5,9 @@ import { listen } from '@tauri-apps/api/event';
 import { open as openUrl } from '@tauri-apps/api/shell';
 import { useWallet, useTheme } from '../App';
 import TitleBar from './TitleBar';
+import AuthenticatorReminder from './AuthenticatorReminder';
+import PasswordRules from './PasswordRules';
+import { passwordProblem } from '../lib/password';
 import { useAppVersion, formatVersion } from '../lib/version';
 
 const NAV_ITEMS = [
@@ -87,7 +90,11 @@ const WalletSwitcher: React.FC = () => {
   const [importName, setImportName]     = useState('');
   const [importMethod, setImportMethod] = useState<'phrase' | 'seed'>('phrase');
   const [importValue, setImportValue]   = useState('');
+  const [importExtra, setImportExtra]   = useState('');
   const [newName, setNewName]   = useState('');
+  const [newExtra, setNewExtra] = useState('');
+  const [newExtra2, setNewExtra2] = useState('');
+  const [useExtra, setUseExtra] = useState(false);
   const [busy, setBusy]         = useState(false);
   const [error, setError]       = useState('');
   const dropRef = useRef<HTMLDivElement>(null);
@@ -148,11 +155,15 @@ const WalletSwitcher: React.FC = () => {
 
   async function createWallet() {
     const name = newName.trim() || `Wallet ${walletCount + 1}`;
+    if (useExtra) {
+      { const problem = passwordProblem(newExtra); if (problem) { setError(problem.replace('The password', 'The extra password')); return; } }
+      if (newExtra !== newExtra2) { setError('The two extra passwords do not match.'); return; }
+    }
     setBusy(true); setError('');
     try {
-      await invoke('create_wallet', { name });
+      await invoke('create_wallet', { name, extraPassword: useExtra ? newExtra : null });
       await reloadRegistry();
-      setCreating(false); setNewName('');
+      setCreating(false); setNewName(''); setNewExtra(''); setNewExtra2(''); setUseExtra(false);
     } catch (e: any) { setError(String(e)); }
     finally { setBusy(false); }
   }
@@ -163,10 +174,10 @@ const WalletSwitcher: React.FC = () => {
     const name = importName.trim() || `Wallet ${walletCount + 1}`;
     setBusy(true); setError('');
     try {
-      await invoke('import_wallet', { name, method: importMethod, value: v });
+      await invoke('import_wallet', { name, method: importMethod, value: v, extraPassword: importMethod === 'phrase' && importExtra ? importExtra : null });
       await reload();
       await reloadRegistry();
-      setImporting(false); setImportValue(''); setImportName(''); setOpen(false);
+      setImporting(false); setImportValue(''); setImportName(''); setImportExtra(''); setOpen(false);
     } catch (e: any) { setError(String(e)); }
     finally { setBusy(false); }
   }
@@ -247,6 +258,22 @@ const WalletSwitcher: React.FC = () => {
                 rows={importMethod === 'phrase' ? 3 : 2}
                 className="w-full bg-gray-900 border border-gray-600 rounded-lg px-2 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-purple-500 resize-none font-mono"
               />
+              {importMethod === 'phrase' && (
+                <>
+                  <input
+                    type="password"
+                    value={importExtra}
+                    onChange={e => setImportExtra(e.target.value)}
+                    placeholder="Extra password (only if the wallet has one)"
+                    className="w-full bg-gray-900 border border-gray-600 rounded-lg px-2 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-purple-500"
+                  />
+                  {importExtra && (
+                    <div className="text-[11px] text-yellow-400/80 leading-snug">
+                      A wrong extra password opens a different, empty wallet. Check the address after importing.
+                    </div>
+                  )}
+                </>
+              )}
               <button
                 onClick={importWallet}
                 disabled={busy}
@@ -268,6 +295,32 @@ const WalletSwitcher: React.FC = () => {
                 placeholder={`Wallet ${walletCount + 1}`}
                 className="w-full bg-gray-900 border border-gray-600 rounded-lg px-2 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
               />
+              <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer select-none">
+                <input type="checkbox" checked={useExtra} onChange={e => setUseExtra(e.target.checked)} />
+                Protect the 24 words with an extra password
+              </label>
+              {useExtra && (
+                <div className="space-y-1.5">
+                  <input
+                    type="password"
+                    value={newExtra}
+                    onChange={e => setNewExtra(e.target.value)}
+                    placeholder="Extra password"
+                    className="w-full bg-gray-900 border border-gray-600 rounded-lg px-2 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                  />
+                  <PasswordRules value={newExtra} />
+                  <input
+                    type="password"
+                    value={newExtra2}
+                    onChange={e => setNewExtra2(e.target.value)}
+                    placeholder="Type it again"
+                    className="w-full bg-gray-900 border border-gray-600 rounded-lg px-2 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                  />
+                  <div className="text-[11px] text-yellow-400/80 leading-snug">
+                    The 24 words then open this wallet only together with this password. Nobody can reset it: if you forget it, the coins are lost. Write it down and keep it apart from the words.
+                  </div>
+                </div>
+              )}
               <button
                 onClick={createWallet}
                 disabled={busy}
@@ -527,6 +580,7 @@ const Layout: React.FC = () => {
       {}
       <main className="flex-1 overflow-auto min-w-0">
         <UpdateBanner />
+        <AuthenticatorReminder />
         <Outlet />
       </main>
       </div>

@@ -631,6 +631,7 @@ fn progress(app: &AppHandle, trade_id: &str, step: &str) {
 
 #[tauri::command]
 pub async fn market_fund(trade_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<String, EgoDesktopError> {
+    crate::commands::totp::consume("send")?;
     let trade = known_trade(&trade_id)?;
     if trade.is_egoc() {
         let body = LockBody { trade_id: trade.id.clone(), escrow: None };
@@ -852,6 +853,7 @@ pub async fn market_feedback(
 #[tauri::command]
 pub async fn market_settle(trade_id: String, outcome: String, state: State<'_, AppState>) -> Result<String, EgoDesktopError> {
     require_active()?;
+    crate::commands::totp::consume("send")?;
     let outcome = Outcome::parse(outcome.trim())
         .ok_or_else(|| EgoDesktopError::InvalidInput("outcome is release or refund".into()))?;
     let trade = known_trade(&trade_id)?;

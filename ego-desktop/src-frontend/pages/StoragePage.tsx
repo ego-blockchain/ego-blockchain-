@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/api/dialog';
 import { useWallet } from '../App';
 import { useConfirm } from '../hooks/useConfirm';
+import { requireConfirm } from '../lib/totp';
 import Pagination from '../components/Pagination';
 import { EGOC_PRICE_USD } from '../constants';
 
@@ -393,6 +394,7 @@ const StoragePage: React.FC = () => {
       setSubError(`Not enough network capacity for the ${plan.name} plan (${plan.gb >= 1024 ? `${plan.gb / 1024} TB` : `${plan.gb} GB`}). Only ${netCapacity ? netCapacity.total_available_gb.toFixed(1) + ' GB' : 'unknown'} available across the network.`);
       return;
     }
+    if (!(await requireConfirm('send'))) return;
     setSubscribing(true);
     setSubError('');
     try {

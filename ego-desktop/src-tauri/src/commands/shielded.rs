@@ -663,6 +663,7 @@ pub async fn shield_deposit(
     state: State<'_, AppState>,
 ) -> Result<ShieldResult, EgoDesktopError> {
     require_open()?;
+    crate::commands::totp::consume("send")?;
     let _guard = crate::ledger::TX_MUTEX.lock().await;
     let kp = state
         .get_keypair()
@@ -811,6 +812,7 @@ pub async fn shield_withdraw(
     recipient: String,
 ) -> Result<UnshieldResult, EgoDesktopError> {
     require_open()?;
+    crate::commands::totp::consume("send")?;
     let recipient = recipient.trim().to_string();
     crate::commands::wallet::validate_ego_address(&recipient)?;
     if crate::ledger::is_reserved_system_source(&recipient) {

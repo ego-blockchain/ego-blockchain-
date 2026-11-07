@@ -87,7 +87,8 @@ pub async fn get_password_status() -> Result<PinStatus, String> {
 
 #[tauri::command]
 pub async fn set_password(password: String) -> Result<(), EgoDesktopError> {
-    let pwd = normalize_pin(&password)?;
+    let pwd = strong_password(&password)?;
+    crate::commands::totp::consume("pin")?;
     let pwd_hash = hash_pin_argon2(&pwd)?;
     let mut ledger = Ledger::load();
     ledger.security_pin_hash = pwd_hash;
@@ -345,13 +346,22 @@ async fn load_active_wallet(
 }
 
 fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesktopError> {
-    let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    create_wallet_files_with(address_override, "")
+}
+
+fn create_wallet_files_with(address_override: Option<&str>, extra: &str) -> Result<String, EgoDesktopError> {
+    let mut entropy = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy);
+    let seed = crate::commands::phrase_lock::wallet_seed(&entropy, extra);
 
     fs::create_dir_all(data_dir())
         .map_err(|e| EgoDesktopError::FileSystemError(format!("Create dir: {e}")))?;
     crate::ledger::save_seed(&seed)
         .map_err(|e| EgoDesktopError::FileSystemError(format!("Write seed: {e}")))?;
+    if !extra.is_empty() {
+        crate::commands::phrase_lock::store_entropy(&seed, &entropy)
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Write recovery words: {e}")))?;
+    }
 
     let keypair = KeyPair::from_bytes(&seed)
         .map_err(|e| EgoDesktopError::CryptoError(format!("Keypair: {e}")))?;
@@ -373,6 +383,7 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
     let mut ledger = Ledger::default();
     ledger.address = final_address.clone();
     ledger.mainnet_address = mainnet_addr;
+    ledger.phrase_protected = !extra.is_empty();
     ledger.save().map_err(EgoDesktopError::WalletError)?;
 
     let mut chain = load_chain();
@@ -576,6 +587,7 @@ pub async fn list_wallets() -> Result<WalletRegistry, EgoDesktopError> {
 #[tauri::command]
 pub async fn create_wallet(
     name: String,
+    extra_password: Option<String>,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<WalletInfo, EgoDesktopError> {
@@ -601,7 +613,11 @@ pub async fn create_wallet(
     registry.active_id = wallet_id.clone();
     save_registry(&registry).map_err(EgoDesktopError::WalletError)?;
 
-    let address = tokio::task::spawn_blocking(|| create_wallet_files(None))
+    let extra = extra_password.unwrap_or_default();
+    if !extra.is_empty() {
+        strong_password(&extra)?;
+    }
+    let address = tokio::task::spawn_blocking(move || create_wallet_files_with(None, &extra))
         .await
         .map_err(|e| EgoDesktopError::CryptoError(format!("Wallet creation panicked: {e}")))??;
 
@@ -626,6 +642,7 @@ pub async fn import_wallet(
     name:       String,
     method:     String,
     value:      String,
+    extra_password: Option<String>,
     state:      State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<WalletInfo, EgoDesktopError> {
@@ -635,13 +652,20 @@ pub async fn import_wallet(
     }
 
     // Derive seed bytes from phrase or hex
+    let extra = extra_password.unwrap_or_default();
+    let mut words_entropy: Option<[u8; 32]> = None;
     let seed: [u8; 32] = if method == "phrase" {
         let words: Vec<String> = value.split_whitespace().map(|w| w.to_lowercase()).collect();
-        let kp = restore_keypair_from_phrase(&words)?;
-        let raw = kp.to_bytes();
-        let mut s = [0u8; 32];
-        s.copy_from_slice(&raw[..32]);
-        s
+        let entropy = phrase_to_entropy(&words)?;
+        if extra.is_empty() {
+            entropy
+        } else {
+            words_entropy = Some(entropy);
+            let extra = extra.clone();
+            tokio::task::spawn_blocking(move || crate::commands::phrase_lock::wallet_seed(&entropy, &extra))
+                .await
+                .map_err(|e| EgoDesktopError::CryptoError(format!("Key derivation: {e}")))?
+        }
     } else if method == "seed" {
         let bytes = hex::decode(value.trim())
             .map_err(|_| EgoDesktopError::InvalidInput("Invalid seed hex — must be 64 hex characters".into()))?;
@@ -673,6 +697,10 @@ pub async fn import_wallet(
             .map_err(|e| EgoDesktopError::FileSystemError(format!("Create dir: {e}")))?;
         save_seed(&seed)
             .map_err(|e| EgoDesktopError::FileSystemError(format!("Write seed: {e}")))?;
+        if let Some(entropy) = words_entropy {
+            crate::commands::phrase_lock::store_entropy(&seed, &entropy)
+                .map_err(|e| EgoDesktopError::FileSystemError(format!("Write recovery words: {e}")))?;
+        }
 
         let keypair = KeyPair::from_bytes(&seed)
             .map_err(|e| EgoDesktopError::CryptoError(format!("Keypair: {e}")))?;
@@ -686,6 +714,7 @@ pub async fn import_wallet(
         let mut ledger = crate::ledger::Ledger::default();
         ledger.address = address.clone();
         ledger.mainnet_address = mainnet_addr;
+        ledger.phrase_protected = words_entropy.is_some();
         ledger.save().map_err(EgoDesktopError::WalletError)?;
 
         Ok::<String, EgoDesktopError>(address)
@@ -858,6 +887,25 @@ fn normalize_pin(pin: &str) -> Result<String, EgoDesktopError> {
         ));
     }
     Ok(pin)
+}
+
+pub(crate) fn strong_password(pw: &str) -> Result<String, EgoDesktopError> {
+    let pw = normalize_pin(pw)?;
+    let missing = if pw.chars().count() < 10 {
+        Some("at least 10 characters")
+    } else if !pw.chars().any(char::is_uppercase) {
+        Some("at least one capital letter")
+    } else if !pw.chars().any(char::is_lowercase) {
+        Some("at least one small letter")
+    } else if !pw.chars().any(|c| c.is_ascii_digit()) {
+        Some("at least one number")
+    } else {
+        None
+    };
+    match missing {
+        Some(what) => Err(EgoDesktopError::InvalidInput(format!("The password needs {what}."))),
+        None => Ok(pw),
+    }
 }
 
 static PIN_ATTEMPTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u32, i64)>>> =
@@ -1038,6 +1086,22 @@ pub fn pin_cache_status() -> Result<serde_json::Value, EgoDesktopError> {
 /// applying the standard lockout. Returns Ok(()) on a valid PIN,
 /// errors on missing/incorrect PIN, and respects the existing
 /// brute-force lockout window. Used by transaction signing flows.
+pub(crate) fn check_wallet_password(password: &str) -> Result<(), EgoDesktopError> {
+    let mut ledger = Ledger::load();
+    if ledger.security_pin_hash.is_empty() {
+        return Ok(());
+    }
+    let address = ledger.address.clone();
+    enforce_pin_lockout_for(&address)?;
+    let pw = normalize_pin(password).map_err(|_| record_failed_pin_for(&address))?;
+    if !pin_matches(&ledger, &pw) {
+        return Err(record_failed_pin_for(&address));
+    }
+    record_successful_pin_for(&address);
+    upgrade_legacy_pin_hash_if_needed(&mut ledger, &pw)?;
+    Ok(())
+}
+
 pub(crate) fn check_pin_for_tx(_pin: &str) -> Result<(), EgoDesktopError> {
     // Password requirement for transactions has been removed.
     Ok(())
@@ -1070,7 +1134,8 @@ fn upgrade_legacy_pin_hash_if_needed(
 
 #[tauri::command]
 pub async fn set_security_pin(pin: String) -> Result<(), EgoDesktopError> {
-    let pin = normalize_pin(&pin)?;
+    let pin = strong_password(&pin)?;
+    crate::commands::totp::consume("pin")?;
     let pin_hash = hash_pin_argon2(&pin)?;
     let mut ledger = Ledger::load();
     ledger.security_pin_hash = pin_hash;
@@ -1121,7 +1186,7 @@ pub async fn reset_pin_with_recovery_phrase(
     recovery_phrase: Vec<String>,
     new_pin: String,
 ) -> Result<(), EgoDesktopError> {
-    let new_pin = normalize_pin(&new_pin)?;
+    let new_pin = strong_password(&new_pin)?;
 
     tokio::task::spawn_blocking(move || -> Result<(), EgoDesktopError> {
         let provided: Vec<String> = recovery_phrase
@@ -1188,6 +1253,8 @@ pub struct RecoveryInfo {
     pub seed_hex: String,
     pub address: String,
     pub has_pin: bool,
+    #[serde(default)]
+    pub phrase_protected: bool,
 }
 
 #[tauri::command]
@@ -1204,6 +1271,7 @@ pub async fn get_recovery_info(pin: String) -> Result<RecoveryInfo, EgoDesktopEr
         record_successful_pin_for(&address);
         upgrade_legacy_pin_hash_if_needed(&mut ledger, &pin_val)?;
     }
+    crate::commands::totp::consume("reveal")?;
 
     let seed_bytes = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {}", e)))?
@@ -1221,6 +1289,7 @@ pub async fn get_recovery_info(pin: String) -> Result<RecoveryInfo, EgoDesktopEr
         seed_hex,
         address: ledger.address,
         has_pin: !ledger.security_pin_hash.is_empty(),
+        phrase_protected: ledger.phrase_protected,
     })
 }
 
@@ -1251,9 +1320,18 @@ fn generate_recovery_phrase(_keypair: &KeyPair) -> EgoResult<Vec<String>> {
 
     // Use the raw 32-byte seed from disk — NOT keypair.to_bytes().
     // This guarantees the phrase encodes exactly what is needed to restore.
-    let seed_bytes = crate::ledger::load_seed()
+    let key_seed = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {e}")))?
         .ok_or_else(|| EgoDesktopError::CryptoError("Seed unavailable for phrase generation".into()))?;
+    let seed_bytes: Vec<u8> = match crate::commands::phrase_lock::phrase_entropy(&key_seed) {
+        Some(entropy) => entropy.to_vec(),
+        None if Ledger::load().phrase_protected => {
+            return Err(EgoDesktopError::CryptoError(
+                "This wallet's 24 words are missing from this computer. Use the raw seed backup or restore the wallet with its words and extra password.".into(),
+            ))
+        }
+        None => key_seed,
+    };
 
     // BIP39 checksum: first byte of SHA256(entropy).
     // We use BLAKE3 (our canonical hash) for the checksum byte.
@@ -1285,6 +1363,14 @@ fn generate_recovery_phrase(_keypair: &KeyPair) -> EgoResult<Vec<String>> {
 /// This is the true inverse of `generate_recovery_phrase`.  It verifies the
 /// checksum so invalid phrases are rejected before any key material is written.
 fn restore_keypair_from_phrase(phrase: &[String]) -> EgoResult<KeyPair> {
+    let seed_arr = phrase_to_entropy(phrase)?;
+    crate::ledger::save_seed(&seed_arr)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Save seed: {e}")))?;
+    KeyPair::from_bytes(&seed_arr)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("{e}")))
+}
+
+pub(crate) fn phrase_to_entropy(phrase: &[String]) -> EgoResult<[u8; 32]> {
     if phrase.len() != 24 {
         return Err(EgoDesktopError::InvalidInput(
             "Recovery phrase must be exactly 24 words".into(),
@@ -1337,13 +1423,7 @@ fn restore_keypair_from_phrase(phrase: &[String]) -> EgoResult<KeyPair> {
 
     let mut seed_arr = [0u8; 32];
     seed_arr.copy_from_slice(seed);
-
-    // Persist the recovered seed so subsequent app launches work without phrase.
-    crate::ledger::save_seed(&seed_arr)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Save seed: {e}")))?;
-
-    KeyPair::from_bytes(&seed_arr)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("{e}")))
+    Ok(seed_arr)
 }
 
 fn generate_address_qr(address: &str) -> EgoResult<String> {
@@ -2099,6 +2179,7 @@ fn aes_decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, EgoDesktopError> 
 #[tauri::command]
 pub async fn export_wallet_backup(passphrase: String) -> Result<String, EgoDesktopError> {
     use base64::Engine as _;
+    crate::commands::totp::consume("export")?;
 
     let seed_bytes = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {}", e)))?
@@ -2232,5 +2313,21 @@ mod auto_lock_tests {
         assert_eq!(normalize_auto_lock(15), 15);
         assert_eq!(normalize_auto_lock(100_000), AUTO_LOCK_MAX_MINUTES);
         assert_eq!(Ledger::default().auto_lock_minutes, AUTO_LOCK_ON_CLOSE, "existing wallets keep locking when the window closes");
+    }
+}
+
+#[cfg(test)]
+mod password_rule_tests {
+    use super::strong_password;
+
+    #[test]
+    fn a_new_password_needs_ten_characters_a_capital_a_small_letter_and_a_number() {
+        assert!(strong_password("Abcdefghi1").is_ok());
+        assert!(strong_password("  Abcdefghi1  ").is_ok(), "spaces around it are trimmed as before");
+        assert!(strong_password("Abcdefgh1").is_err(), "9 characters");
+        assert!(strong_password("abcdefghi1").is_err(), "no capital");
+        assert!(strong_password("ABCDEFGHI1").is_err(), "no small letter");
+        assert!(strong_password("Abcdefghij").is_err(), "no number");
+        assert!(strong_password("\u{c4}bcdefghi1").is_ok(), "an accented capital counts");
     }
 }

@@ -1987,6 +1987,7 @@ pub async fn send_external_tx(
     contract:     Option<String>,
     decimals:     Option<u8>,
 ) -> Result<String, EgoDesktopError> {
+    crate::commands::totp::consume("send")?;
     let seed = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to load seed: {e}")))?
         .ok_or_else(|| EgoDesktopError::FileSystemError("Wallet not initialised".into()))?;

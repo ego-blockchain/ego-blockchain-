@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import PasswordRules from './PasswordRules';
+import { passwordProblem } from '../lib/password';
 
 interface Props {
   address: string;
@@ -22,7 +24,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
 
   async function handleCreateAccount() {
     if (!name.trim()) { setError('Please enter your name.'); return; }
-    if (pwd.length < 8) { setError('Password must be at least 8 characters.'); return; }
+    { const problem = passwordProblem(pwd); if (problem) { setError(problem); return; } }
     if (pwd !== pwd2)   { setError('Passwords do not match.'); return; }
 
     setLoading(true); setError('');
@@ -82,9 +84,10 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
                 type="password"
                 value={pwd}
                 onChange={e => setPwd(e.target.value)}
-                placeholder="At least 8 characters"
+                placeholder="10+ characters, a capital, a small letter, a number"
                 className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition text-white"
               />
+              <PasswordRules value={pwd} />
             </div>
             <div>
               <label className="text-xs text-gray-400 block mb-1.5">Confirm Password</label>

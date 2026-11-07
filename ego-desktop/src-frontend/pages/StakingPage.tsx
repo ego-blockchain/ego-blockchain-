@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { useWallet } from '../App';
 import { useConfirm } from '../hooks/useConfirm';
+import { requireConfirm } from '../lib/totp';
 
 interface StakePosition {
   id:         string;
@@ -125,6 +126,7 @@ const StakingPage: React.FC = () => {
   async function handleStake() {
     const amt = Math.round((parseFloat(stakeAmount) || 0) * 1_000_000);
     if (amt <= 0) return;
+    if (!(await requireConfirm('send'))) return;
     setSubmitting(true);
     setResult(null);
     try {
@@ -146,6 +148,7 @@ const StakingPage: React.FC = () => {
       const fee = (feeUegoc / 1_000_000).toFixed(4);
       if (!await confirm(`Early unstake will deduct ${fee} EGOC as a 10% fee.`, { detail: 'This fee goes to network nodes. Only this position is unstaked; your other positions are unaffected.', confirmLabel: 'Unstake Early' })) return;
     }
+    if (!(await requireConfirm('send'))) return;
     setSubmitting(true);
     setResult(null);
     try {

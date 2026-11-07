@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { passwordProblem } from '../lib/password';
 import { listen } from '@tauri-apps/api/event';
 import { appWindow } from '@tauri-apps/api/window';
 
@@ -131,10 +132,7 @@ export function GlobalLockScreen({ children }: { children: React.ReactNode }) {
       setResetPwdError('Enter all 24 recovery words.');
       return;
     }
-    if (resetNewPwd.length < 8) {
-      setResetPwdError('New password must be at least 8 characters.');
-      return;
-    }
+    { const problem = passwordProblem(resetNewPwd); if (problem) { setResetPwdError(problem); return; } }
     if (resetNewPwd !== resetNewPwd2) {
       setResetPwdError('Passwords do not match.');
       return;

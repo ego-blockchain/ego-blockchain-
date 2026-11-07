@@ -91,6 +91,7 @@ pub async fn mint_credits(
     if amount_uegoc == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
     }
+    crate::commands::totp::consume("send")?;
     let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = Ledger::load();
     if ledger.address.is_empty() {
@@ -161,6 +162,7 @@ pub async fn pay_credits(
     if credits == 0 {
         return Err(EgoDesktopError::InvalidInput("Credits must be > 0".into()));
     }
+    crate::commands::totp::consume("send")?;
     let to = to_address.trim().to_string();
     if !to.starts_with("egot1") || to.len() < 20 {
         return Err(EgoDesktopError::InvalidInput("Invalid recipient address".into()));

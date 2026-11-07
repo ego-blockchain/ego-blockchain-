@@ -8,6 +8,7 @@ import PhoneAccessBanner from '../components/PhoneAccessBanner';
 import { txDisplayAmount, EGOC_PRICE_USD } from '../constants';
 
 import { RPC_URL, txUrl, blockUrl, addressUrl } from '../config';
+import { requireTotp } from '../lib/totp';
 import { open as openWebUrl } from '@tauri-apps/api/shell';
 import { useAppVersion, formatVersion } from '../lib/version';
 
@@ -709,6 +710,10 @@ const WalletPage: React.FC = () => {
       is_private: sendForm.isPrivate,
       via_radio: sendForm.viaRadio,
     };
+    if (!(await requireTotp('send'))) {
+      setEmailStep('idle');
+      return;
+    }
     try {
       const res = await invoke<TxResult>('send_transaction', { request });
       setEmailStep('idle');
@@ -1147,6 +1152,10 @@ const WalletPage: React.FC = () => {
   async function doExtSend() {
     if (!extSend || !extSendTo.trim() || !extSendAmount.trim()) return;
     setExtSending(true); setExtSendError(''); setExtSendTxid('');
+    if (!(await requireTotp('send'))) {
+      setExtSending(false);
+      return;
+    }
     try {
       const txid = await invoke<string>('send_external_tx', {
         chainSymbol: extSend.symbol,
@@ -1281,7 +1290,6 @@ const WalletPage: React.FC = () => {
 
   const egocBal  = balance ? balance.egoc : (wallet ? wallet.balance_uegoc / 1_000_000 : 0);
   const formatted = balance?.formatted ?? wallet?.balance_formatted ?? '—';
-  const fiatBal   = (egocBal * egocUsd).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 
   return (
     <div className="p-6 max-w-3xl mx-auto space-y-5">
@@ -1295,9 +1303,7 @@ const WalletPage: React.FC = () => {
                 {isLiveMode ? '0.00 EGOC' : formatted}
               </div>
             </div>
-            <div className={`text-sm mt-1 ${isLiveMode ? 'text-gray-500' : 'text-blue-300'}`}>
-              {isLiveMode ? '≈ $0.00 USD' : `≈ ${fiatBal} USD`}
-            </div>
+            {isLiveMode && <div className="text-sm mt-1 text-gray-500">≈ $0.00 USD</div>}
             {!isLiveMode && balance && balance.pending_out_uegoc > 0 && (
               <div className="text-xs mt-1 text-yellow-300 font-medium">
                 {(balance.pending_out_uegoc / 1_000_000).toFixed(2)} EGOC pending · available {((balance.uegoc - balance.pending_out_uegoc) / 1_000_000).toFixed(2)} EGOC
@@ -3090,6 +3096,7 @@ const WalletPage: React.FC = () => {
                 <button
                   disabled={shieldBusy || splitIntoNotes(parseFloat(shieldAmt) || 0).notes.length === 0}
                   onClick={async () => {
+                    if (!(await requireTotp('send'))) return;
                     setShieldBusy(true);
                     setShieldMsg(null);
                     try {
@@ -3183,6 +3190,7 @@ const WalletPage: React.FC = () => {
                       const want = Math.round(parseFloat(shieldSend) * 1_000_000);
                       const picked = pickNotesFor(want);
                       if (!picked) return;
+                      if (!(await requireTotp('send'))) return;
                       setShieldBusy(true);
                       setShieldMsg(null);
                       try {
@@ -3392,6 +3400,7 @@ const WalletPage: React.FC = () => {
               <button
                 disabled={creditsBusy || !(parseFloat(creditsAmt) > 0)}
                 onClick={async () => {
+                  if (!(await requireTotp('send'))) return;
                   setCreditsBusy(true);
                   setCreditsMsg(null);
                   try {
@@ -3438,6 +3447,10 @@ const WalletPage: React.FC = () => {
                   onClick={async () => {
                     setCreditsBusy(true);
                     setCreditsMsg(null);
+                    if (!(await requireTotp('send'))) {
+                      setCreditsBusy(false);
+                      return;
+                    }
                     try {
                       const res = await invoke<{ hash: string; credits: number; message: string }>('pay_credits', {
                         toAddress: egusdSendTo.trim(),
