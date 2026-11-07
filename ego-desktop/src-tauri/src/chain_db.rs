@@ -6188,16 +6188,61 @@ impl TxKind {
         }
     }
 
-    /// Paid by the network is a reward; paid by someone else is received;
-    /// anything the address signed, even to itself, is sent.
-    pub fn of(tx: &LedgerTx, address: &str) -> Self {
+    /// Paid by the network is a reward. Sent and received are only payments
+    /// between people: EGOC with an amount, or EGUSD (`credits_pay`, no EGOC).
+    /// Network records (ready and check-in batches), stakes, conversions,
+    /// payments to system accounts or to yourself are none of these.
+    pub fn of(tx: &LedgerTx, address: &str) -> Option<Self> {
         let incoming = tx.to == address && tx.from != address;
-        if !incoming {
-            return Self::Sent;
+        if incoming
+            && (tx.from == NODE_POOL_ADDR
+                || matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward" | "uptime_reward" | "storage_reward"))
+        {
+            return Some(Self::Rewards);
         }
-        let reward = tx.from == NODE_POOL_ADDR
-            || matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward" | "uptime_reward" | "storage_reward");
-        if reward { Self::Rewards } else { Self::Received }
+        let between_users = tx.from != tx.to
+            && !is_system_address(&tx.from)
+            && !is_system_address(&tx.to)
+            && (tx.amount > 0 || tx.tx_type == "credits_pay");
+        if !between_users {
+            None
+        } else if tx.from == address {
+            Some(Self::Sent)
+        } else if tx.to == address {
+            Some(Self::Received)
+        } else {
+            None
+        }
+    }
+}
+
+/// The chain's own accounts (node pool, staking, fee sink, escrows, burn,
+/// shielded pool...) are a word padded with zeros; a person's never is.
+fn is_system_address(addr: &str) -> bool {
+    addr.is_empty() || addr.contains("0000000000") || crate::ledger::is_reserved_system_source(addr)
+}
+
+#[cfg(test)]
+mod tx_kind_tests {
+    use super::*;
+
+    fn tx(from: &str, to: &str, tx_type: &str, amount: u64) -> LedgerTx {
+        LedgerTx { from: from.into(), to: to.into(), tx_type: tx_type.into(), amount, ..Default::default() }
+    }
+
+    #[test]
+    fn tx_kind_lists_only_payments_between_people_as_sent_or_received() {
+        let me = "egot1ypxxgvy0y5g8gynm3y2tkegzggs64rcts5dq7sl8";
+        let you = "egot1ypqmxa69jykgnn00mkxhtlc36xx50ymje57ccuzr";
+        assert_eq!(TxKind::of(&tx(me, you, "transfer", 5), me), Some(TxKind::Sent));
+        assert_eq!(TxKind::of(&tx(you, me, "transfer", 5), me), Some(TxKind::Received));
+        assert_eq!(TxKind::of(&tx(me, you, "credits_pay", 0), me), Some(TxKind::Sent));
+        assert_eq!(TxKind::of(&tx(NODE_POOL_ADDR, me, "reward", 5), me), Some(TxKind::Rewards));
+        assert_eq!(TxKind::of(&tx("", NODE_POOL_ADDR, "ready_batch", 0), me), None);
+        assert_eq!(TxKind::of(&tx(me, you, "transfer", 0), me), None);
+        assert_eq!(TxKind::of(&tx(me, me, "transfer", 5), me), None);
+        assert_eq!(TxKind::of(&tx(me, "egot1staking000000000000000000000000000000000", "stake", 5), me), None);
+        assert_eq!(TxKind::of(&tx(me, "egot1feesink0000000000000000000000000000000", "credits_pay", 0), me), None);
     }
 }
 
@@ -6205,7 +6250,7 @@ impl TxKind {
 pub fn get_address_txs_of_kind(address: &str, limit: usize, kind: Option<TxKind>) -> Vec<LedgerTx> {
     let mut txs = get_tx_history_for_addr(address);
     if let Some(kind) = kind {
-        txs.retain(|t| TxKind::of(t, address) == kind);
+        txs.retain(|t| TxKind::of(t, address) == Some(kind));
     }
     txs.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
     txs.truncate(limit);
