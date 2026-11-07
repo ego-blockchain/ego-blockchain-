@@ -19,6 +19,11 @@ on:
         required: false
         type: boolean
         default: false
+      macos_only:
+        description: 'Only build macOS (skip Windows/Linux — use to rebuild just the macOS artifacts for an existing tag)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -58,7 +63,7 @@ jobs:
   build-windows:
     name: Windows x64
     runs-on: windows-latest
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_only != true }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.linux_only != true && inputs.macos_only != true) }}
     permissions:
       contents: write
 
@@ -99,13 +104,18 @@ jobs:
   # ── macOS Apple Silicon (aarch64 — M1/M2/M3/M4) ──────────────────────────
   build-macos-arm:
     name: macOS Apple Silicon
-    runs-on: macos-14
+    runs-on: macos-15
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.linux_only != true && inputs.windows_only != true) }}
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version != '' && inputs.version || github.ref }}
+
+      - name: Stop Spotlight indexing (keeps hdiutil from finding the DMG busy)
+        run: sudo mdutil -a -i off || true
 
       - uses: actions/setup-node@v4
         with:
@@ -144,17 +154,20 @@ jobs:
   # GitHub no longer provisions the free hosted macos-13 (Intel) runner, so that
   # label queues forever. Build Intel by cross-compiling on macos-14 (Apple
   # Silicon) via --target x86_64-apple-darwin; DMG packaging is arch-independent.
-  # macos-14 is pinned (not macos-latest) to avoid newer macOS runner images
-  # whose hdiutil regresses bundle_dmg.sh in headless CI.
   build-macos-intel:
     name: macOS Intel
-    runs-on: macos-14
+    runs-on: macos-15
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.linux_only != true && inputs.windows_only != true) }}
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version != '' && inputs.version || github.ref }}
+
+      - name: Stop Spotlight indexing (keeps hdiutil from finding the DMG busy)
+        run: sudo mdutil -a -i off || true
 
       - uses: actions/setup-node@v4
         with:
@@ -196,7 +209,7 @@ jobs:
   build-linux:
     name: Linux x64
     runs-on: ubuntu-22.04
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_only != true }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.windows_only != true && inputs.macos_only != true) }}
     permissions:
       contents: write
 
