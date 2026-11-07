@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,9 @@ const SHARE_LIMIT: usize = 50;
 const MAX_FAILURES: u8 = 2;
 const BUCKET_SIZE: f64 = 120.0;
 const REFILL_PER_SEC: f64 = 6.0;
+const CHECKERS_PER_ROUND: usize = 3;
+const PEER_CHECK_GAP_SECS: i64 = 600;
+const PEER_CHECKS_PER_MINUTE: usize = 30;
 pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
 /// /storage takes a whole encrypted block, base64-encoded, in one request.
 pub(crate) const MAX_STORAGE_BODY_BYTES: usize = 512 * 1024;
@@ -49,6 +52,7 @@ const SELF_CHECK_MAX_SECS: i64 = 24 * 3600;
 const SELF_CHECK_KEEP_SECS: i64 = 50 * 60;
 
 static SELF_CHECK: Mutex<(i64, i64)> = Mutex::new((0, SELF_CHECK_FIRST_SECS));
+static SELF_CHECK_V6: Mutex<(i64, i64)> = Mutex::new((0, SELF_CHECK_FIRST_SECS));
 
 fn next_self_check(backoff: i64, reachable: Option<bool>, now: i64) -> (i64, i64) {
     match reachable {
@@ -125,12 +129,27 @@ pub struct GatewayStatus {
     pub reached_locally_at: Option<i64>,
     pub known_gateways: usize,
     pub problem: Option<String>,
+    pub endpoint_v6: Option<String>,
+    pub reached_v6_at: Option<i64>,
+    pub reachable_v6: bool,
+    pub router_v6_open: Option<String>,
 }
 
 static STATUS: Mutex<Option<GatewayStatus>> = Mutex::new(None);
 static BUCKETS: Mutex<Option<HashMap<IpAddr, (f64, Instant)>>> = Mutex::new(None);
 static TABLE: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
 static OWN: Mutex<Option<Announcement>> = Mutex::new(None);
+static OWN_V6: Mutex<Option<Announcement>> = Mutex::new(None);
+static OWN_V6_ADDR: Mutex<Option<Ipv6Addr>> = Mutex::new(None);
+static PEER_CHECKS: Mutex<Option<(HashMap<u64, i64>, Vec<i64>)>> = Mutex::new(None);
+
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 pub fn port() -> u16 {
     std::env::var("EGO_GATEWAY_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PORT)
@@ -205,12 +224,90 @@ fn is_public(ip: &Ipv4Addr) -> bool {
         || ip.is_multicast() || ip.is_documentation() || o[0] == 0 || (o[0] == 100 && (64..128).contains(&o[1])) || o[0] >= 240)
 }
 
-fn parse_endpoint(endpoint: &str) -> Option<(Ipv4Addr, u16)> {
+fn is_global_v6(ip: &Ipv6Addr) -> bool {
+    let s = ip.segments();
+    (s[0] & 0xe000) == 0x2000 && !(s[0] == 0x2001 && (s[1] == 0x0db8 || s[1] == 0)) && s[0] != 0x2002
+}
+
+fn site(ip: &Ipv6Addr) -> u64 {
+    (u128::from(*ip) >> 72) as u64
+}
+
+fn endpoint_for(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(v4) => format!("https://{v4}:{port}/rpc"),
+        IpAddr::V6(v6) => format!("https://[{v6}]:{port}/rpc"),
+    }
+}
+
+fn parse_endpoint(endpoint: &str) -> Option<(IpAddr, u16)> {
     let rest = endpoint.strip_prefix("https://")?.strip_suffix("/rpc")?;
     let (host, port) = rest.rsplit_once(':')?;
-    let ip: Ipv4Addr = host.parse().ok()?;
     let port: u16 = port.parse().ok()?;
-    (is_public(&ip) && port >= 1024 && format!("https://{ip}:{port}/rpc") == endpoint).then_some((ip, port))
+    let ip = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => IpAddr::V6(v6.parse().ok()?),
+        None => IpAddr::V4(host.parse().ok()?),
+    };
+    let public = match ip {
+        IpAddr::V4(v4) => is_public(&v4),
+        IpAddr::V6(v6) => is_global_v6(&v6),
+    };
+    (public && port >= 1024 && endpoint_for(ip, port) == endpoint).then_some((ip, port))
+}
+
+fn own_global_v6() -> Option<Ipv6Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888), 53)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V6(ip) if is_global_v6(&ip) => Some(ip),
+        _ => None,
+    }
+}
+
+fn own_v6_addr() -> Option<Ipv6Addr> {
+    let cached = *OWN_V6_ADDR.lock().unwrap_or_else(|e| e.into_inner());
+    cached.or_else(own_global_v6)
+}
+
+fn reached_over_v6(from: &Ipv6Addr, own: Option<Ipv6Addr>) -> Option<bool> {
+    if from.to_ipv4_mapped().is_some() {
+        return None;
+    }
+    if is_global_v6(from) {
+        return Some(own.map(|o| site(&o) != site(from)).unwrap_or(false));
+    }
+    let s = from.segments();
+    ((s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80).then_some(false)
+}
+
+fn peer_check_allowed(target_site: u64, now: i64) -> bool {
+    let mut guard = PEER_CHECKS.lock().unwrap_or_else(|e| e.into_inner());
+    let (by_site, recent) = guard.get_or_insert_with(|| (HashMap::new(), Vec::new()));
+    recent.retain(|t| now - *t < 60);
+    by_site.retain(|_, t| now - *t < PEER_CHECK_GAP_SECS);
+    if recent.len() >= PEER_CHECKS_PER_MINUTE || by_site.contains_key(&target_site) {
+        return false;
+    }
+    recent.push(now);
+    by_site.insert(target_site, now);
+    true
+}
+
+pub async fn check_for_peer(endpoint: String) {
+    let Some((IpAddr::V6(target), port)) = parse_endpoint(&endpoint) else { return };
+    let Some(mine) = own_v6_addr() else { return };
+    if site(&mine) == site(&target) || !peer_check_allowed(site(&target), chrono::Utc::now().timestamp()) {
+        return;
+    }
+    let Ok(client) = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return;
+    };
+    let _ = client.get(format!("https://[{target}]:{port}/health")).send().await;
 }
 
 pub fn check(a: &Announcement, now: i64) -> Result<(), &'static str> {
@@ -288,6 +385,9 @@ pub fn share(now: i64) -> Vec<Announcement> {
     if let Some(own) = OWN.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         out.push(own);
     }
+    if let Some(own) = OWN_V6.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        out.push(own);
+    }
     for a in verified.into_iter().chain(unverified) {
         if out.len() >= SHARE_LIMIT {
             break;
@@ -319,6 +419,13 @@ fn cost(method: &str) -> f64 {
     }
 }
 
+fn bucket_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+        v4 => v4,
+    }
+}
+
 fn allow(ip: IpAddr, cost: f64) -> bool {
     let mut guard = BUCKETS.lock().unwrap_or_else(|e| e.into_inner());
     let buckets = guard.get_or_insert_with(HashMap::new);
@@ -326,7 +433,7 @@ fn allow(ip: IpAddr, cost: f64) -> bool {
     if buckets.len() > 100_000 {
         buckets.retain(|_, (_, seen)| now.duration_since(*seen) < Duration::from_secs(600));
     }
-    let (tokens, seen) = buckets.entry(ip).or_insert((BUCKET_SIZE, now));
+    let (tokens, seen) = buckets.entry(bucket_key(ip)).or_insert((BUCKET_SIZE, now));
     *tokens = (*tokens + now.duration_since(*seen).as_secs_f64() * REFILL_PER_SEC).min(BUCKET_SIZE);
     *seen = now;
     if *tokens < cost {
@@ -667,13 +774,16 @@ pub(crate) async fn answer(ip: IpAddr, body: Value) -> Result<Value, Value> {
 }
 
 async fn health(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Json<Value> {
-    if let IpAddr::V4(ip) = peer.ip() {
-        let now = chrono::Utc::now().timestamp();
-        if is_public(&ip) {
-            update(|s| s.reached_from_internet_at = Some(now));
-        } else if ip.is_private() {
-            update(|s| s.reached_locally_at = Some(now));
-        }
+    let now = chrono::Utc::now().timestamp();
+    match peer.ip() {
+        IpAddr::V4(ip) if is_public(&ip) => update(|s| s.reached_from_internet_at = Some(now)),
+        IpAddr::V4(ip) if ip.is_private() => update(|s| s.reached_locally_at = Some(now)),
+        IpAddr::V6(ip) => match reached_over_v6(&ip, own_v6_addr()) {
+            Some(true) => update(|s| s.reached_v6_at = Some(now)),
+            Some(false) => update(|s| s.reached_locally_at = Some(now)),
+            None => {}
+        },
+        _ => {}
     }
     Json(json!({ "ok": true, "service": "ego-gateway", "version": env!("CARGO_PKG_VERSION") }))
 }
@@ -698,6 +808,16 @@ async fn serve(cert_pem: String, key_pem: String) {
         }
     };
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port()));
+    let _v6 = match v6_listener() {
+        Ok(listener) => Some(AbortOnDrop(tokio::spawn(
+            axum_server::from_tcp_rustls(listener, config.clone())
+                .serve(router().into_make_service_with_connect_info::<SocketAddr>()),
+        ))),
+        Err(e) => {
+            tracing::debug!("[gateway] not listening on IPv6: {e}");
+            None
+        }
+    };
     update(|s| s.running = true);
     let result = axum_server::bind_rustls(addr, config)
         .serve(router().into_make_service_with_connect_info::<SocketAddr>())
@@ -708,6 +828,18 @@ async fn serve(cert_pem: String, key_pem: String) {
             s.problem = Some(format!("The gateway couldn't listen on port {}: {e}", port()));
         }
     });
+}
+
+fn v6_listener() -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(true)?;
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port())).into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
 }
 
 struct LocalAdvert {
@@ -768,7 +900,10 @@ async fn public_ipv4(client: &reqwest::Client) -> Option<Ipv4Addr> {
 
 async fn make_announcement(client: &reqwest::Client, cert_sha256: &str) -> Result<Announcement, String> {
     let ip = public_ipv4(client).await.ok_or("Couldn't find this computer's public internet address.")?;
-    let endpoint = format!("https://{ip}:{}/rpc", port());
+    sign_announcement(endpoint_for(IpAddr::V4(ip), port()), cert_sha256)
+}
+
+fn sign_announcement(endpoint: String, cert_sha256: &str) -> Result<Announcement, String> {
     // A headless node never unlocks a wallet, so it signs with the saved seed
     // the way its P2P announcements do.
     let kp = crate::app::global_app_state()
@@ -903,6 +1038,73 @@ async fn announce_loop(cert_sha256: String) {
     }
 }
 
+async fn ask_peers_to_check(endpoint: &str) -> usize {
+    let cutoff = chrono::Utc::now().timestamp() - crate::p2p::PEER_LIVENESS_SECS;
+    let mut endpoints: Vec<String> = tokio::task::spawn_blocking(crate::p2p::load_peer_cache)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.last_seen >= cutoff && !p.endpoint.is_empty())
+        .map(|p| p.endpoint)
+        .collect();
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints.shuffle(&mut rand::thread_rng());
+    endpoints.truncate(CHECKERS_PER_ROUND);
+    for peer in &endpoints {
+        let msg = crate::p2p::P2PMessage::GatewayCheck { endpoint: endpoint.to_string() };
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            let _ = crate::p2p::send_message(&peer, &msg).await;
+        });
+    }
+    endpoints.len()
+}
+
+async fn announce_v6_once(cert_sha256: &str) -> bool {
+    let Some(ip) = own_global_v6() else {
+        *OWN_V6_ADDR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_V6.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        update(|s| {
+            s.endpoint_v6 = None;
+            s.reachable_v6 = false;
+        });
+        return false;
+    };
+    *OWN_V6_ADDR.lock().unwrap_or_else(|e| e.into_inner()) = Some(ip);
+    let Ok(a) = sign_announcement(endpoint_for(IpAddr::V6(ip), port()), cert_sha256) else { return false };
+    let now = a.ts;
+    let reached = status().reached_v6_at.map(|t| now - t < REACHED_FOR_SECS).unwrap_or(false);
+    let due = SELF_CHECK_V6.lock().map(|g| now >= g.0).unwrap_or(false);
+    if due && ask_peers_to_check(&a.endpoint).await > 0 {
+        if let Ok(mut g) = SELF_CHECK_V6.lock() {
+            *g = next_self_check(g.1, Some(reached), now);
+        }
+    }
+    update(|s| {
+        s.endpoint_v6 = Some(a.endpoint.clone());
+        s.reachable_v6 = reached;
+    });
+    if !reached {
+        *OWN_V6.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return false;
+    }
+    *OWN_V6.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.clone());
+    if sampled(&a.node, status().known_gateways, GOSSIP_SAMPLE) {
+        if let Ok(data) = serde_json::to_vec(&a) {
+            crate::p2p::publish_gossip(GOSSIP_TOPIC, data).await;
+        }
+    }
+    true
+}
+
+async fn announce_v6_loop(cert_sha256: String) {
+    loop {
+        let wait = if announce_v6_once(&cert_sha256).await { ANNOUNCE_EVERY } else { RETRY_UNREACHABLE };
+        tokio::time::sleep(wait).await;
+    }
+}
+
 async fn find_router() -> Result<igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>, String> {
     igd_next::aio::tokio::search_gateway(igd_next::SearchOptions {
         timeout: Some(Duration::from_secs(5)),
@@ -958,6 +1160,22 @@ async fn close_router_port() {
         let _ = router.remove_port(igd_next::PortMappingProtocol::TCP, port()).await;
         let _ = router.remove_port(igd_next::PortMappingProtocol::UDP, port()).await;
     }
+    crate::router_v6::close(own_v6_addr(), port()).await;
+}
+
+async fn open_router_v6() {
+    let Some(ip) = own_v6_addr() else {
+        update(|s| s.router_v6_open = None);
+        return;
+    };
+    let router = find_router().await.ok().map(|g| (g.addr, g.root_url.clone()));
+    match crate::router_v6::open(router, ip, port()).await {
+        Ok(how) => update(|s| s.router_v6_open = Some(how.to_string())),
+        Err(e) => {
+            tracing::debug!("[gateway] the router did not open IPv6 port {}: {e}", port());
+            update(|s| s.router_v6_open = None);
+        }
+    }
 }
 
 async fn router_loop() {
@@ -975,6 +1193,7 @@ async fn router_loop() {
                 });
             }
         }
+        open_router_v6().await;
         tokio::time::sleep(ROUTER_RENEW).await;
     }
 }
@@ -994,14 +1213,16 @@ async fn probe(client: &reqwest::Client, a: &Announcement) -> bool {
     resp.json::<Value>().await.map(|v| v["service"] == "ego-gateway").unwrap_or(false)
 }
 
-fn due_for_probe(now: i64) -> Vec<Announcement> {
+fn due_for_probe(now: i64, have_v6: bool) -> Vec<Announcement> {
     let own = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|a| a.endpoint.clone());
+    let own_v6 = OWN_V6.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|a| a.endpoint.clone());
     let guard = TABLE.lock().unwrap_or_else(|e| e.into_inner());
     let mut due: Vec<Announcement> = guard
         .as_ref()
         .map(|t| {
             t.values()
-                .filter(|e| Some(&e.announcement.endpoint) != own.as_ref())
+                .filter(|e| Some(&e.announcement.endpoint) != own.as_ref() && Some(&e.announcement.endpoint) != own_v6.as_ref())
+                .filter(|e| have_v6 || !matches!(parse_endpoint(&e.announcement.endpoint), Some((IpAddr::V6(_), _))))
                 .filter(|e| e.failures < MAX_FAILURES && !e.verified_at.map(|t| now - t < VERIFIED_FOR_SECS).unwrap_or(false))
                 .map(|e| e.announcement.clone())
                 .collect()
@@ -1039,7 +1260,8 @@ async fn probe_loop() {
     loop {
         tokio::time::sleep(PROBE_EVERY).await;
         let now = chrono::Utc::now().timestamp();
-        for a in due_for_probe(now) {
+        let have_v6 = tokio::task::spawn_blocking(own_v6_addr).await.ok().flatten().is_some();
+        for a in due_for_probe(now, have_v6) {
             let reachable = probe(&client, &a).await;
             record_probe(&a.endpoint, reachable, chrono::Utc::now().timestamp());
         }
@@ -1066,6 +1288,7 @@ pub async fn supervise() {
                     tasks.push(webrtc);
                     tasks.push(tokio::spawn(router_loop()));
                     tasks.push(tokio::spawn(advertise_loop(fingerprint.clone())));
+                    tasks.push(tokio::spawn(announce_v6_loop(fingerprint.clone())));
                     tasks.push(tokio::spawn(announce_loop(fingerprint)));
                     tasks.push(tokio::spawn(probe_loop()));
                 }
@@ -1077,11 +1300,15 @@ pub async fn supervise() {
                 t.abort();
             }
             *OWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_V6.lock().unwrap_or_else(|e| e.into_inner()) = None;
             tokio::spawn(close_router_port());
             update(|s| {
                 s.running = false;
                 s.bootstrap_listed = false;
                 s.reachable = false;
+                s.reachable_v6 = false;
+                s.endpoint_v6 = None;
+                s.router_v6_open = None;
                 s.router_port_open = None;
                 s.router_public_ip = None;
                 s.local_advertised = false;
@@ -1184,6 +1411,70 @@ mod tests {
         record_probe("https://203.0.114.1:47398/rpc", false, now);
         record_probe("https://203.0.114.1:47398/rpc", false, now);
         assert!(!share(now).iter().any(|a| a.endpoint == "https://203.0.114.1:47398/rpc"), "two failed checks drop a gateway");
+    }
+
+    #[test]
+    fn ipv6_gateways_are_written_one_way_and_must_be_global() {
+        let ok = "https://[2001:56a:7d8e:d100::1]:47398/rpc";
+        assert!(matches!(parse_endpoint(ok), Some((IpAddr::V6(_), 47398))));
+        assert!(parse_endpoint("https://[2001:056a:7d8e:d100::1]:47398/rpc").is_none(), "only the short form, so one gateway is one entry");
+        assert!(parse_endpoint("https://[2001:56A:7D8E:D100::1]:47398/rpc").is_none(), "lower case only");
+        for local in ["fd00::1", "fe80::1", "::1", "2001:db8::1", "2002:c000:204::1", "2001:0:4136:e378::1", "::ffff:8.8.8.8"] {
+            assert!(parse_endpoint(&format!("https://[{local}]:47398/rpc")).is_none(), "{local}");
+        }
+        assert!(parse_endpoint("https://[2001:56a:7d8e:d100::1]:80/rpc").is_none(), "a low port");
+        assert!(parse_endpoint("https://8.8.8.8:47398/rpc").is_some(), "IPv4 still works");
+        assert_eq!(endpoint_for("2001:56a::1".parse().unwrap(), 47398), "https://[2001:56a::1]:47398/rpc");
+    }
+
+    #[test]
+    fn an_ipv6_announcement_is_checked_like_any_other() {
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let cert = "c".repeat(64);
+        let now = 1_800_000_000;
+        assert!(check(&signed(&key, "https://[2001:56a:7d8e:d100::1]:47398/rpc", &cert, now), now).is_ok());
+        assert_eq!(check(&signed(&key, "https://[fd00::1]:47398/rpc", &cert, now), now), Err("endpoint"));
+    }
+
+    #[test]
+    fn only_a_visit_from_outside_the_home_network_proves_ipv6_reach() {
+        let own: Ipv6Addr = "2001:56a:7d8e:d100:e4bd:b14b:6b0:3959".parse().unwrap();
+        let same_home: Ipv6Addr = "2001:56a:7d8e:d1ff::5".parse().unwrap();
+        let neighbour: Ipv6Addr = "2001:56a:7d8e:d200::5".parse().unwrap();
+        let phone: Ipv6Addr = "2607:fb90:1234::9".parse().unwrap();
+        assert_eq!(reached_over_v6(&phone, Some(own)), Some(true));
+        assert_eq!(reached_over_v6(&neighbour, Some(own)), Some(true), "another customer's /56");
+        assert_eq!(reached_over_v6(&same_home, Some(own)), Some(false), "the other computer at home");
+        assert_eq!(reached_over_v6(&"fe80::1".parse().unwrap(), Some(own)), Some(false));
+        assert_eq!(reached_over_v6(&"fd12::1".parse().unwrap(), Some(own)), Some(false));
+        assert_eq!(reached_over_v6(&phone, None), Some(false), "without its own address it can't tell, so it doesn't claim reach");
+        assert_eq!(reached_over_v6(&"::ffff:8.8.8.8".parse().unwrap(), Some(own)), None);
+    }
+
+    #[test]
+    fn one_ipv6_home_shares_one_request_budget() {
+        let a: IpAddr = "2001:56a:7d8e:d100::1".parse().unwrap();
+        let b: IpAddr = "2001:56a:7d8e:d100:ffff::2".parse().unwrap();
+        let c: IpAddr = "2001:56a:7d8e:d101::1".parse().unwrap();
+        assert_eq!(bucket_key(a), bucket_key(b));
+        assert_ne!(bucket_key(a), bucket_key(c));
+        let v4: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(bucket_key(v4), v4);
+    }
+
+    #[test]
+    fn a_node_checks_each_home_at_most_once_in_ten_minutes_and_thirty_homes_a_minute() {
+        let now = 1_900_000_000;
+        let first = 0x2001_056a_7d8e_d1;
+        assert!(peer_check_allowed(first, now));
+        assert!(!peer_check_allowed(first, now + 60), "the same home again too soon");
+        assert!(peer_check_allowed(first, now + PEER_CHECK_GAP_SECS + 61));
+        let later = now + 10_000;
+        for i in 0..PEER_CHECKS_PER_MINUTE as u64 {
+            assert!(peer_check_allowed(1_000 + i, later));
+        }
+        assert!(!peer_check_allowed(5_000, later + 1), "no more than thirty a minute");
+        assert!(peer_check_allowed(5_000, later + 61));
     }
 
     #[test]

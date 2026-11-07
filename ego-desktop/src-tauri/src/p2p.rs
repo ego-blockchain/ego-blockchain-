@@ -4693,6 +4693,9 @@ pub enum P2PMessage {
         timestamp:          i64,
         signature:          String,
     },
+    GatewayCheck {
+        endpoint: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -9784,6 +9787,9 @@ async fn handle_event(
 
 pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<tauri::Wry>>) {
     match msg {
+        P2PMessage::GatewayCheck { endpoint } => {
+            crate::gateway::check_for_peer(endpoint).await;
+        }
         // ── Consensus-v2 (BftEngine) — the live consensus path ───────────────
         // Feed the engine that drives the real chain: validate + vote on proposals,
         // tally votes, persist the agreed LedgerBlock on QC. Inline runs instead only

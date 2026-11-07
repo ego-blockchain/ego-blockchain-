@@ -37,6 +37,7 @@ mod vault_chain;
 mod hold_chain;
 mod pq_chain;
 mod gateway;
+mod router_v6;
 mod webrtc_gateway;
 mod phone_storage;
 mod phone_dao;
