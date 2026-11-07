@@ -59,11 +59,35 @@ env:
     2. **AppImage**: `chmod +x Ego.Desktop_*_amd64.AppImage && ./Ego.Desktop_*_amd64.AppImage`
 
 jobs:
+  release:
+    name: Draft release
+    runs-on: ubuntu-latest
+    if: ${{ github.ref_type == 'tag' || inputs.version != '' }}
+    permissions:
+      contents: write
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+    steps:
+      - name: Find or create the one draft every build uploads to
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          BODY: ${{ env.RELEASE_BODY }}
+        run: |
+          ID=$(gh api "repos/${{ github.repository }}/releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -1)
+          if [ -z "$ID" ]; then
+            ID=$(gh api "repos/${{ github.repository }}/releases" -f tag_name="$TAG" -f name="Ego Desktop $TAG" -f body="$BODY" -F draft=true -F prerelease=false --jq .id)
+          fi
+          [ -n "$ID" ] || { echo "no release id"; exit 1; }
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
   # ── Windows (x64) ─────────────────────────────────────────────────────────
   build-windows:
     name: Windows x64
     runs-on: windows-latest
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.linux_only != true && inputs.macos_only != true) }}
+    needs: release
+    if: ${{ !cancelled() && needs.release.result != 'failure' && (github.event_name != 'workflow_dispatch' || (inputs.linux_only != true && inputs.macos_only != true)) }}
     permissions:
       contents: write
 
@@ -95,17 +119,14 @@ jobs:
           # SIGNTOOL_SIGN_COMMAND: 'signtool sign /f cert.pfx /p ${{ secrets.WIN_CERT_PASS }} /t http://timestamp.digicert.com'
         with:
           projectPath: ego-desktop
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          releaseName: Ego Desktop ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          releaseBody: ${{ env.RELEASE_BODY }}
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.release.outputs.id }}
 
   # ── macOS Apple Silicon (aarch64 — M1/M2/M3/M4) ──────────────────────────
   build-macos-arm:
     name: macOS Apple Silicon
     runs-on: macos-15
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.linux_only != true && inputs.windows_only != true) }}
+    needs: release
+    if: ${{ !cancelled() && needs.release.result != 'failure' && (github.event_name != 'workflow_dispatch' || (inputs.linux_only != true && inputs.windows_only != true)) }}
     permissions:
       contents: write
 
@@ -144,11 +165,7 @@ jobs:
           RUSTFLAGS: '-C target-cpu=apple-m1'
         with:
           projectPath: ego-desktop
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          releaseName: Ego Desktop ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          releaseBody: ${{ env.RELEASE_BODY }}
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.release.outputs.id }}
 
   # ── macOS Intel (x64 cross-compiled from Apple Silicon) ──────────────────
   # GitHub no longer provisions the free hosted macos-13 (Intel) runner, so that
@@ -157,7 +174,8 @@ jobs:
   build-macos-intel:
     name: macOS Intel
     runs-on: macos-15
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.linux_only != true && inputs.windows_only != true) }}
+    needs: release
+    if: ${{ !cancelled() && needs.release.result != 'failure' && (github.event_name != 'workflow_dispatch' || (inputs.linux_only != true && inputs.windows_only != true)) }}
     permissions:
       contents: write
 
@@ -199,17 +217,14 @@ jobs:
         with:
           projectPath: ego-desktop
           args: --target x86_64-apple-darwin
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          releaseName: Ego Desktop ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          releaseBody: ${{ env.RELEASE_BODY }}
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.release.outputs.id }}
 
   # ── Linux (x64 — .deb + .AppImage) ───────────────────────────────────────
   build-linux:
     name: Linux x64
     runs-on: ubuntu-22.04
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.windows_only != true && inputs.macos_only != true) }}
+    needs: release
+    if: ${{ !cancelled() && needs.release.result != 'failure' && (github.event_name != 'workflow_dispatch' || (inputs.windows_only != true && inputs.macos_only != true)) }}
     permissions:
       contents: write
 
@@ -286,13 +301,15 @@ jobs:
         run: npx tauri build
 
       - name: Upload Linux artifacts to release
-        if: github.ref_type == 'tag' || inputs.version != ''
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: true
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          name: Ego Desktop ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          body: ${{ env.RELEASE_BODY }}
-          files: |
-            ego-desktop/src-tauri/target/release/bundle/appimage/*.AppImage
-            ego-desktop/src-tauri/target/release/bundle/deb/*.deb
+        if: needs.release.outputs.id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.release.outputs.id }}
+        run: |
+          for f in ego-desktop/src-tauri/target/release/bundle/appimage/*.AppImage ego-desktop/src-tauri/target/release/bundle/deb/*.deb; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            curl -sSf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+              --data-binary @"$f" "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=$name" > /dev/null
+            echo "uploaded $name"
+          done
