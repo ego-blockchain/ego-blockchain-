@@ -23,7 +23,7 @@ pub const GW_ZONE: &str = "gw.egoblockchain.com";
 const CERT_DOMAIN: &str = "ego/cert/v1";
 const CHECK_AGAIN_SECS: i64 = 10 * 60;
 const CHECKS_AT_ONCE: usize = 8;
-const CHECK_TIMEOUT_SECS: u64 = 6;
+const CHECK_TIMEOUT_SECS: u64 = 10;
 const CHECKED_MAX: usize = 100_000;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,10 +36,34 @@ static CHECKING: Lazy<tokio::sync::Semaphore> = Lazy::new(|| tokio::sync::Semaph
 static PROBE: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .tls_info(true)
         .timeout(std::time::Duration::from_secs(CHECK_TIMEOUT_SECS))
         .build()
         .ok()
 });
+
+async fn served_cert(ip: Ipv4Addr, port: u16) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let client = PROBE.as_ref()?;
+    let resp = client.get(format!("https://{ip}:{port}/health")).send().await.ok()?;
+    let der = resp.extensions().get::<reqwest::tls::TlsInfo>()?.peer_certificate()?.to_vec();
+    Some(hex::encode(Sha256::digest(&der)))
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Served {
+    Same,
+    Other(String),
+    Nothing,
+}
+
+pub fn compare_served(announced: &str, served: Option<String>) -> Served {
+    match served {
+        Some(fp) if fp == announced => Served::Same,
+        Some(fp) => Served::Other(fp),
+        None => Served::Nothing,
+    }
+}
 
 pub fn caller_ip(headers: &HeaderMap) -> Option<Ipv4Addr> {
     headers.get("x-real-ip")?.to_str().ok()?.trim().parse().ok()
@@ -204,17 +228,35 @@ pub fn check(a: &Announcement, now: i64) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub async fn handle_register(Json(a): Json<Announcement>) -> impl IntoResponse {
+pub async fn handle_register(headers: HeaderMap, Json(a): Json<Announcement>) -> impl IntoResponse {
     let now = chrono::Utc::now().timestamp();
     if let Err(e) = check(&a, now) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
     }
-    let mut gateways = GATEWAYS.write().await;
-    if let Some(prev) = gateways.get(&a.endpoint) {
-        if prev.pubkey == a.pubkey && now - prev.ts < ANNOUNCE_GAP_SECS {
+    if let Some(prev) = GATEWAYS.read().await.get(&a.endpoint) {
+        if prev.pubkey == a.pubkey && prev.cert_sha256 == a.cert_sha256 && now - prev.ts < ANNOUNCE_GAP_SECS {
             return (StatusCode::OK, Json(json!({ "listed": true, "next_in": ANNOUNCE_GAP_SECS - (now - prev.ts) })));
         }
     }
+    let (ip, port) = match may_check(&a.endpoint, caller_ip(&headers)) {
+        Ok(target) => target,
+        Err(e) => return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))),
+    };
+    let Ok(_permit) = CHECKING.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "Busy checking other nodes, try again later." })));
+    };
+    match compare_served(&a.cert_sha256, served_cert(ip, port).await) {
+        Served::Same => list(a, now).await,
+        Served::Other(fp) => {
+            GATEWAYS.write().await.retain(|k, g| !(k == &a.endpoint && g.cert_sha256 != fp));
+            (StatusCode::CONFLICT, Json(json!({ "error": "This address answers with another computer's certificate, so phones would reach a different computer. It is not listed." })))
+        }
+        Served::Nothing => (StatusCode::BAD_REQUEST, Json(json!({ "error": "Nothing answered at this address from the internet, so it is not listed." }))),
+    }
+}
+
+async fn list(a: Announcement, now: i64) -> (StatusCode, Json<serde_json::Value>) {
+    let mut gateways = GATEWAYS.write().await;
     if gateways.len() >= MAX_GATEWAYS && !gateways.contains_key(&a.endpoint) {
         gateways.retain(|_, g| now - g.ts < FRESH_SECS);
         if gateways.len() >= MAX_GATEWAYS {
@@ -330,6 +372,25 @@ mod tests {
     }
 
     #[test]
+    fn only_the_computer_that_answers_at_the_address_is_listed() {
+        let mine = "ab".repeat(32);
+        assert_eq!(compare_served(&mine, Some(mine.clone())), Served::Same);
+        assert_eq!(compare_served(&mine, Some("cd".repeat(32))), Served::Other("cd".repeat(32)), "another computer in the same home answers");
+        assert_eq!(compare_served(&mine, None), Served::Nothing);
+    }
+
+    #[tokio::test]
+    async fn registering_needs_the_caller_to_be_the_address() {
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "8.8.4.4".parse().unwrap());
+        let resp = handle_register(h, Json(announcement(&key, "https://9.9.9.10:47398/rpc", now))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(!GATEWAYS.read().await.contains_key("https://9.9.9.10:47398/rpc"));
+    }
+
+    #[test]
     fn the_address_matches_the_wallet_derivation() {
         let pk = SigningKey::from_bytes(&[0u8; 32]).verifying_key().to_bytes();
         assert_eq!(address_of(&pk), "egot1yzwkx349luk82ksl0xe2tm6rfwj26t7pg5apncg2");
@@ -339,7 +400,7 @@ mod tests {
     async fn the_list_is_built_once_and_served_from_cache() {
         let key = SigningKey::from_bytes(&[3u8; 32]);
         let now = chrono::Utc::now().timestamp();
-        let _ = handle_register(Json(announcement(&key, "https://9.9.9.9:47398/rpc", now))).await.into_response();
+        let _ = list(announcement(&key, "https://9.9.9.9:47398/rpc", now), now).await;
         let first = handle_list().await;
         assert_eq!(first.headers()[header::CACHE_CONTROL], CACHE_CONTROL);
         let stamp = LIST_CACHE.read().await.0;

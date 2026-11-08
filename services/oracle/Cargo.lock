@@ -383,6 +383,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower-http 0.5.2",
  "tracing",
