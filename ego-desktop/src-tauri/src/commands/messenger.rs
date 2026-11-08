@@ -500,7 +500,6 @@ pub async fn get_my_contact_bundle(
     let ledger      = Ledger::load();
     let my_addr     = ledger.address.clone();
     let ed25519_b64 = STANDARD.encode(keypair.ed25519_public_key().as_bytes());
-    let name_b64    = STANDARD.encode(my_name.as_bytes());
 
     // Prefer a relay circuit (works across NAT); fall back to whatever the swarm
     // has (public IP or LAN IP). Both are valid endpoints — LAN works fine for
@@ -519,25 +518,29 @@ pub async fn get_my_contact_bundle(
             "P2P network not started yet — please wait a few seconds and try again.".into(),
         ));
     }
-    let endpoint_b64 = STANDARD.encode(public_endpoint.as_bytes());
+    Ok(contact_card(&my_addr, &ed25519_b64, &my_name, &public_endpoint, &ensure_bundle_token()))
+}
 
-    // Ensure a bundle token exists in the ledger
-    let token = {
-        let mut l = Ledger::load();
-        if l.bundle_token.is_empty() {
-            let mut bytes = [0u8; 16];
-            OsRng.fill_bytes(&mut bytes);
-            l.bundle_token = hex::encode(bytes);
-            let _ = l.save();
-        }
-        l.bundle_token.clone()
-    };
+pub(crate) fn ensure_bundle_token() -> String {
+    let mut l = Ledger::load();
+    if l.bundle_token.is_empty() {
+        let mut bytes = [0u8; 16];
+        OsRng.fill_bytes(&mut bytes);
+        l.bundle_token = hex::encode(bytes);
+        let _ = l.save();
+    }
+    l.bundle_token
+}
 
-    // Format: egocontact1:{addr}:{ed25519_b64}:{name_b64}:{endpoint_b64}:{token}
-    Ok(format!(
+pub(crate) fn contact_card(addr: &str, ed25519_b64: &str, name: &str, endpoint: &str, token: &str) -> String {
+    format!(
         "egocontact1:{}:{}:{}:{}:{}",
-        my_addr, ed25519_b64, name_b64, endpoint_b64, token
-    ))
+        addr,
+        ed25519_b64,
+        STANDARD.encode(name.as_bytes()),
+        STANDARD.encode(endpoint.as_bytes()),
+        token
+    )
 }
 
 /// Revoke the current contact bundle by rotating the token.
@@ -558,6 +561,7 @@ pub async fn revoke_contact_bundle() -> Result<String, EgoDesktopError> {
         let _ = save_contacts(&contacts);
     }
 
+    crate::account_record::changed();
     Ok(ledger.bundle_token)
 }
 

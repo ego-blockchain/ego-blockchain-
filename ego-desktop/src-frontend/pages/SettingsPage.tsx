@@ -7,6 +7,7 @@ import { writeBinaryFile, readBinaryFile } from '@tauri-apps/api/fs';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 import AuthenticatorCard from '../components/AuthenticatorCard';
+import BundleIdCard from '../components/BundleIdCard';
 import PasswordRules from '../components/PasswordRules';
 import { passwordProblem } from '../lib/password';
 import { requireTotp } from '../lib/totp';
@@ -370,6 +371,8 @@ const SettingsPage: React.FC = () => {
           </div>
         </div>
       </div>
+
+      <BundleIdCard />
 
       {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">

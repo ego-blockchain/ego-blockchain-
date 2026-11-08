@@ -38,6 +38,7 @@ mod hold_chain;
 mod pq_chain;
 mod gateway;
 mod router_v6;
+mod account_record;
 mod webrtc_gateway;
 mod phone_storage;
 mod phone_dao;
@@ -525,6 +526,7 @@ fn headless_main() {
         });
 
         tokio::spawn(crate::gateway::supervise());
+        tokio::spawn(crate::account_record::run());
         tokio::spawn(crate::commands::storage::renew_loop());
 
         tokio::spawn(async {
@@ -1755,6 +1757,7 @@ fn main() {
             });
 
             tauri::async_runtime::spawn(crate::gateway::supervise());
+            tauri::async_runtime::spawn(crate::account_record::run());
             tauri::async_runtime::spawn(crate::commands::storage::renew_loop());
 
             tauri::async_runtime::spawn(async move {

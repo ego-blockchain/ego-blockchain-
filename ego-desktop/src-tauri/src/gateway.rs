@@ -419,6 +419,8 @@ fn cost(method: &str) -> f64 {
         "shielded.lookup" => 2.0,
         "shielded.leaves" => 4.0,
         "storage.putManifest" | "storage.delete" | "storage.planStatus" => 4.0,
+        "account.put" => 4.0,
+        "messenger.deliver" => 10.0,
         _ => 1.0,
     }
 }
@@ -732,7 +734,9 @@ async fn own_node_earnings(params: &Value) -> Result<Value, (i32, String)> {
 }
 
 pub(crate) fn fits(method: &str, len: usize) -> bool {
-    len <= MAX_BODY_BYTES || (len <= MAX_STORAGE_BODY_BYTES && crate::phone_storage::METHODS.contains(&method))
+    len <= MAX_BODY_BYTES
+        || (len <= MAX_STORAGE_BODY_BYTES
+            && (crate::phone_storage::METHODS.contains(&method) || crate::account_record::METHODS.contains(&method)))
 }
 
 async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>) -> Response {
@@ -767,6 +771,9 @@ pub(crate) async fn answer(ip: IpAddr, body: Value) -> Result<Value, Value> {
             .await
             .unwrap_or_else(|| Err((-32601, NOT_HERE.to_string()))),
         m if crate::phone_dao::METHODS.contains(&m) => crate::phone_dao::dispatch(m, &params)
+            .await
+            .unwrap_or_else(|| Err((-32601, NOT_HERE.to_string()))),
+        m if crate::account_record::METHODS.contains(&m) => crate::account_record::dispatch(m, &params)
             .await
             .unwrap_or_else(|| Err((-32601, NOT_HERE.to_string()))),
         _ => Err((-32601, NOT_HERE.to_string())),
