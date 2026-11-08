@@ -5253,7 +5253,7 @@ pub fn validate_tm_block_for(block: &LedgerBlock, txs: &[LedgerTx], parent_ts: i
     validate_peer_block_checked(block, txs, true, false, Some(miners))
 }
 
-pub const FAUCET_CLOSED_FROM_HEIGHT: u64 = 87_100;
+pub const FAUCET_CLOSED_FROM_HEIGHT: u64 = 107_100;
 
 pub fn faucet_closed_for(height: u64, is_proposal: bool) -> bool {
     is_proposal || height >= FAUCET_CLOSED_FROM_HEIGHT
