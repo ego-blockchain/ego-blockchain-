@@ -26,6 +26,7 @@ const REACHED_FOR_SECS: i64 = 60 * 60;
 const BOOTSTRAP_SAMPLE: usize = 200;
 const GOSSIP_SAMPLE: usize = 1_000;
 const SUPERVISE_EVERY: Duration = Duration::from_secs(10);
+const BIND_RETRY: Duration = Duration::from_secs(60);
 const PROBE_EVERY: Duration = Duration::from_secs(5 * 60);
 const PROBES_PER_ROUND: usize = 3;
 const VERIFIED_FOR_SECS: i64 = 60 * 60;
@@ -133,6 +134,8 @@ pub struct GatewayStatus {
     pub reached_v6_at: Option<i64>,
     pub reachable_v6: bool,
     pub router_v6_open: Option<String>,
+    pub router_external_port: Option<u16>,
+    pub port_taken: bool,
 }
 
 static STATUS: Mutex<Option<GatewayStatus>> = Mutex::new(None);
@@ -141,6 +144,7 @@ static TABLE: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
 static OWN: Mutex<Option<Announcement>> = Mutex::new(None);
 static OWN_V6: Mutex<Option<Announcement>> = Mutex::new(None);
 static OWN_V6_ADDR: Mutex<Option<Ipv6Addr>> = Mutex::new(None);
+static OWN_PUBLIC_V4: Mutex<Option<Ipv4Addr>> = Mutex::new(None);
 static PEER_CHECKS: Mutex<Option<(HashMap<u64, i64>, Vec<i64>)>> = Mutex::new(None);
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -776,7 +780,9 @@ pub(crate) async fn answer(ip: IpAddr, body: Value) -> Result<Value, Value> {
 async fn health(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Json<Value> {
     let now = chrono::Utc::now().timestamp();
     match peer.ip() {
-        IpAddr::V4(ip) if is_public(&ip) => update(|s| s.reached_from_internet_at = Some(now)),
+        IpAddr::V4(ip) if is_public(&ip) && Some(ip) != *OWN_PUBLIC_V4.lock().unwrap_or_else(|e| e.into_inner()) => {
+            update(|s| s.reached_from_internet_at = Some(now))
+        }
         IpAddr::V4(ip) if ip.is_private() => update(|s| s.reached_locally_at = Some(now)),
         IpAddr::V6(ip) => match reached_over_v6(&ip, own_v6_addr()) {
             Some(true) => update(|s| s.reached_v6_at = Some(now)),
@@ -808,6 +814,18 @@ async fn serve(cert_pem: String, key_pem: String) {
         }
     };
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port()));
+    let v4 = loop {
+        match std::net::TcpListener::bind(addr).and_then(|l| l.set_nonblocking(true).map(|_| l)) {
+            Ok(l) => break l,
+            Err(e) => {
+                update(|s| {
+                    s.running = false;
+                    s.problem = Some(format!("The gateway couldn't listen on port {}: {e}. Is another Ego Desktop running on this computer?", port()));
+                });
+                tokio::time::sleep(BIND_RETRY).await;
+            }
+        }
+    };
     let _v6 = match v6_listener() {
         Ok(listener) => Some(AbortOnDrop(tokio::spawn(
             axum_server::from_tcp_rustls(listener, config.clone())
@@ -819,7 +837,7 @@ async fn serve(cert_pem: String, key_pem: String) {
         }
     };
     update(|s| s.running = true);
-    let result = axum_server::bind_rustls(addr, config)
+    let result = axum_server::from_tcp_rustls(v4, config)
         .serve(router().into_make_service_with_connect_info::<SocketAddr>())
         .await;
     update(|s| {
@@ -900,7 +918,9 @@ async fn public_ipv4(client: &reqwest::Client) -> Option<Ipv4Addr> {
 
 async fn make_announcement(client: &reqwest::Client, cert_sha256: &str) -> Result<Announcement, String> {
     let ip = public_ipv4(client).await.ok_or("Couldn't find this computer's public internet address.")?;
-    sign_announcement(endpoint_for(IpAddr::V4(ip), port()), cert_sha256)
+    *OWN_PUBLIC_V4.lock().unwrap_or_else(|e| e.into_inner()) = Some(ip);
+    let outside_port = status().router_external_port.unwrap_or(port());
+    sign_announcement(endpoint_for(IpAddr::V4(ip), outside_port), cert_sha256)
 }
 
 fn sign_announcement(endpoint: String, cert_sha256: &str) -> Result<Announcement, String> {
@@ -940,13 +960,12 @@ async fn tell_bootstrap(client: &reqwest::Client, a: &Announcement) -> Result<bo
     Ok(reply["listed"].as_bool().unwrap_or(false))
 }
 
-fn should_announce(declared: bool, router_open: Option<bool>, router_ip: Option<&str>, public_ip: &str, reached_at: Option<i64>, now: i64) -> bool {
-    if declared {
-        return true;
-    }
-    let mapped = router_open == Some(true) && router_ip == Some(public_ip);
-    let reached = reached_at.map(|t| now - t < REACHED_FOR_SECS).unwrap_or(false);
-    mapped || reached
+fn should_announce(declared: bool, reached_at: Option<i64>, now: i64) -> bool {
+    declared || reached_at.map(|t| now - t < REACHED_FOR_SECS).unwrap_or(false)
+}
+
+fn someone_else_answers(checked: Option<bool>, reached_at: Option<i64>, now: i64) -> bool {
+    checked == Some(true) && !should_announce(false, reached_at, now)
 }
 
 fn sampled(node: &str, known: usize, target: usize) -> bool {
@@ -963,7 +982,38 @@ fn sampled(node: &str, known: usize, target: usize) -> bool {
     u64::from_be_bytes(first) % spread as u64 == 0
 }
 
+fn forget_own_v4() {
+    *OWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    update(|s| {
+        s.reachable = false;
+        s.bootstrap_listed = false;
+    });
+}
+
+async fn take_own_port() -> bool {
+    let before = status().router_external_port;
+    update(|s| s.port_taken = true);
+    match open_router_port().await {
+        Ok((ip, outside)) => {
+            update(|s| {
+                s.router_port_open = Some(is_public(&ip));
+                s.router_public_ip = Some(ip.to_string());
+                s.router_external_port = Some(outside);
+            });
+            Some(outside) != before && outside != port()
+        }
+        Err(e) => {
+            tracing::debug!("[gateway] {e}");
+            false
+        }
+    }
+}
+
 async fn announce_once(client: &reqwest::Client, cert_sha256: &str) -> bool {
+    if !status().running {
+        forget_own_v4();
+        return false;
+    }
     let a = match make_announcement(client, cert_sha256).await {
         Ok(a) => a,
         Err(e) => {
@@ -972,30 +1022,32 @@ async fn announce_once(client: &reqwest::Client, cert_sha256: &str) -> bool {
         }
     };
     let now = chrono::Utc::now().timestamp();
-    let public_ip = parse_endpoint(&a.endpoint).map(|(ip, _)| ip.to_string()).unwrap_or_default();
-    let before = status();
-    let mapped = before.router_port_open == Some(true) && before.router_public_ip.as_deref() == Some(public_ip.as_str());
     let due = SELF_CHECK.lock().map(|g| now >= g.0).unwrap_or(false);
-    if !declared_public() && !mapped && due {
+    if !declared_public() && due {
         let result = ask_to_be_checked(client, &a.endpoint).await;
+        let reached_at = status().reached_from_internet_at;
+        let taken = someone_else_answers(result, reached_at, chrono::Utc::now().timestamp());
+        let moved = taken && take_own_port().await;
         if let Ok(mut g) = SELF_CHECK.lock() {
-            *g = next_self_check(g.1, result, now);
+            *g = if moved {
+                (0, SELF_CHECK_FIRST_SECS)
+            } else {
+                next_self_check(g.1, result.map(|r| r && !taken), now)
+            };
         }
-        match result {
-            Some(true) => eprintln!("[Gateway] the bootstrap server reached {} from the internet, so this gateway can be listed", a.endpoint),
-            Some(false) => eprintln!("[Gateway] the bootstrap server could not reach {}: open TCP port {} on your router to serve phones and apps", a.endpoint, port()),
-            None => {}
+        match (result, taken) {
+            (Some(true), true) => eprintln!(
+                "[Gateway] {} is answered by another computer in this home{}",
+                a.endpoint,
+                if moved { ", so the router gave this one its own port" } else { " and the router gave no other port" }
+            ),
+            (Some(true), false) => eprintln!("[Gateway] the bootstrap server reached {} from the internet, so this gateway can be listed", a.endpoint),
+            (Some(false), _) => eprintln!("[Gateway] the bootstrap server could not reach {}: phones can't use this computer over IPv4", a.endpoint),
+            (None, _) => {}
         }
     }
     let snapshot = status();
-    let reachable = should_announce(
-        declared_public(),
-        snapshot.router_port_open,
-        snapshot.router_public_ip.as_deref(),
-        &public_ip,
-        snapshot.reached_from_internet_at,
-        now,
-    );
+    let reachable = should_announce(declared_public(), snapshot.reached_from_internet_at, now);
     update(|s| {
         s.endpoint = Some(a.endpoint.clone());
         s.reachable = reachable;
@@ -1062,7 +1114,8 @@ async fn ask_peers_to_check(endpoint: &str) -> usize {
 }
 
 async fn announce_v6_once(cert_sha256: &str) -> bool {
-    let Some(ip) = own_global_v6() else {
+    let ip = if status().running { own_global_v6() } else { None };
+    let Some(ip) = ip else {
         *OWN_V6_ADDR.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *OWN_V6.lock().unwrap_or_else(|e| e.into_inner()) = None;
         update(|s| {
@@ -1123,42 +1176,54 @@ async fn local_ipv4_toward(router: SocketAddr) -> Option<Ipv4Addr> {
     }
 }
 
-async fn open_router_port() -> Result<Ipv4Addr, String> {
+fn outside_port_to_ask(saved: Option<u16>, taken: bool) -> Option<u16> {
+    match saved {
+        Some(p) if p != port() || !taken => Some(p),
+        Some(_) => None,
+        None if taken => None,
+        None => Some(port()),
+    }
+}
+
+async fn open_router_port() -> Result<(Ipv4Addr, u16), String> {
+    const PHONES: &str = "Ego Desktop phone gateway";
     let router = find_router().await?;
-    let local = local_ipv4_toward(router.addr).await.ok_or("couldn't find this computer's local address")?;
-    router
-        .add_port(
-            igd_next::PortMappingProtocol::TCP,
-            port(),
-            SocketAddr::from((local, port())),
-            ROUTER_LEASE_SECS,
-            "Ego Desktop phone gateway",
-        )
-        .await
-        .map_err(|e| format!("the router refused to open port {}: {e}", port()))?;
+    let local = SocketAddr::from((local_ipv4_toward(router.addr).await.ok_or("couldn't find this computer's local address")?, port()));
+    let tcp = igd_next::PortMappingProtocol::TCP;
+    let before = status();
+    let wanted = outside_port_to_ask(before.router_external_port, before.port_taken);
+    let outside = match wanted {
+        Some(p) => match router.add_port(tcp, p, local, ROUTER_LEASE_SECS, PHONES).await {
+            Ok(()) => p,
+            Err(igd_next::AddPortError::PortInUse) => router
+                .add_any_port(tcp, local, ROUTER_LEASE_SECS, PHONES)
+                .await
+                .map_err(|e| format!("port {p} belongs to another computer and the router gave no other: {e}"))?,
+            Err(e) => return Err(format!("the router refused to open port {p}: {e}")),
+        },
+        None => router
+            .add_any_port(tcp, local, ROUTER_LEASE_SECS, PHONES)
+            .await
+            .map_err(|e| format!("the router gave no free port: {e}"))?,
+    };
     if let Err(e) = router
-        .add_port(
-            igd_next::PortMappingProtocol::UDP,
-            port(),
-            SocketAddr::from((local, port())),
-            ROUTER_LEASE_SECS,
-            "Ego Desktop browser gateway",
-        )
+        .add_port(igd_next::PortMappingProtocol::UDP, outside, local, ROUTER_LEASE_SECS, "Ego Desktop browser gateway")
         .await
     {
-        tracing::debug!("[gateway] the router refused to open UDP port {} for browsers: {e}", port());
+        tracing::debug!("[gateway] the router refused to open UDP port {outside} for browsers: {e}");
     }
     match router.get_external_ip().await {
-        Ok(IpAddr::V4(ip)) => Ok(ip),
+        Ok(IpAddr::V4(ip)) => Ok((ip, outside)),
         Ok(_) => Err("the router has no IPv4 address".into()),
         Err(e) => Err(format!("the router didn't give its public address: {e}")),
     }
 }
 
 async fn close_router_port() {
+    let outside = status().router_external_port.unwrap_or(port());
     if let Ok(router) = find_router().await {
-        let _ = router.remove_port(igd_next::PortMappingProtocol::TCP, port()).await;
-        let _ = router.remove_port(igd_next::PortMappingProtocol::UDP, port()).await;
+        let _ = router.remove_port(igd_next::PortMappingProtocol::TCP, outside).await;
+        let _ = router.remove_port(igd_next::PortMappingProtocol::UDP, outside).await;
     }
     crate::router_v6::close(own_v6_addr(), port()).await;
 }
@@ -1181,9 +1246,10 @@ async fn open_router_v6() {
 async fn router_loop() {
     loop {
         match open_router_port().await {
-            Ok(ip) => update(|s| {
+            Ok((ip, outside)) => update(|s| {
                 s.router_port_open = Some(is_public(&ip));
                 s.router_public_ip = Some(ip.to_string());
+                s.router_external_port = Some(outside);
             }),
             Err(e) => {
                 tracing::debug!("[gateway] {e}");
@@ -1270,6 +1336,7 @@ async fn probe_loop() {
 
 pub async fn supervise() {
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut waiting: Option<(String, String, String)> = None;
     loop {
         let want = tokio::task::spawn_blocking(enabled).await.unwrap_or(false);
         let alive = tasks.first().map(|h| !h.is_finished()).unwrap_or(false);
@@ -1277,25 +1344,32 @@ pub async fn supervise() {
             for t in tasks.drain(..) {
                 t.abort();
             }
+            waiting = None;
             match tokio::task::spawn_blocking(certificate).await {
                 Ok(Ok((cert, key, fingerprint))) => {
                     update(|s| {
                         s.cert_sha256 = Some(fingerprint.clone());
                         s.problem = None;
                     });
-                    let webrtc = tokio::spawn(crate::webrtc_gateway::serve(cert.clone(), key.clone(), fingerprint.clone(), port()));
-                    tasks.push(tokio::spawn(serve(cert, key)));
-                    tasks.push(webrtc);
-                    tasks.push(tokio::spawn(router_loop()));
-                    tasks.push(tokio::spawn(advertise_loop(fingerprint.clone())));
-                    tasks.push(tokio::spawn(announce_v6_loop(fingerprint.clone())));
-                    tasks.push(tokio::spawn(announce_loop(fingerprint)));
-                    tasks.push(tokio::spawn(probe_loop()));
+                    tasks.push(tokio::spawn(serve(cert.clone(), key.clone())));
+                    waiting = Some((cert, key, fingerprint));
                 }
                 Ok(Err(e)) => update(|s| s.problem = Some(e)),
                 Err(e) => update(|s| s.problem = Some(e.to_string())),
             }
-        } else if !want && !tasks.is_empty() {
+        }
+        if want && status().running {
+            if let Some((cert, key, fingerprint)) = waiting.take() {
+                tasks.push(tokio::spawn(crate::webrtc_gateway::serve(cert, key, fingerprint.clone(), port())));
+                tasks.push(tokio::spawn(router_loop()));
+                tasks.push(tokio::spawn(advertise_loop(fingerprint.clone())));
+                tasks.push(tokio::spawn(announce_v6_loop(fingerprint.clone())));
+                tasks.push(tokio::spawn(announce_loop(fingerprint)));
+                tasks.push(tokio::spawn(probe_loop()));
+            }
+        }
+        if !want && !tasks.is_empty() {
+            waiting = None;
             for t in tasks.drain(..) {
                 t.abort();
             }
@@ -1478,15 +1552,31 @@ mod tests {
     }
 
     #[test]
-    fn only_a_reachable_computer_is_announced() {
+    fn only_a_computer_that_was_reached_from_the_internet_is_announced() {
         let now = 1_800_000_000;
-        assert!(should_announce(false, Some(true), Some("8.8.8.8"), "8.8.8.8", None, now));
-        assert!(!should_announce(false, Some(true), Some("100.64.0.9"), "8.8.8.8", None, now), "a router behind the provider's shared address is not enough");
-        assert!(!should_announce(false, Some(false), None, "8.8.8.8", None, now));
-        assert!(!should_announce(false, None, None, "8.8.8.8", None, now));
-        assert!(should_announce(false, Some(false), None, "8.8.8.8", Some(now - 60), now), "a manual port forward counts once someone reached it");
-        assert!(!should_announce(false, Some(false), None, "8.8.8.8", Some(now - 2 * 3_600), now));
-        assert!(should_announce(true, None, None, "8.8.8.8", None, now), "a server that says it has a public address is announced");
+        assert!(!should_announce(false, None, now), "an open router port alone is not enough: another computer may answer");
+        assert!(should_announce(false, Some(now - 60), now));
+        assert!(!should_announce(false, Some(now - 2 * 3_600), now));
+        assert!(should_announce(true, None, now), "a server that says it has a public address is announced");
+    }
+
+    #[test]
+    fn a_check_that_reaches_the_address_but_not_this_computer_means_someone_else_answers() {
+        let now = 1_800_000_000;
+        assert!(someone_else_answers(Some(true), None, now));
+        assert!(someone_else_answers(Some(true), Some(now - 2 * 3_600), now));
+        assert!(!someone_else_answers(Some(true), Some(now - 5), now));
+        assert!(!someone_else_answers(Some(false), None, now), "nobody answers at all");
+        assert!(!someone_else_answers(None, None, now), "the check never ran");
+    }
+
+    #[test]
+    fn a_computer_whose_port_is_taken_asks_the_router_for_any_other() {
+        assert_eq!(outside_port_to_ask(None, false), Some(port()));
+        assert_eq!(outside_port_to_ask(None, true), None);
+        assert_eq!(outside_port_to_ask(Some(port()), false), Some(port()));
+        assert_eq!(outside_port_to_ask(Some(port()), true), None, "not the port another computer answers on");
+        assert_eq!(outside_port_to_ask(Some(51_234), true), Some(51_234), "the port the router gave it is kept");
     }
 
     #[test]
