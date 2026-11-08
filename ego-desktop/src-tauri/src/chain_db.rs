@@ -5253,6 +5253,12 @@ pub fn validate_tm_block_for(block: &LedgerBlock, txs: &[LedgerTx], parent_ts: i
     validate_peer_block_checked(block, txs, true, false, Some(miners))
 }
 
+pub const FAUCET_CLOSED_FROM_HEIGHT: u64 = 87_100;
+
+pub fn faucet_closed_for(height: u64, is_proposal: bool) -> bool {
+    is_proposal || height >= FAUCET_CLOSED_FROM_HEIGHT
+}
+
 fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: bool) -> Result<(), String> {
     validate_peer_block_checked(block, txs, is_proposal, is_proposal, None)
 }
@@ -5267,7 +5273,7 @@ fn validate_peer_block_checked(
     if block.height == 0 {
         return if block.hash == GENESIS_HASH { Ok(()) } else { Err("invalid genesis hash".into()) };
     }
-    if is_proposal {
+    if faucet_closed_for(block.height, is_proposal) {
         if let Some(tx) = txs.iter().find(|t| t.tx_type == "faucet") {
             return Err(format!("faucet tx {} refused: the testnet faucet is closed", tx.hash));
         }
@@ -12915,6 +12921,17 @@ mod faucet_closed_tests {
         assert!(e.contains("faucet is closed"), "{e}");
         let e = validate_tm_block(&block, &[faucet_tx()], 0).unwrap_err();
         assert!(e.contains("faucet is closed"), "{e}");
+    }
+
+    #[test]
+    fn from_the_closing_height_no_block_with_a_faucet_payout_is_accepted_even_when_synced() {
+        let after = LedgerBlock { height: FAUCET_CLOSED_FROM_HEIGHT, ..LedgerBlock::default() };
+        let e = validate_peer_block(&after, &[faucet_tx()]).unwrap_err();
+        assert!(e.contains("faucet is closed"), "{e}");
+        let before = LedgerBlock { height: FAUCET_CLOSED_FROM_HEIGHT - 1, ..LedgerBlock::default() };
+        let e = validate_peer_block(&before, &[faucet_tx()]).unwrap_err();
+        assert!(!e.contains("faucet is closed"), "old blocks that paid from the faucet still sync: {e}");
+        assert!(faucet_closed_for(1, true) && !faucet_closed_for(FAUCET_CLOSED_FROM_HEIGHT - 1, false));
     }
 }
 

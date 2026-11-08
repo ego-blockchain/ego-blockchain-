@@ -322,8 +322,10 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
 
         "wallet.getBalance" => {
             let addr = p["address"].as_str().unwrap_or_default();
+            let before = crate::chain_db::local_chain_height();
             let bal  = crate::chain_db::balance_of(addr);
-            RpcResponse::ok(req.id, json!({ "uegoc": bal, "egoc": bal as f64 / 1_000_000.0 }))
+            let height = (crate::chain_db::local_chain_height() == before).then_some(before);
+            RpcResponse::ok(req.id, json!({ "uegoc": bal, "egoc": bal as f64 / 1_000_000.0, "height": height }))
         }
 
         "wallet.getNonce" => {
