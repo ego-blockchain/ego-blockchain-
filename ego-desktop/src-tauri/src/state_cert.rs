@@ -27,6 +27,7 @@ const STATE_META_KEYS: &[&[u8]] = &[b"bhf", b"randao_mix", b"latest_height"];
 const STATE_META_PREFIXES: &[&[u8]] = &[
     b"n2",
     b"s2",
+    b"s3",
     b"bhr:",
     b"ftotal:",
     b"sc:",

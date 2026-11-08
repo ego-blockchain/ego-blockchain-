@@ -266,6 +266,9 @@ async fn publish_storage_proofs_if_due() {
     if recorded > 0 {
         eprintln!("[PoSt] recorded {recorded} of your file(s) on-chain so their hosts can be paid");
     }
+    if crate::commands::consensus::claim_storage_if_due().await {
+        eprintln!("[PoSt] told the network how much storage space this computer offers");
+    }
     match crate::commands::consensus::prove_stored_files().await {
         Ok(r) if r.proofs_submitted > 0 => {
             eprintln!("[PoSt] published {} storage proof(s) on-chain", r.proofs_submitted);

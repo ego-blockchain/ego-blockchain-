@@ -1728,6 +1728,10 @@ pub fn fee_exempt(tx: &LedgerTx) -> bool {
     if crate::chain_db::is_price_report(tx) {
         return crate::chain_db::may_report_price(&tx.from);
     }
+    if crate::storage_pay::is_storage_claim(tx) {
+        return crate::chain_db::local_chain_height().saturating_add(1) >= crate::storage_pay::PLAN_PAY_FROM_HEIGHT
+            && registered();
+    }
     false
 }
 
@@ -1942,6 +1946,9 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     }
     if crate::chain_db::is_storage_file_tx(tx) {
         crate::chain_db::parse_storage_file(tx)?;
+    }
+    if crate::storage_pay::is_storage_claim(tx) && crate::storage_pay::claim_offer(tx).is_none() {
+        return Err(format!("storage_claim {} must say the space it offers as storage_claim:<bytes>", tx.hash));
     }
 
     if !is_validator_reg && !is_uptime && !fee_exempt(tx) && tx.fee_uegoc < crate::tokenomics::FEE_FLOOR_UEGOC {

@@ -337,6 +337,11 @@ pub struct HostedStorage {
     pub earned_total_uegoc: u64,
     pub registered: bool,
     pub paused_reason: Option<String>,
+    pub plan_pay: bool,
+    pub plans_kept: usize,
+    pub reserved_bytes: u64,
+    pub offered_bytes: u64,
+    pub last_claim: i64,
 }
 
 pub const HOSTED_FILES_SHOWN: usize = 50;
@@ -415,6 +420,14 @@ pub async fn get_hosted_storage() -> Result<HostedStorage, EgoDesktopError> {
         let mut out = hosted_storage(&ledger.stored_files, &me, now, &view, &pay);
         out.registered = !me.is_empty() && crate::chain_db::is_registered_node(&me);
         out.paused_reason = crate::commands::coverage::earning_block_reason();
+        if !me.is_empty() {
+            let hosting = crate::chain_db::plan_hosting(&me);
+            out.plan_pay = hosting.active;
+            out.plans_kept = hosting.plans.len();
+            out.reserved_bytes = hosting.reserved_bytes;
+            out.offered_bytes = hosting.offered_bytes;
+            out.last_claim = hosting.last_claim;
+        }
         out
     })
     .await

@@ -23,6 +23,11 @@ interface HostedStorage {
   earned_total_uegoc: number;
   registered: boolean;
   paused_reason: string | null;
+  plan_pay: boolean;
+  plans_kept: number;
+  reserved_bytes: number;
+  offered_bytes: number;
+  last_claim: number;
 }
 
 const SHOWN = 8;
@@ -49,8 +54,12 @@ function short(addr: string) {
   return addr.length > 18 ? `${addr.slice(0, 10)}…${addr.slice(-6)}` : addr;
 }
 
-function status(f: HostedFile): { text: string; tone: string } {
+function status(f: HostedFile, planPay: boolean): { text: string; tone: string } {
   if (!f.holding) return { text: 'Receiving the data', tone: 'text-gray-400' };
+  if (planPay) {
+    if (f.last_proof > 0) return { text: `Held, proved ${ago(f.last_proof)}`, tone: 'text-green-400' };
+    return { text: 'Held, first proof within the hour', tone: 'text-green-400' };
+  }
   if (!f.recorded) return { text: "Not paying yet: its owner hasn't recorded it on the chain", tone: 'text-yellow-400' };
   if (!f.plan_active) return { text: 'Not paying: its owner has no paid plan right now', tone: 'text-yellow-400' };
   if (f.last_proof > 0) return { text: `Paying, last proved ${ago(f.last_proof)}`, tone: 'text-green-400' };
@@ -72,10 +81,11 @@ const KeptForOthersCard: React.FC<{ allocatedGb: number; onSetUp: () => void }> 
   return (
     <div className="bg-gray-800 rounded-2xl border border-gray-700 p-5 space-y-4">
       <div>
-        <div className="font-semibold">Files you keep for other people</div>
+        <div className="font-semibold">Storage you keep for other people</div>
         <div className="text-xs text-gray-400 mt-1">
-          Every file is kept by 3 computers, one main copy and two backups. Each of them is paid on the chain for the
-          days it proves it still holds the file, while the owner's storage plan runs.
+          {data.plan_pay
+            ? "Each storage plan is kept by 3 computers. Each of them is paid its share of the plan every month, whether the space is used or not, while it stays online and keeps the owner's files."
+            : "Every file is kept by 3 computers, one main copy and two backups. Each of them is paid on the chain for the days it proves it still holds the file, while the owner's storage plan runs."}
         </div>
       </div>
 
@@ -92,9 +102,25 @@ const KeptForOthersCard: React.FC<{ allocatedGb: number; onSetUp: () => void }> 
         ))}
       </div>
 
+      {data.plan_pay && (
+        <div className="text-sm text-gray-300">
+          Space kept for{' '}
+          <span className={data.plans_kept > 0 ? 'text-green-400' : 'text-gray-400'}>
+            {data.plans_kept === 1 ? '1 storage plan' : `${data.plans_kept} storage plans`}
+          </span>
+          : {size(data.reserved_bytes)} reserved of {size(data.offered_bytes)} offered
+          {data.last_claim > 0 && <span className="text-gray-500"> · checked in {ago(data.last_claim)}</span>}
+        </div>
+      )}
+
       <div className="text-sm text-gray-300">
-        {data.file_count === 1 ? '1 file' : `${data.file_count} files`} kept here, {size(data.hosted_bytes)} held,{' '}
-        <span className={data.paying_files > 0 ? 'text-green-400' : 'text-gray-400'}>{data.paying_files} paying</span>
+        {data.file_count === 1 ? '1 file' : `${data.file_count} files`} kept here, {size(data.hosted_bytes)} held
+        {!data.plan_pay && (
+          <>
+            ,{' '}
+            <span className={data.paying_files > 0 ? 'text-green-400' : 'text-gray-400'}>{data.paying_files} paying</span>
+          </>
+        )}
       </div>
 
       {!data.registered && (
@@ -115,7 +141,7 @@ const KeptForOthersCard: React.FC<{ allocatedGb: number; onSetUp: () => void }> 
       {data.files.length > 0 && (
         <div className="divide-y divide-gray-700/60">
           {data.files.slice(0, SHOWN).map(f => {
-            const st = status(f);
+            const st = status(f, data.plan_pay);
             return (
               <div key={f.cid} className="py-2 flex items-center justify-between gap-3 text-sm">
                 <div className="min-w-0">

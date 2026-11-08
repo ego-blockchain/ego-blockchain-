@@ -10037,11 +10037,40 @@ pub fn drs_tm_ready_signer(epoch: u64, pos: u64) -> Option<(String, String)> {
 fn storage_pay_in(db: &DB, ov: &mut crate::drs::Ov, block: &LedgerBlock, txs: &[&LedgerTx]) -> Vec<(String, u64)> {
     let at = block.timestamp;
     let price = consensus_price_in(db, block.height / STORAGE_PAY_EPOCH);
-    crate::storage_pay::process_expiries(ov, at, block.height);
+    let claims_count = block.height >= crate::storage_pay::PLAN_PAY_FROM_HEIGHT;
+    let counted_claim = |tx: &LedgerTx| {
+        claims_count
+            && crate::storage_pay::is_storage_claim(tx)
+            && crate::storage_pay::claim_offer(tx).is_some()
+            && is_registered_in(db, &tx.from)
+    };
+    if txs.iter().any(|tx| counted_claim(tx)) {
+        crate::storage_pay::start_plan_mode(ov, at);
+    }
+    let plan_mode = crate::storage_pay::plan_mode(ov, block.height);
+    let stale = crate::storage_pay::process_expiries(ov, at, block.height);
+    if plan_mode {
+        for (cid, host) in stale {
+            if let Some(f) = recorded_file_in(db, &cid) {
+                crate::storage_pay::mark_stale(ov, &f.owner, &host, at);
+            }
+        }
+        crate::storage_pay::process_plan_drops(ov, at);
+    }
     let mut out = Vec::new();
     for tx in txs {
         if let Some((bytes, price_micro, period)) = crate::storage_pay::plan_payment(tx) {
             crate::storage_pay::add_plan(ov, &tx.from, at, bytes, price_micro, period);
+            if plan_mode {
+                crate::storage_pay::want_hosts(ov, &tx.from, at);
+            }
+        }
+        if plan_mode && counted_claim(tx) {
+            let offer = crate::storage_pay::claim_offer(tx).unwrap_or(0);
+            let pay = crate::storage_pay::apply_claim(ov, &tx.from, offer, at, price);
+            if pay > 0 {
+                out.push((tx.from.clone(), pay));
+            }
         }
         if is_storage_file_tx(tx) && storage_file_owner_ok(db, tx).is_ok() {
             match parse_storage_file(tx) {
@@ -10074,6 +10103,33 @@ fn storage_pay_in(db: &DB, ov: &mut crate::drs::Ov, block: &LedgerBlock, txs: &[
 pub fn storage_plan_active(owner: &str, at: i64) -> bool {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     crate::storage_pay::active_plan(&crate::drs::Ov::new(db), owner, at).is_some()
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PlanHosting {
+    pub plans: Vec<String>,
+    pub offered_bytes: u64,
+    pub reserved_bytes: u64,
+    pub last_claim: i64,
+    pub active: bool,
+}
+
+pub fn plan_hosting(host: &str) -> PlanHosting {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let height = local_chain_height_in(&db);
+    let ov = crate::drs::Ov::new(&db);
+    PlanHosting {
+        plans: crate::storage_pay::host_plans(&ov, host),
+        offered_bytes: crate::storage_pay::offered(&ov, host),
+        reserved_bytes: crate::storage_pay::reserved(&ov, host),
+        last_claim: crate::storage_pay::last_claim(&ov, host),
+        active: height.saturating_add(1) >= crate::storage_pay::PLAN_PAY_FROM_HEIGHT,
+    }
+}
+
+pub fn plan_hosts_of(owner: &str) -> Vec<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::storage_pay::plan_hosts(&crate::drs::Ov::new(&db), owner)
 }
 
 pub fn storage_last_proof(cid: &str, host: &str) -> i64 {
@@ -10828,7 +10884,8 @@ pub fn is_free_housekeeping(tx: &LedgerTx) -> bool {
         && (tx.tx_type == "validator_register"
             || is_uptime_checkin(tx)
             || tx.tx_type == crate::storage_proof::POST_PROOF_TX
-            || is_price_report(tx))
+            || is_price_report(tx)
+            || crate::storage_pay::is_storage_claim(tx))
 }
 
 pub const STATE_CHECKPOINT_EVERY: u64 = 10_000;

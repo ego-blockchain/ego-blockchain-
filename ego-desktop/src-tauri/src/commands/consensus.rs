@@ -180,6 +180,61 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
     Ok(PostChallengeResult { challenges_found: found, proofs_submitted: submitted, failures, details })
 }
 
+pub async fn claim_storage_if_due() -> bool {
+    let ledger = Ledger::load();
+    let me = ledger.address.clone();
+    let offer = ledger.storage_allocated_bytes;
+    if me.is_empty() || offer == 0 {
+        return false;
+    }
+    if crate::chain_db::local_chain_height().saturating_add(1) < crate::storage_pay::PLAN_PAY_FROM_HEIGHT {
+        return false;
+    }
+    if !crate::chain_db::is_registered_node(&me) {
+        return false;
+    }
+    if tokio::task::spawn_blocking(crate::commands::coverage::earning_block_reason).await.ok().flatten().is_some() {
+        return false;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let me2 = me.clone();
+    let last = tokio::task::spawn_blocking(move || crate::chain_db::plan_hosting(&me2).last_claim).await.unwrap_or(0);
+    if last > 0 && now.saturating_sub(last) < crate::storage_pay::CLAIM_EVERY_SECS {
+        return false;
+    }
+    let pending = crate::mempool::get_mempool()
+        .peek_all()
+        .into_iter()
+        .any(|t| t.from == me && crate::storage_pay::is_storage_claim(&t));
+    if pending {
+        return false;
+    }
+    let Some(kp) = node_keypair() else { return false };
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
+    let mut ledger = Ledger::load();
+    let nonce = crate::ledger::next_nonce_for(&me, ledger.nonce);
+    let mut tx = crate::ledger::LedgerTx {
+        from: me.clone(),
+        to: me.clone(),
+        amount: 0,
+        fee_uegoc: 0,
+        tx_type: crate::storage_pay::TX_STORAGE_CLAIM.to_string(),
+        memo: Some(crate::storage_pay::claim_memo(offer)),
+        timestamp: now,
+        nonce,
+        chain_id: 1,
+        status: "Pending".to_string(),
+        ..Default::default()
+    };
+    if send_signed(&mut tx, &kp).is_ok() {
+        ledger.nonce = nonce;
+        let _ = ledger.save();
+        true
+    } else {
+        false
+    }
+}
+
 pub const PROOF_EVERY_SECS: i64 = 20 * 3600;
 pub const MAX_PROOFS_PER_ROUND: usize = 8;
 

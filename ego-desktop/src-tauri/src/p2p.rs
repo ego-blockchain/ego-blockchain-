@@ -6936,7 +6936,15 @@ pub async fn request_file_pinning(cids: Vec<String>) {
         rounds += 1;
         let owner = if file.owner.is_empty() { my_addr.clone() } else { file.owner.clone() };
         let want = MIN_REPLICAS.saturating_sub(file.replica_peers.len()).max(1);
-        let chosen = pin_candidates(&cid, &contacts, &peers, |id, _| {
+        let mut first: Vec<(String, Vec<String>)> = crate::chain_db::plan_hosts_of(&owner)
+            .into_iter()
+            .filter_map(|h| {
+                let eps: Vec<String> = peers.iter().filter(|(id, _)| *id == h).flat_map(|(_, e)| e.clone()).collect();
+                (!eps.is_empty()).then_some((h, eps))
+            })
+            .collect();
+        first.extend(contacts.iter().cloned());
+        let chosen = pin_candidates(&cid, &first, &peers, |id, _| {
             id == my_addr
                 || id == owner
                 || file.replica_peers.iter().any(|r| r == id)
