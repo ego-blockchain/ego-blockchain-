@@ -1105,6 +1105,7 @@ fn main() {
             commands::coverage::get_poc_events,
             commands::coverage::get_network_peers,
             commands::earnings::get_earnings_data,
+            commands::earnings::get_hosted_storage,
             commands::earnings::submit_poc_event,
             commands::earnings::get_poc_score,
             commands::staking::get_staking_info,

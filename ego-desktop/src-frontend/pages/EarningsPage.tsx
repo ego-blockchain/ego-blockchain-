@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { useNavigate } from 'react-router-dom';
+import KeptForOthersCard from '../components/KeptForOthersCard';
 
 interface EarningsData {
   daily_rewards: number;
@@ -295,6 +296,8 @@ const EarningsPage: React.FC = () => {
           <button onClick={() => navigate('/storage')} className="text-xs text-blue-400 hover:text-blue-300">Manage →</button>
         </div>
       )}
+
+      <KeptForOthersCard allocatedGb={allocatedGb} onSetUp={() => navigate('/storage')} />
 
       {computeStatus?.enabled && (
         <div className="bg-gray-800 rounded-2xl border border-gray-700 p-4 flex items-center justify-between gap-4">

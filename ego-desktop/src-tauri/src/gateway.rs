@@ -419,6 +419,7 @@ fn cost(method: &str) -> f64 {
         "shielded.lookup" => 2.0,
         "shielded.leaves" => 4.0,
         "storage.putManifest" | "storage.delete" | "storage.planStatus" => 4.0,
+        "storage.commitment" => 20.0,
         "account.put" => 4.0,
         "messenger.deliver" => 10.0,
         _ => 1.0,

@@ -397,3 +397,22 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod phone_record_tests {
+    #[test]
+    fn a_phone_works_out_the_same_file_record_as_the_node() {
+        let mut data: Vec<u8> = (0..2500u32).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        data.extend((0..2500u32).map(|i| ((i * 13 + 1) % 256) as u8));
+        let tree = crate::proof::MerkleTree::build(&data);
+        assert_eq!((tree.n_real, tree.n_padded), (5, 8));
+        assert_eq!(hex::encode(tree.root), "99ab8af962f138bf5869373cff059a8683962ca2ed3b9b81876062c04ab31281");
+        let body = r#"{"bytes":5000,"cid":"egomfd1test","comm_d":"99ab8af962f138bf5869373cff059a8683962ca2ed3b9b81876062c04ab31281","n_padded_leaves":8,"n_real_leaves":5}"#;
+        assert_eq!(
+            crate::chain_db::storage_file_memo(body, false),
+            "storage_file:0c29394d1bb6f1feb85d6194f9de3fc73edae25cf657d1cbe348afd6c97a5ce4"
+        );
+        let rec: crate::chain_db::StorageFileRecord = serde_json::from_str(body).unwrap();
+        assert_eq!((rec.bytes, rec.n_real_leaves, rec.n_padded_leaves), (5000, 5, 8));
+    }
+}

@@ -339,6 +339,52 @@ async fn plan_status(params: &Value) -> RpcResult {
         .map_err(|e| (-32603, e.to_string()))
 }
 
+fn file_id(params: &Value) -> Result<String, (i32, String)> {
+    let cid = params["cid"].as_str().unwrap_or_default().to_string();
+    if !cid.starts_with("egomfd1") || cid.len() > 80 {
+        return Err((-32602, "That isn't a file ID.".into()));
+    }
+    Ok(cid)
+}
+
+async fn recorded(params: &Value) -> RpcResult {
+    let cid = file_id(params)?;
+    tokio::task::spawn_blocking(move || {
+        let rec = crate::chain_db::recorded_storage_file(&cid);
+        json!({
+            "recorded": rec.is_some(),
+            "owner": rec.as_ref().map(|r| r.owner.clone()),
+            "bytes": rec.as_ref().map(|r| r.record.bytes),
+        })
+    })
+    .await
+    .map_err(|e| (-32603, e.to_string()))
+}
+
+static COMMITMENT_BUSY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn commitment(params: &Value) -> RpcResult {
+    let cid = file_id(params)?;
+    let _one_at_a_time = COMMITMENT_BUSY.lock().await;
+    tokio::task::spawn_blocking(move || {
+        let manifest = crate::blocks::load_manifest(&cid)
+            .ok()
+            .filter(|m| m.manifest_cid == cid && crate::blocks::have_all_blocks(m))
+            .ok_or((-32011, "This computer doesn't hold that file.".to_string()))?;
+        let (comm_d, n_real, n_padded, bytes) = crate::storage_proof::manifest_commitment(&manifest)
+            .map_err(|e| (-32603, e.to_string()))?;
+        Ok(json!({
+            "cid": cid,
+            "comm_d": comm_d,
+            "n_real_leaves": n_real,
+            "n_padded_leaves": n_padded,
+            "bytes": bytes,
+        }))
+    })
+    .await
+    .map_err(|e| (-32603, e.to_string()))?
+}
+
 pub const METHODS: &[&str] = &[
     "storage.putBlock",
     "storage.putManifest",
@@ -348,6 +394,8 @@ pub const METHODS: &[&str] = &[
     "storage.usage",
     "storage.plans",
     "storage.planStatus",
+    "storage.recorded",
+    "storage.commitment",
 ];
 
 pub async fn dispatch(method: &str, params: &Value) -> Option<RpcResult> {
@@ -360,6 +408,8 @@ pub async fn dispatch(method: &str, params: &Value) -> Option<RpcResult> {
         "storage.usage" => usage(params).await,
         "storage.plans" => Ok(crate::commands::storage::plans_view()),
         "storage.planStatus" => plan_status(params).await,
+        "storage.recorded" => recorded(params).await,
+        "storage.commitment" => commitment(params).await,
         _ => return None,
     })
 }

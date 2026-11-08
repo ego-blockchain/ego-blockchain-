@@ -4296,6 +4296,8 @@ pub enum P2PMessage {
         reason:   String,
         #[serde(default)]
         from_addr: String,
+        #[serde(default)]
+        from_endpoint: String,
     },
 
     /// Master → slaves: "I still hold this CID, replica is healthy"
@@ -6834,64 +6836,131 @@ pub async fn push_shard_data_to_slaves() {
     }
 }
 
+const PIN_ROUND_EVERY_SECS: i64 = 120;
+const PIN_ASK_AGAIN_SECS: i64 = 1_800;
+const PIN_CIDS_PER_ROUND: usize = 32;
+const PIN_STATE_MAX: usize = 50_000;
+
+static PIN_ASKED: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+static PIN_ROUNDS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+static MASTER_ENDPOINTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn recent(map: &OnceLock<Mutex<HashMap<String, i64>>>, key: &str, now: i64, within: i64) -> bool {
+    map.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .map_or(false, |&at| now.saturating_sub(at) < within)
+}
+
+fn mark(map: &OnceLock<Mutex<HashMap<String, i64>>>, key: String, now: i64, keep: i64) {
+    let mut m = map.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() >= PIN_STATE_MAX {
+        m.retain(|_, at| now.saturating_sub(*at) < keep);
+    }
+    m.insert(key, now);
+}
+
+pub fn remember_master_endpoint(cid: &str, endpoint: &str) {
+    if endpoint.is_empty() { return; }
+    let mut m = MASTER_ENDPOINTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() >= PIN_STATE_MAX {
+        m.clear();
+    }
+    m.insert(cid.to_string(), endpoint.to_string());
+}
+
+pub fn master_endpoint(cid: &str) -> Option<String> {
+    MASTER_ENDPOINTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner()).get(cid).cloned()
+}
+
+pub fn pin_rank(cid: &str, id: &str) -> String {
+    ego_core::hash_data(format!("ego/pin/v1\n{cid}\n{id}").as_bytes()).to_hex()
+}
+
+pub fn pin_candidates(
+    cid: &str,
+    contacts: &[(String, Vec<String>)],
+    peers: &[(String, Vec<String>)],
+    skip: impl Fn(&str, &[String]) -> bool,
+    want: usize,
+) -> Vec<(String, Vec<String>)> {
+    let mut seen = std::collections::HashSet::new();
+    let usable = |(id, eps): &(String, Vec<String>)| !id.is_empty() && !eps.is_empty() && !skip(id, eps);
+    let mut out: Vec<(String, Vec<String>)> = contacts.iter()
+        .filter(|c| usable(c))
+        .filter(|(id, _)| seen.insert(id.clone()))
+        .cloned()
+        .collect();
+    let mut ranked: Vec<(String, &(String, Vec<String>))> = peers.iter()
+        .filter(|p| usable(p))
+        .filter(|(id, eps)| seen.insert(id.clone()) && eps.iter().all(|e| seen.insert(format!("ep:{e}"))))
+        .map(|p| (pin_rank(cid, &p.0), p))
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0));
+    out.extend(ranked.into_iter().map(|(_, p)| p.clone()));
+    out.truncate(want);
+    out
+}
+
 pub async fn request_file_pinning(cids: Vec<String>) {
     if cids.is_empty() { return; }
     let ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
         .await.unwrap_or_default();
     if ledger.address.is_empty() { return; }
+    let now = chrono::Utc::now().timestamp();
+    let my_addr = ledger.address.clone();
+    let my_ep = get_public_endpoint().await;
 
-    let replica_map: std::collections::HashMap<String, Vec<String>> = ledger.stored_files.iter()
-        .map(|f| (f.cid.clone(), f.replica_peers.clone()))
+    let contacts: Vec<(String, Vec<String>)> = tokio::task::spawn_blocking(load_contacts).await.unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.status == "approved" && !c.endpoint.is_empty())
+        .map(|c| {
+            let mut eps = c.all_endpoints.clone();
+            if !eps.contains(&c.endpoint) { eps.push(c.endpoint.clone()); }
+            (c.address, eps)
+        })
+        .collect();
+    let peers: Vec<(String, Vec<String>)> = tokio::task::spawn_blocking(load_peer_cache).await.unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.endpoint.is_empty() && p.endpoint != my_ep)
+        .map(|p| (p.address, vec![p.endpoint]))
         .collect();
 
-    let my_ep    = get_public_endpoint().await;
-    let contacts = tokio::task::spawn_blocking(load_contacts).await.unwrap_or_default();
-    for contact in contacts.iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
-        let contact_addr = contact.address.clone();
-        let ep = contact.endpoint.clone();
-        if ep.is_empty() { continue; }
-        let all_eps = contact.all_endpoints.clone();
-        let from    = ledger.address.clone();
-        let my_ep2  = my_ep.clone();
-
-        let cids_to_send: Vec<String> = cids.iter()
-            .filter(|cid| {
-                replica_map.get(*cid)
-                    .map(|replicas| !replicas.contains(&contact_addr))
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect();
-
-        if cids_to_send.is_empty() { continue; }
-
-        tokio::spawn(async move {
-            let mut eps = if all_eps.is_empty() { vec![ep.clone()] } else { all_eps };
-            if !eps.contains(&ep) { eps.push(ep); }
-            for cid in cids_to_send {
-                let (fee, expiry, owner) = {
-                    tokio::task::spawn_blocking(crate::ledger::Ledger::load).await
-                        .map(|l| l.stored_files.iter()
-                        .find(|f| f.cid == cid)
-                        .map(|f| (f.storage_fee_uegoc, f.expiry, f.owner.clone()))
-                        .unwrap_or_default()).unwrap_or_default()
-                };
-                let msg = P2PMessage::PinRequest {
-                    cid,
-                    from_addr:         from.clone(),
-                    from_endpoint:     my_ep2.clone(),
-                    storage_fee_uegoc: fee,
-                    expiry,
-                    owner:             if owner.is_empty() { from.clone() } else { owner },
-                };
+    let mut rounds = 0usize;
+    for cid in cids {
+        if rounds >= PIN_CIDS_PER_ROUND { break; }
+        let Some(file) = ledger.stored_files.iter().find(|f| f.cid == cid) else { continue };
+        if recent(&PIN_ROUNDS, &cid, now, PIN_ROUND_EVERY_SECS) { continue; }
+        mark(&PIN_ROUNDS, cid.clone(), now, PIN_ROUND_EVERY_SECS);
+        rounds += 1;
+        let owner = if file.owner.is_empty() { my_addr.clone() } else { file.owner.clone() };
+        let want = MIN_REPLICAS.saturating_sub(file.replica_peers.len()).max(1);
+        let chosen = pin_candidates(&cid, &contacts, &peers, |id, _| {
+            id == my_addr
+                || id == owner
+                || file.replica_peers.iter().any(|r| r == id)
+                || file.replica_grace.contains_key(id)
+                || recent(&PIN_ASKED, &format!("{cid}\n{id}"), now, PIN_ASK_AGAIN_SECS)
+        }, want);
+        for (id, eps) in chosen {
+            mark(&PIN_ASKED, format!("{cid}\n{id}"), now, PIN_ASK_AGAIN_SECS);
+            let msg = P2PMessage::PinRequest {
+                cid:               cid.clone(),
+                from_addr:         my_addr.clone(),
+                from_endpoint:     my_ep.clone(),
+                storage_fee_uegoc: file.storage_fee_uegoc,
+                expiry:            file.expiry,
+                owner:             owner.clone(),
+            };
+            tokio::spawn(async move {
                 if let Err(e) = send_message_any(&eps, &msg).await {
                     if !e.contains("none of the requested protocols") {
                         eprintln!("[P2P] PinRequest failed: {}", e);
                     }
-                    break;
                 }
-            }
-        });
+            });
+        }
     }
 }
 
@@ -6966,6 +7035,7 @@ pub async fn check_file_replication() {
     let mut pin_needed: Vec<String> = Vec::new();
     let mut payouts: Vec<(String, u64, String)> = Vec::new(); // (recipient, amount_uegoc, cid)
     let mut heartbeats: Vec<P2PMessage> = Vec::new();
+    let mut targeted_heartbeats: Vec<(P2PMessage, Vec<String>)> = Vec::new();
     let mut promotions: Vec<P2PMessage> = Vec::new();
 
     // ── Re-publish under-distributed Active files when connectivity returns ───
@@ -7105,12 +7175,20 @@ pub async fn check_file_replication() {
                 }
 
                 // Broadcast heartbeat to all known slaves
-                heartbeats.push(P2PMessage::ReplicaHeartbeat {
+                let heartbeat = P2PMessage::ReplicaHeartbeat {
                     cid:          file.cid.clone(),
                     master_addr:  my_addr.clone(),
                     timestamp:    now,
                     master_since: file.master_since,
-                });
+                };
+                match heartbeat_targets(&file.replica_peers, &file.replica_grace, &file.replica_endpoints) {
+                    Some(eps) => {
+                        if !eps.is_empty() {
+                            targeted_heartbeats.push((heartbeat, eps));
+                        }
+                    }
+                    None => heartbeats.push(heartbeat),
+                }
 
                 // ── Recruitment gate ──────────────────────────────────────
                 // A slot covered by a holder in its 24h grace does NOT trigger a
@@ -7256,9 +7334,61 @@ pub async fn check_file_replication() {
     drop(guard);
     broadcast_replication(promotions, true);
     broadcast_replication(heartbeats, false);
+    send_targeted_heartbeats(targeted_heartbeats);
     if !pin_needed.is_empty() {
         request_file_pinning(pin_needed).await;
     }
+}
+
+const REPLICA_ENDPOINTS_MAX: usize = 16;
+
+pub fn remember_replica_endpoint(map: &mut HashMap<String, String>, addr: &str, endpoint: &str) -> bool {
+    if addr.is_empty() || endpoint.is_empty() || map.get(addr).map_or(false, |e| e == endpoint) {
+        return false;
+    }
+    if !map.contains_key(addr) && map.len() >= REPLICA_ENDPOINTS_MAX {
+        return false;
+    }
+    map.insert(addr.to_string(), endpoint.to_string());
+    true
+}
+
+pub fn heartbeat_targets(
+    replicas: &[String],
+    grace: &HashMap<String, i64>,
+    endpoints: &HashMap<String, String>,
+) -> Option<Vec<String>> {
+    let holders_known = replicas.iter().chain(grace.keys()).all(|a| endpoints.contains_key(a));
+    if !holders_known {
+        return None;
+    }
+    let mut eps: Vec<String> = endpoints.values().cloned().collect();
+    eps.sort();
+    eps.dedup();
+    Some(eps)
+}
+
+static TARGETED_HEARTBEATS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn send_targeted_heartbeats(sends: Vec<(P2PMessage, Vec<String>)>) {
+    if sends.is_empty() || TARGETED_HEARTBEATS_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async move {
+        let pairs: Vec<(&P2PMessage, &String)> = sends.iter()
+            .flat_map(|(m, eps)| eps.iter().map(move |e| (m, e)))
+            .collect();
+        futures::stream::iter(pairs)
+            .for_each_concurrent(REPLICATION_SEND_CONCURRENCY, |(m, e)| async move {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(REPLICATION_SEND_TIMEOUT_SECS),
+                    send_message_any(std::slice::from_ref(e), m),
+                )
+                .await;
+            })
+            .await;
+        TARGETED_HEARTBEATS_IN_FLIGHT.store(false, Ordering::Release);
+    });
 }
 
 const REPLICATION_SEND_CONCURRENCY: usize = 16;
@@ -10002,6 +10132,17 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 .any(|f| f.cid == cid && !f.local_path.is_empty() && !f.local_path.starts_with("sender:"));
             let my_addr   = ledger.address.clone(); // This is line 6145 in the user's code (approx)
             let ep        = from_endpoint.clone();
+            if owner == my_addr {
+                let my_addr2 = my_addr.clone();
+                tokio::spawn(async move {
+                    let _ = send_message_any(&[ep], &P2PMessage::PinAck {
+                        cid, accepted: false, reason: "This node belongs to the file's owner".into(),
+                        from_addr: my_addr2, from_endpoint: String::new(),
+                    }).await;
+                });
+                return;
+            }
+            remember_master_endpoint(&cid, &from_endpoint);
 
             // Collateral = 20% of deal fee.  Slave must have enough balance to lock it.
             let collateral   = storage_fee_uegoc / 5;
@@ -10012,9 +10153,10 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             if has_file {
                 let my_addr2 = my_addr.clone();
                 tokio::spawn(async move {
+                    let from_endpoint = get_public_endpoint().await;
                     let _ = send_message_any(&[ep], &P2PMessage::PinAck {
                         cid, accepted: true, reason: "Already stored".into(),
-                        from_addr: my_addr2,
+                        from_addr: my_addr2, from_endpoint,
                     }).await;
                 });
             } else if capacity > 0 && used + 10_000_000 < capacity && can_collateral {
@@ -10078,11 +10220,11 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                     let _ = send_message_any(&[ep2.clone()], &P2PMessage::FileRequest {
                         cid: cid2.clone(),
                         requester_addr:     my_addr,
-                        requester_endpoint: my_ep,
+                        requester_endpoint: my_ep.clone(),
                     }).await;
                     let _ = send_message_any(&[ep2], &P2PMessage::PinAck {
                         cid: cid2, accepted: true, reason: "Pinning".into(),
-                        from_addr: my_addr2,
+                        from_addr: my_addr2, from_endpoint: my_ep,
                     }).await;
                 });
             } else {
@@ -10095,13 +10237,13 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 tokio::spawn(async move {
                     let _ = send_message_any(&[ep], &P2PMessage::PinAck {
                         cid, accepted: false, reason,
-                        from_addr: my_addr2,
+                        from_addr: my_addr2, from_endpoint: String::new(),
                     }).await;
                 });
             }
         }
 
-        P2PMessage::PinAck { cid, accepted, reason, from_addr: ack_from } => {
+        P2PMessage::PinAck { cid, accepted, reason, from_addr: ack_from, from_endpoint: ack_ep } => {
             eprintln!("[P2P] PinAck for {} — accepted={} reason={}", cid, accepted, reason);
 
             if accepted && !ack_from.is_empty() {
@@ -10112,6 +10254,9 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
 
                 let now = chrono::Utc::now().timestamp();
                 for f in ledger.stored_files.iter_mut() {
+                    if f.cid == cid && f.replication_role == "master" && remember_replica_endpoint(&mut f.replica_endpoints, &ack_from, &ack_ep) {
+                        changed = true;
+                    }
                     if f.cid == cid && !f.replica_peers.contains(&ack_from) {
                         // If this pin is covering for a holder that is dark but still
                         // inside its slot window, record who it stands in for so it
@@ -11096,6 +11241,8 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                         let contacts = load_contacts();
                         contacts.iter().find(|c| c.address == from_addr)
                             .map(|c| c.endpoint.clone())
+                            .filter(|e| !e.is_empty())
+                            .or_else(|| master_endpoint(&manifest_cid))
                             .unwrap_or_default()
                     };
                     for block_cid in missing {
@@ -11489,10 +11636,14 @@ async fn update_ledger_for_block(manifest_cid: &str, app: Option<&tauri::AppHand
         if received > prev {
             f.last_block_at = chrono::Utc::now().timestamp();
         }
-        if received >= total && f.status != "Active" {
-            f.status     = "Received".to_string();
-            f.local_path = crate::blocks::manifest_path(manifest_cid)
-                .to_string_lossy().to_string();
+        if received >= total {
+            let path = crate::blocks::manifest_path(manifest_cid).to_string_lossy().to_string();
+            if f.status != "Active" {
+                f.status     = "Received".to_string();
+                f.local_path = path;
+            } else if f.local_path.is_empty() || f.local_path.starts_with("sender:") {
+                f.local_path = path;
+            }
         }
         let _ = tokio::task::spawn_blocking(move || ledger.save()).await;
     }
@@ -19261,5 +19412,57 @@ async fn receive_hold_vote(body: crate::hold_chain::HoldBody, signer: String, si
     .flatten();
     if let Some((signer, sig)) = checked {
         pool_hold_vote(body, signer, sig, Utc::now().timestamp());
+    }
+}
+
+#[cfg(test)]
+mod replication_reach_tests {
+    use super::*;
+
+    fn peer(id: &str) -> (String, Vec<String>) {
+        (id.to_string(), vec![format!("/ip4/1.2.3.4/tcp/1/p2p/{id}")])
+    }
+
+    #[test]
+    fn copies_are_asked_of_network_peers_not_only_of_messenger_contacts() {
+        let peers: Vec<_> = (0..50).map(|i| peer(&format!("egot1node{i}"))).collect();
+        let picked = pin_candidates("egomfd1file", &[], &peers, |_, _| false, 2);
+        assert_eq!(picked.len(), 2, "a node with no contacts still finds two holders");
+        let again = pin_candidates("egomfd1file", &[], &peers, |_, _| false, 2);
+        assert_eq!(picked, again, "the same file asks the same computers first");
+        let other = pin_candidates("egomfd1other", &[], &peers, |_, _| false, 2);
+        assert_ne!(picked, other, "different files spread over different computers");
+    }
+
+    #[test]
+    fn computers_already_holding_or_recently_asked_are_passed_over() {
+        let peers: Vec<_> = (0..10).map(|i| peer(&format!("egot1node{i}"))).collect();
+        let first = pin_candidates("egomfd1file", &[], &peers, |_, _| false, 10);
+        let skipped = first[0].0.clone();
+        let next = pin_candidates("egomfd1file", &[], &peers, |id, _| id == skipped, 1);
+        assert_eq!(next[0].0, first[1].0);
+        let contact = peer("egot1friend");
+        let with_contact = pin_candidates("egomfd1file", &[contact.clone()], &peers, |_, _| false, 2);
+        assert_eq!(with_contact[0], contact, "approved contacts are still asked first");
+        assert!(pin_candidates("egomfd1file", &[], &[], |_, _| false, 2).is_empty());
+    }
+
+    #[test]
+    fn heartbeats_go_only_to_known_copies_and_fall_back_to_everyone_otherwise() {
+        let mut eps = HashMap::new();
+        assert!(remember_replica_endpoint(&mut eps, "egot1b", "/ip4/1/tcp/1"));
+        assert!(!remember_replica_endpoint(&mut eps, "egot1b", "/ip4/1/tcp/1"));
+        assert!(!remember_replica_endpoint(&mut eps, "egot1c", ""));
+        let replicas = vec!["egot1b".to_string(), "egot1c".to_string()];
+        assert_eq!(heartbeat_targets(&replicas, &HashMap::new(), &eps), None, "an older copy that never said where it is");
+        assert!(remember_replica_endpoint(&mut eps, "egot1c", "/ip4/2/tcp/1"));
+        assert_eq!(heartbeat_targets(&replicas, &HashMap::new(), &eps), Some(vec!["/ip4/1/tcp/1".to_string(), "/ip4/2/tcp/1".to_string()]));
+        let mut grace = HashMap::new();
+        grace.insert("egot1d".to_string(), 5);
+        assert_eq!(heartbeat_targets(&replicas, &grace, &eps), None);
+        for i in 0..40 {
+            remember_replica_endpoint(&mut eps, &format!("egot1x{i}"), "/ip4/9/tcp/9");
+        }
+        assert_eq!(eps.len(), REPLICA_ENDPOINTS_MAX);
     }
 }

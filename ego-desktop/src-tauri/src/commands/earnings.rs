@@ -2,6 +2,7 @@ use crate::app::{AppState, EarningsData, RewardBreakdown};
 use crate::error::EgoDesktopError;
 use crate::ledger::{load_chain, poc_signing_bytes, Ledger, LedgerTx};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tauri::State;
 
 use crate::tokenomics::{
@@ -310,4 +311,169 @@ pub async fn get_poc_score(
         last_event: None, is_validator: crate::ledger::get_validator_stake(&address) > 0,
         validator_rank: None,
     })
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct HostedFile {
+    pub cid: String,
+    pub owner: String,
+    pub bytes: u64,
+    pub role: String,
+    pub copies: usize,
+    pub holding: bool,
+    pub recorded: bool,
+    pub plan_active: bool,
+    pub last_proof: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+pub struct HostedStorage {
+    pub files: Vec<HostedFile>,
+    pub file_count: usize,
+    pub hosted_bytes: u64,
+    pub paying_files: usize,
+    pub earned_24h_uegoc: u64,
+    pub earned_30d_uegoc: u64,
+    pub earned_total_uegoc: u64,
+    pub registered: bool,
+    pub paused_reason: Option<String>,
+}
+
+pub const HOSTED_FILES_SHOWN: usize = 50;
+
+pub struct ChainView<'a> {
+    pub recorded: &'a dyn Fn(&str) -> Option<String>,
+    pub plan_active: &'a dyn Fn(&str) -> bool,
+    pub last_proof: &'a dyn Fn(&str) -> i64,
+}
+
+pub fn hosted_storage(
+    files: &[crate::ledger::StoredFile],
+    me: &str,
+    now: i64,
+    chain: &ChainView,
+    storage_pay: &[(i64, u64)],
+) -> HostedStorage {
+    let mut plans: HashMap<String, bool> = HashMap::new();
+    let mut out: Vec<HostedFile> = files.iter()
+        .filter(|f| f.status == "Active" && !f.owner.is_empty() && f.owner != me)
+        .map(|f| {
+            let holding = (f.blocks_total == 0 || f.blocks_received >= f.blocks_total)
+                && !f.local_path.is_empty()
+                && !f.local_path.starts_with("sender:");
+            let recorded = (chain.recorded)(&f.cid).map_or(false, |owner| owner == f.owner);
+            let plan_active = *plans.entry(f.owner.clone()).or_insert_with(|| (chain.plan_active)(&f.owner));
+            HostedFile {
+                cid: f.cid.clone(),
+                owner: f.owner.clone(),
+                bytes: if f.encrypted_size > 0 { f.encrypted_size } else { f.original_size },
+                role: f.replication_role.clone(),
+                copies: if f.replication_role == "master" { 1 + f.replica_peers.len() } else { 0 },
+                holding,
+                recorded,
+                plan_active,
+                last_proof: if recorded { (chain.last_proof)(&f.cid) } else { 0 },
+            }
+        })
+        .collect();
+    let paying = |h: &HostedFile| h.holding && h.recorded && h.plan_active;
+    out.sort_by(|a, b| paying(b).cmp(&paying(a)).then(b.bytes.cmp(&a.bytes)).then(a.cid.cmp(&b.cid)));
+    let earned_since = |secs: i64| storage_pay.iter().filter(|(t, _)| now.saturating_sub(*t) <= secs).map(|(_, a)| *a).sum::<u64>();
+    let summary = HostedStorage {
+        file_count: out.len(),
+        hosted_bytes: out.iter().filter(|h| h.holding).map(|h| h.bytes).sum(),
+        paying_files: out.iter().filter(|h| paying(h)).count(),
+        earned_24h_uegoc: earned_since(86_400),
+        earned_30d_uegoc: earned_since(30 * 86_400),
+        earned_total_uegoc: storage_pay.iter().map(|(_, a)| *a).sum(),
+        ..Default::default()
+    };
+    out.truncate(HOSTED_FILES_SHOWN);
+    HostedStorage { files: out, ..summary }
+}
+
+#[tauri::command]
+pub async fn get_hosted_storage() -> Result<HostedStorage, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let ledger = Ledger::load();
+        let me = ledger.address.clone();
+        let now = chrono::Utc::now().timestamp();
+        let pay: Vec<(i64, u64)> = if me.is_empty() {
+            Vec::new()
+        } else {
+            crate::chain_db::reward_entries_for(&me)
+                .into_iter()
+                .filter(|r| r.kind == crate::chain_db::REWARD_STORAGE)
+                .map(|r| (r.timestamp, r.amount_uegoc))
+                .collect()
+        };
+        let me2 = me.clone();
+        let recorded = |cid: &str| crate::chain_db::recorded_storage_file(cid).map(|r| r.owner);
+        let plan_active = move |owner: &str| crate::chain_db::storage_plan_active(owner, now);
+        let last_proof = move |cid: &str| crate::chain_db::storage_last_proof(cid, &me2);
+        let view = ChainView { recorded: &recorded, plan_active: &plan_active, last_proof: &last_proof };
+        let mut out = hosted_storage(&ledger.stored_files, &me, now, &view, &pay);
+        out.registered = !me.is_empty() && crate::chain_db::is_registered_node(&me);
+        out.paused_reason = crate::commands::coverage::earning_block_reason();
+        out
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
+}
+
+#[cfg(test)]
+mod hosted_tests {
+    use super::*;
+    use crate::ledger::StoredFile;
+
+    fn file(cid: &str, owner: &str, role: &str, path: &str, size: u64) -> StoredFile {
+        StoredFile {
+            cid: cid.into(),
+            owner: owner.into(),
+            status: "Active".into(),
+            replication_role: role.into(),
+            local_path: path.into(),
+            encrypted_size: size,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_kept_file_pays_only_when_held_recorded_by_its_owner_and_covered_by_a_plan() {
+        let mut master = file("egomfd1a", "egot1phone", "master", "storage/a.json", 500);
+        master.replica_peers = vec!["egot1b".into(), "egot1c".into()];
+        let files = vec![
+            master,
+            file("egomfd1b", "egot1phone", "slave", "storage/b.json", 300),
+            file("egomfd1c", "egot1phone", "slave", "sender:egot1master", 200),
+            file("egomfd1d", "egot1noplan", "master", "storage/d.json", 100),
+            file("egomfd1e", "egot1phone", "master", "storage/e.json", 50),
+            file("egomfd1mine", "egot1me", "master", "storage/m.json", 999),
+        ];
+        let recorded = |cid: &str| match cid {
+            "egomfd1a" | "egomfd1b" | "egomfd1c" => Some("egot1phone".to_string()),
+            "egomfd1d" => Some("egot1noplan".to_string()),
+            "egomfd1e" => Some("egot1someoneelse".to_string()),
+            _ => None,
+        };
+        let plan_active = |owner: &str| owner == "egot1phone";
+        let last_proof = |cid: &str| if cid == "egomfd1a" { 1_000 } else { 0 };
+        let view = ChainView { recorded: &recorded, plan_active: &plan_active, last_proof: &last_proof };
+        let now = 100 * 86_400;
+        let pay = vec![(now - 3_600, 7), (now - 2 * 86_400, 11), (now - 40 * 86_400, 13)];
+        let h = hosted_storage(&files, "egot1me", now, &view, &pay);
+
+        assert_eq!(h.file_count, 5, "the node's own file is not kept for anyone else");
+        assert_eq!(h.paying_files, 2);
+        assert_eq!(h.hosted_bytes, 500 + 300 + 100 + 50, "a copy still waiting for its data holds nothing yet");
+        assert_eq!(h.files[0].cid, "egomfd1a");
+        assert_eq!(h.files[0].copies, 3);
+        assert_eq!(h.files[0].last_proof, 1_000);
+        assert_eq!(h.files[1].cid, "egomfd1b");
+        let waiting = h.files.iter().find(|f| f.cid == "egomfd1c").unwrap();
+        assert!(!waiting.holding && waiting.recorded && waiting.plan_active);
+        assert!(!h.files.iter().find(|f| f.cid == "egomfd1d").unwrap().plan_active);
+        assert!(!h.files.iter().find(|f| f.cid == "egomfd1e").unwrap().recorded, "a record by someone else is not the owner's");
+        assert_eq!((h.earned_24h_uegoc, h.earned_30d_uegoc, h.earned_total_uegoc), (7, 18, 31));
+    }
 }

@@ -828,6 +828,9 @@ pub struct StoredFile {
     /// returns to master plus MIN_REPLICAS. Nobody re-transfers anything.
     #[serde(default)]
     pub replica_provisional: std::collections::HashMap<String, String>,
+
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub replica_endpoints: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

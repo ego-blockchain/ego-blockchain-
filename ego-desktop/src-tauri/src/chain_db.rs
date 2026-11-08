@@ -10071,6 +10071,11 @@ fn storage_pay_in(db: &DB, ov: &mut crate::drs::Ov, block: &LedgerBlock, txs: &[
     out
 }
 
+pub fn storage_plan_active(owner: &str, at: i64) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::storage_pay::active_plan(&crate::drs::Ov::new(db), owner, at).is_some()
+}
+
 pub fn storage_last_proof(cid: &str, host: &str) -> i64 {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     crate::storage_pay::last_proof(&crate::drs::Ov::new(db), cid, host)

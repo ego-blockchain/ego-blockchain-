@@ -86,8 +86,7 @@ fn send_signed(tx: &mut crate::ledger::LedgerTx, kp: &ego_core::KeyPair) -> Resu
 ///
 /// The challenge comes from a recent committed block, so every node derives the same
 /// question and nobody hands out challenges. A proof only counts toward pay when it matches
-/// the owner's on-chain record of the file and carries the challenged pieces, and only a
-/// staked host may send proofs without a fee.
+/// the owner's on-chain record of the file and carries the challenged pieces.
 #[tauri::command]
 pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError> {
     let ledger = Ledger::load();
@@ -112,11 +111,10 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
     };
     let Some(kp) = node_keypair() else { return Ok(empty("Wallet is locked".into())) };
 
-    let hosted: Vec<_> = ledger.stored_files.iter()
-        .filter(|f| f.status == "Active" && !f.owner.is_empty() && f.owner != prover_addr)
-        .filter(|f| f.blocks_total == 0 || f.blocks_received >= f.blocks_total)
-        .cloned()
-        .collect();
+    let now = chrono::Utc::now().timestamp();
+    let hosted = due_for_proof(&ledger.stored_files, &prover_addr, now, |cid| {
+        crate::chain_db::recorded_storage_file(cid).map(|r| (r, crate::chain_db::storage_last_proof(cid, &prover_addr)))
+    });
 
     let mut nonce = crate::ledger::next_nonce_for(&prover_addr, ledger.nonce);
     let mut submitted = 0usize;
@@ -124,19 +122,7 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
     let mut found = 0usize;
     let mut details = Vec::new();
 
-    let now = chrono::Utc::now().timestamp();
-    let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", crate::ledger::get_validator_stake(&prover_addr) > 0)
-        .max(crate::mempool::MIN_FEE_UEGOC)
-        .max(crate::chain_db::get_current_base_fee());
-    for f in &hosted {
-        let Some(record) = crate::chain_db::recorded_storage_file(&f.cid) else { continue };
-        if now - crate::chain_db::storage_last_proof(&f.cid, &prover_addr) < 20 * 3600 {
-            continue;
-        }
-        if crate::chain_db::balance_of(&prover_addr) < fee.saturating_mul(submitted as u64 + 1) {
-            details.push("Not enough EGOC for the network fee on more proofs".into());
-            break;
-        }
+    for (f, record) in &hosted {
         let Ok(manifest) = crate::blocks::load_manifest(&f.cid) else { continue };
         found += 1;
         let (cid, prover, hash) = (f.cid.clone(), prover_addr.clone(), block_hash.clone());
@@ -162,7 +148,7 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
             from: prover_addr.clone(),
             to: prover_addr.clone(),
             amount: 0,
-            fee_uegoc: fee,
+            fee_uegoc: 0,
             tx_type: crate::storage_proof::POST_PROOF_TX.to_string(),
             call_args: serde_json::to_string(&body).map_err(|e| EgoDesktopError::SerializationError(e.to_string()))?,
             timestamp: chrono::Utc::now().timestamp(),
@@ -192,6 +178,28 @@ pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError
     }
 
     Ok(PostChallengeResult { challenges_found: found, proofs_submitted: submitted, failures, details })
+}
+
+pub const PROOF_EVERY_SECS: i64 = 20 * 3600;
+pub const MAX_PROOFS_PER_ROUND: usize = 8;
+
+pub fn due_for_proof(
+    files: &[crate::ledger::StoredFile],
+    me: &str,
+    now: i64,
+    chain: impl Fn(&str) -> Option<(crate::chain_db::RecordedStorageFile, i64)>,
+) -> Vec<(crate::ledger::StoredFile, crate::chain_db::RecordedStorageFile)> {
+    let mut due: Vec<(i64, crate::ledger::StoredFile, crate::chain_db::RecordedStorageFile)> = files.iter()
+        .filter(|f| f.status == "Active" && !f.owner.is_empty() && f.owner != me)
+        .filter(|f| f.blocks_total == 0 || f.blocks_received >= f.blocks_total)
+        .filter_map(|f| {
+            let (record, last) = chain(&f.cid)?;
+            (record.owner == f.owner && now.saturating_sub(last) >= PROOF_EVERY_SECS).then(|| (last, f.clone(), record))
+        })
+        .collect();
+    due.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cid.cmp(&b.1.cid)));
+    due.truncate(MAX_PROOFS_PER_ROUND);
+    due.into_iter().map(|(_, f, r)| (f, r)).collect()
 }
 
 /// Record this node's own files on chain, so the hosts holding them can be paid. Only files
@@ -749,4 +757,46 @@ pub async fn resync_chain(app: tauri::AppHandle) -> Result<(), EgoDesktopError> 
     crate::chain_db::request_resync().map_err(EgoDesktopError::DatabaseError)?;
     app.restart();
     Ok(())
+}
+
+#[cfg(test)]
+mod proof_order_tests {
+    use super::*;
+    use crate::chain_db::{RecordedStorageFile, StorageFileRecord};
+    use crate::ledger::StoredFile;
+
+    fn kept(cid: &str, owner: &str) -> StoredFile {
+        StoredFile { cid: cid.into(), owner: owner.into(), status: "Active".into(), ..Default::default() }
+    }
+
+    fn rec(owner: &str) -> RecordedStorageFile {
+        RecordedStorageFile {
+            owner: owner.into(),
+            record: StorageFileRecord { cid: String::new(), comm_d: String::new(), n_real_leaves: 1, n_padded_leaves: 1, bytes: 1 },
+            height: 1,
+        }
+    }
+
+    #[test]
+    fn the_longest_unproved_files_go_first_and_a_round_stays_inside_the_nonce_window() {
+        let now = 10 * 86_400;
+        let mut files: Vec<StoredFile> = (0..20).map(|i| kept(&format!("egomfd1f{i:02}"), "egot1phone")).collect();
+        files.push(kept("egomfd1mine", "egot1me"));
+        files.push(kept("egomfd1norecord", "egot1phone"));
+        files.push(kept("egomfd1fresh", "egot1phone"));
+        files.push(kept("egomfd1stolen", "egot1phone"));
+        let chain = |cid: &str| match cid {
+            "egomfd1norecord" => None,
+            "egomfd1fresh" => Some((rec("egot1phone"), now - 3_600)),
+            "egomfd1stolen" => Some((rec("egot1other"), 0)),
+            c => {
+                let i: i64 = c.trim_start_matches("egomfd1f").parse().unwrap_or(0);
+                Some((rec("egot1phone"), i * 1_000))
+            }
+        };
+        let due = due_for_proof(&files, "egot1me", now, chain);
+        assert_eq!(due.len(), MAX_PROOFS_PER_ROUND);
+        let cids: Vec<&str> = due.iter().map(|(f, _)| f.cid.as_str()).collect();
+        assert_eq!(cids, (0..8).map(|i| format!("egomfd1f{i:02}")).collect::<Vec<_>>().iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    }
 }

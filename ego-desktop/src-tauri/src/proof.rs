@@ -251,7 +251,7 @@ pub const POST_SUSPEND_SECS:        i64 = 7 * 24 * 3600;
 /// How often a node re-proves its storage to the chain. Proofs expire, so a validator that
 /// stops proving loses its seat; this keeps an honest node's evidence current without
 /// filling blocks with proofs.
-const ONCHAIN_PROOF_INTERVAL_SECS: i64 = 6 * 3_600;
+const ONCHAIN_PROOF_INTERVAL_SECS: i64 = 3_600;
 static LAST_ONCHAIN_PROOF: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 async fn publish_storage_proofs_if_due() {
