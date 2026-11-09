@@ -4019,6 +4019,10 @@ pub enum P2PMessage {
     ProfileUpdate {
         from_addr: String,
         avatar:    String,
+        /// The sender's own display name. Absent from older versions, and then
+        /// the name stays as it is.
+        #[serde(default)]
+        name:      String,
     },
     /// Any messenger message, encrypted to one recipient and broadcast on the
     /// gossip mesh. Direct dials and DHT records both fail whenever every peer
@@ -10056,6 +10060,10 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                     }
                 }
             }
+            if crate::commands::messenger::is_blocked(&from_addr) {
+                eprintln!("[Messenger] Dropped contact request from blocked {}", from_addr);
+                return;
+            }
             eprintln!("[Messenger] Contact request accepted from {} ({})", from_name, from_addr);
             let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
             let mut contacts = load_contacts();
@@ -10094,6 +10102,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 bundle_token:       None,
                 avatar:             String::new(),
                 last_request_at:    0,
+                name_at:            0,
             };
             contacts.push(contact.clone());
             let _ = save_contacts(&contacts);
@@ -10672,7 +10681,7 @@ P2PMessage::ChatMessage { bundle, seq } => {
     }
 }
 
-P2PMessage::ProfileUpdate { from_addr, avatar } => {
+P2PMessage::ProfileUpdate { from_addr, avatar, name } => {
     // Same ceiling the setter enforces — a peer doesn't get to park an
     // unbounded blob in our contacts file.
     const MAX_AVATAR_BYTES: usize = 96 * 1024;
@@ -10683,21 +10692,42 @@ P2PMessage::ProfileUpdate { from_addr, avatar } => {
         eprintln!("[Messenger] Rejected profile picture from {}", from_addr);
         return;
     }
-    let copy = P2PMessage::ProfileUpdate { from_addr: from_addr.clone(), avatar: avatar.clone() };
-    let updated = {
+    if crate::commands::messenger::is_blocked(&from_addr) {
+        return;
+    }
+    let name: String = name.trim().chars().take(32).collect();
+    let copy = P2PMessage::ProfileUpdate { from_addr: from_addr.clone(), avatar: avatar.clone(), name: name.clone() };
+    let (updated, renamed) = {
         let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
         let mut contacts = load_contacts();
         match contacts.iter_mut()
             .find(|c| c.address == from_addr && c.status == "approved")
         {
-            Some(c) if c.avatar != avatar => {
-                c.avatar = avatar;
-                let _ = save_contacts(&contacts);
-                true
+            Some(c) => {
+                let mut changed = false;
+                let mut renamed = false;
+                if c.avatar != avatar {
+                    c.avatar = avatar;
+                    changed = true;
+                }
+                // Their own name replaces whatever it was called here.
+                if !name.is_empty() && c.name != name {
+                    c.name = name;
+                    c.name_at = Utc::now().timestamp();
+                    changed = true;
+                    renamed = true;
+                }
+                if changed {
+                    let _ = save_contacts(&contacts);
+                }
+                (changed, renamed)
             }
-            _ => false,
+            None => (false, false),
         }
     };
+    if renamed {
+        crate::account_record::changed();
+    }
     if updated {
         tokio::spawn(crate::phone_mail::mirror(copy));
         if let Some(h) = app {

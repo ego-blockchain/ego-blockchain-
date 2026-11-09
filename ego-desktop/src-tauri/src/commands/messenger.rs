@@ -57,6 +57,12 @@ pub struct Contact {
     /// falls back to their initial.
     #[serde(default)]
     pub avatar: String,
+
+    /// When `name` last changed (unix seconds): a rename here or on the phone, or the
+    /// contact renaming themselves. 0 for names that predate this field. The newest
+    /// name wins when the phone and this computer disagree.
+    #[serde(default)]
+    pub name_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +109,8 @@ pub struct Reaction {
 pub const MSG_REPLY:    &str = "reply";
 pub const MSG_REACTION: &str = "reaction";
 pub const MSG_EDIT:     &str = "edit";
+/// Removes one of the sender's own messages on both sides ("delete for everyone").
+pub const MSG_DELETE:   &str = "delete";
 
 /// How long a sender may still edit a message they sent.
 pub const EDIT_WINDOW_SECS: i64 = 60 * 60;
@@ -118,6 +126,8 @@ struct ReplyBody  { reply_to: String, text: String }
 struct ReactBody  { target: String, emoji: String, #[serde(default)] remove: bool }
 #[derive(Deserialize)]
 struct EditBody   { target: String, text: String }
+#[derive(Deserialize)]
+struct DeleteBody { target: String }
 
 fn default_true() -> bool { true }
 
@@ -320,7 +330,24 @@ async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
 }
 
 pub fn is_control_type(t: &str) -> bool {
-    t == MSG_REACTION || t == MSG_EDIT
+    t == MSG_REACTION || t == MSG_EDIT || t == MSG_DELETE
+}
+
+/// Remove a message its sender asked to delete for everyone. Only the sender's own
+/// messages go; one that's already gone (cleared, or deleted here first) is no error.
+fn apply_delete(target: &str, who: &str) -> Result<bool, String> {
+    let mut msgs = load_messages();
+    if !remove_own(&mut msgs, target, who) {
+        return Ok(false);
+    }
+    save_messages(&msgs).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+fn remove_own(msgs: &mut Vec<Message>, target: &str, who: &str) -> bool {
+    let before = msgs.len();
+    msgs.retain(|m| !(m.id == target && m.from == who));
+    msgs.len() != before
 }
 
 /// Toggle one person's reaction on one message. Returns whether anything changed,
@@ -384,6 +411,10 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
 
     let my_addr = crate::ledger::Ledger::load().address;
 
+    if is_blocked(&from) {
+        return Err("Sender is blocked".into());
+    }
+
     let _cg = CONTACTS_LOCK.lock().unwrap();
     let mut contacts = load_contacts();
     let contact_pos = contacts.iter().position(|c| c.address == from)
@@ -433,11 +464,15 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
     // A reaction or an edit is not a message in its own right: it changes one that
     // already arrived. Apply it to the stored conversation and hand the caller a
     // marker it can recognise, so no receipt and no notification are raised for it.
-    if mtype == MSG_REACTION || mtype == MSG_EDIT {
+    if is_control_type(&mtype) {
         let applied = if mtype == MSG_REACTION {
             serde_json::from_str::<ReactBody>(&content)
                 .map_err(|_| "Malformed reaction".to_string())
                 .and_then(|b| apply_reaction(&b.target, &from, &b.emoji, b.remove))
+        } else if mtype == MSG_DELETE {
+            serde_json::from_str::<DeleteBody>(&content)
+                .map_err(|_| "Malformed delete".to_string())
+                .and_then(|b| apply_delete(&b.target, &from))
         } else {
             serde_json::from_str::<EditBody>(&content)
                 .map_err(|_| "Malformed edit".to_string())
@@ -661,6 +696,7 @@ pub async fn import_contact(
             bundle_token:       bundle_token.clone(),
             avatar:             String::new(),
             last_request_at:    chrono::Utc::now().timestamp(),
+            name_at:            0,
         };
         contacts.push(contact.clone());
         save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
@@ -1367,6 +1403,127 @@ pub async fn delete_message(message_id: String) -> Result<(), EgoDesktopError> {
     save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)
 }
 
+/// Delete one of your own messages here and on the other person's side.
+#[tauri::command]
+pub async fn delete_message_for_everyone(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    contact_addr: String,
+    message_id: String,
+) -> Result<(), EgoDesktopError> {
+    let me = Ledger::load().address;
+    if !load_messages().iter().any(|m| m.id == message_id && m.from == me) {
+        return Err(EgoDesktopError::InvalidInput("Only your own messages can be deleted for everyone".into()));
+    }
+    apply_delete(&message_id, &me).map_err(EgoDesktopError::InvalidInput)?;
+    let body = serde_json::json!({ "target": message_id }).to_string();
+    send_message(app, state, contact_addr, body, MSG_DELETE.to_string(), None).await
+}
+
+/// Remove every message with one contact, leaving the contact.
+#[tauri::command]
+pub async fn clear_conversation(contact_addr: String) -> Result<(), EgoDesktopError> {
+    let mut msgs = load_messages();
+    msgs.retain(|m| m.from != contact_addr && m.to != contact_addr);
+    save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)
+}
+
+// ── Blocking ─────────────────────────────────────────────────────────────────
+// A blocked person's messages, contact requests and picture changes are dropped.
+// The list travels in the account record so the phone and this computer agree:
+// each entry carries when it was decided, and the newest decision per address wins,
+// so unblocking on one device isn't undone by an older block on the other.
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BlockEntry {
+    pub address: String,
+    pub blocked: bool,
+    pub at: i64,
+}
+
+static BLOCKS_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+const MAX_BLOCKS: usize = 1_000;
+
+fn blocks_path() -> std::path::PathBuf { data_dir().join("blocks.json") }
+
+/// Every block decision, blocked or since unblocked.
+pub fn load_blocks() -> Vec<BlockEntry> {
+    fs::read(blocks_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_blocks(list: &[BlockEntry]) -> Result<(), String> {
+    let bytes = serde_json::to_vec(list).map_err(|e| e.to_string())?;
+    crate::utils::atomic_write(&blocks_path(), &bytes).map_err(|e| e.to_string())
+}
+
+pub fn is_blocked(addr: &str) -> bool {
+    load_blocks().iter().any(|b| b.address == addr && b.blocked)
+}
+
+/// Fold another device's decisions in, newest per address winning. Returns how many changed.
+pub fn merge_blocks(incoming: &[BlockEntry]) -> usize {
+    let _g = BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut list = load_blocks();
+    let changed = fold_blocks(&mut list, incoming, chrono::Utc::now().timestamp());
+    if changed > 0 {
+        let _ = save_blocks(&list);
+    }
+    changed
+}
+
+fn fold_blocks(list: &mut Vec<BlockEntry>, incoming: &[BlockEntry], now: i64) -> usize {
+    let mut changed = 0;
+    for b in incoming.iter().take(MAX_BLOCKS) {
+        // A decision dated in the future would win every later one, so it's ignored.
+        if !crate::account_record::valid_owner(&b.address) || b.at > now + 600 {
+            continue;
+        }
+        match list.iter_mut().find(|e| e.address == b.address) {
+            Some(e) if b.at > e.at => { *e = b.clone(); changed += 1; }
+            Some(_) => {}
+            None => { list.push(b.clone()); changed += 1; }
+        }
+    }
+    if changed > 0 {
+        list.sort_by_key(|e| std::cmp::Reverse(e.at));
+        list.truncate(MAX_BLOCKS);
+    }
+    changed
+}
+
+fn set_blocked(addr: &str, blocked: bool) -> Result<(), EgoDesktopError> {
+    if !crate::account_record::valid_owner(addr) {
+        return Err(EgoDesktopError::InvalidInput("That isn't a wallet address".into()));
+    }
+    let now = chrono::Utc::now().timestamp();
+    {
+        let _g = BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut list = load_blocks();
+        list.retain(|e| e.address != addr);
+        list.insert(0, BlockEntry { address: addr.to_string(), blocked, at: now });
+        list.truncate(MAX_BLOCKS);
+        save_blocks(&list).map_err(EgoDesktopError::FileSystemError)?;
+    }
+    crate::account_record::changed();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn block_contact(contact_addr: String) -> Result<(), EgoDesktopError> {
+    set_blocked(&contact_addr, true)
+}
+
+#[tauri::command]
+pub async fn unblock_contact(contact_addr: String) -> Result<(), EgoDesktopError> {
+    set_blocked(&contact_addr, false)
+}
+
+/// Addresses currently blocked.
+#[tauri::command]
+pub async fn get_blocked_contacts() -> Result<Vec<String>, EgoDesktopError> {
+    Ok(load_blocks().into_iter().filter(|b| b.blocked).map(|b| b.address).collect())
+}
+
 #[tauri::command]
 pub async fn delete_contact(
     _state: State<'_, AppState>,
@@ -1378,6 +1535,7 @@ pub async fn delete_contact(
         contacts.retain(|c| c.address != contact_addr);
         save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
     }
+    crate::account_record::changed();
     Ok(())
 }
 
@@ -1468,6 +1626,7 @@ pub async fn broadcast_profile(avatar: String) {
         let msg = p2p::P2PMessage::ProfileUpdate {
             from_addr: my_addr.clone(),
             avatar:    avatar.clone(),
+            name:      my_display_name(),
         };
         let mut delivered = false;
         if !contact.endpoint.is_empty() {
@@ -1492,6 +1651,11 @@ pub async fn set_display_name(name: String) -> Result<String, EgoDesktopError> {
     let mut ledger = Ledger::load();
     ledger.display_name = name.clone();
     ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+    crate::account_record::note_name_changed(&ledger.address, chrono::Utc::now().timestamp());
+    crate::account_record::changed();
+    // Contacts see the new name too; the picture goes along so older versions keep it.
+    let avatar = ledger.avatar.clone();
+    tokio::spawn(async move { broadcast_profile(avatar).await; });
     Ok(name)
 }
 
@@ -1553,7 +1717,10 @@ pub async fn rename_contact(
     let contact = contacts.iter_mut().find(|c| c.address == contact_addr)
         .ok_or_else(|| EgoDesktopError::NotFound("Contact not found".into()))?;
     contact.name = new_name;
-    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)
+    contact.name_at = chrono::Utc::now().timestamp();
+    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+    crate::account_record::changed();
+    Ok(())
 }
 
 pub async fn deposit_in_relay_inbox(from_addr: &str, to_addr: &str, msg: &crate::p2p::P2PMessage) {
@@ -1614,5 +1781,63 @@ mod phone_vector_tests {
         assert_eq!(hex::encode(k3), "2a2bf0f76ef65f416186db15771d4a26f76116afe44fafb6c9f28f18a8c8eaae");
         assert_eq!(hex::encode(b1), "1dcb7320c0899a34810b8db102e42f2ba7a961ae85825e5523c41f354fcfcf14");
         assert_eq!(hex::encode(&ct), "e57ad9294306f690ae510b1f9cb9ccf65bf048b3686d70781e580f0ec6aae9f8d5e0");
+    }
+}
+
+#[cfg(test)]
+mod block_and_delete_tests {
+    use super::*;
+
+    fn entry(address: &str, blocked: bool, at: i64) -> BlockEntry {
+        BlockEntry { address: address.into(), blocked, at }
+    }
+
+    #[test]
+    fn the_newest_block_decision_wins_across_devices() {
+        let a = "egot1yqlden7hzn3fnj9abcdefghijklmnopqrstuvwx";
+        let b = "egot1yzskw067qn4f8zwyh4vzxljxtv79mph8nyd3tc5p";
+        assert!(crate::account_record::valid_owner(a) && crate::account_record::valid_owner(b));
+        let mut here = vec![entry(a, true, 100)];
+        // Unblocked later on the phone: taken.
+        assert_eq!(fold_blocks(&mut here, &[entry(a, false, 200)], 1_000), 1);
+        assert!(!here[0].blocked);
+        // An older block from the other device doesn't undo it.
+        assert_eq!(fold_blocks(&mut here, &[entry(a, true, 150)], 1_000), 0);
+        assert!(!here[0].blocked);
+        // New addresses are added; future-dated and malformed ones are ignored.
+        assert_eq!(fold_blocks(&mut here, &[entry(b, true, 300), entry("nope", true, 300), entry(a, true, 99_999)], 1_000), 1);
+        assert!(here.iter().any(|e| e.address == b && e.blocked));
+        assert!(!here.iter().find(|e| e.address == a).unwrap().blocked);
+    }
+
+    fn message(id: &str, from: &str) -> Message {
+        Message {
+            id: id.into(), from: from.into(), to: "egot1me".into(), content: "hi".into(),
+            message_type: "text".into(), timestamp: 1, outgoing: false, read: false,
+            read_by_recipient: false, delivered: false, reply_to: None, reactions: Vec::new(), edited_at: None,
+        }
+    }
+
+    #[test]
+    fn only_the_sender_can_delete_a_message_for_everyone() {
+        let mut msgs = vec![message("1-aa", "egot1them"), message("2-bb", "egot1me")];
+        assert!(!remove_own(&mut msgs, "2-bb", "egot1them"), "someone else's message must stay");
+        assert_eq!(msgs.len(), 2);
+        assert!(remove_own(&mut msgs, "1-aa", "egot1them"));
+        assert_eq!(msgs.len(), 1);
+        assert!(!remove_own(&mut msgs, "1-aa", "egot1them"), "already gone is not an error");
+        assert!(is_control_type(MSG_DELETE), "a delete must never show as a message");
+    }
+
+    #[test]
+    fn profile_updates_from_older_versions_still_parse() {
+        let old = r#"{"type":"profile_update","from_addr":"egot1x","avatar":""}"#;
+        match serde_json::from_str::<crate::p2p::P2PMessage>(old) {
+            Ok(crate::p2p::P2PMessage::ProfileUpdate { name, .. }) => assert!(name.is_empty()),
+            other => panic!("old profile update didn't parse: {other:?}"),
+        }
+        let new = crate::p2p::P2PMessage::ProfileUpdate { from_addr: "egot1x".into(), avatar: String::new(), name: "Ana".into() };
+        let text = serde_json::to_string(&new).unwrap();
+        assert!(text.contains(r#""name":"Ana""#), "{text}");
     }
 }

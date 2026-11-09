@@ -51,6 +51,17 @@ pub struct SyncContact {
     pub shared_key_hex: String,
     #[serde(default)]
     pub endpoint: String,
+    /// When `name` last changed (unix seconds), so the phone can tell whose name is newer.
+    #[serde(default)]
+    pub name_at: i64,
+}
+
+/// A contact renamed on the phone, for this computer to take on if it's newer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SyncRename {
+    pub address: String,
+    pub name: String,
+    pub at: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -114,6 +125,16 @@ pub struct Content {
     pub avatar_at: i64,
     #[serde(default)]
     pub token: String,
+    /// When `name` was last set (unix seconds). The newer of the phone's and this
+    /// computer's names becomes the name on both.
+    #[serde(default)]
+    pub name_at: i64,
+    /// Block decisions, kept the same on the phone and this computer.
+    #[serde(default)]
+    pub blocks: Vec<crate::commands::messenger::BlockEntry>,
+    /// Contacts renamed on the phone.
+    #[serde(default)]
+    pub renames: Vec<SyncRename>,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -495,6 +516,7 @@ fn build_content(ledger: &crate::ledger::Ledger, bundle: String) -> Content {
             ed25519: c.ed25519_pubkey,
             shared_key_hex: c.shared_key_hex,
             endpoint: c.endpoint,
+            name_at: c.name_at,
         })
         .collect();
     contacts.sort_by(|a, b| a.address.cmp(&b.address));
@@ -538,6 +560,8 @@ fn build_content(ledger: &crate::ledger::Ledger, bundle: String) -> Content {
         files,
         payments,
         sent: Vec::new(),
+        name_at: name_changed_at(&me),
+        blocks: crate::commands::messenger::load_blocks(),
         ..Content::default()
     }
 }
@@ -546,6 +570,42 @@ const MAX_PHONE_AVATAR_BYTES: usize = 96 * 1024;
 
 fn avatar_marker(owner: &str) -> PathBuf {
     dir().join(format!("{owner}.avatar_at"))
+}
+
+fn name_marker(owner: &str) -> PathBuf {
+    dir().join(format!("{owner}.name_at"))
+}
+
+/// When this wallet's display name was last set, here or taken from the phone.
+pub fn name_changed_at(owner: &str) -> i64 {
+    std::fs::read_to_string(name_marker(owner)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+pub fn note_name_changed(owner: &str, at: i64) {
+    if owner.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(dir());
+    let _ = std::fs::write(name_marker(owner), at.to_string());
+}
+
+/// Takes the phone's display name when it was set after this computer's. Returns true
+/// when it did, so contacts can be told.
+pub fn merge_phone_name(content: &Content, me: &str) -> bool {
+    let name: String = content.name.trim().chars().take(32).collect();
+    if name.is_empty() || content.name_at <= name_changed_at(me) || content.name_at > chrono::Utc::now().timestamp() + 600 {
+        return false;
+    }
+    let mut ledger = crate::ledger::Ledger::load();
+    if ledger.address != me {
+        return false;
+    }
+    ledger.display_name = name;
+    if ledger.save().is_err() {
+        return false;
+    }
+    note_name_changed(me, content.name_at);
+    true
 }
 
 pub fn merge_phone(content: &Content, me: &str) -> usize {
@@ -583,7 +643,23 @@ pub fn merge_phone(content: &Content, me: &str) -> usize {
                         bundle_token: None,
                         avatar: String::new(),
                         last_request_at: 0,
+                        name_at: c.name_at,
                     });
+                    changed += 1;
+                }
+            }
+        }
+        // Renames made on the phone, when newer than the name here.
+        let now = chrono::Utc::now().timestamp();
+        for r in content.renames.iter().take(MAX_CONTACTS) {
+            let name: String = r.name.trim().chars().take(32).collect();
+            if name.is_empty() || r.at > now + 600 {
+                continue;
+            }
+            if let Some(k) = contacts.iter_mut().find(|k| k.address == r.address) {
+                if r.at > k.name_at && k.name != name {
+                    k.name = name;
+                    k.name_at = r.at;
                     changed += 1;
                 }
             }
@@ -591,6 +667,9 @@ pub fn merge_phone(content: &Content, me: &str) -> usize {
         if changed > 0 {
             let _ = save_contacts(&contacts);
         }
+    }
+    if crate::commands::messenger::merge_blocks(&content.blocks) > 0 {
+        changed += 1;
     }
     let applied: i64 = std::fs::read_to_string(avatar_marker(me)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     if content.avatar_at > applied
@@ -728,7 +807,18 @@ async fn once() {
     if let Ok(content) = open(&phone, &seed) {
         let me = owner.clone();
         let want = content.want_history;
+        let named = content.clone();
+        let me_named = me.clone();
         let added = tokio::task::spawn_blocking(move || merge_sent(&content.sent, &me) + merge_phone(&content, &me)).await.unwrap_or(0);
+        let renamed = tokio::task::spawn_blocking(move || merge_phone_name(&named, &me_named)).await.unwrap_or(false);
+        if added > 0 || renamed {
+            // Republish so the record carries what was just taken from the phone.
+            changed();
+        }
+        if renamed {
+            let avatar = crate::ledger::Ledger::load().avatar;
+            tokio::spawn(crate::commands::messenger::broadcast_profile(avatar));
+        }
         tokio::spawn(crate::phone_mail::backfill_if_asked(want));
         if added > 0 {
             if let Some(h) = crate::p2p::APP_HANDLE.get() {
@@ -758,7 +848,7 @@ mod tests {
             v: 1,
             name: "Artit".into(),
             bundle: "egocontact1:egot1x:a:b:c:d".into(),
-            contacts: vec![SyncContact { address: "egot1you".into(), name: "You".into(), ed25519: "k".into(), shared_key_hex: "00".repeat(32), endpoint: String::new() }],
+            contacts: vec![SyncContact { address: "egot1you".into(), name: "You".into(), ed25519: "k".into(), shared_key_hex: "00".repeat(32), endpoint: String::new(), name_at: 0 }],
             files: vec![SyncFile { cid: "egomfd1aa".into(), name: "cat.jpg".into(), size: 5, key_nonce_hex: "11".repeat(44), stored_at: 7, received: false }],
             payments: Vec::new(),
             sent: Vec::new(),

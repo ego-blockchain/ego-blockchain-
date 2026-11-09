@@ -564,6 +564,8 @@ const MessengerPage: React.FC = () => {
   const cidToMsgId = useRef<Record<string, string>>({});
 
   const [editingName, setEditingName] = useState(false);
+  const [blocked, setBlocked] = useState<Set<string>>(new Set());
+  useEffect(() => { loadBlocked(); }, []);
   const [nameInput, setNameInput]     = useState('');
   const nameInputRef = useRef<HTMLInputElement>(null);
 
@@ -919,9 +921,31 @@ useEffect(() => {
   async function handleClearChat(addr: string) {
     if (!await confirm('Clear all messages?', { detail: 'This removes all messages with this contact from your device.', confirmLabel: 'Clear' })) return;
     try {
-      await invoke('clear_messages', { contactAddr: addr });
+      await invoke('clear_conversation', { contactAddr: addr });
       if (selected?.address === addr) setMessages([]);
     } catch (e) { console.error(e); }
+  }
+
+  async function loadBlocked() {
+    try { setBlocked(new Set(await invoke<string[]>('get_blocked_contacts'))); } catch {}
+  }
+
+  async function handleBlock(addr: string, block: boolean) {
+    if (block && !await confirm('Block this contact?', { detail: "You won't get their messages, requests or picture changes, here or on your iPhone. You can unblock them any time.", confirmLabel: 'Block' })) return;
+    try {
+      await invoke(block ? 'block_contact' : 'unblock_contact', { contactAddr: addr });
+      await loadBlocked();
+    } catch (e: any) { setMsgError(String(e)); }
+  }
+
+  async function handleDeleteForEveryone(m: Message) {
+    if (!selected) return;
+    if (!await confirm('Delete for everyone?', { detail: 'It is removed here and on the other person\'s devices once they get the update.', confirmLabel: 'Delete' })) return;
+    setMsgError('');
+    try {
+      await invoke('delete_message_for_everyone', { contactAddr: selected.address, messageId: m.id });
+      await loadMessages(selected.address);
+    } catch (e: any) { setMsgError(String(e)); }
   }
 
   async function handleRenameContact(addr: string, newName: string) {
@@ -1263,6 +1287,13 @@ useEffect(() => {
                   <div className="text-xs text-gray-400 font-mono">{truncAddr(selected.address)}</div>
                 </div>
                 <button
+                  onClick={() => handleBlock(selected.address, !blocked.has(selected.address))}
+                  className="shrink-0 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-300 hover:bg-gray-500/10 rounded-lg transition-colors"
+                  title={blocked.has(selected.address) ? 'Unblock contact' : 'Block contact'}
+                >
+                  {blocked.has(selected.address) ? 'Unblock' : 'Block'}
+                </button>
+                <button
                   onClick={() => handleClearChat(selected.address)}
                   className="shrink-0 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-300 hover:bg-gray-500/10 rounded-lg transition-colors"
                   title="Clear chat"
@@ -1414,13 +1445,22 @@ useEffect(() => {
                     </p>
                   <div className={`relative flex items-end gap-1 ${m.outgoing ? 'justify-end' : 'justify-start'}`}>
                     {m.outgoing && (
-                      <button
-                        onClick={() => handleDeleteMessage(m.id)}
-                        className="opacity-0 group-hover:opacity-100 transition-opacity w-5 h-5 flex items-center justify-center text-gray-500 hover:text-red-400 shrink-0 text-xs"
-                        title="Delete message"
-                      >
-                        🗑
-                      </button>
+                      <>
+                        <button
+                          onClick={() => handleDeleteForEveryone(m)}
+                          className="opacity-0 group-hover:opacity-100 transition-opacity w-5 h-5 flex items-center justify-center text-gray-500 hover:text-red-400 shrink-0 text-xs"
+                          title="Delete for everyone"
+                        >
+                          ⊘
+                        </button>
+                        <button
+                          onClick={() => handleDeleteMessage(m.id)}
+                          className="opacity-0 group-hover:opacity-100 transition-opacity w-5 h-5 flex items-center justify-center text-gray-500 hover:text-red-400 shrink-0 text-xs"
+                          title="Delete for me"
+                        >
+                          🗑
+                        </button>
+                      </>
                     )}
 
                     {/* Avatar for incoming messages */}
@@ -1709,7 +1749,8 @@ useEffect(() => {
                     }
                   }}
                   rows={1}
-                  placeholder={selected.address === EGO_AI_ADDRESS ? 'Ask Ego AI anything…' : 'Type a message… Enter to send, Shift+Enter for a new line'}
+                  disabled={blocked.has(selected.address)}
+                  placeholder={selected.address === EGO_AI_ADDRESS ? 'Ask Ego AI anything…' : blocked.has(selected.address) ? 'You blocked this contact. Unblock them to send messages.' : 'Type a message… Enter to send, Shift+Enter for a new line'}
                   className={`flex-1 bg-gray-700 border rounded-xl px-4 py-2.5 text-sm focus:outline-none resize-none leading-relaxed max-h-40 overflow-y-auto ${
                     selected.address === EGO_AI_ADDRESS
                       ? 'border-yellow-600/40 focus:border-yellow-400'
@@ -1718,7 +1759,7 @@ useEffect(() => {
                 />
                 <button
                   onClick={() => handleSend('text')}
-                  disabled={(selected.address === EGO_AI_ADDRESS ? aiThinking : sending) || !msgInput.trim()}
+                  disabled={(selected.address === EGO_AI_ADDRESS ? aiThinking : sending) || !msgInput.trim() || blocked.has(selected.address)}
                   className={`shrink-0 px-5 py-2.5 disabled:opacity-50 rounded-xl text-sm font-medium transition-colors ${
                     selected.address === EGO_AI_ADDRESS
                       ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
