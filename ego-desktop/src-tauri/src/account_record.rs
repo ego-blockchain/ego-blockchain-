@@ -106,6 +106,14 @@ pub struct Content {
     pub payments: Vec<SyncPayment>,
     #[serde(default)]
     pub sent: Vec<SyncSent>,
+    #[serde(default)]
+    pub want_history: i64,
+    #[serde(default)]
+    pub avatar: String,
+    #[serde(default)]
+    pub avatar_at: i64,
+    #[serde(default)]
+    pub token: String,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -127,7 +135,7 @@ pub fn record_key(seed: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn signing_key(seed: &[u8]) -> Result<ed25519_dalek::SigningKey, String> {
+pub(crate) fn signing_key(seed: &[u8]) -> Result<ed25519_dalek::SigningKey, String> {
     let bytes: [u8; 32] = seed.try_into().map_err(|_| "The wallet seed is not 32 bytes.".to_string())?;
     Ok(ed25519_dalek::SigningKey::from_bytes(&bytes))
 }
@@ -164,7 +172,7 @@ pub fn open(env: &Envelope, seed: &[u8]) -> Result<Content, String> {
     serde_json::from_slice(&plain).map_err(|e| e.to_string())
 }
 
-fn valid_owner(owner: &str) -> bool {
+pub(crate) fn valid_owner(owner: &str) -> bool {
     owner.starts_with("ego") && owner.len() <= 90 && owner.bytes().all(|c| c.is_ascii_alphanumeric())
 }
 
@@ -172,7 +180,7 @@ fn valid_slot(slot: &str) -> bool {
     slot == SLOT_DESKTOP || slot == SLOT_PHONE
 }
 
-fn signer_of(pubkey: &str, sig: &str, message: &[u8]) -> Result<String, String> {
+pub(crate) fn signer_of(pubkey: &str, sig: &str, message: &[u8]) -> Result<String, String> {
     use ed25519_dalek::{Signature, VerifyingKey};
     let bad = || "This record isn't signed by the wallet it names.".to_string();
     let pk: [u8; 32] = hex::decode(pubkey).ok().and_then(|v| v.try_into().ok()).ok_or_else(bad)?;
@@ -297,11 +305,11 @@ pub fn newest(candidates: Vec<Envelope>, owner: &str, slot: &str, now_ms: i64) -
         .max_by_key(|e| e.ver)
 }
 
-fn own_node() -> String {
+pub(crate) fn own_node() -> String {
     crate::ledger::Ledger::load().address
 }
 
-fn listed_nodes(now: i64) -> Vec<(String, String)> {
+pub(crate) fn listed_nodes(now: i64) -> Vec<(String, String)> {
     crate::gateway::share(now).into_iter().map(|a| (a.node, a.endpoint)).collect()
 }
 
@@ -400,8 +408,14 @@ async fn deliver(params: &Value) -> RpcResult {
         return Err((-32005, "Too many messages in a minute. Wait a moment and try again.".into()));
     }
     let msg = crate::p2p::P2PMessage::ChatMessage { bundle, seq: 0 };
-    if !crate::p2p::gossip_sealed_dm(&to, &to_ed25519, &msg).await {
+    let Some(sealed) = crate::p2p::seal_dm(&to, &to_ed25519, &msg) else {
         return Err((-32602, "The contact's key couldn't be used to seal the message.".into()));
+    };
+    if let Ok(data) = serde_json::to_vec(&sealed) {
+        crate::p2p::publish_gossip(crate::p2p::DM_TOPIC, data).await;
+    }
+    if let Some(mail) = crate::phone_mail::from_p2p(&sealed) {
+        let _ = tokio::task::spawn_blocking(move || crate::phone_mail::on_gossip(mail, &own_node())).await;
     }
     crate::p2p::dht_inbox_deposit(&owner, &to, &msg).await;
     if tokio::task::spawn_blocking(own_node).await.unwrap_or_default() == to {
@@ -447,7 +461,7 @@ fn big_endpoint(rpc_endpoint: &str) -> String {
     rpc_endpoint.strip_suffix("/rpc").map(|b| format!("{b}/storage")).unwrap_or_else(|| rpc_endpoint.to_string())
 }
 
-async fn call_peer(endpoint: &str, method: &str, params: Value) -> Option<Value> {
+pub(crate) async fn call_peer(endpoint: &str, method: &str, params: Value) -> Option<Value> {
     let client = PEER_CLIENT.as_ref()?;
     let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let resp = client.post(big_endpoint(endpoint)).json(&body).send().await.ok()?;
@@ -524,7 +538,76 @@ fn build_content(ledger: &crate::ledger::Ledger, bundle: String) -> Content {
         files,
         payments,
         sent: Vec::new(),
+        ..Content::default()
     }
+}
+
+const MAX_PHONE_AVATAR_BYTES: usize = 96 * 1024;
+
+fn avatar_marker(owner: &str) -> PathBuf {
+    dir().join(format!("{owner}.avatar_at"))
+}
+
+pub fn merge_phone(content: &Content, me: &str) -> usize {
+    use crate::commands::messenger::{load_contacts, save_contacts, Contact, CONTACTS_LOCK};
+    let mut changed = 0;
+    {
+        let _cg = CONTACTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut contacts = load_contacts();
+        for c in content.contacts.iter().take(MAX_CONTACTS) {
+            if c.address == me || !valid_owner(&c.address) || c.shared_key_hex.len() != 64 || c.ed25519.is_empty() {
+                continue;
+            }
+            match contacts.iter_mut().find(|k| k.address == c.address) {
+                Some(k) if k.status == "pending_in" || (k.status == "pending_out" && k.shared_key_hex == c.shared_key_hex) => {
+                    k.status = "approved".into();
+                    k.shared_key_hex = c.shared_key_hex.clone();
+                    changed += 1;
+                }
+                Some(_) => {}
+                None => {
+                    contacts.push(Contact {
+                        address: c.address.clone(),
+                        name: c.name.clone(),
+                        ed25519_pubkey: c.ed25519.clone(),
+                        kyber_pubkey: String::new(),
+                        shared_key_hex: c.shared_key_hex.clone(),
+                        status: "approved".into(),
+                        added_at: chrono::Utc::now().timestamp(),
+                        endpoint: c.endpoint.clone(),
+                        all_endpoints: Vec::new(),
+                        ratchet_send_chain: String::new(),
+                        ratchet_recv_chain: String::new(),
+                        ratchet_send_count: 0,
+                        ratchet_recv_count: 0,
+                        bundle_token: None,
+                        avatar: String::new(),
+                        last_request_at: 0,
+                    });
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            let _ = save_contacts(&contacts);
+        }
+    }
+    let applied: i64 = std::fs::read_to_string(avatar_marker(me)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    if content.avatar_at > applied
+        && content.avatar.len() <= MAX_PHONE_AVATAR_BYTES
+        && (content.avatar.is_empty() || (content.avatar.starts_with("data:image/") && content.avatar.contains(";base64,")))
+    {
+        let mut ledger = crate::ledger::Ledger::load();
+        if ledger.address == me {
+            ledger.avatar = content.avatar.clone();
+            if ledger.save().is_ok() {
+                let _ = std::fs::create_dir_all(dir());
+                let _ = std::fs::write(avatar_marker(me), content.avatar_at.to_string());
+                changed += 1;
+            }
+        }
+    }
+    changed
 }
 
 pub fn merge_sent(sent: &[SyncSent], me: &str) -> usize {
@@ -644,7 +727,9 @@ async fn once() {
     let _ = tokio::task::spawn_blocking(move || store(&p)).await;
     if let Ok(content) = open(&phone, &seed) {
         let me = owner.clone();
-        let added = tokio::task::spawn_blocking(move || merge_sent(&content.sent, &me)).await.unwrap_or(0);
+        let want = content.want_history;
+        let added = tokio::task::spawn_blocking(move || merge_sent(&content.sent, &me) + merge_phone(&content, &me)).await.unwrap_or(0);
+        tokio::spawn(crate::phone_mail::backfill_if_asked(want));
         if added > 0 {
             if let Some(h) = crate::p2p::APP_HANDLE.get() {
                 use tauri::Manager;
@@ -677,6 +762,7 @@ mod tests {
             files: vec![SyncFile { cid: "egomfd1aa".into(), name: "cat.jpg".into(), size: 5, key_nonce_hex: "11".repeat(44), stored_at: 7, received: false }],
             payments: Vec::new(),
             sent: Vec::new(),
+            ..Content::default()
         }
     }
 
@@ -804,3 +890,19 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod phone_merge_tests {
+    use super::*;
+
+    #[test]
+    fn a_phone_record_from_before_messenger_still_opens() {
+        let old = r#"{"v":1,"name":"","bundle":"","contacts":[],"files":[],"payments":[],"sent":[]}"#;
+        let content: Content = serde_json::from_str(old).unwrap();
+        assert_eq!(content.want_history, 0);
+        assert!(content.avatar.is_empty());
+        let newer = r#"{"v":1,"want_history":5,"avatar":"data:image/jpeg;base64,AA","avatar_at":9,"token":"ab"}"#;
+        let content: Content = serde_json::from_str(newer).unwrap();
+        assert_eq!((content.want_history, content.avatar_at, content.token.as_str()), (5, 9, "ab"));
+    }
+}

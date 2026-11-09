@@ -597,12 +597,6 @@ pub async fn import_contact(
     }
 
     let endpoint = endpoint_opt.unwrap_or_default();
-    if endpoint.is_empty() {
-        return Err(EgoDesktopError::InvalidInput(
-            "This contact card has no network endpoint — it was likely generated before the P2P relay connected. \
-             Ask the contact to wait for P2P to connect and regenerate their card.".into(),
-        ));
-    }
 
     let keypair        = state.get_keypair()
         .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
@@ -682,7 +676,9 @@ pub async fn import_contact(
         from_endpoint:   my_endpoint,
         bundle_token,
     };
-    if let Err(e) = p2p::send_message(&endpoint, &request).await {
+    if endpoint.is_empty() {
+        deposit_in_relay_inbox(&my_addr, &addr, &request).await;
+    } else if let Err(e) = p2p::send_message(&endpoint, &request).await {
         eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
         // Deposit in SOVRAN's inbox (addr = recipient), not our own.
         deposit_in_relay_inbox(&my_addr, &addr, &request).await;
@@ -1131,6 +1127,7 @@ pub async fn send_message(
         }
 
         let p2p_msg = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
+        tokio::spawn(crate::phone_mail::mirror(p2p_msg.clone()));
         if stored_endpoint.is_empty() {
             eprintln!("[Messenger] No endpoint for {} — queued in outbox + DHT inbox + gossip + local link", contact_addr_key);
             crate::commands::outbox::enqueue(&contact_addr_key, "", &p2p_msg);
@@ -1258,12 +1255,14 @@ async fn send_read_receipt(contact_addr: &str, message_ids: Vec<String>) {
     if endpoint.is_empty() {
         crate::commands::outbox::enqueue(contact_addr, "", &msg);
         deposit_in_relay_inbox(&my_addr, contact_addr, &msg).await;
+        crate::p2p::gossip_sealed_dm(contact_addr, &contact.ed25519_pubkey, &msg).await;
         return;
     }
     if let Err(e) = crate::p2p::send_message(&endpoint, &msg).await {
         eprintln!("[Messenger] read receipt delivery to {} failed: {} — queuing", contact_addr, e);
         crate::commands::outbox::enqueue(contact_addr, &endpoint, &msg);
         deposit_in_relay_inbox(&my_addr, contact_addr, &msg).await;
+        crate::p2p::gossip_sealed_dm(contact_addr, &contact.ed25519_pubkey, &msg).await;
     }
 }
 
@@ -1591,5 +1590,29 @@ mod display_name_tests {
         let out = short_address(long);
         assert_eq!(out, "egot1yqlden7…");
         assert!(out.chars().count() < long.chars().count());
+    }
+}
+
+#[cfg(test)]
+mod phone_vector_tests {
+    use super::*;
+    use aes_gcm::aead::Aead;
+
+    #[test]
+    fn the_phone_derives_the_same_ratchet_keys() {
+        let shared = [5u8; 32];
+        let send = init_ratchet_chain(&shared, true, "egot1a", "egot1b");
+        assert_eq!(send, init_ratchet_chain(&shared, false, "egot1b", "egot1a"));
+        let (k1, c1) = ratchet_advance(&send);
+        let (_, c2) = ratchet_advance(&c1);
+        let (k3, _) = ratchet_advance(&c2);
+        let back = init_ratchet_chain(&shared, false, "egot1a", "egot1b");
+        let (b1, _) = ratchet_advance(&back);
+        let cipher = Aes256Gcm::new_from_slice(&k3).unwrap();
+        let ct = cipher.encrypt(Nonce::from_slice(&[1u8; 12]), b"hello from desktop".as_ref()).unwrap();
+        assert_eq!(hex::encode(k1), "3997b123a79775169fbff52b178a968fa3266e6b50ea8eb9f496b6dca934c0af");
+        assert_eq!(hex::encode(k3), "2a2bf0f76ef65f416186db15771d4a26f76116afe44fafb6c9f28f18a8c8eaae");
+        assert_eq!(hex::encode(b1), "1dcb7320c0899a34810b8db102e42f2ba7a961ae85825e5523c41f354fcfcf14");
+        assert_eq!(hex::encode(&ct), "e57ad9294306f690ae510b1f9cb9ccf65bf048b3686d70781e580f0ec6aae9f8d5e0");
     }
 }

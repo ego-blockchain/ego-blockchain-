@@ -482,15 +482,35 @@ pub fn stake_meta(addr: &str) -> Option<(i64, u32)> {
 /// lock days and the unstake timestamp — so every node derives the same value.
 /// Clamped to the remaining STAKING_POOL balance (incl. pending deltas this block)
 /// so it can never exceed the seeded reward pool.
+fn node_online_secs_in(db: &DB, addr: &str, at: i64, secs: u64, height: u64) -> u64 {
+    if height < crate::tokenomics::NODE_STAKE_FROM_HEIGHT {
+        return 0;
+    }
+    crate::drs::node_online_secs(&crate::drs::Ov::new(db), addr, at).min(secs)
+}
+
+pub fn node_stake_online_secs(addr: &str, at: i64, secs: u64) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let height = local_chain_height_in(&db).saturating_add(1);
+    node_online_secs_in(&db, addr, at, secs, height)
+}
+
+pub fn node_stake_rate(addr: &str, at: i64) -> bool {
+    node_stake_online_secs(addr, at, u64::MAX) > 0
+}
+
 fn staking_reward_for_unstake(
     db: &DB,
     tx: &LedgerTx,
     pool_pending_delta: i128,
+    height: u64,
 ) -> u64 {
     let Some((start_ts, lock_days)) = get_stake_meta(db, &tx.from) else { return 0; };
     let secs = (tx.timestamp - start_ts).max(0) as u64;
     let principal = tx.amount;
-    let entitled = crate::tokenomics::staking_reward_uegoc(principal, lock_days, secs);
+    let online = node_online_secs_in(db, &tx.from, tx.timestamp, secs, height);
+    let entitled = crate::tokenomics::staking_reward_uegoc(principal, lock_days, secs)
+        .saturating_add(crate::tokenomics::node_staking_bonus_uegoc(principal, lock_days, online));
     if entitled == 0 { return 0; }
 
     let cf_bal = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return 0 };
@@ -2318,7 +2338,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             // Accrued APR reward, paid from the staking reward pool (separate from
             // the principal-holding contract). Deterministic from on-chain data.
             let pool_pending = *balance_delta.get(STAKING_POOL_ADDR).unwrap_or(&0);
-            let reward = staking_reward_for_unstake(db, tx, pool_pending);
+            let reward = staking_reward_for_unstake(db, tx, pool_pending, block.height);
             if reward > 0 {
                 *balance_delta.entry(tx.from.clone()).or_insert(0) += reward as i128;
                 *balance_delta.entry(STAKING_POOL_ADDR.to_string()).or_insert(0) -= reward as i128;
@@ -4194,7 +4214,7 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let reward_by_unstake: std::collections::HashMap<String, u64> = stamped.iter()
         .filter(|tx| is_unstake_tx(tx))
         .filter_map(|tx| {
-            let r = staking_reward_for_unstake(&db, tx, 0);
+            let r = staking_reward_for_unstake(&db, tx, 0, height);
             if r > 0 { Some((tx.hash.clone(), r)) } else { None }
         })
         .collect();
@@ -4633,7 +4653,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
                 *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += credit as i128 - tx.fee_uegoc as i128;
                 *deltas.entry(STAKING_ADDR.as_bytes().to_vec()).or_insert(0) -= credit as i128;
                 let pool_pending = *deltas.get(STAKING_POOL_ADDR.as_bytes()).unwrap_or(&0);
-                let reward = staking_reward_for_unstake(&db, tx, pool_pending);
+                let reward = staking_reward_for_unstake(&db, tx, pool_pending, height);
                 if reward > 0 {
                     *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += reward as i128;
                     *deltas.entry(STAKING_POOL_ADDR.as_bytes().to_vec()).or_insert(0) -= reward as i128;
@@ -4872,7 +4892,7 @@ fn compute_projected_state_root_inner(db: &DB, txs: &[LedgerTx]) -> String {
             *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += credit as i128 - tx.fee_uegoc as i128;
             *deltas.entry(STAKING_ADDR.as_bytes().to_vec()).or_insert(0) -= credit as i128;
             let pool_pending = *deltas.get(STAKING_POOL_ADDR.as_bytes()).unwrap_or(&0);
-            let reward = staking_reward_for_unstake(db, tx, pool_pending);
+            let reward = staking_reward_for_unstake(db, tx, pool_pending, local_chain_height_in(db).saturating_add(1));
             if reward > 0 {
                 *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += reward as i128;
                 *deltas.entry(STAKING_POOL_ADDR.as_bytes().to_vec()).or_insert(0) -= reward as i128;
@@ -10112,13 +10132,17 @@ pub struct PlanHosting {
     pub reserved_bytes: u64,
     pub last_claim: i64,
     pub active: bool,
+    pub daily_uegoc: u64,
 }
 
 pub fn plan_hosting(host: &str) -> PlanHosting {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let height = local_chain_height_in(&db);
     let ov = crate::drs::Ov::new(&db);
+    let price = consensus_price_in(&db, height.saturating_add(1) / STORAGE_PAY_EPOCH);
+    let now = chrono::Utc::now().timestamp();
     PlanHosting {
+        daily_uegoc: crate::storage_pay::daily_plan_pay(&ov, host, now, price),
         plans: crate::storage_pay::host_plans(&ov, host),
         offered_bytes: crate::storage_pay::offered(&ov, host),
         reserved_bytes: crate::storage_pay::reserved(&ov, host),

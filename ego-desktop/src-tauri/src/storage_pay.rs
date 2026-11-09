@@ -481,8 +481,7 @@ pub fn apply_claim(ov: &mut Ov, host: &str, offer: u64, at: i64, price_micro_per
         let since = if paid > 0 { paid } else { at };
         let elapsed = at.saturating_sub(since).clamp(0, CLAIM_PAY_CAP_SECS) as u128;
         if let (Some(price), false) = (price_micro_per_egoc, is_stale(ov, &owner, host)) {
-            pay += plan.price_micro as u128 * elapsed * SHARE_PERCENT * 1_000_000u128
-                / (plan.period.max(1) as u128 * 100 * PLAN_HOSTS as u128 * price.max(1) as u128);
+            pay += plan_share(&plan, elapsed, price);
         }
         if paid > 0 {
             ov.del(drop_key(paid.saturating_add(HOST_DROP_SECS), &owner, host));
@@ -492,6 +491,22 @@ pub fn apply_claim(ov: &mut Ov, host: &str, offer: u64, at: i64, price_micro_per
     }
     fill_waiting(ov, host, at);
     pay.min(u64::MAX as u128) as u64
+}
+
+fn plan_share(plan: &PlanSpan, elapsed: u128, price_micro_per_egoc: u64) -> u128 {
+    plan.price_micro as u128 * elapsed * SHARE_PERCENT * 1_000_000u128
+        / (plan.period.max(1) as u128 * 100 * PLAN_HOSTS as u128 * price_micro_per_egoc.max(1) as u128)
+}
+
+pub fn daily_plan_pay(ov: &Ov, host: &str, at: i64, price_micro_per_egoc: Option<u64>) -> u64 {
+    let Some(price) = price_micro_per_egoc else { return 0 };
+    let total: u128 = host_plans(ov, host)
+        .iter()
+        .filter(|owner| !is_stale(ov, owner, host))
+        .filter_map(|owner| active_plan(ov, owner, at))
+        .map(|plan| plan_share(&plan, 86_400, price))
+        .sum();
+    total.min(u64::MAX as u128) as u64
 }
 
 pub fn process_plan_drops(ov: &mut Ov, at: i64) {
@@ -674,6 +689,21 @@ mod plan_pay_tests {
         assert!(host_plans(&ov, "egot1h1").is_empty());
         assert!(plan_hosts(&ov, "egot1owner").is_empty());
         assert_eq!(reserved(&ov, "egot1h1"), 0);
+    }
+
+    #[test]
+    fn the_daily_pay_shown_matches_what_a_day_of_claims_pays() {
+        let mut ov = Ov::memory();
+        bought(&mut ov);
+        apply_claim(&mut ov, "egot1h1", 100 * GB, 100, PRICE);
+        ov.commit_memory();
+        assert_eq!(daily_plan_pay(&ov, "egot1h1", 200, PRICE), share(86_400));
+        assert_eq!(daily_plan_pay(&ov, "egot1h1", 200, None), 0);
+        assert_eq!(daily_plan_pay(&ov, "egot1h2", 200, PRICE), 0);
+        mark_stale(&mut ov, "egot1owner", "egot1h1", 300);
+        ov.commit_memory();
+        assert_eq!(daily_plan_pay(&ov, "egot1h1", 400, PRICE), 0);
+        assert_eq!(daily_plan_pay(&ov, "egot1h1", MONTH + 10, PRICE), 0);
     }
 
     #[test]

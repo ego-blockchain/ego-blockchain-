@@ -421,6 +421,10 @@ fn cost(method: &str) -> f64 {
         "storage.putManifest" | "storage.delete" | "storage.planStatus" => 4.0,
         "storage.commitment" => 20.0,
         "account.put" => 4.0,
+        "mail.get" => 2.0,
+        "mail.put" => 4.0,
+        "mail.send" => 6.0,
+        "ai.ask" => 3.0,
         "messenger.deliver" => 10.0,
         _ => 1.0,
     }
@@ -734,10 +738,36 @@ async fn own_node_earnings(params: &Value) -> Result<Value, (i32, String)> {
     }))
 }
 
+pub fn serving() -> bool {
+    OWN.lock().unwrap_or_else(|e| e.into_inner()).is_some() || OWN_V6.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+const AI_MAX_CHARS: usize = 2_000;
+const AI_MAX_TURNS: usize = 10;
+
+async fn ai_ask(params: &Value) -> Result<Value, (i32, String)> {
+    let question = params["question"].as_str().unwrap_or_default().trim().to_string();
+    if question.is_empty() || question.chars().count() > AI_MAX_CHARS {
+        return Err((-32602, "Ask a question of up to 2,000 characters.".into()));
+    }
+    let history: Vec<crate::commands::ai::AiChatMessage> = serde_json::from_value(params["history"].clone()).unwrap_or_default();
+    let skip = history.len().saturating_sub(AI_MAX_TURNS);
+    let history: Vec<crate::commands::ai::AiChatMessage> = history
+        .into_iter()
+        .skip(skip)
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .map(|m| crate::commands::ai::AiChatMessage { role: m.role, content: m.content.chars().take(AI_MAX_CHARS).collect() })
+        .collect();
+    let answer = crate::commands::ai::ask_ego_ai(question, history).await.map_err(|e| (-32603, e))?;
+    Ok(json!({ "answer": answer }))
+}
+
 pub(crate) fn fits(method: &str, len: usize) -> bool {
     len <= MAX_BODY_BYTES
         || (len <= MAX_STORAGE_BODY_BYTES
-            && (crate::phone_storage::METHODS.contains(&method) || crate::account_record::METHODS.contains(&method)))
+            && (crate::phone_storage::METHODS.contains(&method)
+                || crate::account_record::METHODS.contains(&method)
+                || crate::phone_mail::METHODS.contains(&method)))
 }
 
 async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>) -> Response {
@@ -777,6 +807,10 @@ pub(crate) async fn answer(ip: IpAddr, body: Value) -> Result<Value, Value> {
         m if crate::account_record::METHODS.contains(&m) => crate::account_record::dispatch(m, &params)
             .await
             .unwrap_or_else(|| Err((-32601, NOT_HERE.to_string()))),
+        m if crate::phone_mail::METHODS.contains(&m) => crate::phone_mail::dispatch(m, &params)
+            .await
+            .unwrap_or_else(|| Err((-32601, NOT_HERE.to_string()))),
+        "ai.ask" => ai_ask(&params).await,
         _ => Err((-32601, NOT_HERE.to_string())),
     };
     Ok(match result {

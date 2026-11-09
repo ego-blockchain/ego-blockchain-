@@ -244,6 +244,16 @@ pub fn staking_reward_uegoc(principal_uegoc: u64, lock_days: u32, secs: u64) -> 
         / (10_000u128 * SECONDS_PER_YEAR as u128)) as u64
 }
 
+pub const NODE_STAKE_FROM_HEIGHT: u64 = 93_728;
+
+pub fn node_staking_bonus_uegoc(principal_uegoc: u64, lock_days: u32, online_secs: u64) -> u64 {
+    staking_reward_uegoc(principal_uegoc, lock_days, online_secs)
+}
+
+pub fn node_apr_bps(lock_days: u32) -> u64 {
+    effective_apr_bps(lock_days) * 2
+}
+
 pub const MIN_STAKE_FREE_TX_UEGOC: u64 = UEGOC_PER_EGOC;
 
 pub const MIN_STAKE_PROGRAM_UEGOC: u64 = 1_000 * UEGOC_PER_EGOC;

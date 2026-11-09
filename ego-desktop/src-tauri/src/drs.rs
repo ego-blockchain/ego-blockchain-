@@ -1172,6 +1172,15 @@ pub fn is_live(ov: &Ov, addr: &str, at: i64) -> bool {
     load_rec(ov, addr).map_or(false, |rec| rec.streak >= MIN_STREAK && at.saturating_sub(rec.last_checkin) <= STREAK_GAP_SECS)
 }
 
+pub fn node_online_secs(ov: &Ov, addr: &str, at: i64) -> u64 {
+    match load_rec(ov, addr) {
+        Some(rec) if rec.streak >= MIN_STREAK && at.saturating_sub(rec.last_checkin) <= STREAK_GAP_SECS => {
+            rec.streak as u64 * CHECKIN_INTERVAL_SECS as u64
+        }
+        _ => 0,
+    }
+}
+
 pub fn is_live_in(ov: &Ov, addr: &str, at: i64, period: u64) -> bool {
     load_rec(ov, addr).map_or(false, |rec| rec.streak >= min_streak(period) && at.saturating_sub(rec.last_checkin) <= STREAK_GAP_SECS)
 }
@@ -1598,6 +1607,30 @@ fn replay_registrations(ov: &mut Ov, blocks: &mut [(u64, i64, Vec<LedgerTx>)]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_staker_earns_the_node_bonus_only_for_its_current_online_run() {
+        let mut ov = Ov::memory();
+        assert_eq!(node_online_secs(&ov, "egot1n", 1_000), 0);
+        let rec = NodeRec { idx: 0, streak: MIN_STREAK - 1, last_checkin: 1_000, ..NodeRec::default() };
+        save_rec(&mut ov, "egot1n", &rec);
+        assert_eq!(node_online_secs(&ov, "egot1n", 1_000), 0, "too new a run");
+        let rec = NodeRec { streak: 10, ..rec };
+        save_rec(&mut ov, "egot1n", &rec);
+        assert_eq!(node_online_secs(&ov, "egot1n", 1_000), 10 * CHECKIN_INTERVAL_SECS as u64);
+        assert_eq!(node_online_secs(&ov, "egot1n", 1_000 + STREAK_GAP_SECS + 1), 0, "gone offline");
+    }
+
+    #[test]
+    fn an_online_node_doubles_its_staking_reward() {
+        let year = crate::tokenomics::SECONDS_PER_YEAR;
+        let base = crate::tokenomics::staking_reward_uegoc(1_000_000_000, 365, year);
+        assert_eq!(base, 225_000_000);
+        assert_eq!(crate::tokenomics::node_staking_bonus_uegoc(1_000_000_000, 365, year), base);
+        assert_eq!(crate::tokenomics::node_staking_bonus_uegoc(1_000_000_000, 365, year / 2), base / 2);
+        assert_eq!(crate::tokenomics::node_apr_bps(365), 4_500);
+        assert_eq!(crate::tokenomics::node_apr_bps(30), 2_500);
+    }
+
     use super::*;
 
     #[test]

@@ -9132,7 +9132,12 @@ async fn handle_event(
                 {
                     let app2 = app.cloned();
                     tokio::spawn(async move {
-                        let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+                        let mail = crate::phone_mail::Sealed { to: to.clone(), eph_pub: eph_pub.clone(), nonce: nonce.clone(), ct: ct.clone(), id: id.clone() };
+                        let my_addr = tokio::task::spawn_blocking(move || {
+                            let me = crate::ledger::Ledger::load().address;
+                            crate::phone_mail::on_gossip(mail, &me);
+                            me
+                        })
                             .await.unwrap_or_default();
                         if my_addr.is_empty() || to != my_addr {
                             return;
@@ -10597,6 +10602,7 @@ P2PMessage::ChatMessage { bundle, seq } => {
             if !is_new {
                 return;
             }
+            tokio::spawn(crate::phone_mail::mirror(P2PMessage::ChatMessage { bundle: bundle.clone(), seq }));
             // A reaction or an edit has already been folded into the conversation it
             // refers to. Refresh whatever is open and stop: it earns no delivery
             // receipt of its own and must not raise a notification.
@@ -10677,6 +10683,7 @@ P2PMessage::ProfileUpdate { from_addr, avatar } => {
         eprintln!("[Messenger] Rejected profile picture from {}", from_addr);
         return;
     }
+    let copy = P2PMessage::ProfileUpdate { from_addr: from_addr.clone(), avatar: avatar.clone() };
     let updated = {
         let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
         let mut contacts = load_contacts();
@@ -10692,6 +10699,7 @@ P2PMessage::ProfileUpdate { from_addr, avatar } => {
         }
     };
     if updated {
+        tokio::spawn(crate::phone_mail::mirror(copy));
         if let Some(h) = app {
             let _ = h.emit_all("ego://contact-updated", &from_addr);
         }
@@ -10716,6 +10724,7 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
     if my_addr.is_empty() || to != my_addr || message_ids.is_empty() { return; }
     let updated = crate::commands::messenger::mark_messages_read_by_recipient(&from, &message_ids);
     if updated > 0 {
+        tokio::spawn(crate::phone_mail::mirror(P2PMessage::ReadReceipt { from: from.clone(), to: to.clone(), message_ids: message_ids.clone() }));
         if let Some(h) = app {
             let _ = h.emit_all("ego://messages-read-receipt", serde_json::json!({ "contact": from }));
         }
@@ -17282,22 +17291,38 @@ fn dm_cipher_key(shared: &[u8; 32]) -> [u8; 32] {
 }
 
 pub fn seal_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMessage) -> Option<P2PMessage> {
-    use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
     use rand::RngCore;
+    let mut eph_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut eph_bytes);
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    seal_dm_with(eph_bytes, nonce_bytes, to_addr, to_ed25519, inner)
+}
+
+pub(crate) fn seal_dm_with(eph_bytes: [u8; 32], nonce_bytes: [u8; 12], to_addr: &str, to_ed25519: &str, inner: &P2PMessage) -> Option<P2PMessage> {
+    seal_plain_with(eph_bytes, nonce_bytes, to_addr, to_ed25519, &serde_json::to_vec(inner).ok()?)
+}
+
+pub(crate) fn seal_plain(to_addr: &str, to_ed25519: &str, plaintext: &[u8]) -> Option<P2PMessage> {
+    use rand::RngCore;
+    let mut eph_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut eph_bytes);
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    seal_plain_with(eph_bytes, nonce_bytes, to_addr, to_ed25519, plaintext)
+}
+
+fn seal_plain_with(eph_bytes: [u8; 32], nonce_bytes: [u8; 12], to_addr: &str, to_ed25519: &str, plaintext: &[u8]) -> Option<P2PMessage> {
+    use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 
     let their_x = ed25519_pub_to_x25519(&decode_pubkey32(to_ed25519)?)?;
 
-    let mut eph_bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut eph_bytes);
     let eph_secret = x25519_dalek::StaticSecret::from(eph_bytes);
     let eph_public = x25519_dalek::PublicKey::from(&eph_secret);
     let shared     = eph_secret.diffie_hellman(&their_x);
 
     let cipher = Aes256Gcm::new_from_slice(&dm_cipher_key(shared.as_bytes())).ok()?;
-    let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let plaintext = serde_json::to_vec(inner).ok()?;
-    let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref()).ok()?;
+    let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext).ok()?;
 
     let ct_hex = hex::encode(&ct);
     Some(P2PMessage::SealedDm {
@@ -17309,7 +17334,7 @@ pub fn seal_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMessage) -> Option<P2
     })
 }
 
-fn open_dm(eph_pub: &str, nonce_hex: &str, ct_hex: &str) -> Option<P2PMessage> {
+pub(crate) fn open_dm(eph_pub: &str, nonce_hex: &str, ct_hex: &str) -> Option<P2PMessage> {
     open_dm_with(&my_x25519_secret()?, eph_pub, nonce_hex, ct_hex)
 }
 
@@ -17381,6 +17406,19 @@ pub async fn gossip_sealed_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMessag
 #[cfg(test)]
 mod sealed_dm_tests {
     use super::*;
+
+    #[test]
+    fn a_phone_opens_the_same_envelope() {
+        let seed = [42u8; 32];
+        let ed_pub = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let inner = P2PMessage::ChatMessage { bundle: "egomsg1:egot1a:egot1b:1:text:00:ff".to_string(), seq: 3 };
+        let sealed = seal_dm_with([7u8; 32], [9u8; 12], "egot1recipient", &hex::encode(ed_pub), &inner).expect("seal");
+        let P2PMessage::SealedDm { eph_pub, ct, id, .. } = sealed else { panic!("not sealed") };
+        assert_eq!(eph_pub, "13be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d");
+        assert_eq!(ct, "f9f981b3b3b46c61a6ff4819e0ed94e710102fef97b2927f9ac038e331df15f607c45b1e381bc910c41e0ee5505afc196e3b68ce9efca08d44bc092d7b7101d843cadab02073f734811f382a2cc820eac15bd2b1bca7944a23422c9be5");
+        assert_eq!(id, "8473410a3926753a6e2b9414840f1897");
+        assert_eq!(serde_json::to_string(&inner).unwrap(), r#"{"type":"chat_message","bundle":"egomsg1:egot1a:egot1b:1:text:00:ff","seq":3}"#);
+    }
 
     fn x25519_secret_from_seed(seed: &[u8; 32]) -> x25519_dalek::StaticSecret {
         use sha2::{Digest, Sha512};

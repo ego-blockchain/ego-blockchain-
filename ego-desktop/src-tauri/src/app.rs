@@ -175,6 +175,10 @@ pub struct EarningsData {
     pub session_started: i64,
 
     pub coverage_online: bool,
+    #[serde(default)]
+    pub storage_plan_pay: bool,
+    #[serde(default)]
+    pub storage_plans_kept: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -21,6 +21,7 @@ interface StakingInfo {
   staked_amount:      number;
   lock_period_days:   number;
   apr:                number;
+  node_rate?:         boolean;
   pending_rewards:    number;
   unlock_date:        number | null;
   staked_at:          number | null;
@@ -118,7 +119,8 @@ const StakingPage: React.FC = () => {
 
   const selectedLock   = LOCK_OPTIONS.find(o => o.days === lockDays)!;
   const lockBonus      = selectedLock.bonus;
-  const effectiveApr   = BASE_APR + selectedLock.bonusPct;
+  const nodeRate       = !!info?.node_rate;
+  const effectiveApr   = (BASE_APR + selectedLock.bonusPct) * (nodeRate ? 2 : 1);
   const projectedYield = stakeAmount
     ? ((parseFloat(stakeAmount) || 0) * (effectiveApr / 100) * (lockDays / 365)).toFixed(2)
     : '0.00';
@@ -286,6 +288,10 @@ const StakingPage: React.FC = () => {
                       <div className="flex justify-between">
                         <span className="text-gray-400">Lock bonus</span>
                         <span className="text-green-400">{lockBonus}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-400">Node bonus</span>
+                        <span className={nodeRate ? 'text-green-400' : 'text-gray-500'}>{nodeRate ? '2× while this computer stays online' : 'Keep this computer online as a node to earn 2×'}</span>
                       </div>
                       <div className="border-t border-gray-700 pt-2 flex justify-between font-bold">
                         <span>Projected yield</span>

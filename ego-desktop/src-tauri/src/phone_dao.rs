@@ -73,7 +73,11 @@ fn staking_status(params: &Value) -> RpcResult {
     let unlock_at = if staked > 0 && started_at > 0 { started_at + lock_days as i64 * crate::dao_chain::DAY_SECS } else { 0 };
     let pool = crate::chain_db::balance_of(crate::chain_db::STAKING_POOL_ADDR);
     let accrued = if staked > 0 && started_at > 0 {
-        crate::tokenomics::staking_reward_uegoc(staked, lock_days, (now - started_at).max(0) as u64).min(pool)
+        let secs = (now - started_at).max(0) as u64;
+        let online = crate::chain_db::node_stake_online_secs(&addr, now, secs);
+        crate::tokenomics::staking_reward_uegoc(staked, lock_days, secs)
+            .saturating_add(crate::tokenomics::node_staking_bonus_uegoc(staked, lock_days, online))
+            .min(pool)
     } else {
         0
     };

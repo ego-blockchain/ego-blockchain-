@@ -23,11 +23,12 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
     let now = chrono::Utc::now().timestamp();
 
     // All blocking I/O in one spawn_blocking call.
-    let (ledger, scale) = tokio::task::spawn_blocking(move || {
+    let (ledger, scale, plan) = tokio::task::spawn_blocking(move || {
         let ledger = Ledger::load();
         let chain  = load_chain();
         let scale  = node_reward_scale(&chain);
-        (ledger, scale)
+        let plan   = (!ledger.address.is_empty()).then(|| crate::chain_db::plan_hosting(&ledger.address));
+        (ledger, scale, plan)
     })
     .await
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
@@ -51,7 +52,11 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
     let billable_gb = (hosted_bytes as f64 / 1_000_000_000.0)
         .min(ledger.storage_allocated_bytes as f64 / 1_000_000_000.0);
 
-    let daily_storage  = (storage_reward_uegoc(billable_gb) as f64 * scale) as u64;
+    let storage_plan_pay = plan.as_ref().map_or(false, |p| p.active);
+    let daily_storage  = match plan.as_ref().filter(|p| p.active) {
+        Some(p) => p.daily_uegoc,
+        None => (storage_reward_uegoc(billable_gb) as f64 * scale) as u64,
+    };
     let consensus_rate = (consensus_daily_uegoc() as f64 * scale) as u64;
     let retrieval_rate = (retrieval_reward_uegoc(1.0) as f64 * scale) as u64;
 
@@ -187,6 +192,8 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
         epoch_rewards:  daily_total.saturating_mul(7),
         total_earned,
         drs_multiplier,
+        storage_plan_pay,
+        storage_plans_kept: plan.as_ref().map_or(0, |p| p.plans.len()),
         reward_breakdown: RewardBreakdown {
             storage_rewards:   daily_storage,
             consensus_rewards: consensus_rate,
@@ -342,6 +349,7 @@ pub struct HostedStorage {
     pub reserved_bytes: u64,
     pub offered_bytes: u64,
     pub last_claim: i64,
+    pub daily_uegoc: u64,
 }
 
 pub const HOSTED_FILES_SHOWN: usize = 50;
@@ -427,6 +435,7 @@ pub async fn get_hosted_storage() -> Result<HostedStorage, EgoDesktopError> {
             out.reserved_bytes = hosting.reserved_bytes;
             out.offered_bytes = hosting.offered_bytes;
             out.last_claim = hosting.last_claim;
+            out.daily_uegoc = hosting.daily_uegoc;
         }
         out
     })

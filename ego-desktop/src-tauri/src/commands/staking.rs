@@ -1,7 +1,7 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
 use crate::ledger::{load_chain, Ledger, LedgerTx};
-use crate::tokenomics::{staking_pool_remaining_uegoc, effective_apr_bps};
+use crate::tokenomics::{staking_pool_remaining_uegoc, effective_apr_bps, node_apr_bps, node_staking_bonus_uegoc, staking_reward_uegoc};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -30,6 +30,7 @@ pub struct StakingInfo {
     pub projected_interest: u64,
     pub early_unstake_fee:  u64,
     pub positions:          Vec<StakePositionView>,
+    pub node_rate:          bool,
 }
 
 /// One stake position as the UI sees it, with its own accrued interest so each
@@ -61,16 +62,19 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
             .map(|t| (now - t).max(0) as u64)
             .unwrap_or(0);
 
-        let apr_bps = effective_apr_bps(ledger.stake_lock_days);
+        let node_rate = !ledger.address.is_empty() && crate::chain_db::node_stake_rate(&ledger.address, now);
+        let online_for = |secs: u64| if node_rate { crate::chain_db::node_stake_online_secs(&ledger.address, now, secs) } else { 0 };
+        let accrue = |amount: u64, lock_days: u32, secs: u64| {
+            staking_reward_uegoc(amount, lock_days, secs)
+                .saturating_add(node_staking_bonus_uegoc(amount, lock_days, online_for(secs)))
+        };
+        let apr_bps = if node_rate { node_apr_bps(ledger.stake_lock_days) } else { effective_apr_bps(ledger.stake_lock_days) };
 
         let pending_rewards = if ledger.staked_amount > 0 && staked_since_secs > 0 {
             let chain = load_chain();
             let pool_left = staking_pool_remaining_uegoc(&chain);
             if pool_left > 0 {
-                (ledger.staked_amount as u128
-                    * apr_bps as u128
-                    * staked_since_secs as u128
-                    / (10_000 * 31_536_000)) as u64
+                accrue(ledger.staked_amount, ledger.stake_lock_days, staked_since_secs).min(pool_left)
             } else {
                 0
             }
@@ -92,10 +96,10 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
         // the whole point of keeping them separate.
         let pool_left = staking_pool_remaining_uegoc(&load_chain());
         let positions: Vec<StakePositionView> = ledger.stake_positions.iter().map(|p| {
-            let bps  = effective_apr_bps(p.lock_days);
-            let held = (now - p.staked_at).max(0) as u128;
+            let bps  = if node_rate { node_apr_bps(p.lock_days) } else { effective_apr_bps(p.lock_days) };
+            let held = (now - p.staked_at).max(0) as u64;
             let accrued = if pool_left > 0 {
-                (p.amount_uegoc as u128 * bps as u128 * held / (10_000 * 31_536_000)) as u64
+                accrue(p.amount_uegoc, p.lock_days, held).min(pool_left)
             } else { 0 };
             StakePositionView {
                 id:         p.id.clone(),
@@ -121,6 +125,7 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
             is_locked,
             projected_interest,
             early_unstake_fee,
+            node_rate,
         })
     })
     .await

@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { useNavigate } from 'react-router-dom';
-import KeptForOthersCard from '../components/KeptForOthersCard';
 
 interface EarningsData {
   daily_rewards: number;
@@ -17,6 +16,8 @@ interface EarningsData {
   pending_rewards: number;
   session_started: number;
   coverage_online: boolean;
+  storage_plan_pay?: boolean;
+  storage_plans_kept?: number;
 }
 
 interface ChainDrs {
@@ -223,7 +224,9 @@ const EarningsPage: React.FC = () => {
       val: bd.storage_rewards,
       color: 'bg-blue-500',
       text: 'text-blue-400',
-      desc: `~$${STORAGE_USD_PER_GB_DAY}/GB/day → converted to EGOC at ${priceStr}`,
+      desc: earnings?.storage_plan_pay
+        ? `Your share of the storage plans kept here (${earnings.storage_plans_kept ?? 0}), paid at each check-in`
+        : `~$${STORAGE_USD_PER_GB_DAY}/GB/day → converted to EGOC at ${priceStr}`,
     },
     {
       label: 'Consensus',
@@ -248,7 +251,7 @@ const EarningsPage: React.FC = () => {
       text: 'text-orange-400',
       desc: `~$${RETRIEVAL_USD_PER_GB}/GB served → EGOC at ${priceStr}`,
     },
-  ] : [];
+  ].filter(b => b.label !== 'Storage' || b.val > 0) : [];
 
   // Current daily storage potential in EGOC (from backend, not hardcoded)
   const maxStorageEgocPerDay = bd ? bd.storage_rewards / 1_000_000 : 0;
@@ -283,6 +286,14 @@ const EarningsPage: React.FC = () => {
             <span className="w-2.5 h-2.5 rounded-full bg-green-400 animate-pulse shrink-0"></span>
             <div>
               <div className="text-sm font-semibold text-green-400">Storage Provider Active</div>
+              {earnings?.storage_plan_pay ? (
+              <div className="text-xs text-gray-400">
+                {allocatedGb.toFixed(1)} GB offered ·{' '}
+                {earnings.storage_plans_kept
+                  ? <><span className="text-green-300 font-semibold">{maxStorageEgocPerDay.toFixed(4)} EGOC/day</span> from {earnings.storage_plans_kept === 1 ? '1 storage plan' : `${earnings.storage_plans_kept} storage plans`} kept here</>
+                  : 'waiting to be given a storage plan to keep'}
+              </div>
+              ) : (
               <div className="text-xs text-gray-400">
                 {allocatedGb.toFixed(1)} GB · max potential{' '}
                 <span className="text-green-300 font-semibold">
@@ -291,13 +302,12 @@ const EarningsPage: React.FC = () => {
                 ≈ <span className="text-gray-500">${(STORAGE_USD_PER_GB_DAY * allocatedGb).toFixed(4)}/day</span>
                 {' '}(if fully utilized by peers)
               </div>
+              )}
             </div>
           </div>
           <button onClick={() => navigate('/storage')} className="text-xs text-blue-400 hover:text-blue-300">Manage →</button>
         </div>
       )}
-
-      <KeptForOthersCard allocatedGb={allocatedGb} onSetUp={() => navigate('/storage')} />
 
       {computeStatus?.enabled && (
         <div className="bg-gray-800 rounded-2xl border border-gray-700 p-4 flex items-center justify-between gap-4">
