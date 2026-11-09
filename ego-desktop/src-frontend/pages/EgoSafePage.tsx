@@ -93,6 +93,11 @@ const EgoSafePage: React.FC = () => {
   // (guards against React 18 batching collapsing file-receiving + file-downloaded into one render)
   const [pendingCids, setPendingCids] = useState<Set<string>>(new Set());
 
+  // An Ego link pasted by hand (copied from Storage on Ego Desktop or the iPhone).
+  const [linkText, setLinkText]       = useState('');
+  const [linkBusy, setLinkBusy]       = useState(false);
+  const [linkMsg, setLinkMsg]         = useState<{ ok: boolean; text: string } | null>(null);
+
 useEffect(() => {
   loadStoredFiles();
   invoke<Contact[]>('get_contacts')
@@ -137,6 +142,31 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
     unlistenRecv.then(fn => fn());
   };
 }, []);
+
+  async function openEgoLink() {
+    const link = linkText.trim();
+    const parts = link.split(':');
+    if (parts.length !== 5 || parts[0] !== 'egoshare1' || !parts[1] || !/^[0-9a-fA-F]{64,}$/.test(parts[2])) {
+      setLinkMsg({ ok: false, text: "That isn't an Ego link. It starts with egoshare1:" });
+      return;
+    }
+    const [, cid, key_nonce_hex, name64, from_address] = parts;
+    let display_name = cid.slice(0, 12);
+    try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
+    setLinkBusy(true);
+    setLinkMsg(null);
+    try {
+      await invoke('import_shared_file', { bundle: { cid, key_nonce_hex, display_name, from_address } });
+      await invoke('request_file_from_contact', { cid, fromAddr: from_address, content: link });
+      setLinkText('');
+      setLinkMsg({ ok: true, text: `Downloading "${display_name}". It appears under Received Files below.` });
+      loadStoredFiles();
+    } catch (e: any) {
+      setLinkMsg({ ok: false, text: `Couldn't open the link: ${e?.message ?? e}` });
+    } finally {
+      setLinkBusy(false);
+    }
+  }
 
   async function loadStoredFiles() {
   try {
@@ -507,6 +537,28 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
             <p className="text-xs text-gray-400 mt-0.5">Files shared with you via EgoSafe</p>
           </div>
           <button onClick={loadStoredFiles} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
+        </div>
+        <div className="px-5 py-3 border-b border-gray-700">
+          <div className="flex gap-2">
+            <input
+              value={linkText}
+              onChange={e => { setLinkText(e.target.value); setLinkMsg(null); }}
+              onKeyDown={e => { if (e.key === 'Enter' && linkText.trim() && !linkBusy) openEgoLink(); }}
+              placeholder="Paste an Ego link (egoshare1:…) someone sent you"
+              spellCheck={false}
+              className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:border-blue-500"
+            />
+            <button
+              onClick={openEgoLink}
+              disabled={!linkText.trim() || linkBusy}
+              className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 px-4 py-2 rounded-lg text-xs font-semibold transition"
+            >
+              {linkBusy ? 'Opening…' : 'Open link'}
+            </button>
+          </div>
+          {linkMsg && (
+            <p className={`text-xs mt-2 ${linkMsg.ok ? 'text-green-400' : 'text-red-400'}`}>{linkMsg.text}</p>
+          )}
         </div>
         {receivedFiles.length === 0 ? (
           <div className="py-10 text-center text-gray-500">
