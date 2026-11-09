@@ -56,6 +56,8 @@ char *ego_wallet_dilithium_public_key(const uint8_t *seed, size_t seed_len);
    key, deterministically with an empty context: {"signature": hex}. */
 char *ego_wallet_dilithium_sign(const uint8_t *seed, size_t seed_len, const uint8_t *message, size_t message_len);
 
+char *ego_ai_answer(const char *question, const char *last_question);
+
 void ego_wallet_string_free(char *s);
 
 #endif

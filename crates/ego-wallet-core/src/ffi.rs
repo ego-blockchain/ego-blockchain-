@@ -613,3 +613,16 @@ mod tests {
         unsafe { ego_wallet_string_free(std::ptr::null_mut()) };
     }
 }
+
+unsafe fn text_from<'a>(ptr: *const c_char) -> Option<&'a str> {
+    (!ptr.is_null()).then(|| std::ffi::CStr::from_ptr(ptr).to_str().ok()).flatten()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ego_ai_answer(question: *const c_char, last_question: *const c_char) -> *mut c_char {
+    let Some(question) = text_from(question) else {
+        return error("The question must be text.");
+    };
+    let answer = crate::ai::answer(question, text_from(last_question).filter(|t| !t.is_empty()));
+    to_c(serde_json::json!({ "answer": answer }))
+}

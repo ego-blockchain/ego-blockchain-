@@ -4,6 +4,7 @@
 //! either side shows the same addresses. The iPhone reaches this through the
 //! C functions in [`ffi`].
 
+pub mod ai;
 pub mod cardano;
 pub mod derive;
 pub mod dilithium;
