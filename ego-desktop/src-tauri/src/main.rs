@@ -528,6 +528,7 @@ fn headless_main() {
 
         tokio::spawn(crate::gateway::supervise());
         tokio::spawn(crate::account_record::run());
+        tokio::spawn(crate::phone_mail::run_catch_up());
         tokio::spawn(crate::commands::storage::renew_loop());
 
         tokio::spawn(async {
@@ -1765,6 +1766,7 @@ fn main() {
 
             tauri::async_runtime::spawn(crate::gateway::supervise());
             tauri::async_runtime::spawn(crate::account_record::run());
+            tauri::async_runtime::spawn(crate::phone_mail::run_catch_up());
             tauri::async_runtime::spawn(crate::commands::storage::renew_loop());
 
             tauri::async_runtime::spawn(async move {

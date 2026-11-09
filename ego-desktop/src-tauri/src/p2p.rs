@@ -17266,7 +17266,7 @@ pub const DM_TOPIC: &str = "ego-dm-v1";
 static DM_SEEN: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 const DM_SEEN_TTL_SECS: i64 = 3600;
 
-fn dm_already_seen(id: &str) -> bool {
+pub(crate) fn dm_already_seen(id: &str) -> bool {
     let now = Utc::now().timestamp();
     let mut map = DM_SEEN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     map.retain(|_, ts| now - *ts < DM_SEEN_TTL_SECS);

@@ -25,6 +25,11 @@ const SKEW_SECS: i64 = 600;
 const STORE_CAP_BYTES: u64 = 128 * 1024 * 1024;
 const HOLD_CACHE_SECS: i64 = 600;
 const HOLD_CACHE_MAX: usize = 20_000;
+const CATCH_UP_FIRST_SECS: u64 = 90;
+const CATCH_UP_EVERY_SECS: u64 = 600;
+const CATCH_UP_LOOK_BACK_MS: i64 = 2 * 86_400_000;
+const CATCH_UP_PAGES: usize = 5;
+const BOOTSTRAP_EVERY_SECS: i64 = 6 * 3600;
 
 type RpcResult = Result<Value, (i32, String)>;
 
@@ -50,6 +55,7 @@ static LOCK: Mutex<()> = Mutex::new(());
 static USAGE: Mutex<Option<u64>> = Mutex::new(None);
 static HOLDS: Mutex<Option<HashMap<String, (bool, i64)>>> = Mutex::new(None);
 static SENDS: Mutex<Option<HashMap<String, std::collections::VecDeque<i64>>>> = Mutex::new(None);
+static BOOTSTRAPPED_AT: Mutex<i64> = Mutex::new(0);
 
 fn is_hex(s: &str, len: Option<usize>) -> bool {
     len.map_or(s.len() % 2 == 0, |l| s.len() == l) && s.bytes().all(|c| c.is_ascii_hexdigit())
@@ -576,6 +582,126 @@ pub async fn mirror(inner: crate::p2p::P2PMessage) {
     push_own(&me, &key, &my_ed, sealed).await;
 }
 
+fn cursor_path(owner: &str) -> PathBuf {
+    dir().join(format!("{owner}.cursors.json"))
+}
+
+fn load_cursors(owner: &str) -> HashMap<String, i64> {
+    std::fs::read(cursor_path(owner)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_cursors(owner: &str, cursors: &HashMap<String, i64>) {
+    let _ = std::fs::create_dir_all(dir());
+    if let Ok(bytes) = serde_json::to_vec(cursors) {
+        let _ = crate::utils::atomic_write(&cursor_path(owner), &bytes);
+    }
+}
+
+async fn bootstrap_gateways(now: i64) {
+    {
+        let mut at = BOOTSTRAPPED_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if now - *at < BOOTSTRAP_EVERY_SECS {
+            return;
+        }
+        *at = now;
+    }
+    let Some(client) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok() else { return };
+    let Ok(resp) = client.get(format!("{}/gateways", crate::p2p::ORACLE_RPC)).send().await else { return };
+    let Ok(body) = resp.json::<Value>().await else { return };
+    for a in body["gateways"].as_array().cloned().unwrap_or_default() {
+        if let Ok(a) = serde_json::from_value::<crate::gateway::Announcement>(a) {
+            crate::gateway::learn(a, now);
+        }
+    }
+}
+
+fn own_places(me: &str, now: i64) -> Vec<(String, String)> {
+    let nodes = crate::account_record::listed_nodes(now);
+    let names: Vec<String> = nodes.iter().map(|(n, _)| n.clone()).collect();
+    crate::account_record::places(me, &names, crate::account_record::PLACES)
+        .into_iter()
+        .filter(|n| n != me)
+        .filter_map(|n| nodes.iter().find(|(m, _)| m == &n).cloned())
+        .collect()
+}
+
+pub fn worth_opening(kept: &Kept, me: &str, since: i64) -> bool {
+    kept.at > since && kept.sealed.to == me && kept.by != me && valid(&kept.sealed)
+}
+
+pub async fn catch_up() {
+    let Ok(Some((me, seed))) = tokio::task::spawn_blocking(|| {
+        let me = crate::ledger::Ledger::load().address;
+        if me.is_empty() {
+            return None;
+        }
+        Some((me, crate::ledger::load_seed().ok().flatten()?))
+    })
+    .await
+    else {
+        return;
+    };
+    let Ok(key) = crate::account_record::signing_key(&seed) else { return };
+    if crate::market_chain::address_of(&key.verifying_key().to_bytes()) != me {
+        return;
+    }
+    let now = chrono::Utc::now();
+    let mut places = own_places(&me, now.timestamp());
+    if places.is_empty() {
+        bootstrap_gateways(now.timestamp()).await;
+        places = own_places(&me, now.timestamp());
+    }
+    if places.is_empty() {
+        return;
+    }
+    use ed25519_dalek::Signer;
+    let pubkey = hex::encode(key.verifying_key().to_bytes());
+    let owner = me.clone();
+    let mut cursors = tokio::task::spawn_blocking(move || load_cursors(&owner)).await.unwrap_or_default();
+    let floor = now.timestamp_millis() - CATCH_UP_LOOK_BACK_MS;
+    let mut opened = 0usize;
+    for (node, endpoint) in places {
+        let mut since = cursors.get(&node).copied().unwrap_or(floor).max(floor);
+        for _ in 0..CATCH_UP_PAGES {
+            let ts = chrono::Utc::now().timestamp();
+            let sig = key.sign(&get_bytes(&me, ts));
+            let params = json!({ "owner": me, "ts": ts, "since": since, "pubkey": pubkey, "sig": hex::encode(sig.to_bytes()) });
+            let Some(answer) = crate::account_record::call_peer(&endpoint, "mail.get", params).await else { break };
+            let mail: Vec<Kept> = serde_json::from_value(answer["mail"].clone()).unwrap_or_default();
+            if mail.is_empty() {
+                break;
+            }
+            for kept in &mail {
+                if !worth_opening(kept, &me, since) || crate::p2p::dm_already_seen(&kept.sealed.id) {
+                    continue;
+                }
+                if let Some(inner) = crate::p2p::open_dm(&kept.sealed.eph_pub, &kept.sealed.nonce, &kept.sealed.ct) {
+                    crate::p2p::handle_incoming(inner, crate::p2p::APP_HANDLE.get()).await;
+                    opened += 1;
+                }
+            }
+            since = mail.iter().map(|k| k.at).max().unwrap_or(since).max(since);
+            if !answer["more"].as_bool().unwrap_or(false) {
+                break;
+            }
+        }
+        cursors.insert(node, since);
+    }
+    let owner = me.clone();
+    let _ = tokio::task::spawn_blocking(move || save_cursors(&owner, &cursors)).await;
+    if opened > 0 {
+        tracing::info!("[Mail] picked up {opened} messages sent while this computer was away");
+    }
+}
+
+pub async fn run_catch_up() {
+    tokio::time::sleep(std::time::Duration::from_secs(CATCH_UP_FIRST_SECS)).await;
+    loop {
+        catch_up().await;
+        tokio::time::sleep(std::time::Duration::from_secs(CATCH_UP_EVERY_SECS)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +780,16 @@ mod tests {
             .sum();
         assert_eq!(total, kept.len());
         assert!(chunks.iter().all(|c| c.len() <= HISTORY_CHUNK_BYTES + 2_048));
+    }
+
+    #[test]
+    fn a_desktop_only_opens_new_mail_others_sent_it() {
+        let me = "egot1me";
+        let fresh = kept(me, 1, "egot1friend", 500);
+        assert!(worth_opening(&fresh, me, 400));
+        assert!(!worth_opening(&fresh, me, 500), "already read up to here");
+        assert!(!worth_opening(&kept(me, 2, me, 600), me, 400), "its own copies are for the phone");
+        assert!(!worth_opening(&kept("egot1other", 3, "egot1friend", 600), me, 400));
     }
 
     #[test]

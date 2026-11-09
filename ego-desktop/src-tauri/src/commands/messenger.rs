@@ -1634,6 +1634,7 @@ pub async fn broadcast_profile(avatar: String) {
             delivered = p2p::send_message(&ep, &msg).await.is_ok();
         }
         if !delivered {
+            crate::commands::outbox::enqueue_latest(&contact.address, &contact.endpoint, &msg, "profile_update");
             p2p::gossip_sealed_dm(&contact.address, &contact.ed25519_pubkey, &msg).await;
         }
     }

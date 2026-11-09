@@ -49,6 +49,17 @@ pub fn enqueue(to_addr: &str, endpoint: &str, msg: &crate::p2p::P2PMessage) {
     eprintln!("[Outbox] Queued message for {} (total: {})", to_addr, entries.len());
 }
 
+pub fn enqueue_latest(to_addr: &str, endpoint: &str, msg: &crate::p2p::P2PMessage, kind: &str) {
+    let tag = format!("\"type\":\"{kind}\"");
+    let mut entries = load_outbox();
+    let before = entries.len();
+    entries.retain(|e| !(e.to_addr == to_addr && e.msg_json.contains(&tag)));
+    if entries.len() != before {
+        save_outbox(&entries);
+    }
+    enqueue(to_addr, endpoint, msg);
+}
+
 pub async fn flush_for(addr: &str, fresh_endpoint: Option<&str>) {
     let mut entries = load_outbox();
     if entries.is_empty() { return; }
