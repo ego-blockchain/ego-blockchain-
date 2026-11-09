@@ -63,7 +63,7 @@ jobs:
   xcframework:
     name: Build EgoWalletCore.xcframework
     needs: agree-with-desktop
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       IPHONEOS_DEPLOYMENT_TARGET: '17.0'
       MACOSX_DEPLOYMENT_TARGET: '14.0'
