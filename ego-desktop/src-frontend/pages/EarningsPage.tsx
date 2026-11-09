@@ -18,6 +18,10 @@ interface EarningsData {
   coverage_online: boolean;
   storage_plan_pay?: boolean;
   storage_plans_kept?: number;
+  storage_used_bytes?: number;
+  storage_reserved_bytes?: number;
+  storage_earned_24h_uegoc?: number;
+  storage_earned_total_uegoc?: number;
 }
 
 interface ChainDrs {
@@ -71,6 +75,13 @@ interface ComputeEarnings {
 interface ComputeStatus {
   enabled:     boolean;
   earnings_uegoc: number;
+}
+
+function fmtBytes(bytes: number) {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+  if (bytes > 0) return `${Math.max(1, Math.round(bytes / 1e3))} KB`;
+  return '0 GB';
 }
 
 function fmtEgoc(uegoc: number, decimals = 4) {
@@ -227,6 +238,11 @@ const EarningsPage: React.FC = () => {
       desc: earnings?.storage_plan_pay
         ? `Your share of the storage plans kept here (${earnings.storage_plans_kept ?? 0}), paid at each check-in`
         : `~$${STORAGE_USD_PER_GB_DAY}/GB/day → converted to EGOC at ${priceStr}`,
+      detail: isStorageSetup
+        ? `${fmtBytes(Math.max(earnings?.storage_used_bytes ?? 0, earnings?.storage_reserved_bytes ?? 0))} used of ${allocatedGb.toFixed(1)} GB set aside`
+          + ` (${fmtBytes(earnings?.storage_used_bytes ?? 0)} of files kept, ${fmtBytes(earnings?.storage_reserved_bytes ?? 0)} reserved for plans)`
+          + ` · earned ${fmtEgoc(earnings?.storage_earned_24h_uegoc ?? 0, 4)} EGOC in the last 24 hours, ${fmtEgoc(earnings?.storage_earned_total_uegoc ?? 0, 4)} EGOC in all`
+        : 'No space set aside yet. Set it up in Storage to keep plans for other people and earn.',
     },
     {
       label: 'Consensus',
@@ -251,7 +267,7 @@ const EarningsPage: React.FC = () => {
       text: 'text-orange-400',
       desc: `~$${RETRIEVAL_USD_PER_GB}/GB served → EGOC at ${priceStr}`,
     },
-  ].filter(b => b.label !== 'Storage' || b.val > 0) : [];
+  ] : [];
 
   // Current daily storage potential in EGOC (from backend, not hardcoded)
   const maxStorageEgocPerDay = bd ? bd.storage_rewards / 1_000_000 : 0;
@@ -440,6 +456,9 @@ const EarningsPage: React.FC = () => {
                       style={{ width: `${pct}%` }}
                     />
                   </div>
+                  {'detail' in bucket && bucket.detail && (
+                    <div className="text-xs text-gray-400 mt-1.5">{bucket.detail}</div>
+                  )}
                 </div>
               );
             })}
@@ -449,7 +468,7 @@ const EarningsPage: React.FC = () => {
             <div className="text-xs text-gray-400 mb-3">Criteria to qualify for each reward</div>
             <div className="grid grid-cols-2 gap-2 text-xs">
               {[
-                { label: 'Storage',   desc: 'Allocate space AND have it used by network peers — reward tracks USD value, not a fixed EGOC amount' },
+                { label: 'Storage',   desc: 'Set aside space and stay online: each storage plan is kept by 3 computers, and each is paid its share of the plan whether the space is used or not' },
                 { label: 'Consensus', desc: 'Node must be online and actively participating in block validation rounds' },
                 { label: 'Coverage',  desc: 'PoC beacon must be online without VPN and pass geographic proof challenges' },
                 { label: 'Retrieval', desc: 'Only paid when other nodes actually request and download data from you' },

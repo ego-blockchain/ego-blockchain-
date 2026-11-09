@@ -23,12 +23,21 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
     let now = chrono::Utc::now().timestamp();
 
     // All blocking I/O in one spawn_blocking call.
-    let (ledger, scale, plan) = tokio::task::spawn_blocking(move || {
+    let (ledger, scale, plan, storage_pay) = tokio::task::spawn_blocking(move || {
         let ledger = Ledger::load();
         let chain  = load_chain();
         let scale  = node_reward_scale(&chain);
         let plan   = (!ledger.address.is_empty()).then(|| crate::chain_db::plan_hosting(&ledger.address));
-        (ledger, scale, plan)
+        let storage_pay: Vec<(i64, u64)> = if ledger.address.is_empty() {
+            Vec::new()
+        } else {
+            crate::chain_db::reward_entries_for(&ledger.address)
+                .into_iter()
+                .filter(|r| r.kind == crate::chain_db::REWARD_STORAGE)
+                .map(|r| (r.timestamp, r.amount_uegoc))
+                .collect()
+        };
+        (ledger, scale, plan, storage_pay)
     })
     .await
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
@@ -194,6 +203,10 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
         drs_multiplier,
         storage_plan_pay,
         storage_plans_kept: plan.as_ref().map_or(0, |p| p.plans.len()),
+        storage_used_bytes: hosted_bytes,
+        storage_reserved_bytes: plan.as_ref().map_or(0, |p| p.reserved_bytes),
+        storage_earned_24h_uegoc: storage_pay.iter().filter(|(t, _)| now - t < 86_400).map(|(_, a)| *a).sum(),
+        storage_earned_total_uegoc: storage_pay.iter().map(|(_, a)| *a).sum(),
         reward_breakdown: RewardBreakdown {
             storage_rewards:   daily_storage,
             consensus_rewards: consensus_rate,

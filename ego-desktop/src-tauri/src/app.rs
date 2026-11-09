@@ -179,6 +179,14 @@ pub struct EarningsData {
     pub storage_plan_pay: bool,
     #[serde(default)]
     pub storage_plans_kept: usize,
+    #[serde(default)]
+    pub storage_used_bytes: u64,
+    #[serde(default)]
+    pub storage_reserved_bytes: u64,
+    #[serde(default)]
+    pub storage_earned_24h_uegoc: u64,
+    #[serde(default)]
+    pub storage_earned_total_uegoc: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
