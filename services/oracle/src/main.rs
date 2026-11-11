@@ -3,6 +3,7 @@ mod archive;
 mod comments;
 mod dns;
 mod gateways;
+mod push;
 
 use axum::{
     extract::{Path, State},
@@ -1625,6 +1626,7 @@ async fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| chain_data_path().with_file_name("blog-comments.json"));
     comments::init(comments_path).await;
+    push::init(chain_data_path().with_file_name("push-devices.json")).await;
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
@@ -1651,6 +1653,8 @@ async fn main() {
         .route("/gateways",                 get(gateways::handle_list))
         .route("/gateways/register",        post(gateways::handle_register))
         .route("/gateways/check",           post(gateways::handle_check))
+        .route("/push/register",            post(push::handle_register))
+        .route("/push/notify",              post(push::handle_notify))
         .route("/blog/comments/:slug",      get(comments::handle_list).post(comments::handle_create))
         .route("/blog/comments/:slug/:id/edit",   post(comments::handle_edit))
         .route("/blog/comments/:slug/:id/delete", post(comments::handle_delete))

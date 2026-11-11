@@ -48,3 +48,30 @@ jobs:
             $RELAY_USER@$RELAY_HOST:/tmp/ego-oracle
           ssh -i /tmp/oracle_key -o StrictHostKeyChecking=no $RELAY_USER@$RELAY_HOST \
             'sudo mv /tmp/ego-oracle /usr/local/bin/ego-oracle && sudo chmod +x /usr/local/bin/ego-oracle && sudo systemctl restart ego-oracle || true'
+
+      # Apple's push key for chat alerts on iPhone (services/oracle/src/push.rs).
+      # Set the secrets APNS_KEY_P8 (the .p8 file's text) and APNS_KEY_ID once;
+      # without them the server still runs and simply sends no alerts.
+      - name: Install Apple push key
+        env:
+          SSH_KEY:      ${{ secrets.RELAY_SSH_KEY }}
+          RELAY_HOST:   ${{ secrets.RELAY_HOST }}
+          RELAY_USER:   ${{ secrets.RELAY_USER }}
+          APNS_KEY_P8:  ${{ secrets.APNS_KEY_P8 }}
+          APNS_KEY_ID:  ${{ secrets.APNS_KEY_ID }}
+        if: ${{ env.SSH_KEY != '' && env.APNS_KEY_P8 != '' && env.APNS_KEY_ID != '' }}
+        run: |
+          echo "$SSH_KEY" > /tmp/oracle_key && chmod 600 /tmp/oracle_key
+          printf '%s\n' "$APNS_KEY_P8" > /tmp/apns.p8
+          printf '{"key_id":"%s","team_id":"L6V6UNMLXM","topic":"com.egoblockchain.wallet"}\n' "$APNS_KEY_ID" > /tmp/apns.json
+          scp -i /tmp/oracle_key -o StrictHostKeyChecking=no /tmp/apns.p8 /tmp/apns.json $RELAY_USER@$RELAY_HOST:/tmp/
+          ssh -i /tmp/oracle_key -o StrictHostKeyChecking=no $RELAY_USER@$RELAY_HOST '
+            data=$(systemctl show ego-oracle -p Environment --value | tr " " "\n" | sed -n "s/^ORACLE_DATA=//p")
+            dir=$(dirname "${data:-/var/lib/ego-oracle/chain.json}")
+            user=$(systemctl show ego-oracle -p User --value); user=${user:-root}
+            sudo mkdir -p "$dir"
+            sudo mv /tmp/apns.p8 /tmp/apns.json "$dir/"
+            sudo chown "$user" "$dir/apns.p8" "$dir/apns.json"
+            sudo chmod 600 "$dir/apns.p8" "$dir/apns.json"
+            echo "Apple push key installed in $dir"'
+          rm -f /tmp/apns.p8 /tmp/apns.json /tmp/oracle_key

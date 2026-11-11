@@ -1072,6 +1072,7 @@ pub async fn send_message(
     );
 
     let stored_endpoint = contacts[contact_pos].endpoint.clone();
+    let shared_key_hex  = contacts[contact_pos].shared_key_hex.clone();
     let all_endpoints   = contacts[contact_pos].all_endpoints.clone();
     let contact_ed25519 = contacts[contact_pos].ed25519_pubkey.clone();
 
@@ -1083,6 +1084,10 @@ pub async fn send_message(
 
     let mut msgs = load_messages();
     if !is_control_type(&message_type) {
+    // The other person's iPhone shows an alert even while Ego Wallet is closed.
+    crate::push_alerts::message_sent(
+        contact_addr.clone(), format!("{}-{}", ts, &nonce_hex[..8]), content.clone(), is_file_bundle, shared_key_hex,
+    );
     msgs.push(Message {
         id:           format!("{}-{}", ts, &nonce_hex[..8]),
         from:         my_addr.clone(),

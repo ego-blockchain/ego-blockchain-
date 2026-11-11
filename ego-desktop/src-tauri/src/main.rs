@@ -40,6 +40,7 @@ mod gateway;
 mod router_v6;
 mod account_record;
 mod phone_mail;
+mod push_alerts;
 mod webrtc_gateway;
 mod phone_storage;
 mod phone_dao;
