@@ -125,7 +125,10 @@ const PLANS: SubscriptionPlan[] = [
   { id: 'basic', name: 'Basic', gb: 50,   priceMonthlyUsd: 0.79,  priceAnnualUsd: 7.90   },
   { id: 'pro',   name: 'Pro',   gb: 200,  priceMonthlyUsd: 1.99,  priceAnnualUsd: 19.90, highlight: true },
   { id: 'max',   name: 'Max',   gb: 1024, priceMonthlyUsd: 4.99,  priceAnnualUsd: 49.90  },
+  { id: 'ultra', name: 'Ultra', gb: 2048, priceMonthlyUsd: 7.99,  priceAnnualUsd: 79.90  },
+  { id: 'mega',  name: 'Mega',  gb: 10240, priceMonthlyUsd: 39.99, priceAnnualUsd: 399.90 },
 ];
+const ALWAYS_OPEN = ['free', 'basic', 'pro', 'max'];
 
 const FREE_GB = 5;
 
@@ -223,6 +226,9 @@ const StoragePage: React.FC = () => {
   const pendingSubRef = useRef<{ sub: ActiveSubscription; until: number } | null>(null);
   const [renewProblem, setRenewProblem] = useState<string | null>(null);
   const [renewWarning, setRenewWarning] = useState<string | null>(null);
+  const [openPlans, setOpenPlans] = useState<string[]>([]);
+  const visiblePlans = PLANS.filter(p => ALWAYS_OPEN.includes(p.id) || openPlans.includes(p.name));
+  const largestPlanGb = Math.max(...visiblePlans.map(p => p.gb));
 
   async function refreshPlan() {
     try {
@@ -231,7 +237,9 @@ const StoragePage: React.FC = () => {
         auto_renew: boolean;
         renew_problem: string | null;
         renew_warning: string | null;
+        open_plans?: string[];
       }>('get_storage_plan');
+      setOpenPlans(status.open_plans ?? []);
       setRenewProblem(status.renew_problem);
       setRenewWarning(status.renew_warning);
       const pending = pendingSubRef.current;
@@ -330,9 +338,9 @@ const StoragePage: React.FC = () => {
     setSubError('');
     // In manage mode, pre-select the next plan up so the user can't accidentally re-buy the same one.
     if (manage && subscription) {
-      const idx = PLANS.findIndex(p => p.id === subscription.plan);
-      const next = PLANS[Math.min(idx + 1, PLANS.length - 1)];
-      setSubPlan(next.id !== subscription.plan ? next.id : PLANS.find(p => p.id !== subscription.plan && p.gb > 0)?.id ?? 'pro');
+      const idx = visiblePlans.findIndex(p => p.id === subscription.plan);
+      const next = visiblePlans[Math.min(idx + 1, visiblePlans.length - 1)];
+      setSubPlan(next.id !== subscription.plan ? next.id : visiblePlans.find(p => p.id !== subscription.plan && p.gb > 0)?.id ?? 'pro');
     }
     setShowSubModal(true);
     // Fetch capacity first (fast, local peer data) — gates the plan cards immediately.
@@ -734,7 +742,7 @@ const StoragePage: React.FC = () => {
                   )}
                   {!subValid && !nearLimit && (
                     <div className="text-xs text-emerald-400">
-                      Need more room? Plans start at 0.79 EGUSD a month for 50 GB, up to 1 TB.
+                      Need more room? Plans start at 0.79 EGUSD a month for 50 GB, up to {largestPlanGb >= 1024 ? `${Math.round(largestPlanGb / 1024)} TB` : `${largestPlanGb} GB`}.
                     </div>
                   )}
                 </div>
@@ -1274,8 +1282,8 @@ const StoragePage: React.FC = () => {
               })()}
 
               {/* Plans grid */}
-              <div className="grid grid-cols-4 gap-2">
-                {PLANS.map(plan => {
+              <div className={`grid ${visiblePlans.length > 4 ? 'grid-cols-3' : 'grid-cols-4'} gap-2`}>
+                {visiblePlans.map(plan => {
                   const priceUsd    = subBilling === 'annual' ? plan.priceAnnualUsd : plan.priceMonthlyUsd;
                   const egocAmt     = priceUsd > 0 ? (priceUsd / egocPriceUsd).toFixed(2) : '0';
                   const perMonthUsd = subBilling === 'annual' && plan.priceAnnualUsd > 0

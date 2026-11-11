@@ -147,40 +147,53 @@ pub struct FilePreview {
     pub previewable: bool,
 }
 
-const STORAGE_PLANS: [(&str, u64, f64, f64); 3] = [
-    ("Basic", 50, 0.79, 7.90),
-    ("Pro", 200, 1.99, 19.90),
-    ("Max", 1024, 4.99, 49.90),
+const STORAGE_PLANS: [(&str, u64, f64, f64, u64); 5] = [
+    ("Basic", 50, 0.79, 7.90, 0),
+    ("Pro", 200, 1.99, 19.90, 0),
+    ("Max", 1024, 4.99, 49.90, 0),
+    ("Ultra", 2048, 7.99, 79.90, BIG_PLANS_FROM_HEIGHT),
+    ("Mega", 10240, 39.99, 399.90, BIG_PLANS_FROM_HEIGHT),
 ];
+pub const BIG_PLANS_FROM_HEIGHT: u64 = 109_635;
+
+fn plan_at(name: &str, height: u64) -> Option<(u64, f64, f64)> {
+    STORAGE_PLANS.iter()
+        .find(|(n, .., from)| *n == name && height >= *from)
+        .map(|(_, gb, monthly, annual, _)| (*gb, *monthly, *annual))
+}
+
+fn open_plan_names(height: u64) -> Vec<&'static str> {
+    STORAGE_PLANS.iter().filter(|(.., from)| height >= *from).map(|(n, ..)| *n).collect()
+}
 const PLAN_PRICE_TOLERANCE: f64 = 0.5;
 pub(crate) const STORAGE_FEE_SINK: &str = "egot1feesink0000000000000000000000000000000";
 
 /// (GB, price in micro-USD, period in seconds) of a plan bought with EGUSD, from its memo.
-pub(crate) fn egusd_plan_terms(memo: &str) -> Option<(u64, u64, i64)> {
-    plan_paid_in_egusd(memo)?;
+pub(crate) fn egusd_plan_terms(memo: &str, height: u64) -> Option<(u64, u64, i64)> {
+    plan_paid_in_egusd(memo, height)?;
     let mut parts = memo.split(':').skip(3);
     let (name, billing) = (parts.next()?, parts.next()?);
-    let (gb, price_usd, period_secs) = plan_price_usd(name, billing)?;
+    let (gb, price_usd, period_secs) = plan_price_usd(name, billing, height)?;
     Some((gb, (price_usd * 1_000_000.0).round() as u64, period_secs))
 }
 
-fn plan_price_usd(name: &str, billing: &str) -> Option<(u64, f64, i64)> {
-    let (_, gb, monthly, annual) = STORAGE_PLANS.iter().find(|(n, ..)| *n == name)?;
+fn plan_price_usd(name: &str, billing: &str, height: u64) -> Option<(u64, f64, i64)> {
+    let (gb, monthly, annual) = plan_at(name, height)?;
     match billing {
-        "monthly" => Some((*gb, *monthly, 30 * 86_400)),
-        "annual" => Some((*gb, *annual, 365 * 86_400)),
+        "monthly" => Some((gb, monthly, 30 * 86_400)),
+        "annual" => Some((gb, annual, 365 * 86_400)),
         _ => None,
     }
 }
 
-pub(crate) fn plan_paid_in_egusd(memo: &str) -> Option<(u64, i64)> {
+pub(crate) fn plan_paid_in_egusd(memo: &str, height: u64) -> Option<(u64, i64)> {
     let rest = memo.strip_prefix("credits_pay:")?;
     let mut parts = rest.split(':');
     let credits: u64 = parts.next()?.parse().ok()?;
     if parts.next()? != "plan" {
         return None;
     }
-    let (gb, price_usd, period_secs) = plan_price_usd(parts.next()?, parts.next()?)?;
+    let (gb, price_usd, period_secs) = plan_price_usd(parts.next()?, parts.next()?, height)?;
     if parts.next().is_some() {
         return None;
     }
@@ -210,8 +223,10 @@ pub async fn subscribe_storage_plan(
 }
 
 async fn pay_for_plan(state: &AppState, plan: &str, billing: &str) -> Result<String, EgoDesktopError> {
-    let (_, price_usd, _) = plan_price_usd(plan, billing)
-        .ok_or_else(|| EgoDesktopError::InvalidInput("Choose Basic, Pro or Max, billed monthly or annual.".into()))?;
+    let height = crate::chain_db::local_chain_height().saturating_add(1);
+    let (_, price_usd, _) = plan_price_usd(plan, billing, height).ok_or_else(|| {
+        EgoDesktopError::InvalidInput(format!("Choose {}, billed monthly or annual.", open_plan_names(height).join(", ")))
+    })?;
     let credits = crate::chain_db::usd_to_credits(price_usd);
     let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = Ledger::load();
@@ -235,21 +250,21 @@ async fn pay_for_plan(state: &AppState, plan: &str, billing: &str) -> Result<Str
     Ok(hash)
 }
 
-pub(crate) fn paid_plan(memo: &str, amount_uegoc: u64, egoc_usd: f64) -> Option<(u64, i64)> {
+pub(crate) fn paid_plan(memo: &str, amount_uegoc: u64, egoc_usd: f64, height: u64) -> Option<(u64, i64)> {
     let rest = memo.strip_prefix("Ego Storage ")?;
     let (name, rest) = rest.split_once(' ')?;
     let billing = rest.trim_start_matches(|c: char| c == '–' || c == '-' || c == ' ').split_whitespace().next()?;
-    let (_, gb, monthly, annual) = STORAGE_PLANS.iter().find(|(n, ..)| *n == name)?;
+    let (gb, monthly, annual) = plan_at(name, height)?;
     let (price_usd, period_secs) = match billing {
-        "monthly" => (*monthly, 30 * 86_400),
-        "annual" => (*annual, 365 * 86_400),
+        "monthly" => (monthly, 30 * 86_400),
+        "annual" => (annual, 365 * 86_400),
         _ => return None,
     };
     if !(egoc_usd.is_finite() && egoc_usd > 0.0) {
         return None;
     }
     let paid_usd = amount_uegoc as f64 / 1_000_000.0 * egoc_usd;
-    (paid_usd >= price_usd * PLAN_PRICE_TOLERANCE).then_some((*gb, period_secs))
+    (paid_usd >= price_usd * PLAN_PRICE_TOLERANCE).then_some((gb, period_secs))
 }
 
 /// The storage space `address` has paid for: its newest valid plan payment on
@@ -277,8 +292,8 @@ struct PlanPayment {
     paid_at: i64,
 }
 
-fn plan_named(name: &str, billing: &str) -> Option<(&'static str, &'static str)> {
-    let name = STORAGE_PLANS.iter().find(|(n, ..)| *n == name)?.0;
+fn plan_named(name: &str, billing: &str, height: u64) -> Option<(&'static str, &'static str)> {
+    let name = STORAGE_PLANS.iter().find(|(n, .., from)| *n == name && height >= *from)?.0;
     let billing = match billing {
         "monthly" => "monthly",
         "annual" => "annual",
@@ -289,17 +304,18 @@ fn plan_named(name: &str, billing: &str) -> Option<(&'static str, &'static str)>
 
 fn plan_payment(tx: &LedgerTx, egoc_usd: f64) -> Option<PlanPayment> {
     let memo = tx.memo.as_deref().unwrap_or("");
+    let height = tx.block_height.unwrap_or(0);
     let (gb, period_secs, name, billing) = if tx.tx_type == "credits_pay" && tx.to == STORAGE_FEE_SINK {
-        let (gb, period) = plan_paid_in_egusd(memo)?;
+        let (gb, period) = plan_paid_in_egusd(memo, height)?;
         let mut parts = memo.split(':').skip(3);
-        let (name, billing) = plan_named(parts.next()?, parts.next()?)?;
+        let (name, billing) = plan_named(parts.next()?, parts.next()?, height)?;
         (gb, period, name, billing)
     } else if tx.tx_type == "transfer" && tx.to == "egot1storagefees000000000000000000000000000000" {
-        let (gb, period) = paid_plan(memo, tx.amount, egoc_usd)?;
+        let (gb, period) = paid_plan(memo, tx.amount, egoc_usd, height)?;
         let rest = memo.strip_prefix("Ego Storage ")?;
         let (name, rest) = rest.split_once(' ')?;
         let billing = rest.trim_start_matches(|c: char| c == '–' || c == '-' || c == ' ').split_whitespace().next()?;
-        let (name, billing) = plan_named(name, billing)?;
+        let (name, billing) = plan_named(name, billing, height)?;
         (gb, period, name, billing)
     } else {
         return None;
@@ -345,6 +361,7 @@ pub struct StoragePlanStatus {
     pub auto_renew: bool,
     pub renew_problem: Option<String>,
     pub renew_warning: Option<String>,
+    pub open_plans: Vec<&'static str>,
 }
 
 static RENEW_STATE: std::sync::Mutex<(i64, Option<String>)> = std::sync::Mutex::new((0, None));
@@ -363,6 +380,7 @@ pub async fn get_storage_plan() -> Result<StoragePlanStatus, EgoDesktopError> {
             auto_renew,
             renew_problem: RENEW_STATE.lock().unwrap_or_else(|e| e.into_inner()).1.clone(),
             renew_warning,
+            open_plans: open_plan_names(crate::chain_db::local_chain_height().saturating_add(1)),
         }
     })
     .await
@@ -381,7 +399,7 @@ fn low_balance_warning(plan: &ActivePlan, now: i64, auto_renew: bool, have: u64)
     if !auto_renew || now >= plan.expires_at || plan.expires_at - now > LOW_BALANCE_WARN_SECS {
         return None;
     }
-    let (_, price_usd, _) = plan_price_usd(&plan.name, &plan.billing)?;
+    let (_, price_usd, _) = plan_price_usd(&plan.name, &plan.billing, u64::MAX)?;
     let price = crate::chain_db::usd_to_credits(price_usd);
     if have >= price {
         return None;
@@ -414,8 +432,15 @@ fn warn_low_balance_once() {
 }
 
 pub fn plans_view() -> serde_json::Value {
+    plans_view_at(crate::chain_db::local_chain_height().saturating_add(1))
+}
+
+fn plans_view_at(height: u64) -> serde_json::Value {
     let mut plans = Vec::new();
-    for (name, gb, monthly, annual) in STORAGE_PLANS {
+    for (name, gb, monthly, annual, from) in STORAGE_PLANS {
+        if height < from {
+            continue;
+        }
         for (billing, price_usd, days) in [("monthly", monthly, 30u64), ("annual", annual, 365u64)] {
             let credits = crate::chain_db::usd_to_credits(price_usd);
             plans.push(serde_json::json!({
@@ -451,7 +476,7 @@ pub fn plan_status_view(owner: &str, now: i64) -> serde_json::Value {
             "egusd_balance": have as f64 / 100.0,
         });
     };
-    let price = plan_price_usd(&p.name, &p.billing).map(|(_, usd, _)| crate::chain_db::usd_to_credits(usd)).unwrap_or(0);
+    let price = plan_price_usd(&p.name, &p.billing, u64::MAX).map(|(_, usd, _)| crate::chain_db::usd_to_credits(usd)).unwrap_or(0);
     serde_json::json!({
         "owner": owner,
         "plan": p,
@@ -1780,31 +1805,31 @@ mod plan_payment_tests {
 
     #[test]
     fn a_full_payment_buys_the_named_plan() {
-        assert_eq!(paid_plan("Ego Storage Pro – monthly ($1.99)", uegoc(1.99), PRICE), Some((200, 30 * 86_400)));
-        assert_eq!(paid_plan("Ego Storage Max – annual ($49.90)", uegoc(49.90), PRICE), Some((1024, 365 * 86_400)));
-        assert_eq!(paid_plan("Ego Storage Basic – monthly ($0.79)", uegoc(0.79), PRICE), Some((50, 30 * 86_400)));
+        assert_eq!(paid_plan("Ego Storage Pro – monthly ($1.99)", uegoc(1.99), PRICE, 0), Some((200, 30 * 86_400)));
+        assert_eq!(paid_plan("Ego Storage Max – annual ($49.90)", uegoc(49.90), PRICE, 0), Some((1024, 365 * 86_400)));
+        assert_eq!(paid_plan("Ego Storage Basic – monthly ($0.79)", uegoc(0.79), PRICE, 0), Some((50, 30 * 86_400)));
     }
 
     #[test]
     fn a_token_payment_with_a_plan_name_buys_nothing() {
-        assert_eq!(paid_plan("Ego Storage Max – annual ($49.90)", 1, PRICE), None);
-        assert_eq!(paid_plan("Ego Storage Max – annual ($0.01)", uegoc(0.01), PRICE), None);
-        assert_eq!(paid_plan("Ego Storage Max – monthly ($4.99)", uegoc(1.0), PRICE), None);
+        assert_eq!(paid_plan("Ego Storage Max – annual ($49.90)", 1, PRICE, 0), None);
+        assert_eq!(paid_plan("Ego Storage Max – annual ($0.01)", uegoc(0.01), PRICE, 0), None);
+        assert_eq!(paid_plan("Ego Storage Max – monthly ($4.99)", uegoc(1.0), PRICE, 0), None);
     }
 
     #[test]
     fn the_note_must_name_a_real_plan_exactly() {
-        assert_eq!(paid_plan("Max storage please", uegoc(100.0), PRICE), None);
-        assert_eq!(paid_plan("Ego Storage Maximum – annual ($49.90)", uegoc(100.0), PRICE), None);
-        assert_eq!(paid_plan("Ego Storage Pro – weekly ($1.99)", uegoc(100.0), PRICE), None);
-        assert_eq!(paid_plan("Ego Storage Pro – monthly ($1.99)", uegoc(100.0), 0.0), None);
+        assert_eq!(paid_plan("Max storage please", uegoc(100.0), PRICE, 0), None);
+        assert_eq!(paid_plan("Ego Storage Maximum – annual ($49.90)", uegoc(100.0), PRICE, 0), None);
+        assert_eq!(paid_plan("Ego Storage Pro – weekly ($1.99)", uegoc(100.0), PRICE, 0), None);
+        assert_eq!(paid_plan("Ego Storage Pro – monthly ($1.99)", uegoc(100.0), 0.0, 0), None);
     }
 
     #[test]
     fn a_price_drop_after_paying_does_not_cancel_the_plan() {
         let paid = uegoc(1.99);
-        assert!(paid_plan("Ego Storage Pro – monthly ($1.99)", paid, PRICE * 0.6).is_some());
-        assert!(paid_plan("Ego Storage Pro – monthly ($1.99)", paid, PRICE * 0.4).is_none());
+        assert!(paid_plan("Ego Storage Pro – monthly ($1.99)", paid, PRICE * 0.6, 0).is_some());
+        assert!(paid_plan("Ego Storage Pro – monthly ($1.99)", paid, PRICE * 0.4, 0).is_none());
     }
 }
 
@@ -1814,17 +1839,28 @@ mod plan_egusd_tests {
 
     #[test]
     fn a_plan_paid_in_full_in_egusd_counts_whatever_egoc_does() {
-        assert_eq!(plan_paid_in_egusd("credits_pay:199:plan:Pro:monthly"), Some((200, 30 * 86_400)));
-        assert_eq!(plan_paid_in_egusd("credits_pay:4990:plan:Max:annual"), Some((1024, 365 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:199:plan:Pro:monthly", 0), Some((200, 30 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:4990:plan:Max:annual", 0), Some((1024, 365 * 86_400)));
+    }
+
+    #[test]
+    fn the_big_plans_count_only_from_their_block() {
+        let at = super::BIG_PLANS_FROM_HEIGHT;
+        assert_eq!(plan_paid_in_egusd("credits_pay:799:plan:Ultra:monthly", at - 1), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:3999:plan:Mega:monthly", at - 1), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:799:plan:Ultra:monthly", at), Some((2048, 30 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:39990:plan:Mega:annual", at), Some((10240, 365 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:3998:plan:Mega:monthly", at), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:199:plan:Pro:monthly", at - 1), Some((200, 30 * 86_400)));
     }
 
     #[test]
     fn an_underpaid_or_made_up_plan_does_not() {
-        assert_eq!(plan_paid_in_egusd("credits_pay:198:plan:Pro:monthly"), None);
-        assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Huge:monthly"), None);
-        assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Pro:weekly"), None);
-        assert_eq!(plan_paid_in_egusd("credits_pay:99999:storage:egocid1abc"), None);
-        assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Pro:monthly:extra"), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:198:plan:Pro:monthly", 0), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Huge:monthly", u64::MAX), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Pro:weekly", 0), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:99999:storage:egocid1abc", 0), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Pro:monthly:extra", 0), None);
     }
 }
 
@@ -1879,12 +1915,14 @@ mod renewal_tests {
 
     #[test]
     fn every_plan_is_listed_with_the_exact_payment_it_needs() {
-        let v = super::plans_view();
+        let at = super::BIG_PLANS_FROM_HEIGHT;
+        assert_eq!(super::plans_view_at(at - 1)["plans"].as_array().unwrap().len(), 6, "three plans before the big ones open");
+        let v = super::plans_view_at(at);
         let plans = v["plans"].as_array().unwrap();
-        assert_eq!(plans.len(), 6, "three plans, monthly and annual");
+        assert_eq!(plans.len(), 10, "five plans, monthly and annual");
         for p in plans {
             let memo = p["memo"].as_str().unwrap();
-            let (gb, period) = super::plan_paid_in_egusd(memo).expect("the listed memo is one the chain accepts as a plan payment");
+            let (gb, period) = super::plan_paid_in_egusd(memo, at).expect("the listed memo is one the chain accepts as a plan payment");
             assert_eq!(gb, p["gb"].as_u64().unwrap());
             assert_eq!(period, p["period_days"].as_i64().unwrap() * DAY);
         }
@@ -1896,7 +1934,7 @@ mod renewal_tests {
     #[test]
     fn a_short_balance_is_flagged_only_in_the_last_ten_days_with_auto_renew_on() {
         let plan = ActivePlan { name: "Pro".into(), billing: "monthly".into(), gb: 200, expires_at: 30 * DAY };
-        let (_, usd, _) = super::plan_price_usd("Pro", "monthly").unwrap();
+        let (_, usd, _) = super::plan_price_usd("Pro", "monthly", 0).unwrap();
         let price = crate::chain_db::usd_to_credits(usd);
         assert!(low_balance_warning(&plan, 19 * DAY, true, 0).is_none(), "more than 10 days left");
         let w = low_balance_warning(&plan, 21 * DAY, true, price - 1).unwrap();

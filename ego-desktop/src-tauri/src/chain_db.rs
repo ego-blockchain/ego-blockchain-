@@ -986,7 +986,7 @@ fn egusd_plan_in(db: &DB, owner: &str, at: i64) -> Option<(u64, u64, i64)> {
         if tx.tx_type != "credits_pay" || tx.from != owner || tx.to != crate::commands::storage::STORAGE_FEE_SINK {
             continue;
         }
-        let Some((gb, price, period)) = crate::commands::storage::egusd_plan_terms(tx.memo.as_deref().unwrap_or("")) else { continue };
+        let Some((gb, price, period)) = crate::commands::storage::egusd_plan_terms(tx.memo.as_deref().unwrap_or(""), tx.block_height.unwrap_or(0)) else { continue };
         let paid_at = tx.block_height.and_then(|h| block_ts_at_in(db, h)).unwrap_or(tx.timestamp);
         payments.push((paid_at, gb, price, period));
     }
@@ -10079,7 +10079,7 @@ fn storage_pay_in(db: &DB, ov: &mut crate::drs::Ov, block: &LedgerBlock, txs: &[
     }
     let mut out = Vec::new();
     for tx in txs {
-        if let Some((bytes, price_micro, period)) = crate::storage_pay::plan_payment(tx) {
+        if let Some((bytes, price_micro, period)) = crate::storage_pay::plan_payment(tx, block.height) {
             crate::storage_pay::add_plan(ov, &tx.from, at, bytes, price_micro, period);
             if plan_mode {
                 crate::storage_pay::want_hosts(ov, &tx.from, at);

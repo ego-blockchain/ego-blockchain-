@@ -532,7 +532,7 @@ mod storage_margin_tests {
 
     /// The plan prices in StoragePage.tsx. Kept here so a change to one without the other
     /// shows up as a failing test rather than as a business losing money per subscriber.
-    const PLANS: [(f64, f64); 3] = [(50.0, 0.79), (200.0, 1.99), (1024.0, 4.99)];
+    const PLANS: [(f64, f64); 5] = [(50.0, 0.79), (200.0, 1.99), (1024.0, 4.99), (2048.0, 7.99), (10240.0, 39.99)];
 
     #[test]
     fn every_plan_earns_more_than_it_costs_to_serve() {
@@ -546,16 +546,17 @@ mod storage_margin_tests {
     }
 
     #[test]
-    fn the_biggest_plan_still_keeps_half() {
-        let (gb, usd) = PLANS[2];
-        let margin = (usd - gb * GB_MONTH_PAID) / usd;
-        assert!(margin > 0.5, "the tier with the thinnest margin keeps {:.0} percent", margin * 100.0);
+    fn every_plan_keeps_over_45_percent() {
+        for (gb, usd) in PLANS {
+            let margin = (usd - gb * GB_MONTH_PAID) / usd;
+            assert!(margin > 0.45, "{gb} GB at ${usd} keeps {:.0} percent", margin * 100.0);
+        }
     }
 
     #[test]
     fn we_undercut_the_clouds_we_are_competing_with() {
         // iCloud+ 50 GB at $0.99, Google One 200 GB at $2.99, Google One 2 TB at $9.99.
-        for ((gb, ours), theirs) in PLANS.iter().zip([0.99, 2.99, 9.99 / 2.0]) {
+        for ((gb, ours), theirs) in PLANS.iter().zip([0.99, 2.99, 9.99 / 2.0, 9.99, 49.99]) {
             assert!(ours < &theirs, "{gb} GB at ${ours} does not beat ${theirs}");
         }
     }

@@ -211,11 +211,11 @@ pub fn last_proof(ov: &Ov, cid: &str, host: &str) -> i64 {
     ov.get(&host_file_key(cid, host)).map(|v| HostFile::decode(&v).last_proof).unwrap_or(0)
 }
 
-pub fn plan_payment(tx: &LedgerTx) -> Option<(u64, u64, i64)> {
+pub fn plan_payment(tx: &LedgerTx, height: u64) -> Option<(u64, u64, i64)> {
     if tx.tx_type != "credits_pay" || tx.to != crate::commands::storage::STORAGE_FEE_SINK {
         return None;
     }
-    let (gb, price_micro, period) = crate::commands::storage::egusd_plan_terms(tx.memo.as_deref().unwrap_or(""))?;
+    let (gb, price_micro, period) = crate::commands::storage::egusd_plan_terms(tx.memo.as_deref().unwrap_or(""), height)?;
     Some((gb.saturating_mul(1_000_000_000), price_micro, period))
 }
 
