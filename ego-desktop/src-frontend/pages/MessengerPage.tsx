@@ -576,6 +576,11 @@ const MessengerPage: React.FC = () => {
     try {
       const cs = await invoke<Contact[]>('get_contacts');
       setContacts(cs);
+      setSelected(prev => {
+        if (!prev || prev.address === EGO_AI_CONTACT.address) return prev;
+        const fresh = cs.find(c => c.address === prev.address);
+        return fresh ? { ...prev, ...fresh } : prev;
+      });
     } catch (e) {
       console.error('get_contacts', e);
     }

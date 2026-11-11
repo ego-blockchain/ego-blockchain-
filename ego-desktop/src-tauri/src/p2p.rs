@@ -4036,6 +4036,8 @@ pub enum P2PMessage {
         nonce:   String,
         ct:      String,
         id:      String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        alert:   String,
     },
     MarketChat {
         trade_id: String,
@@ -9131,12 +9133,12 @@ async fn handle_event(
                 // Sealed messenger envelope. Every node forwards these; only the
                 // addressee holds the key that opens one, so everyone else drops
                 // it after a string compare — no crypto on other people's mail.
-                if let Ok(P2PMessage::SealedDm { to, eph_pub, nonce, ct, id }) =
+                if let Ok(P2PMessage::SealedDm { to, eph_pub, nonce, ct, id, alert }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     let app2 = app.cloned();
                     tokio::spawn(async move {
-                        let mail = crate::phone_mail::Sealed { to: to.clone(), eph_pub: eph_pub.clone(), nonce: nonce.clone(), ct: ct.clone(), id: id.clone() };
+                        let mail = crate::phone_mail::Sealed { to: to.clone(), eph_pub: eph_pub.clone(), nonce: nonce.clone(), ct: ct.clone(), id: id.clone(), alert };
                         let my_addr = tokio::task::spawn_blocking(move || {
                             let me = crate::ledger::Ledger::load().address;
                             crate::phone_mail::on_gossip(mail, &me);
@@ -11955,7 +11957,7 @@ pub async fn ingest_sideband_bytes(
         // node can carry one without being able to read it. That is exactly what an offline
         // link needs: whoever hears the broadcast takes it, and if it is not theirs they pass
         // it on until it reaches somebody with a connection.
-        P2PMessage::SealedDm { to, eph_pub, nonce, ct, id } => {
+        P2PMessage::SealedDm { to, eph_pub, nonce, ct, id, alert } => {
             if dm_already_seen(&id) {
                 return Ok(());
             }
@@ -11974,7 +11976,7 @@ pub async fn ingest_sideband_bytes(
             }
             // Not ours. Carry it: the sender had no connection, so this node is how it
             // reaches the network, and nothing here can read what it is passing on.
-            let onward = P2PMessage::SealedDm { to, eph_pub, nonce, ct, id };
+            let onward = P2PMessage::SealedDm { to, eph_pub, nonce, ct, id, alert };
             if let Ok(data) = serde_json::to_vec(&onward) {
                 publish_gossip(DM_TOPIC, data).await;
             }
@@ -17330,7 +17332,23 @@ pub fn seal_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMessage) -> Option<P2
 }
 
 pub(crate) fn seal_dm_with(eph_bytes: [u8; 32], nonce_bytes: [u8; 12], to_addr: &str, to_ed25519: &str, inner: &P2PMessage) -> Option<P2PMessage> {
-    seal_plain_with(eph_bytes, nonce_bytes, to_addr, to_ed25519, &serde_json::to_vec(inner).ok()?)
+    seal_plain_with(eph_bytes, nonce_bytes, to_addr, to_ed25519, &serde_json::to_vec(inner).ok()?, alerts(to_addr, inner))
+}
+
+pub(crate) fn alerts(to_addr: &str, inner: &P2PMessage) -> &'static str {
+    match inner {
+        P2PMessage::ContactRequest { from_addr, .. } if from_addr != to_addr => crate::phone_mail::ALERT_REQUEST,
+        P2PMessage::ChatMessage { bundle, .. } => {
+            let parts: Vec<&str> = bundle.trim().splitn(7, ':').collect();
+            let chat = parts.len() == 7
+                && parts[0] == "egomsg1"
+                && parts[1] != to_addr
+                && parts[2] == to_addr
+                && matches!(parts[4], "text" | "reply" | "file_bundle");
+            if chat { crate::phone_mail::ALERT_CHAT } else { "" }
+        }
+        _ => "",
+    }
 }
 
 pub(crate) fn seal_plain(to_addr: &str, to_ed25519: &str, plaintext: &[u8]) -> Option<P2PMessage> {
@@ -17339,10 +17357,10 @@ pub(crate) fn seal_plain(to_addr: &str, to_ed25519: &str, plaintext: &[u8]) -> O
     rand::rngs::OsRng.fill_bytes(&mut eph_bytes);
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    seal_plain_with(eph_bytes, nonce_bytes, to_addr, to_ed25519, plaintext)
+    seal_plain_with(eph_bytes, nonce_bytes, to_addr, to_ed25519, plaintext, "")
 }
 
-fn seal_plain_with(eph_bytes: [u8; 32], nonce_bytes: [u8; 12], to_addr: &str, to_ed25519: &str, plaintext: &[u8]) -> Option<P2PMessage> {
+fn seal_plain_with(eph_bytes: [u8; 32], nonce_bytes: [u8; 12], to_addr: &str, to_ed25519: &str, plaintext: &[u8], alert: &str) -> Option<P2PMessage> {
     use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 
     let their_x = ed25519_pub_to_x25519(&decode_pubkey32(to_ed25519)?)?;
@@ -17361,6 +17379,7 @@ fn seal_plain_with(eph_bytes: [u8; 32], nonce_bytes: [u8; 12], to_addr: &str, to
         nonce:   hex::encode(nonce_bytes),
         id:      hex::encode(&blake3::hash(ct_hex.as_bytes()).as_bytes()[..16]),
         ct:      ct_hex,
+        alert:   alert.to_string(),
     })
 }
 
@@ -17450,6 +17469,28 @@ mod sealed_dm_tests {
         assert_eq!(serde_json::to_string(&inner).unwrap(), r#"{"type":"chat_message","bundle":"egomsg1:egot1a:egot1b:1:text:00:ff","seq":3}"#);
     }
 
+    #[test]
+    fn only_new_messages_and_requests_from_others_alert() {
+        let chat = |kind: &str, from: &str, to: &str| P2PMessage::ChatMessage { bundle: format!("egomsg1:{from}:{to}:1:{kind}:00:ff"), seq: 1 };
+        assert_eq!(alerts("egot1b", &chat("text", "egot1a", "egot1b")), crate::phone_mail::ALERT_CHAT);
+        assert_eq!(alerts("egot1b", &chat("reply", "egot1a", "egot1b")), crate::phone_mail::ALERT_CHAT);
+        assert_eq!(alerts("egot1b", &chat("file_bundle", "egot1a", "egot1b")), crate::phone_mail::ALERT_CHAT);
+        assert_eq!(alerts("egot1b", &chat("reaction", "egot1a", "egot1b")), "");
+        assert_eq!(alerts("egot1b", &chat("edit", "egot1a", "egot1b")), "");
+        assert_eq!(alerts("egot1a", &chat("text", "egot1a", "egot1b")), "", "a copy of your own message for your phone");
+        let receipt = P2PMessage::ReadReceipt { from: "egot1a".into(), to: "egot1b".into(), message_ids: vec!["x".into()] };
+        assert_eq!(alerts("egot1b", &receipt), "");
+        let profile = P2PMessage::ProfileUpdate { from_addr: "egot1a".into(), avatar: String::new(), name: "A".into() };
+        assert_eq!(alerts("egot1b", &profile), "");
+
+        let ed_pub = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]).verifying_key().to_bytes();
+        let quiet = seal_dm("egot1b", &hex::encode(ed_pub), &receipt).expect("seal");
+        assert!(!String::from_utf8(serde_json::to_vec(&quiet).unwrap()).unwrap().contains("alert"));
+        let loud = seal_dm("egot1b", &hex::encode(ed_pub), &chat("text", "egot1a", "egot1b")).expect("seal");
+        let P2PMessage::SealedDm { alert, .. } = loud else { panic!("not sealed") };
+        assert_eq!(alert, crate::phone_mail::ALERT_CHAT);
+    }
+
     fn x25519_secret_from_seed(seed: &[u8; 32]) -> x25519_dalek::StaticSecret {
         use sha2::{Digest, Sha512};
         let expanded = Sha512::digest(seed);
@@ -17488,7 +17529,7 @@ mod sealed_dm_tests {
         };
         let sealed = seal_dm("egot1recipient", &hex::encode(ed_pub), &inner).expect("seal");
 
-        let P2PMessage::SealedDm { to, eph_pub, nonce, ct, id } = sealed else {
+        let P2PMessage::SealedDm { to, eph_pub, nonce, ct, id, .. } = sealed else {
             panic!("seal_dm produced the wrong variant");
         };
         assert_eq!(to, "egot1recipient");

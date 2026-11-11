@@ -7,7 +7,11 @@ use std::sync::Mutex;
 pub const GET_DOMAIN: &str = "ego/mail-get/v1";
 pub const PUT_DOMAIN: &str = "ego/mail-put/v1";
 pub const SEND_DOMAIN: &str = "ego/mail-send/v1";
-pub const METHODS: &[&str] = &["mail.get", "mail.put", "mail.send"];
+pub const PEEK_DOMAIN: &str = "ego/mail-peek/v1";
+pub const READER_DOMAIN: &str = "ego/mail-reader/v1";
+pub const METHODS: &[&str] = &["mail.get", "mail.put", "mail.send", "mail.peek"];
+pub const ALERT_CHAT: &str = "chat";
+pub const ALERT_REQUEST: &str = "request";
 
 const KEEP_MS: i64 = 30 * 86_400_000;
 const MAX_PER_OWNER: usize = 500;
@@ -30,6 +34,8 @@ const CATCH_UP_EVERY_SECS: u64 = 600;
 const CATCH_UP_LOOK_BACK_MS: i64 = 2 * 86_400_000;
 const CATCH_UP_PAGES: usize = 5;
 const BOOTSTRAP_EVERY_SECS: i64 = 6 * 3600;
+const READER_GRANT_MAX_SECS: i64 = 120 * 86_400;
+const PEEK_ITEMS: usize = 50;
 
 type RpcResult = Result<Value, (i32, String)>;
 
@@ -40,6 +46,8 @@ pub struct Sealed {
     pub nonce: String,
     pub ct: String,
     pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alert: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -73,6 +81,7 @@ pub fn valid(s: &Sealed) -> bool {
         && s.ct.len() <= MAX_CT_HEX
         && is_hex(&s.ct, None)
         && s.id == id_of(&s.ct)
+        && (s.alert.is_empty() || s.alert == ALERT_CHAT || s.alert == ALERT_REQUEST)
 }
 
 fn dir() -> PathBuf {
@@ -200,6 +209,62 @@ pub fn since(owner: &str, since_ms: i64, now_ms: i64) -> (Vec<Kept>, bool) {
     (out, more)
 }
 
+pub fn alerts_since(owner: &str, since_ms: i64, now_ms: i64) -> (Vec<Value>, i64) {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    alerts_in(load(owner), since_ms, now_ms)
+}
+
+fn alerts_in(list: Vec<Kept>, since_ms: i64, now_ms: i64) -> (Vec<Value>, i64) {
+    let fresh: Vec<Kept> = list
+        .into_iter()
+        .filter(|k| k.at > since_ms && now_ms.saturating_sub(k.at) < KEEP_MS)
+        .collect();
+    let latest = fresh.iter().map(|k| k.at).max().unwrap_or(since_ms).max(since_ms);
+    let alerts = fresh
+        .iter()
+        .rev()
+        .filter(|k| !k.sealed.alert.is_empty())
+        .take(PEEK_ITEMS)
+        .map(|k| json!({ "id": k.sealed.id, "at": k.at, "alert": k.sealed.alert }))
+        .collect();
+    (alerts, latest)
+}
+
+pub fn reader_bytes(owner: &str, reader: &str, until: i64) -> Vec<u8> {
+    format!("{READER_DOMAIN}\n{owner}\n{reader}\n{until}").into_bytes()
+}
+
+pub fn peek_bytes(owner: &str, reader: &str, ts: i64, since: i64) -> Vec<u8> {
+    format!("{PEEK_DOMAIN}\n{owner}\n{reader}\n{ts}\n{since}").into_bytes()
+}
+
+fn reader_allowed(params: &Value, owner: &str, now: i64) -> Result<(), (i32, String)> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let reader = params["reader"].as_str().unwrap_or_default();
+    let until = params["until"].as_i64().unwrap_or_default();
+    let ts = params["ts"].as_i64().unwrap_or_default();
+    let since = params["since"].as_i64().unwrap_or(0);
+    if until <= now || until > now + READER_GRANT_MAX_SECS {
+        return Err((-32003, "This alert key has expired. Open Ego Wallet once to renew it.".into()));
+    }
+    let granted = crate::account_record::signer_of(
+        params["pubkey"].as_str().unwrap_or_default(),
+        params["grant"].as_str().unwrap_or_default(),
+        &reader_bytes(owner, reader, until),
+    )
+    .map_err(|_| (-32003, "This alert key wasn't given by the wallet it names.".to_string()))?;
+    if granted != owner {
+        return Err((-32003, "This alert key wasn't given by the wallet it names.".into()));
+    }
+    let bad = || (-32003, "This request isn't signed by the alert key.".to_string());
+    let pk: [u8; 32] = hex::decode(reader).ok().and_then(|v| v.try_into().ok()).ok_or_else(bad)?;
+    let sig: [u8; 64] = hex::decode(params["sig"].as_str().unwrap_or_default()).ok().and_then(|v| v.try_into().ok()).ok_or_else(bad)?;
+    VerifyingKey::from_bytes(&pk)
+        .map_err(|_| bad())?
+        .verify_strict(&peek_bytes(owner, reader, ts, since), &Signature::from_bytes(&sig))
+        .map_err(|_| bad())
+}
+
 pub fn get_bytes(owner: &str, ts: i64) -> Vec<u8> {
     format!("{GET_DOMAIN}\n{owner}\n{ts}").into_bytes()
 }
@@ -293,12 +358,13 @@ pub fn on_gossip(sealed: Sealed, me: &str) {
 
 pub fn from_p2p(msg: &crate::p2p::P2PMessage) -> Option<Sealed> {
     match msg {
-        crate::p2p::P2PMessage::SealedDm { to, eph_pub, nonce, ct, id } => Some(Sealed {
+        crate::p2p::P2PMessage::SealedDm { to, eph_pub, nonce, ct, id, alert } => Some(Sealed {
             to: to.clone(),
             eph_pub: eph_pub.clone(),
             nonce: nonce.clone(),
             ct: ct.clone(),
             id: id.clone(),
+            alert: alert.clone(),
         }),
         _ => None,
     }
@@ -319,6 +385,23 @@ async fn get(params: &Value) -> RpcResult {
         .await
         .map_err(|e| (-32603, e.to_string()))?;
     Ok(json!({ "mail": mail, "more": more }))
+}
+
+async fn peek(params: &Value) -> RpcResult {
+    let owner = params["owner"].as_str().unwrap_or_default().to_string();
+    let ts = params["ts"].as_i64().unwrap_or_default();
+    let since_ms = params["since"].as_i64().unwrap_or(0);
+    if !crate::account_record::valid_owner(&owner) {
+        return Err((-32602, "owner must be a wallet address".into()));
+    }
+    let now = chrono::Utc::now();
+    fresh(ts, now.timestamp())?;
+    reader_allowed(params, &owner, now.timestamp())?;
+    let now_ms = now.timestamp_millis();
+    let (alerts, latest) = tokio::task::spawn_blocking(move || alerts_since(&owner, since_ms, now_ms))
+        .await
+        .map_err(|e| (-32603, e.to_string()))?;
+    Ok(json!({ "alerts": alerts, "latest": latest }))
 }
 
 async fn put(params: &Value) -> RpcResult {
@@ -363,6 +446,7 @@ async fn send(params: &Value) -> RpcResult {
         nonce: sealed.nonce.clone(),
         ct: sealed.ct.clone(),
         id: sealed.id.clone(),
+        alert: sealed.alert.clone(),
     };
     if let Ok(data) = serde_json::to_vec(&wire) {
         crate::p2p::publish_gossip(crate::p2p::DM_TOPIC, data).await;
@@ -388,6 +472,7 @@ pub async fn dispatch(method: &str, params: &Value) -> Option<RpcResult> {
         "mail.get" => get(params).await,
         "mail.put" => put(params).await,
         "mail.send" => send(params).await,
+        "mail.peek" => peek(params).await,
         _ => return None,
     })
 }
@@ -708,7 +793,7 @@ mod tests {
 
     fn sealed(to: &str, n: u8) -> Sealed {
         let ct = hex::encode([n; 40]);
-        Sealed { to: to.into(), eph_pub: "ab".repeat(32), nonce: "cd".repeat(12), id: id_of(&ct), ct }
+        Sealed { to: to.into(), eph_pub: "ab".repeat(32), nonce: "cd".repeat(12), id: id_of(&ct), ct, alert: String::new() }
     }
 
     fn kept(to: &str, n: u8, by: &str, at: i64) -> Kept {
@@ -790,6 +875,65 @@ mod tests {
         assert!(!worth_opening(&fresh, me, 500), "already read up to here");
         assert!(!worth_opening(&kept(me, 2, me, 600), me, 400), "its own copies are for the phone");
         assert!(!worth_opening(&kept("egot1other", 3, "egot1friend", 600), me, 400));
+    }
+
+    #[test]
+    fn an_alert_key_the_wallet_gave_can_see_that_mail_waits_and_nothing_else() {
+        use ed25519_dalek::Signer;
+        let wallet = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let owner = crate::market_chain::address_of(&wallet.verifying_key().to_bytes());
+        let reader = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+        let reader_hex = hex::encode(reader.verifying_key().to_bytes());
+        let now = 1_000_000;
+        let until = now + 90 * 86_400;
+        let grant = hex::encode(wallet.sign(&reader_bytes(&owner, &reader_hex, until)).to_bytes());
+        let params = |reader_key: &ed25519_dalek::SigningKey, until: i64, grant: &str| {
+            let sig = reader_key.sign(&peek_bytes(&owner, &reader_hex, now, 7));
+            json!({
+                "owner": owner, "ts": now, "since": 7, "reader": reader_hex, "until": until,
+                "grant": grant, "pubkey": hex::encode(wallet.verifying_key().to_bytes()),
+                "sig": hex::encode(sig.to_bytes()),
+            })
+        };
+        assert!(reader_allowed(&params(&reader, until, &grant), &owner, now).is_ok());
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        assert!(reader_allowed(&params(&stranger, until, &grant), &owner, now).is_err(), "only the key the wallet named");
+        assert!(reader_allowed(&params(&reader, until + 1, &grant), &owner, now).is_err(), "the grant covers its end date");
+        assert!(reader_allowed(&params(&reader, until, &grant), &owner, until + 1).is_err(), "an old grant stops working");
+        let self_made = hex::encode(stranger.sign(&reader_bytes(&owner, &reader_hex, until)).to_bytes());
+        assert!(reader_allowed(&params(&reader, until, &self_made), &owner, now).is_err(), "nobody else can grant one");
+        let long = now + READER_GRANT_MAX_SECS + 10;
+        let long_grant = hex::encode(wallet.sign(&reader_bytes(&owner, &reader_hex, long)).to_bytes());
+        assert!(reader_allowed(&params(&reader, long, &long_grant), &owner, now).is_err());
+    }
+
+    #[test]
+    fn a_peek_names_only_new_alerting_mail_and_moves_past_the_rest() {
+        let owner = "egot1phone";
+        let mut list: Vec<Kept> = (1..=6).map(|i| kept(owner, i, "", i as i64 * 100)).collect();
+        list[1].sealed.alert = ALERT_CHAT.into();
+        list[3].sealed.alert = ALERT_REQUEST.into();
+        list[4].sealed.alert = ALERT_CHAT.into();
+        let (alerts, latest) = alerts_in(list.clone(), 250, 1_000);
+        assert_eq!(latest, 600, "receipts and profile changes still move the cursor");
+        let ids: Vec<&str> = alerts.iter().map(|a| a["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec![list[4].sealed.id.as_str(), list[3].sealed.id.as_str()]);
+        assert_eq!(alerts[1]["alert"], ALERT_REQUEST);
+        assert!(alerts[0].get("ct").is_none(), "a peek carries no message");
+        let (none, same) = alerts_in(list, 600, 1_000);
+        assert!(none.is_empty());
+        assert_eq!(same, 600);
+    }
+
+    #[test]
+    fn only_known_alert_kinds_are_kept() {
+        let mut s = sealed("egot1phone", 1);
+        s.alert = ALERT_CHAT.into();
+        assert!(valid(&s));
+        s.alert = ALERT_REQUEST.into();
+        assert!(valid(&s));
+        s.alert = "x".repeat(5000);
+        assert!(!valid(&s));
     }
 
     #[test]
