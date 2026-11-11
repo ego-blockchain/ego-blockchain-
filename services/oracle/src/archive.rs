@@ -132,6 +132,96 @@ pub fn archived_from(dir: &Path, have: &BTreeSet<u64>, from: u64, below: u64, li
     out
 }
 
+pub const HOLDERS_TOP: usize = 100;
+
+const SYSTEM_ADDRESSES: [(&str, &str); 13] = [
+    ("egot1staking000000000000000000000000000000000", "Staked coins"),
+    ("egot1nodepool000000000000000000000000000000000", "Node rewards pool"),
+    ("egot1ecosystem00000000000000000000000000000000", "Ecosystem fund"),
+    ("egot1foundation00000000000000000000000000000000", "Foundation"),
+    ("egot1stakingpool0000000000000000000000000000000", "Staking rewards pool"),
+    ("egot1shieldedpool000000000000000000000000000", "Shielded pool"),
+    ("egot1yzwkx349luk82ksl0xe2tm6rfwj26t7pg5apncg2", "Testnet faucet"),
+    ("egot1faucet000000000000000000000000000000000000", "Testnet faucet"),
+    ("egot1marketescrow000000000000000000000000000", "P2P trade escrow"),
+    ("egot1computeescrow000000000000000000000000000", "Compute escrow"),
+    ("egot1reserveescrow00000000000000000000000000", "Reservation escrow"),
+    ("egot1clusterescrow00000000000000000000000", "Cluster escrow"),
+    ("egot1burncredits00000000000000000000000000000", "Credits burn"),
+];
+
+const HOLDER_GROUPS_EGOC: [u64; 7] = [0, 1, 100, 1_000, 10_000, 100_000, 1_000_000];
+
+pub fn system_label(addr: &str) -> Option<&'static str> {
+    if let Some((_, label)) = SYSTEM_ADDRESSES.iter().find(|(a, _)| *a == addr) {
+        return Some(label);
+    }
+    addr.contains("0000000000").then_some("System address")
+}
+
+fn snapshot_balances(snap: &Value) -> Vec<(String, u64)> {
+    let Some(list) = snap["balances"].as_array() else { return Vec::new() };
+    list.iter()
+        .filter_map(|e| {
+            let addr = String::from_utf8(hex::decode(e[0].as_str()?).ok()?).ok()?;
+            let raw = hex::decode(e[1].as_str()?).ok()?;
+            let amount = u64::from_le_bytes(raw.get(..8)?.try_into().ok()?);
+            (amount > 0 && (addr.starts_with("egot1") || addr.starts_with("ego1"))).then_some((addr, amount))
+        })
+        .collect()
+}
+
+pub fn holders_summary(snap: &Value) -> Value {
+    let mut rows = snapshot_balances(snap);
+    let total: u128 = rows.iter().map(|(_, v)| *v as u128).sum();
+    let mut wallets = 0u64;
+    let mut wallet_total = 0u128;
+    let mut groups = vec![(0u64, 0u128); HOLDER_GROUPS_EGOC.len()];
+    for (addr, v) in &rows {
+        if system_label(addr).is_some() {
+            continue;
+        }
+        wallets += 1;
+        wallet_total += *v as u128;
+        let egoc = v / 1_000_000;
+        let g = HOLDER_GROUPS_EGOC.iter().rposition(|lo| egoc >= *lo).unwrap_or(0);
+        groups[g].0 += 1;
+        groups[g].1 += *v as u128;
+    }
+    let shielded = rows.iter().find(|(a, _)| system_label(a) == Some("Shielded pool")).map_or(0, |(_, v)| *v);
+    let by_size = |a: &(String, u64), b: &(String, u64)| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+    if rows.len() > HOLDERS_TOP {
+        rows.select_nth_unstable_by(HOLDERS_TOP - 1, by_size);
+        rows.truncate(HOLDERS_TOP);
+    }
+    rows.sort_unstable_by(by_size);
+    let top: Vec<Value> = rows
+        .iter()
+        .map(|(a, v)| json!({ "address": a, "balance_uegoc": v, "label": system_label(a) }))
+        .collect();
+    let groups: Vec<Value> = HOLDER_GROUPS_EGOC
+        .iter()
+        .enumerate()
+        .map(|(i, lo)| {
+            json!({
+                "min_egoc": lo,
+                "max_egoc": HOLDER_GROUPS_EGOC.get(i + 1),
+                "wallets": groups[i].0,
+                "total_uegoc": groups[i].1 as u64,
+            })
+        })
+        .collect();
+    json!({
+        "height": snap["height"].as_u64(),
+        "total_uegoc": total as u64,
+        "wallets": wallets,
+        "wallet_total_uegoc": wallet_total as u64,
+        "shielded_uegoc": shielded,
+        "groups": groups,
+        "top": top,
+    })
+}
+
 pub fn snapshot_balance(snap: &Value, addr: &str) -> Option<u64> {
     let want = hex::encode(addr.as_bytes());
     let found = snap["balances"].as_array()?.iter().find(|e| e[0].as_str().map_or(false, |k| k.eq_ignore_ascii_case(&want)))?;
@@ -468,6 +558,49 @@ mod tests {
         assert_eq!(blocks.len(), 150);
         assert_eq!(archived_from(&dir, &have, 150, 300, 10, "txs").len(), 10);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn holders_are_ranked_and_pools_are_named() {
+        let bal = |a: &str, v: u64| json!([hex::encode(a.as_bytes()), hex::encode(v.to_le_bytes())]);
+        let snap = json!({ "height": 42, "balances": [
+            bal("egot1nodepool000000000000000000000000000000000", 299_000_000_000_000),
+            bal("egot1shieldedpool000000000000000000000000000", 2_080_000_000),
+            bal("egot1alice", 150_000_000_000),
+            bal("egot1bob", 5_000_000),
+            bal("egot1carol", 0),
+            bal("egot1dave", 500_000),
+        ]});
+        let h = holders_summary(&snap);
+        assert_eq!(h["height"], 42);
+        assert_eq!(h["wallets"], 3);
+        assert_eq!(h["wallet_total_uegoc"], 150_005_500_000u64);
+        assert_eq!(h["shielded_uegoc"], 2_080_000_000u64);
+        assert_eq!(h["total_uegoc"], 299_152_085_500_000u64);
+        let top = h["top"].as_array().unwrap();
+        assert_eq!(top.len(), 5);
+        assert_eq!(top[0]["label"], "Node rewards pool");
+        assert_eq!(top[1]["address"], "egot1alice");
+        assert!(top[1]["label"].is_null());
+        assert_eq!(top[2]["label"], "Shielded pool");
+        assert!(top.iter().all(|t| t["address"] != "egot1carol"));
+        let groups = h["groups"].as_array().unwrap();
+        let count = |lo: u64| groups.iter().find(|g| g["min_egoc"] == lo).unwrap()["wallets"].as_u64().unwrap();
+        assert_eq!((count(0), count(1), count(100_000)), (1, 1, 1));
+        assert!(groups.last().unwrap()["max_egoc"].is_null());
+    }
+
+    #[test]
+    fn only_the_largest_holders_are_listed() {
+        let list: Vec<Value> = (1..=HOLDERS_TOP as u64 + 50)
+            .map(|i| json!([hex::encode(format!("egot1w{i}").as_bytes()), hex::encode((i * 1_000_000).to_le_bytes())]))
+            .collect();
+        let h = holders_summary(&json!({ "height": 1, "balances": list }));
+        let top = h["top"].as_array().unwrap();
+        assert_eq!(top.len(), HOLDERS_TOP);
+        assert_eq!(top[0]["balance_uegoc"], (HOLDERS_TOP as u64 + 50) * 1_000_000);
+        assert_eq!(top[HOLDERS_TOP - 1]["balance_uegoc"], 51_000_000u64);
+        assert_eq!(h["wallets"], HOLDERS_TOP as u64 + 50);
     }
 
     #[test]

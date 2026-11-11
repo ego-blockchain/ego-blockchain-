@@ -606,6 +606,7 @@ pub struct AppState {
     /// Latest trusted state snapshot (raw JSON from a writer node) for checkpoint
     /// fast-sync. Kept in memory; the writer re-pushes it every ~100 blocks.
     pub snapshot:     Arc<RwLock<Option<serde_json::Value>>>,
+    pub holders_cache: Arc<RwLock<Option<(Option<u64>, Arc<Value>)>>>,
     pub blocks_cache: Arc<RwLock<Option<Arc<Vec<Value>>>>>,
     pub txs_cache:    Arc<RwLock<Option<Arc<Vec<Value>>>>>,
     pub user_txs_cache: Arc<RwLock<Option<Arc<Vec<Value>>>>>,
@@ -1259,6 +1260,23 @@ async fn handle_chain_gaps(
     Json(json!({ "from": from, "to": to, "tip": tip, "missing": missing }))
 }
 
+async fn handle_holders(State(state): State<AppState>) -> impl IntoResponse {
+    let snap = state.snapshot.read().await;
+    let Some(s) = snap.as_ref() else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "no snapshot available yet" }))).into_response();
+    };
+    let height = s["height"].as_u64();
+    if let Some((h, v)) = state.holders_cache.read().await.as_ref() {
+        if *h == height {
+            return Json(v.as_ref().clone()).into_response();
+        }
+    }
+    let summary = Arc::new(archive::holders_summary(s));
+    drop(snap);
+    *state.holders_cache.write().await = Some((height, summary.clone()));
+    Json(summary.as_ref().clone()).into_response()
+}
+
 async fn handle_snapshot_get(State(state): State<AppState>) -> impl IntoResponse {
     let snap = state.snapshot.read().await;
     match snap.as_ref() {
@@ -1527,6 +1545,7 @@ async fn main() {
         post_rate_limit: Arc::new(RwLock::new(HashMap::new())),
         submit_token:    std::env::var("ORACLE_SUBMIT_TOKEN").ok().filter(|s| !s.trim().is_empty()),
         snapshot:        Arc::new(RwLock::new(load_snapshot())),
+        holders_cache:   Arc::new(RwLock::new(None)),
         blocks_cache:    Arc::new(RwLock::new(None)),
         txs_cache:       Arc::new(RwLock::new(None)),
         user_txs_cache:  Arc::new(RwLock::new(None)),
@@ -1642,6 +1661,7 @@ async fn main() {
         .route("/chain/archive",            get(handle_archive_index))
         .route("/chain/archive/:bucket",    get(handle_archive_bucket))
         .route("/chain/find",               get(handle_find))
+        .route("/chain/holders",            get(handle_holders))
         .route("/chain/snapshot",           post(handle_snapshot_submit).get(handle_snapshot_get).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)))
         .route("/prices",                   get(handle_prices))
         .route("/price/:symbol",            get(handle_price))
