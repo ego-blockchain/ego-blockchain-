@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const MARKET_ESCROW_ADDR: &str = "egot1marketescrow000000000000000000000000000";
 pub const MARKET_CHAIN_ID: u8 = 1;
-pub const ACTIVATION_HEIGHT: Option<u64> = None;
+pub const ACTIVATION_HEIGHT: Option<u64> = Some(crate::drs::NODE_PAY_V2_FROM_HEIGHT);
 
 pub const TX_OFFER: &str = "market_offer";
 pub const TX_OFFER_CLOSE: &str = "market_offer_close";
@@ -36,6 +36,9 @@ pub const MAKER_FEE_BPS: u64 = 100;
 pub const MIN_TRADE_UEGOC: u64 = 1_000_000;
 pub const MAX_TRADE_UEGOC: u64 = 10_000_000_000_000;
 pub const MAX_OPEN_OFFERS_PER_MAKER: usize = 20;
+pub const NO_SHOW_LIMIT: usize = 3;
+pub const NO_SHOW_WINDOW_SECS: i64 = 30 * 86_400;
+const NO_SHOW_SCAN: usize = 50;
 pub const MAX_PENDING_TRADES_PER_TAKER: usize = 5;
 pub const MAX_METHODS: usize = 8;
 pub const MAX_METHOD_LEN: usize = 32;
@@ -61,6 +64,9 @@ pub enum Family {
     Tron,
     Solana,
     Cardano,
+    Bitcoin,
+    Dogecoin,
+    Xrp,
 }
 
 impl Family {
@@ -71,8 +77,108 @@ impl Family {
             Family::Tron => "tron",
             Family::Solana => "solana",
             Family::Cardano => "cardano",
+            Family::Bitcoin => "bitcoin",
+            Family::Dogecoin => "dogecoin",
+            Family::Xrp => "xrp",
         }
     }
+
+    pub fn presigned(self) -> bool {
+        matches!(self, Family::Bitcoin | Family::Dogecoin | Family::Xrp)
+    }
+
+    pub fn coin(self) -> Option<crate::escrow::bitcoin::Coin> {
+        match self {
+            Family::Bitcoin => Some(crate::escrow::bitcoin::Coin::Bitcoin),
+            Family::Dogecoin => Some(crate::escrow::bitcoin::Coin::Dogecoin),
+            _ => None,
+        }
+    }
+}
+
+pub fn btc_payout(family: Family, s: &str) -> Option<(crate::escrow::bitcoin::Pubkey, String)> {
+    use crate::escrow::bitcoin as btc;
+    let coin = family.coin()?;
+    let (key_hex, address) = match s.trim().split_once('@') {
+        Some((k, a)) => (k, Some(a)),
+        None => (s.trim(), None),
+    };
+    let key = btc::parse_pubkey(key_hex).ok()?;
+    let address = match address {
+        Some(a) if btc::valid_address(coin, a) => a.to_string(),
+        Some(_) => return None,
+        None => btc::payout_address(coin, &key),
+    };
+    Some((key, address))
+}
+
+pub fn xrp_payout(s: &str) -> Option<(String, String)> {
+    use crate::escrow::xrp;
+    let (signer, dest) = match s.trim().split_once('@') {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => (s.trim(), s.trim()),
+    };
+    (xrp::valid_address(signer) && xrp::valid_address(dest)).then(|| (signer.to_string(), dest.to_string()))
+}
+
+pub const XRP_FEE_MAX_DROPS: u64 = 1_000_000;
+
+pub fn xrp_sig_payload(sig_hex: &str) -> Result<(u32, u64, Vec<Vec<u8>>, Option<[u8; 33]>), String> {
+    let raw = hex::decode(sig_hex.trim()).map_err(|_| "the outside signature is not hex".to_string())?;
+    if raw.len() < 12 + 1 + 8 {
+        return Err("the XRP signature package is too short".into());
+    }
+    let sequence = u32::from_be_bytes(raw[..4].try_into().unwrap_or([0; 4]));
+    let fee = u64::from_be_bytes(raw[4..12].try_into().unwrap_or([0; 8]));
+    if fee == 0 || fee > XRP_FEE_MAX_DROPS {
+        return Err(format!("the XRP network fee is 1 to {XRP_FEE_MAX_DROPS} drops"));
+    }
+    let mut pos = 12;
+    let mut sigs = Vec::new();
+    let mut key = None;
+    while pos < raw.len() {
+        let left = raw.len() - pos;
+        if left == 33 && matches!(raw[pos], 2 | 3) && !sigs.is_empty() {
+            let mut k = [0u8; 33];
+            k.copy_from_slice(&raw[pos..]);
+            key = Some(k);
+            break;
+        }
+        let n = raw[pos] as usize;
+        if !(8..=73).contains(&n) || left < 1 + n || raw[pos + 1] != 0x30 {
+            return Err("the XRP signature package holds something that is not a DER signature".into());
+        }
+        sigs.push(raw[pos + 1..pos + 1 + n].to_vec());
+        pos += 1 + n;
+    }
+    if sigs.is_empty() || sigs.len() > 2 {
+        return Err("the XRP signature package holds one or two signatures".into());
+    }
+    Ok((sequence, fee, sigs, key))
+}
+
+pub fn presigned_payload_ok(family: Family, sig_hex: &str) -> Result<(), String> {
+    match family {
+        Family::Xrp => xrp_sig_payload(sig_hex).map(|_| ()),
+        _ => btc_sig_payload(sig_hex).map(|_| ()),
+    }
+}
+
+pub const BTC_FEE_RATE_MAX: u32 = 10_000;
+
+pub fn btc_sig_payload(sig_hex: &str) -> Result<(u32, Vec<u8>), String> {
+    let raw = hex::decode(sig_hex.trim()).map_err(|_| "the outside signature is not hex".to_string())?;
+    if raw.len() < 4 + 9 || raw.len() > 4 + 73 {
+        return Err("the outside signature is a fee rate and a DER signature".into());
+    }
+    let rate = u32::from_le_bytes(raw[..4].try_into().unwrap_or([0; 4]));
+    if rate == 0 || rate > BTC_FEE_RATE_MAX {
+        return Err(format!("the network fee rate is 1 to {BTC_FEE_RATE_MAX} per byte"));
+    }
+    if raw[raw.len() - 1] != crate::escrow::bitcoin::SIGHASH_ALL || raw[4] != 0x30 {
+        return Err("the outside signature is not a DER signature for the whole transaction".into());
+    }
+    Ok((rate, raw[4..].to_vec()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -105,6 +211,9 @@ pub const ASSETS: &[AssetInfo] = &[
     asset("USDT-SPL", "USDT", "solana", Family::Solana, 1),
     asset("SOL", "SOL", "solana", Family::Solana, 10_000),
     asset("ADA", "ADA", "cardano", Family::Cardano, 10_000_000),
+    asset("BTC", "BTC", "bitcoin", Family::Bitcoin, 100),
+    asset("DOGE", "DOGE", "dogecoin", Family::Dogecoin, 10_000_000),
+    asset("XRP", "XRP", "xrp", Family::Xrp, 10_000_000),
 ];
 
 pub const CARDANO_NETWORK_ID: u8 = 0;
@@ -132,7 +241,7 @@ fn base58_len(s: &str, len: usize) -> bool {
 fn cardano_address(s: &str) -> Option<Vec<u8>> {
     crate::escrow::cardano::parse_address(s)
         .ok()
-        .filter(|raw| crate::escrow::cardano::network_of(raw) == CARDANO_NETWORK_ID)
+        .filter(|raw| matches!(crate::escrow::cardano::network_of(raw), 0 | 1))
 }
 
 pub fn valid_chain_address(family: Family, s: &str) -> bool {
@@ -146,12 +255,16 @@ pub fn valid_chain_address(family: Family, s: &str) -> bool {
         }
         Family::Solana => base58_len(s, 32),
         Family::Cardano => cardano_address(s).is_some_and(|raw| crate::escrow::cardano::payment_key_hash(&raw).is_some()),
+        Family::Bitcoin | Family::Dogecoin => btc_payout(family, s).is_some(),
+        Family::Xrp => xrp_payout(s).is_some(),
     }
 }
 
 pub fn valid_escrow_contract(family: Family, s: &str) -> bool {
     match family {
         Family::Cardano => cardano_address(s).is_some_and(|raw| crate::escrow::cardano::payment_script_hash(&raw).is_some()),
+        Family::Bitcoin | Family::Dogecoin => family.coin().is_some_and(|c| crate::escrow::bitcoin::valid_address(c, s)),
+        Family::Xrp => crate::escrow::xrp::valid_address(s),
         other => valid_chain_address(other, s),
     }
 }
@@ -159,7 +272,7 @@ pub fn valid_escrow_contract(family: Family, s: &str) -> bool {
 pub fn valid_chain_tx(family: Family, s: &str) -> bool {
     let digits = match family {
         Family::Evm => s.strip_prefix("0x"),
-        Family::Tron | Family::Cardano => Some(s),
+        Family::Tron | Family::Cardano | Family::Bitcoin | Family::Dogecoin | Family::Xrp => Some(s),
         Family::Solana => return base58_len(s, 64),
         Family::Ego => None,
     };
@@ -171,12 +284,15 @@ pub fn native_sig_len(family: Family) -> Option<usize> {
         Family::Evm | Family::Tron => Some(65),
         Family::Solana => Some(64),
         Family::Cardano => Some(96),
-        Family::Ego => None,
+        Family::Bitcoin | Family::Dogecoin | Family::Xrp | Family::Ego => None,
     }
 }
 
 pub fn verify_native_cancel(trade: &Trade, sig_hex: &str) -> Result<(), String> {
     let info = asset_info(&trade.asset).ok_or("the trade's asset is not listed")?;
+    if info.family.presigned() {
+        return presigned_payload_ok(info.family, sig_hex);
+    }
     let len = native_sig_len(info.family).ok_or("an EGOC settlement carries no outside signature")?;
     let sig = hex::decode(sig_hex)
         .ok()
@@ -251,6 +367,7 @@ const UNDO_PREFIX: &[u8] = b"market:undo:";
 const ESCROW_KEY: &[u8] = b"market:escrow";
 
 pub fn rule_active(height: u64) -> bool {
+    #[cfg(test)]
     if let Ok(v) = std::env::var("EGO_MARKET_HEIGHT") {
         if let Ok(h) = v.trim().parse::<u64>() {
             return height >= h;
@@ -261,6 +378,26 @@ pub fn rule_active(height: u64) -> bool {
 
 pub fn rule_active_at_tip() -> bool {
     rule_active(chain_db::local_chain_height().saturating_add(1))
+}
+
+pub fn current_arbiters<R: Reader + ?Sized>(reader: &R, height: u64) -> Vec<String> {
+    let fixed: Vec<String> = arbiters_at(height).iter().map(|a| a.to_string()).collect();
+    if !crate::dao_chain::arbiter_rules_active(height) {
+        return fixed;
+    }
+    let Some(list) = reader.get(crate::dao_chain::ARBITERS_KEY).and_then(|v| serde_json::from_slice::<Vec<String>>(&v).ok()) else {
+        return fixed;
+    };
+    list.into_iter()
+        .filter(|a| {
+            fixed.contains(a)
+                || reader
+                    .get(format!("stake:{a}").as_bytes())
+                    .and_then(|v| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes))
+                    .unwrap_or(0)
+                    >= crate::dao_chain::ARBITER_MIN_STAKE_UEGOC
+        })
+        .collect()
 }
 
 pub fn arbiters_at(height: u64) -> &'static [&'static str] {
@@ -451,6 +588,20 @@ pub struct ArbiterBody {
     pub sol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ada: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xrp: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaidBody {
+    pub trade_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_sig: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +615,12 @@ pub struct ArbiterAddresses {
     #[serde(default)]
     pub ada: Option<String>,
     #[serde(default)]
+    pub btc: Option<String>,
+    #[serde(default)]
+    pub doge: Option<String>,
+    #[serde(default)]
+    pub xrp: Option<String>,
+    #[serde(default)]
     pub height: u64,
 }
 
@@ -474,6 +631,9 @@ impl ArbiterAddresses {
             Family::Tron => self.tron.as_deref(),
             Family::Solana => self.sol.as_deref(),
             Family::Cardano => self.ada.as_deref(),
+            Family::Bitcoin => self.btc.as_deref(),
+            Family::Dogecoin => self.doge.as_deref(),
+            Family::Xrp => self.xrp.as_deref(),
             Family::Ego => None,
         }
     }
@@ -605,6 +765,8 @@ pub struct Trade {
     pub escrow: Option<EscrowRef>,
     #[serde(default)]
     pub native_sig: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_sig: Option<String>,
 }
 
 impl Trade {
@@ -1030,6 +1192,25 @@ fn prefix_ceiling(prefix: &[u8]) -> Vec<u8> {
 pub trait Reader {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
     fn scan(&self, prefix: &[u8], newest_first: bool, limit: usize) -> Vec<(Vec<u8>, Vec<u8>)>;
+    fn balance(&self, _addr: &str) -> Option<u64> {
+        None
+    }
+}
+
+pub fn recent_no_shows<R: Reader + ?Sized>(reader: &R, addr: &str, now: i64) -> usize {
+    let prefix = user_trades_prefix(addr);
+    let mut count = 0;
+    for (k, _) in reader.scan(&prefix, true, NO_SHOW_SCAN) {
+        let Some(id) = k.get(prefix.len() + 8..).and_then(|b| std::str::from_utf8(b).ok()) else { continue };
+        let Some(t) = read::<Trade>(reader, &trade_key(id)) else { continue };
+        if now.saturating_sub(t.opened_at) > NO_SHOW_WINDOW_SECS {
+            break;
+        }
+        if t.seller == addr && t.is_lock_expired(now) {
+            count += 1;
+        }
+    }
+    count
 }
 
 pub struct DbReader<'a>(pub &'a DB);
@@ -1038,6 +1219,11 @@ impl Reader for DbReader<'_> {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let cf = self.0.cf_handle(CF_META)?;
         self.0.get_cf(cf, key).ok().flatten()
+    }
+
+    fn balance(&self, addr: &str) -> Option<u64> {
+        let cf = self.0.cf_handle(CF_BALANCES)?;
+        Some(self.0.get_cf(cf, addr.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0))
     }
 
     fn scan(&self, prefix: &[u8], newest_first: bool, limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -1159,7 +1345,7 @@ impl<'r, R: Reader + ?Sized> Planner<'r, R> {
             reader,
             height,
             now,
-            arbiters: arbiters_at(height).iter().map(|a| a.to_string()).collect(),
+            arbiters: current_arbiters(reader, height),
             touched: HashSet::new(),
             offers_by_maker: HashMap::new(),
             pending_by_taker: HashMap::new(),
@@ -1368,6 +1554,20 @@ impl<'r, R: Reader + ?Sized> Planner<'r, R> {
             return invalid(format!("offer {id} already exists"));
         }
         let maker = tx.from.clone();
+        if b.side == Side::Sell {
+            if recent_no_shows(self.reader, &maker, self.now) >= NO_SHOW_LIMIT {
+                return invalid(format!(
+                    "{maker} is paused: in {NO_SHOW_LIMIT} recent trades it did not lock the coins in time; try again later"
+                ));
+            }
+            if is_egoc(&b.asset) {
+                if let Some(have) = self.reader.balance(&maker) {
+                    if have < b.max_micro {
+                        return invalid(format!("{maker} holds {have} uEGOC, less than the {} uEGOC this offer sells", b.max_micro));
+                    }
+                }
+            }
+        }
         let existing = self.open_offer_count(&maker);
         if existing >= MAX_OPEN_OFFERS_PER_MAKER {
             return invalid(format!(
@@ -1521,6 +1721,11 @@ impl<'r, R: Reader + ?Sized> Planner<'r, R> {
             }
             Some(address)
         };
+        if recent_no_shows(self.reader, &seller, self.now) >= NO_SHOW_LIMIT {
+            return invalid(format!(
+                "{seller} is paused: in {NO_SHOW_LIMIT} recent trades it did not lock the coins in time"
+            ));
+        }
         let state = if egoc && offer.side == Side::Buy {
             TradeState::Locked
         } else {
@@ -1569,6 +1774,7 @@ impl<'r, R: Reader + ?Sized> Planner<'r, R> {
             arbiter_payout: None,
             escrow: None,
             native_sig: None,
+            release_sig: None,
         };
         match self.assign_arbiter(&trade) {
             Some((arbiter, payout)) => {
@@ -1688,8 +1894,15 @@ impl<'r, R: Reader + ?Sized> Planner<'r, R> {
     }
 
     fn paid_effects(&self, tx: &LedgerTx) -> Result<Effects, Refusal> {
-        let b: TradeRef = body(tx)?;
+        let b: PaidBody = body(tx)?;
         let trade = self.known_trade(&b.trade_id)?;
+        let family = asset_info(&trade.asset).map(|a| a.family).unwrap_or(Family::Ego);
+        match (&b.release_sig, family.presigned()) {
+            (Some(sig), true) => presigned_payload_ok(family, sig).map_err(Refusal::Invalid)?,
+            (None, true) => return invalid("a Bitcoin, Dogecoin or XRP trade is marked paid with the buyer's signature for the release"),
+            (Some(_), false) => return invalid("only Bitcoin, Dogecoin and XRP trades carry a release signature"),
+            (None, false) => {}
+        }
         if trade.state != TradeState::Locked {
             return invalid(format!("trade {} is not waiting for payment", trade.id));
         }
@@ -1702,6 +1915,7 @@ impl<'r, R: Reader + ?Sized> Planner<'r, R> {
         let mut next = trade.clone();
         next.state = TradeState::Paid;
         next.paid_at = Some(self.now);
+        next.release_sig = b.release_sig.clone();
         let mut fx = Effects::default();
         fx.touches.push(format!("trade:{}", trade.id));
         fx.writes.push((trade_key(&trade.id), Some(encode(&next))));
@@ -1866,8 +2080,10 @@ impl<'r, R: Reader + ?Sized> Planner<'r, R> {
             if trade.is_egoc() {
                 return invalid("an EGOC settlement carries no outside signature");
             }
-            if (b.outcome, b.by) != (Outcome::Refund, Role::Buyer) {
-                return invalid("only the buyer's refund carries an outside signature");
+            let presigned = asset_info(&trade.asset).is_some_and(|a| a.family.presigned());
+            let arbiter_refund = presigned && (b.outcome, b.by) == (Outcome::Refund, Role::Arbiter);
+            if (b.outcome, b.by) != (Outcome::Refund, Role::Buyer) && !arbiter_refund {
+                return invalid("only the buyer's refund carries an outside signature, or on Bitcoin, Dogecoin and XRP the arbiter's refund");
             }
             verify_native_cancel(&trade, native).map_err(Refusal::Invalid)?;
         }
@@ -1939,7 +2155,7 @@ impl<'r, R: Reader + ?Sized> Planner<'r, R> {
         if !self.arbiters.iter().any(|a| *a == tx.from) {
             return invalid("only an arbiter publishes arbiter addresses");
         }
-        if b.evm.is_none() && b.tron.is_none() && b.sol.is_none() && b.ada.is_none() {
+        if b.evm.is_none() && b.tron.is_none() && b.sol.is_none() && b.ada.is_none() && b.btc.is_none() && b.doge.is_none() && b.xrp.is_none() {
             return invalid("publish at least one address");
         }
         if b.evm.as_deref().is_some_and(|a| !valid_chain_address(Family::Evm, a)) {
@@ -1954,7 +2170,16 @@ impl<'r, R: Reader + ?Sized> Planner<'r, R> {
         if b.ada.as_deref().is_some_and(|a| !valid_chain_address(Family::Cardano, a)) {
             return invalid("the Cardano address is not a testnet key address");
         }
-        let record = ArbiterAddresses { evm: b.evm, tron: b.tron, sol: b.sol, ada: b.ada, height: self.height };
+        if b.btc.as_deref().is_some_and(|a| btc_payout(Family::Bitcoin, a).is_none()) {
+            return invalid("the Bitcoin entry is a public key, optionally followed by @ and a Bitcoin address");
+        }
+        if b.doge.as_deref().is_some_and(|a| btc_payout(Family::Dogecoin, a).is_none()) {
+            return invalid("the Dogecoin entry is a public key, optionally followed by @ and a Dogecoin address");
+        }
+        if b.xrp.as_deref().is_some_and(|a| xrp_payout(a).is_none()) {
+            return invalid("the XRP entry is an XRP address, optionally followed by @ and a second XRP address");
+        }
+        let record = ArbiterAddresses { evm: b.evm, tron: b.tron, sol: b.sol, ada: b.ada, btc: b.btc, doge: b.doge, xrp: b.xrp, height: self.height };
         let mut fx = Effects::default();
         fx.touches.push(format!("arbiter:{}", tx.from));
         fx.writes.push((arbiter_addr_key(&tx.from), Some(encode(&record))));
@@ -2384,7 +2609,7 @@ pub fn params_view() -> Value {
             "chain_time": now,
             "wall_time": chrono::Utc::now().timestamp(),
             "assets": ASSETS,
-            "arbiter_addresses": arbiters_at(height)
+            "arbiter_addresses": current_arbiters(&DbReader(db), height)
                 .iter()
                 .map(|a| (a.to_string(), read::<ArbiterAddresses>(&DbReader(db), &arbiter_addr_key(a))))
                 .collect::<BTreeMap<String, Option<ArbiterAddresses>>>(),
@@ -2402,7 +2627,8 @@ pub fn params_view() -> Value {
             "offer_ttl_secs": OFFER_TTL_SECS,
             "feedback_window_secs": FEEDBACK_WINDOW_SECS,
             "max_margin_bps": MAX_MARGIN_BPS,
-            "arbiters": arbiters_at(height),
+            "arbiters": current_arbiters(&DbReader(db), height),
+            "arbiter_min_stake_uegoc": crate::dao_chain::ARBITER_MIN_STAKE_UEGOC,
             "escrow_held_uegoc": totals.held_uegoc,
             "active_trades": totals.active_trades,
             "ops": SIGNED_OPS,
@@ -2477,6 +2703,9 @@ pub fn offers_view(
                 if offer.closed_height.is_none() {
                     break;
                 }
+                continue;
+            }
+            if offer.side == Side::Sell && recent_no_shows(&reader, &offer.maker, now) >= NO_SHOW_LIMIT {
                 continue;
             }
             if filter.method.is_some_and(|m| !offer.methods.iter().any(|x| x == m)) {
@@ -2855,7 +3084,7 @@ mod tests {
     fn malformed_offers_are_refused() {
         let maker = Who::new(1);
         let cases: Vec<(Box<dyn Fn(&mut OfferBody)>, &str)> = vec![
-            (Box::new(|b| b.asset = "BTC".into()), "not traded"),
+            (Box::new(|b| b.asset = "XMR".into()), "not traded"),
             (Box::new(|b| b.fiat = "eur".into()), "three-letter"),
             (Box::new(|b| b.price = Price::Fixed(0)), "fixed price"),
             (Box::new(|b| b.price = Price::MarginBps(5_001)), "margin"),
@@ -3107,6 +3336,29 @@ mod tests {
         w.now += ACCEPT_WINDOW_SECS;
         let later = w.open(&buyer, &makers[MAX_PENDING_TRADES_PER_TAKER].1, 2_000_000);
         w.one(&later).unwrap();
+    }
+
+    #[test]
+    fn a_seller_who_misses_three_locks_in_a_month_is_paused() {
+        let mut w = World::new();
+        let seller = Who::new(1);
+        let offers: Vec<String> = (0..4).map(|_| w.post_offer(&seller, &sell_offer())).collect();
+        for (i, id) in offers.iter().take(NO_SHOW_LIMIT).enumerate() {
+            let buyer = Who::new(40 + i as u8);
+            let open = w.open(&buyer, id, 2_000_000);
+            w.one(&open).unwrap();
+            w.now += ACCEPT_WINDOW_SECS;
+        }
+        assert_eq!(recent_no_shows(&w.store, &seller.addr, w.now), NO_SHOW_LIMIT);
+        let late = w.open(&Who::new(60), &offers[3], 2_000_000);
+        refused(w.one(&late), "is paused");
+        let again = w.op(&seller, TX_OFFER, &sell_offer(), 0);
+        refused(w.one(&again), "is paused");
+        let other = Who::new(2);
+        let fine = w.op(&other, TX_OFFER, &sell_offer(), 0);
+        w.one(&fine).unwrap();
+        w.now += NO_SHOW_WINDOW_SECS + 60;
+        assert_eq!(recent_no_shows(&w.store, &seller.addr, w.now), 0, "the pause ends once the misses are older than 30 days");
     }
 
     #[test]
@@ -3649,7 +3901,7 @@ mod tests {
             (usdt_offer(Side::Buy, Some(EVM_JUDGE)), "is not a tron address"),
             (usdt_offer(Side::Buy, Some("T0000000000000000000000000000000O")), "is not a tron address"),
             (OfferBody { payout_address: Some(TRON_BUYER.into()), ..sell_offer() }, "EGOC offers take no payout"),
-            (OfferBody { asset: "DOGE".into(), ..sell_offer() }, "not traded on this market"),
+            (OfferBody { asset: "XMR".into(), ..sell_offer() }, "not traded on this market"),
         ];
         for (body, needle) in cases {
             let mut w = World::new();
@@ -3917,6 +4169,9 @@ mod tests {
             tron: Some(TRON_JUDGE.into()),
             sol: Some(sol_addr(70)),
             ada: Some(ada_addr(70)),
+            btc: None,
+            doge: None,
+            xrp: None,
         };
         let tx = w.op(judge, TX_ARBITER, &body, 0);
         w.one(&tx).unwrap();
@@ -3963,7 +4218,6 @@ mod tests {
             (coin_offer("SOL", Side::Buy, Some("1111".into()), 10_000), "is not a solana address"),
             (coin_offer("SOL", Side::Buy, Some(sol_addr(3)), 9_999), "trade limits"),
             (coin_offer("USDC-SPL", Side::Buy, None, 1), "say where you receive USDC on solana"),
-            (coin_offer("ADA", Side::Buy, Some(mainnet), 10_000_000), "is not a cardano address"),
             (coin_offer("ADA", Side::Buy, Some(ada_script()), 10_000_000), "is not a cardano address"),
             (coin_offer("ADA", Side::Buy, Some(sol_addr(3)), 10_000_000), "is not a cardano address"),
             (coin_offer("ADA", Side::Buy, Some(ada_addr(3)), 9_999_999), "trade limits"),
@@ -3978,6 +4232,7 @@ mod tests {
             coin_offer("SOL", Side::Buy, Some(sol_addr(3)), 10_000),
             coin_offer("USDT-SPL", Side::Buy, Some(sol_addr(3)), 1),
             coin_offer("ADA", Side::Buy, Some(ada_addr(3)), 10_000_000),
+            coin_offer("ADA", Side::Buy, Some(mainnet), 10_000_000),
             coin_offer("ADA", Side::Sell, None, 10_000_000),
         ] {
             let tx = w.op(&maker, TX_OFFER, &body, 0);

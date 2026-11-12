@@ -22,6 +22,8 @@ interface EarningsData {
   storage_reserved_bytes?: number;
   storage_earned_24h_uegoc?: number;
   storage_earned_total_uegoc?: number;
+  early_rank?: number | null;
+  early_places_taken?: number;
 }
 
 interface ChainDrs {
@@ -217,17 +219,10 @@ const EarningsPage: React.FC = () => {
     ? (bd.storage_rewards + bd.consensus_rewards + bd.coverage_rewards + bd.retrieval_rewards) || 1
     : 1;
 
-  // USD targets (must match tokenomics.rs constants)
-  const STORAGE_USD_PER_GB_DAY = 0.002;
-  const CONSENSUS_USD_PER_DAY  = 0.20;
-  const COVERAGE_USD_PER_DAY   = 0.15;
-  const RETRIEVAL_USD_PER_GB   = 0.003;
-
-  const impliedEgocPrice: number | null = egocUsd > 0 ? egocUsd : null;
-
-  const priceStr = impliedEgocPrice !== null
-    ? `~$${impliedEgocPrice.toFixed(impliedEgocPrice < 0.01 ? 5 : 4)}/EGOC`
-    : 'live price';
+  const earlyRank = earnings?.early_rank;
+  const earlyNote = earlyRank !== undefined && earlyRank !== null
+    ? ` · you are node #${earlyRank + 1}, earning ${+(earnings?.drs_multiplier ?? 1).toFixed(2)}× per point`
+    : '';
 
   const buckets = bd ? [
     {
@@ -237,7 +232,7 @@ const EarningsPage: React.FC = () => {
       text: 'text-blue-400',
       desc: earnings?.storage_plan_pay
         ? `Your share of the storage plans kept here (${earnings.storage_plans_kept ?? 0}), paid at each check-in`
-        : `~$${STORAGE_USD_PER_GB_DAY}/GB/day → converted to EGOC at ${priceStr}`,
+        : 'Your share of the storage half of the daily node pool, for the space you offer',
       detail: isStorageSetup
         ? `${fmtBytes(Math.max(earnings?.storage_used_bytes ?? 0, earnings?.storage_reserved_bytes ?? 0))} used of ${allocatedGb.toFixed(1)} GB set aside`
           + ` (${fmtBytes(earnings?.storage_used_bytes ?? 0)} of files kept, ${fmtBytes(earnings?.storage_reserved_bytes ?? 0)} reserved for plans)`
@@ -245,11 +240,11 @@ const EarningsPage: React.FC = () => {
         : 'No space set aside yet. Set it up in Storage to keep plans for other people and earn.',
     },
     {
-      label: 'Consensus',
+      label: 'Uptime',
       val: bd.consensus_rewards,
       color: 'bg-purple-500',
       text: 'text-purple-400',
-      desc: `~$${CONSENSUS_USD_PER_DAY}/day → EGOC at ${priceStr}`,
+      desc: `Your share of the daily node pool for staying online${earlyNote}`,
     },
     {
       label: 'Coverage',
@@ -257,15 +252,8 @@ const EarningsPage: React.FC = () => {
       color: 'bg-green-500',
       text: 'text-green-400',
       desc: earnings?.coverage_online
-        ? `~$${COVERAGE_USD_PER_DAY}/day → EGOC at ${priceStr}`
+        ? 'Your share of the daily node pool for coverage that nearby nodes confirmed'
         : 'Offline — criteria not met',
-    },
-    {
-      label: 'Retrieval',
-      val: bd.retrieval_rewards,
-      color: 'bg-orange-500',
-      text: 'text-orange-400',
-      desc: `~$${RETRIEVAL_USD_PER_GB}/GB served → EGOC at ${priceStr}`,
     },
   ] : [];
 
@@ -283,8 +271,8 @@ const EarningsPage: React.FC = () => {
             <div className="font-semibold mb-1">Storage rewards are zero — configure storage first</div>
             <div className="text-sm text-gray-400">
               Share disk space to earn{' '}
-              <span className="text-green-400 font-semibold">~${STORAGE_USD_PER_GB_DAY}/GB/day in EGOC</span>
-              {' '}— paid when your space is actually used by other peers
+              <span className="text-green-400 font-semibold">a part of the storage half of the daily node pool</span>
+              {' '}plus a share of every storage plan kept on your disk
             </div>
           </div>
           <button
@@ -311,12 +299,11 @@ const EarningsPage: React.FC = () => {
               </div>
               ) : (
               <div className="text-xs text-gray-400">
-                {allocatedGb.toFixed(1)} GB · max potential{' '}
+                {allocatedGb.toFixed(1)} GB offered ·{' '}
                 <span className="text-green-300 font-semibold">
                   {maxStorageEgocPerDay.toFixed(4)} EGOC/day
                 </span>{' '}
-                ≈ <span className="text-gray-500">${(STORAGE_USD_PER_GB_DAY * allocatedGb).toFixed(4)}/day</span>
-                {' '}(if fully utilized by peers)
+                from the node pool, plus storage plans once people buy them
               </div>
               )}
             </div>

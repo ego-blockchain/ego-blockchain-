@@ -19,6 +19,25 @@ pub const TX_KNOW_REVEAL: &str = "dao_know_reveal";
 pub const TX_REPORT: &str = "dao_report";
 pub const DAO_TYPES: [&str; 7] = [TX_PROPOSE, TX_VOTE, TX_KNOW, TX_REVEAL, TX_WITHDRAW, TX_KNOW_REVEAL, TX_REPORT];
 pub const KINDS: [&str; 5] = ["protocol", "resource", "feature", "parameter", "tender"];
+pub const KIND_ARBITER_ADD: &str = "arbiter_add";
+pub const KIND_ARBITER_REMOVE: &str = "arbiter_remove";
+pub const ARBITER_KINDS: [&str; 2] = [KIND_ARBITER_ADD, KIND_ARBITER_REMOVE];
+pub const ARBITER_OPTIONS: [&str; 2] = ["Yes", "No"];
+pub const ARBITER_MIN_STAKE_UEGOC: u64 = 10_000 * 1_000_000;
+pub const MAX_ARBITERS: usize = 100;
+pub const ARBITERS_KEY: &[u8] = b"dao:arbiters";
+const ARBITER_SETTLE_PER_BLOCK: usize = 64;
+pub const OUTCOME_REJECTED: u8 = 0;
+pub const OUTCOME_APPLIED: u8 = 1;
+pub const OUTCOME_UNCHANGED: u8 = 2;
+
+pub fn arbiter_rules_active(height: u64) -> bool {
+    height >= crate::drs::NODE_PAY_V2_FROM_HEIGHT
+}
+
+pub fn is_arbiter_kind(kind: &str) -> bool {
+    ARBITER_KINDS.contains(&kind)
+}
 
 pub const MAX_BODY_BYTES: usize = 16_384;
 pub const MAX_TITLE_BYTES: usize = 200;
@@ -65,6 +84,8 @@ pub struct ProposeBody {
     pub questions: Vec<Question>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub answers_commit: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -125,6 +146,8 @@ pub struct Proposal {
     pub withdrawn: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revealed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target: String,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -212,14 +235,32 @@ fn text_ok(s: &str, max: usize) -> bool {
 }
 
 pub fn check_propose(b: &ProposeBody) -> Result<(), String> {
+    check_propose_at(b, crate::chain_db::local_chain_height().saturating_add(1))
+}
+
+fn arbiter_address_ok(a: &str) -> bool {
+    a.starts_with("egot1") && (20..=80).contains(&a.len()) && a.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+pub fn check_propose_at(b: &ProposeBody, height: u64) -> Result<(), String> {
+    if is_arbiter_kind(&b.kind) && arbiter_rules_active(height) {
+        if !arbiter_address_ok(&b.target) {
+            return Err("an arbiter proposal names the Ego address it adds or removes".into());
+        }
+        if b.options.iter().map(String::as_str).ne(ARBITER_OPTIONS.iter().copied()) {
+            return Err("an arbiter proposal is voted Yes or No".into());
+        }
+        if !b.questions.is_empty() {
+            return Err("an arbiter proposal is decided by stake alone, with no knowledge test".into());
+        }
+    } else if !KINDS.contains(&b.kind.as_str()) {
+        return Err(format!("unknown type '{}'; use {}", b.kind, KINDS.join(", ")));
+    }
     if !text_ok(&b.title, MAX_TITLE_BYTES) {
         return Err(format!("a title is needed, at most {MAX_TITLE_BYTES} bytes"));
     }
     if b.description.len() > MAX_DESCRIPTION_BYTES {
         return Err(format!("the description is longer than {MAX_DESCRIPTION_BYTES} bytes"));
-    }
-    if !KINDS.contains(&b.kind.as_str()) {
-        return Err(format!("unknown type '{}'; use {}", b.kind, KINDS.join(", ")));
     }
     if b.options.len() < 2 || b.options.len() > MAX_OPTIONS {
         return Err(format!("a proposal needs 2 to {MAX_OPTIONS} options"));
@@ -255,7 +296,7 @@ fn answers_shape_ok(questions: &[Question], answers: &[u8]) -> bool {
     answers.len() == questions.len() && questions.iter().zip(answers).all(|(q, a)| (*a as usize) < q.options.len())
 }
 
-pub fn well_formed(tx: &LedgerTx) -> Result<(), String> {
+pub fn well_formed(tx: &LedgerTx, height: u64) -> Result<(), String> {
     if !is_dao_tx(tx) {
         return Err(format!("{} is not a DAO transaction", tx.tx_type));
     }
@@ -270,7 +311,7 @@ pub fn well_formed(tx: &LedgerTx) -> Result<(), String> {
     }
     let unreadable = |e: serde_json::Error| format!("the body is not readable: {e}");
     match tx.tx_type.as_str() {
-        TX_PROPOSE => check_propose(&serde_json::from_str::<ProposeBody>(&tx.call_args).map_err(unreadable)?),
+        TX_PROPOSE => check_propose_at(&serde_json::from_str::<ProposeBody>(&tx.call_args).map_err(unreadable)?, height),
         TX_VOTE => {
             let b: VoteBody = serde_json::from_str(&tx.call_args).map_err(unreadable)?;
             if !is_id(&b.id) || b.option as usize >= MAX_OPTIONS {
@@ -314,6 +355,74 @@ pub fn well_formed(tx: &LedgerTx) -> Result<(), String> {
 
 fn key(parts: std::fmt::Arguments) -> Vec<u8> {
     format!("dao:{parts}").into_bytes()
+}
+
+fn arbiter_end_key(ends_at: i64, id: &str) -> Vec<u8> {
+    key(format_args!("ae:{:020}:{id}", ends_at.max(0) as u64))
+}
+
+fn arbiter_outcome_key(id: &str) -> Vec<u8> {
+    key(format_args!("ao:{id}"))
+}
+
+fn arbiter_end_parts(k: &[u8]) -> Option<(i64, String)> {
+    let s = std::str::from_utf8(k.strip_prefix(b"dao:ae:".as_slice())?).ok()?;
+    let (ts, id) = s.split_once(':')?;
+    Some((ts.parse::<u64>().ok()? as i64, id.to_string()))
+}
+
+pub fn arbiter_list(ov: &Ov, height: u64) -> Vec<String> {
+    load::<Vec<String>>(ov, ARBITERS_KEY)
+        .unwrap_or_else(|| crate::market_chain::arbiters_at(height).iter().map(|a| a.to_string()).collect())
+}
+
+pub fn arbiter_outcome(ov: &Ov, id: &str) -> Option<u8> {
+    ov.get(&arbiter_outcome_key(id)).and_then(|v| v.first().copied())
+}
+
+fn decide_arbiter(ov: &mut Ov, p: &Proposal, network_stake: u64, height: u64) -> u8 {
+    if p.withdrawn || p.target.is_empty() || !is_arbiter_kind(&p.kind) {
+        return OUTCOME_REJECTED;
+    }
+    let tallies: Vec<u64> = load(ov, &tally_key(&p.id)).unwrap_or_default();
+    let yes = tallies.first().copied().unwrap_or(0);
+    let no = tallies.get(1).copied().unwrap_or(0);
+    let voters = u64_at(ov, &stake_count_key(&p.id));
+    let quorum = voters >= MIN_STAKE_VOTERS
+        && (yes as u128 + no as u128) * 100 >= network_stake as u128 * MIN_STAKE_PERCENT;
+    if !quorum || yes <= no {
+        return OUTCOME_REJECTED;
+    }
+    let mut list = arbiter_list(ov, height);
+    let listed = list.iter().any(|a| *a == p.target);
+    if p.kind == KIND_ARBITER_ADD {
+        if listed || list.len() >= MAX_ARBITERS || stake_of(ov, &p.target) < ARBITER_MIN_STAKE_UEGOC {
+            return OUTCOME_UNCHANGED;
+        }
+        list.push(p.target.clone());
+    } else {
+        if !listed || list.len() <= 1 {
+            return OUTCOME_UNCHANGED;
+        }
+        list.retain(|a| *a != p.target);
+    }
+    save(ov, ARBITERS_KEY.to_vec(), &list);
+    OUTCOME_APPLIED
+}
+
+fn settle_arbiter_votes(ov: &mut Ov, block: &LedgerBlock, network_stake: u64) {
+    let due = ov.committed_keys(b"dao:ae:", ARBITER_SETTLE_PER_BLOCK, |k| {
+        arbiter_end_parts(k).map_or(true, |(ts, _)| ts > block.timestamp)
+    });
+    for k in due {
+        let Some((_, id)) = arbiter_end_parts(&k) else { continue };
+        ov.del(k);
+        let outcome = match load_proposal(ov, &id) {
+            Some(p) => decide_arbiter(ov, &p, network_stake, block.height),
+            None => OUTCOME_REJECTED,
+        };
+        ov.put(arbiter_outcome_key(&id), vec![outcome]);
+    }
 }
 
 fn p_key(id: &str) -> Vec<u8> {
@@ -483,6 +592,8 @@ fn propose(ov: &mut Ov, block: &LedgerBlock, tx: &LedgerTx, network_stake: u64) 
     }
     times.push(block.timestamp);
     save(ov, created_key(&tx.from), &times);
+    let arbiter_vote = is_arbiter_kind(&b.kind) && arbiter_rules_active(block.height);
+    let target = if arbiter_vote { b.target.clone() } else { String::new() };
     let p = Proposal {
         id: id.clone(),
         title: b.title,
@@ -498,7 +609,11 @@ fn propose(ov: &mut Ov, block: &LedgerBlock, tx: &LedgerTx, network_stake: u64) 
         answers: None,
         withdrawn: false,
         revealed_at: None,
+        target,
     };
+    if arbiter_vote {
+        ov.put(arbiter_end_key(p.ends_at, &id), Vec::new());
+    }
     save(ov, tally_key(&id), &vec![0u64; p.options.len()]);
     ov.put(idx_key(p.created_at, &id), Vec::new());
     save(ov, p_key(&id), &p);
@@ -621,7 +736,7 @@ fn withdraw(ov: &mut Ov, block: &LedgerBlock, tx: &LedgerTx) -> Result<(), Strin
 }
 
 pub fn apply_tx(ov: &mut Ov, block: &LedgerBlock, tx: &LedgerTx, network_stake: u64) -> Result<(), String> {
-    well_formed(tx)?;
+    well_formed(tx, block.height)?;
     match tx.tx_type.as_str() {
         TX_PROPOSE => propose(ov, block, tx, network_stake),
         TX_VOTE => stake_vote(ov, block, tx),
@@ -646,6 +761,9 @@ pub fn apply_block(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx], network_
             tracing::debug!("[DAO] {} {} had no effect: {e}", tx.tx_type, tx.hash);
         }
     }
+    if arbiter_rules_active(block.height) {
+        settle_arbiter_votes(ov, block, network_stake);
+    }
 }
 
 pub fn validate(ov: &Ov, block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), String> {
@@ -655,7 +773,7 @@ pub fn validate(ov: &Ov, block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), St
         if !active {
             return Err(format!("{} {} refused: DAO transactions are not active at block {}", tx.tx_type, tx.hash, block.height));
         }
-        well_formed(tx).map_err(|e| format!("{} {} rejected: {e}", tx.tx_type, tx.hash))?;
+        well_formed(tx, block.height).map_err(|e| format!("{} {} rejected: {e}", tx.tx_type, tx.hash))?;
         if locks_stake(tx) {
             voters.insert(tx.from.as_str());
         }
@@ -686,7 +804,7 @@ pub fn proposal_fit(ov: &Ov, tx: &LedgerTx, height: u64, timestamp: i64, unstake
         if !rule_active(height) {
             return Fit::Later(format!("DAO transactions start at block {:?}", ACTIVATION_HEIGHT));
         }
-        if let Err(e) = well_formed(tx) {
+        if let Err(e) = well_formed(tx, height) {
             return Fit::Never(e);
         }
         if locks_stake(tx) && unstakers.contains(&tx.from) {
@@ -704,7 +822,7 @@ pub fn admit(tx: &LedgerTx) -> Result<(), String> {
         if !rule_active_at_tip() {
             return Err(format!("{} refused: DAO transactions are not active yet", tx.tx_type));
         }
-        well_formed(tx)?;
+        well_formed(tx, crate::chain_db::local_chain_height().saturating_add(1))?;
     }
     if crate::chain_db::is_unstake_tx(tx) && rule_active_at_tip() {
         let until = locked_until(&Ov::new(crate::chain_db::global_db()), &tx.from);
@@ -773,6 +891,7 @@ pub fn to_public(ov: &Ov, p: &Proposal, voter: Option<&str>, now: i64) -> DaoPro
         my_test_score,
         on_chain: true,
         answers_revealed: p.answers.is_some(),
+        target: p.target.clone(),
     }
 }
 
@@ -891,6 +1010,7 @@ mod tests {
             duration_days: 7,
             questions,
             answers_commit: commit,
+            target: String::new(),
         }
     }
 
@@ -913,15 +1033,15 @@ mod tests {
     #[test]
     fn a_changed_body_is_not_well_formed() {
         let mut t = tx(ALICE, TX_PROPOSE, &body(vec![], String::new()), 1);
-        assert!(well_formed(&t).is_ok());
+        assert!(well_formed(&t, 0).is_ok());
         t.call_args = t.call_args.replace("Yes", "Yep");
-        assert!(well_formed(&t).is_err());
+        assert!(well_formed(&t, 0).is_err());
         let mut sent = tx(ALICE, TX_PROPOSE, &body(vec![], String::new()), 1);
         sent.to = BOB.into();
-        assert!(well_formed(&sent).is_err());
+        assert!(well_formed(&sent, 0).is_err());
         let mut paid = tx(ALICE, TX_PROPOSE, &body(vec![], String::new()), 1);
         paid.amount = 5;
-        assert!(well_formed(&paid).is_err());
+        assert!(well_formed(&paid, 0).is_err());
     }
 
     #[test]
@@ -1100,5 +1220,114 @@ mod tests {
         } else {
             assert!(validate(&ov, &block(10, 4_999), std::slice::from_ref(&unstake)).is_ok());
         }
+    }
+}
+
+#[cfg(test)]
+mod arbiter_vote_tests {
+    use super::*;
+
+    fn block(height: u64, timestamp: i64) -> LedgerBlock {
+        LedgerBlock { height, timestamp, ..LedgerBlock::default() }
+    }
+
+    fn proposal(ov: &mut Ov, kind: &str, target: &str, ends_at: i64) -> String {
+        let id = "a".repeat(64);
+        let p = Proposal {
+            id: id.clone(),
+            title: "arbiter".into(),
+            kind: kind.into(),
+            options: vec!["Yes".into(), "No".into()],
+            ends_at,
+            target: target.into(),
+            ..Proposal::default()
+        };
+        save(ov, p_key(&id), &p);
+        ov.put(arbiter_end_key(ends_at, &id), Vec::new());
+        id
+    }
+
+    fn votes(ov: &mut Ov, id: &str, yes: u64, no: u64, voters: u64) {
+        save(ov, tally_key(id), &vec![yes, no]);
+        put_u64(ov, stake_count_key(id), voters);
+    }
+
+    #[test]
+    fn a_passed_vote_adds_a_staked_arbiter_when_it_ends_and_not_before() {
+        let h = crate::drs::NODE_PAY_V2_FROM_HEIGHT;
+        let mut ov = Ov::memory();
+        ov.put(b"stake:egot1newarbiter0000000000".to_vec(), (20_000u64 * 1_000_000).to_le_bytes().to_vec());
+        let id = proposal(&mut ov, KIND_ARBITER_ADD, "egot1newarbiter0000000000", 1_000);
+        votes(&mut ov, &id, 900, 100, 5);
+        ov.commit_memory();
+        apply_block(&mut ov, &block(h, 999), &[], 10_000);
+        ov.commit_memory();
+        assert_eq!(arbiter_outcome(&ov, &id), None, "nothing happens before the vote ends");
+        apply_block(&mut ov, &block(h + 1, 1_000), &[], 10_000);
+        ov.commit_memory();
+        assert_eq!(arbiter_outcome(&ov, &id), Some(OUTCOME_APPLIED));
+        let list = arbiter_list(&ov, h);
+        assert!(list.contains(&"egot1newarbiter0000000000".to_string()));
+        assert!(list.len() >= 2, "the founding arbiter stays until the DAO removes it");
+    }
+
+    #[test]
+    fn a_vote_without_quorum_or_majority_or_stake_changes_nothing() {
+        let h = crate::drs::NODE_PAY_V2_FROM_HEIGHT;
+        for (yes, no, voters, staked, want) in [
+            (900u64, 100u64, 2u64, true, OUTCOME_REJECTED),
+            (100, 900, 5, true, OUTCOME_REJECTED),
+            (500, 500, 5, true, OUTCOME_REJECTED),
+            (1, 0, 5, true, OUTCOME_REJECTED),
+            (900, 100, 5, false, OUTCOME_UNCHANGED),
+        ] {
+            let mut ov = Ov::memory();
+            if staked {
+                ov.put(b"stake:egot1candidate000000000".to_vec(), (20_000u64 * 1_000_000).to_le_bytes().to_vec());
+            }
+            let id = proposal(&mut ov, KIND_ARBITER_ADD, "egot1candidate000000000", 10);
+            votes(&mut ov, &id, yes, no, voters);
+            ov.commit_memory();
+            apply_block(&mut ov, &block(h, 10), &[], 10_000);
+            ov.commit_memory();
+            assert_eq!(arbiter_outcome(&ov, &id), Some(want), "{yes} {no} {voters} {staked}");
+            assert!(!arbiter_list(&ov, h).contains(&"egot1candidate000000000".to_string()));
+        }
+    }
+
+    #[test]
+    fn the_last_arbiter_cannot_be_voted_away() {
+        let h = crate::drs::NODE_PAY_V2_FROM_HEIGHT;
+        let mut ov = Ov::memory();
+        let only = crate::market_chain::arbiters_at(h)[0].to_string();
+        let id = proposal(&mut ov, KIND_ARBITER_REMOVE, &only, 10);
+        votes(&mut ov, &id, 900, 0, 5);
+        ov.commit_memory();
+        apply_block(&mut ov, &block(h, 10), &[], 10_000);
+        ov.commit_memory();
+        assert_eq!(arbiter_outcome(&ov, &id), Some(OUTCOME_UNCHANGED));
+        assert_eq!(arbiter_list(&ov, h), vec![only]);
+    }
+
+    #[test]
+    fn arbiter_proposals_are_refused_before_the_switch_and_must_be_yes_or_no() {
+        let h = crate::drs::NODE_PAY_V2_FROM_HEIGHT;
+        let mut b = ProposeBody {
+            title: "Add an arbiter".into(),
+            description: String::new(),
+            kind: KIND_ARBITER_ADD.into(),
+            options: vec!["Yes".into(), "No".into()],
+            duration_days: 7,
+            questions: Vec::new(),
+            answers_commit: String::new(),
+            target: "egot1candidate000000000".into(),
+        };
+        assert!(check_propose_at(&b, h - 1).is_err(), "old nodes do not know this type, so it waits for the switch");
+        assert!(check_propose_at(&b, h).is_ok());
+        b.options = vec!["Maybe".into(), "No".into()];
+        assert!(check_propose_at(&b, h).is_err());
+        b.options = vec!["Yes".into(), "No".into()];
+        b.target = "0xabc".into();
+        assert!(check_propose_at(&b, h).is_err());
     }
 }

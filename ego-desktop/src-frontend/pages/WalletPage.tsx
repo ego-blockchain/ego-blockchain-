@@ -727,10 +727,13 @@ const WalletPage: React.FC = () => {
     }
   }
 
+  const sendingToSelf = !!sendForm.to.trim() && sendForm.to.trim() === myAddress.trim();
+
   async function handleSend() {
     if (!sendForm.to || !sendForm.amount) return;
-    if (sendForm.to.trim() === myAddress.trim()) {
-      setTxResult({ hash: '', success: false, message: 'Cannot send to your own address' });
+    if (sendingToSelf) {
+      setEmailStep('idle');
+      setTxResult({ hash: '', success: false, message: 'This is your own address. Choose another address to send to.' });
       return;
     }
     setSending(true);
@@ -3621,9 +3624,12 @@ const WalletPage: React.FC = () => {
                     <input
                       value={sendForm.to}
                       onChange={e => setSendForm(f => ({ ...f, to: e.target.value }))}
-                      className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm font-mono outline-none transition"
+                      className={`w-full bg-gray-900 border rounded-xl px-4 py-3 text-sm font-mono outline-none transition ${sendingToSelf ? 'border-red-500' : 'border-gray-700 focus:border-blue-500'}`}
                       placeholder="egot1..."
                     />
+                    {sendingToSelf && (
+                      <div className="text-xs text-red-400 mt-1.5">This is your own address. Choose another address to send to.</div>
+                    )}
                   </div>
                   <div>
                     <label className="text-xs text-gray-400 block mb-1.5">Amount (EGOC)</label>
@@ -3734,8 +3740,8 @@ const WalletPage: React.FC = () => {
                     </div>
                   </div>
                   <button
-                    onClick={() => { if (sendForm.to && sendForm.amount) setEmailStep('review'); }}
-                    disabled={!sendForm.to || !sendForm.amount || sending}
+                    onClick={() => { if (sendForm.to && sendForm.amount && !sendingToSelf) setEmailStep('review'); }}
+                    disabled={!sendForm.to || !sendForm.amount || sending || sendingToSelf}
                     className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed py-3 rounded-xl font-semibold transition"
                   >
                     Review & Sign

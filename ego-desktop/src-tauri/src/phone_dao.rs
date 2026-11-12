@@ -73,11 +73,7 @@ fn staking_status(params: &Value) -> RpcResult {
     let unlock_at = if staked > 0 && started_at > 0 { started_at + lock_days as i64 * crate::dao_chain::DAY_SECS } else { 0 };
     let pool = crate::chain_db::balance_of(crate::chain_db::STAKING_POOL_ADDR);
     let accrued = if staked > 0 && started_at > 0 {
-        let secs = (now - started_at).max(0) as u64;
-        let online = crate::chain_db::node_stake_online_secs(&addr, now, secs);
-        crate::tokenomics::staking_reward_uegoc(staked, lock_days, secs)
-            .saturating_add(crate::tokenomics::node_staking_bonus_uegoc(staked, lock_days, online))
-            .min(pool)
+        crate::chain_db::staking_reward_preview(&addr, staked, now).min(pool)
     } else {
         0
     };
@@ -85,7 +81,18 @@ fn staking_status(params: &Value) -> RpcResult {
         (crate::dao_chain::locked_until(ov, &addr), crate::hold_chain::stake_locked_until(ov, &addr))
     });
     let vote_locked_until = dao_lock.max(hold_lock);
-    let apr = |days: u32| crate::tokenomics::effective_apr_bps(days) as f64 / 100.0;
+    let node_rate = crate::chain_db::node_stake_rate(&addr, now);
+    let share = crate::chain_db::stake_share_view(&addr);
+    let apr = |days: u32| {
+        let bps = if share.live {
+            crate::chain_db::stake_rate_bps(&share, days, share.act_milli)
+        } else if node_rate {
+            crate::tokenomics::node_apr_bps(days)
+        } else {
+            crate::tokenomics::effective_apr_bps(days)
+        };
+        bps as f64 / 100.0
+    };
     let lock_options: Vec<Value> = [30u32, 90, 180, 365].iter().map(|d| json!({ "days": d, "apr": apr(*d) })).collect();
     Ok(json!({
         "address": addr,
@@ -103,6 +110,8 @@ fn staking_status(params: &Value) -> RpcResult {
         "staking_address": crate::chain_db::STAKING_ADDR,
         "lock_options": lock_options,
         "max_lock_days": 1825,
+        "budget_live": share.live,
+        "activity_milli": if share.live { share.act_milli } else if node_rate { 2_000 } else { 1_000 },
     }))
 }
 

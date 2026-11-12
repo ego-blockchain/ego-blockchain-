@@ -45,7 +45,7 @@ pub const LIVE_SEATS_FROM_HEIGHT: u64 = 79_841;
 const LIVE_SEAT_EPOCHS: u64 = 3;
 const WIDEN_READY_EPOCHS: u64 = 8;
 const WIDEN_MAX_OUTSIDERS: usize = 512;
-pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT];
+pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT, NODE_PAY_V2_FROM_HEIGHT];
 const KEY_STORAGE_TOTAL: &[u8] = b"n2swt";
 const KEY_LAST_MAKERS: &[u8] = b"n2last";
 
@@ -83,6 +83,47 @@ pub fn node_reward_per_day_at(at: i64) -> u64 {
     let era = at.saturating_sub(CHECKIN_HALVING_START_TS).max(0) / CHECKIN_HALVING_SECS;
     if era >= 64 { 0 } else { NODE_REWARD_PER_DAY_UEGOC >> era }
 }
+
+pub const NODE_PAY_V2_FROM_HEIGHT: u64 = 117_701;
+const _: () = assert!((NODE_PAY_V2_FROM_HEIGHT - SHORT_EPOCH_FROM_HEIGHT) % SHORT_EPOCH == 0);
+pub const NODE_REWARD_V2_PER_DAY_UEGOC: u64 = 13_689_253_948;
+pub const NODE_PAY_ERAS: i64 = 30;
+pub const RANK_PAY_SETTLE_SECS: i64 = STREAK_GAP_SECS + 3_600;
+pub const EARLY_RANKS: u64 = 100;
+pub const MIDDLE_RANKS: u64 = 1_000;
+pub const LATE_RANKS: u64 = 10_000;
+
+pub fn node_reward_per_day(height: u64, at: i64) -> u64 {
+    if height < NODE_PAY_V2_FROM_HEIGHT {
+        return node_reward_per_day_at(at);
+    }
+    let era = at.saturating_sub(CHECKIN_HALVING_START_TS).max(0) / CHECKIN_HALVING_SECS;
+    if era >= NODE_PAY_ERAS { 0 } else { NODE_REWARD_V2_PER_DAY_UEGOC >> era }
+}
+
+pub const STAKE_PAY_PER_DAY_UEGOC: u64 = 47_912_388_819;
+const STAKE_SCALE: u128 = 1_000_000_000_000_000_000;
+const STAKE_MIGRATE_MAX: usize = 100_000;
+
+pub fn stake_per_day(height: u64, at: i64) -> u64 {
+    if height < NODE_PAY_V2_FROM_HEIGHT {
+        return 0;
+    }
+    let era = at.saturating_sub(CHECKIN_HALVING_START_TS).max(0) / CHECKIN_HALVING_SECS;
+    if era >= NODE_PAY_ERAS { 0 } else { STAKE_PAY_PER_DAY_UEGOC >> era }
+}
+
+pub fn early_mult_milli(rank: u64) -> u64 {
+    if rank < EARLY_RANKS {
+        10_000
+    } else if rank < MIDDLE_RANKS {
+        7_000 - 5_500 * (rank - EARLY_RANKS) / (MIDDLE_RANKS - EARLY_RANKS)
+    } else if rank < LATE_RANKS {
+        1_500 - 500 * (rank - MIDDLE_RANKS) / (LATE_RANKS - MIDDLE_RANKS)
+    } else {
+        1_000
+    }
+}
 pub const MAX_CHECKINS_PER_BLOCK: usize = 2_048;
 pub const MAX_EXPIRIES_PER_BLOCK: usize = 20_000;
 pub const ANCHOR_MAX_AGE: u64 = 300;
@@ -95,6 +136,283 @@ pub const TX_TM_READY_BATCH: &str = "tm_ready_batch";
 const GB: u64 = 1_000_000_000;
 const KEY_COUNT: &[u8] = b"n2count";
 const KEY_ELIGIBLE: &[u8] = b"n2elig";
+const KEY_PAY_SINCE: &[u8] = b"n2pays";
+const KEY_RANK_NEXT: &[u8] = b"n2rkn";
+const KEY_PAY_BASE_TOTAL: &[u8] = b"n2pbt";
+const KEY_PAY_STORAGE_TOTAL: &[u8] = b"n2pst";
+
+const KEY_STAKE_ACC: &[u8] = b"n2sk";
+
+fn staker_key(addr: &str) -> Vec<u8> {
+    format!("n2st:{addr}").into_bytes()
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Staker {
+    pub principal: u64,
+    pub lock_days: u32,
+    pub act_milli: u64,
+    pub points: u128,
+    pub snap: u128,
+    pub owed: u64,
+}
+
+impl Staker {
+    fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(60);
+        v.extend_from_slice(&self.principal.to_le_bytes());
+        v.extend_from_slice(&self.lock_days.to_le_bytes());
+        v.extend_from_slice(&self.act_milli.to_le_bytes());
+        v.extend_from_slice(&self.points.to_le_bytes());
+        v.extend_from_slice(&self.snap.to_le_bytes());
+        v.extend_from_slice(&self.owed.to_le_bytes());
+        v
+    }
+
+    fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < 60 {
+            return None;
+        }
+        Some(Self {
+            principal: u64::from_le_bytes(b[0..8].try_into().ok()?),
+            lock_days: u32::from_le_bytes(b[8..12].try_into().ok()?),
+            act_milli: u64::from_le_bytes(b[12..20].try_into().ok()?),
+            points: u128::from_le_bytes(b[20..36].try_into().ok()?),
+            snap: u128::from_le_bytes(b[36..52].try_into().ok()?),
+            owed: u64::from_le_bytes(b[52..60].try_into().ok()?),
+        })
+    }
+
+    fn pending(&self, r: u128) -> u64 {
+        (self.points.saturating_mul(r.saturating_sub(self.snap)) / STAKE_SCALE).min(u64::MAX as u128) as u64
+    }
+}
+
+pub fn load_staker(ov: &Ov, addr: &str) -> Option<Staker> {
+    ov.get(&staker_key(addr)).and_then(|v| Staker::decode(&v))
+}
+
+pub fn stake_acc(ov: &Ov) -> (u128, i64, u128) {
+    match ov.get(KEY_STAKE_ACC) {
+        Some(v) if v.len() >= 40 => (
+            u128::from_le_bytes(v[0..16].try_into().unwrap_or([0; 16])),
+            i64::from_le_bytes(v[16..24].try_into().unwrap_or([0; 8])),
+            u128::from_le_bytes(v[24..40].try_into().unwrap_or([0; 16])),
+        ),
+        _ => (0, 0, 0),
+    }
+}
+
+fn put_stake_acc(ov: &mut Ov, r: u128, last: i64, total: u128) {
+    let mut v = Vec::with_capacity(40);
+    v.extend_from_slice(&r.to_le_bytes());
+    v.extend_from_slice(&last.to_le_bytes());
+    v.extend_from_slice(&total.to_le_bytes());
+    ov.put(KEY_STAKE_ACC.to_vec(), v);
+}
+
+pub fn lock_milli(lock_days: u32) -> u64 {
+    crate::tokenomics::effective_apr_bps(lock_days) * 1_000 / crate::tokenomics::STAKING_APR_BPS.max(1)
+}
+
+pub fn activity_of(rec: &NodeRec, at: i64) -> u64 {
+    if rec.streak >= MIN_STREAK && at.saturating_sub(rec.last_checkin) <= STREAK_GAP_SECS {
+        2_000 + storage_points(rec, at) * 1_000 / STORAGE_CAP
+    } else {
+        1_000
+    }
+}
+
+pub fn activity_milli(ov: &Ov, addr: &str, at: i64) -> u64 {
+    load_rec(ov, addr).map_or(1_000, |rec| activity_of(&rec, at))
+}
+
+pub fn stake_points(principal: u64, lock_days: u32, act_milli: u64) -> u128 {
+    principal as u128 * lock_milli(lock_days) as u128 * act_milli as u128 / 1_000_000
+}
+
+pub fn stake_point_rate_bps(height: u64, at: i64, total_points: u128) -> u64 {
+    let base = crate::tokenomics::STAKING_APR_BPS;
+    if total_points == 0 {
+        return base;
+    }
+    let budget = stake_per_day(height, at) as u128 * 365 * 10_000 / total_points;
+    (base as u128).min(budget) as u64
+}
+
+fn accrue_stake(ov: &mut Ov, height: u64, at: i64) {
+    let (r, last, total) = stake_acc(ov);
+    let dt = if last == 0 { 0 } else { at.saturating_sub(last).clamp(0, 86_400) as u128 };
+    let mut next = r;
+    if total > 0 && dt > 0 {
+        let nominal = STAKE_SCALE * crate::tokenomics::STAKING_APR_BPS as u128 * dt
+            / (10_000 * crate::tokenomics::SECONDS_PER_YEAR as u128);
+        let budget = stake_per_day(height, at) as u128 * dt * STAKE_SCALE / (86_400 * total);
+        next = r.saturating_add(nominal.min(budget));
+    }
+    if next != r || last != at {
+        put_stake_acc(ov, next, at, total);
+    }
+}
+
+fn set_staker(ov: &mut Ov, addr: &str, principal: u64, lock_days: u32, act_milli: u64) {
+    let (r, last, total) = stake_acc(ov);
+    let old = load_staker(ov, addr);
+    let mut st = old.unwrap_or_default();
+    if old.is_some() {
+        st.owed = st.owed.saturating_add(st.pending(r));
+    }
+    st.snap = r;
+    let old_points = old.map_or(0, |o| o.points);
+    st.principal = principal;
+    st.lock_days = lock_days;
+    st.act_milli = act_milli;
+    st.points = stake_points(principal, lock_days, act_milli);
+    ov.put(staker_key(addr), st.encode());
+    put_stake_acc(ov, r, last, total.saturating_sub(old_points).saturating_add(st.points));
+}
+
+fn remove_staker(ov: &mut Ov, addr: &str) {
+    if let Some(st) = load_staker(ov, addr) {
+        let (r, last, total) = stake_acc(ov);
+        put_stake_acc(ov, r, last, total.saturating_sub(st.points));
+        ov.del(staker_key(addr));
+    }
+}
+
+pub fn stake_owed(ov: &Ov, addr: &str) -> u64 {
+    let (r, _, _) = stake_acc(ov);
+    load_staker(ov, addr).map_or(0, |st| st.owed.saturating_add(st.pending(r)))
+}
+
+fn committed_stake(ov: &Ov, addr: &str) -> u64 {
+    ov.get(format!("stake:{addr}").as_bytes()).map(|v| read_u64_le(&v)).unwrap_or(0)
+}
+
+fn migrate_stakers(ov: &mut Ov, at: i64) {
+    let keys = ov.committed_keys(b"stakemeta:", STAKE_MIGRATE_MAX, |_| false);
+    for key in keys {
+        let Some(addr) = std::str::from_utf8(&key[b"stakemeta:".len()..]).ok().map(str::to_string) else { continue };
+        let Some(meta) = ov.get(&key) else { continue };
+        if meta.len() < 12 {
+            continue;
+        }
+        let lock_days = u32::from_le_bytes(meta[8..12].try_into().unwrap_or([0; 4]));
+        let principal = committed_stake(ov, &addr);
+        if principal > 0 {
+            let act = activity_milli(ov, &addr, at);
+            set_staker(ov, &addr, principal, lock_days, act);
+        }
+    }
+}
+
+fn apply_stake_changes(ov: &mut Ov, txs: &[&LedgerTx], at: i64) {
+    for tx in txs {
+        if crate::chain_db::is_stake_tx(tx) {
+            let prev = load_staker(ov, &tx.from).map_or_else(|| committed_stake(ov, &tx.from), |s| s.principal);
+            let act = activity_milli(ov, &tx.from, at);
+            set_staker(ov, &tx.from, prev.saturating_add(tx.amount), crate::chain_db::stake_lock_days_of(tx), act);
+        } else if crate::chain_db::is_unstake_tx(tx) {
+            remove_staker(ov, &tx.from);
+        }
+    }
+}
+
+fn rank_key(addr: &str) -> Vec<u8> {
+    format!("n2rk:{addr}").into_bytes()
+}
+
+fn pay_base_key(addr: &str) -> Vec<u8> {
+    format!("n2pb:{addr}").into_bytes()
+}
+
+fn pay_storage_key(addr: &str) -> Vec<u8> {
+    format!("n2ps:{addr}").into_bytes()
+}
+
+pub fn rank_of(ov: &Ov, addr: &str) -> Option<u64> {
+    ov.get(&rank_key(addr)).map(|v| read_u64_le(&v))
+}
+
+pub fn ranks_given(ov: &Ov) -> u64 {
+    ov.get(KEY_RANK_NEXT).map(|v| read_u64_le(&v)).unwrap_or(0)
+}
+
+fn rank_or_assign(ov: &mut Ov, addr: &str) -> u64 {
+    if let Some(rank) = rank_of(ov, addr) {
+        return rank;
+    }
+    let rank = ranks_given(ov);
+    ov.put(rank_key(addr), u64_le(rank).to_vec());
+    ov.put(KEY_RANK_NEXT.to_vec(), u64_le(rank + 1).to_vec());
+    rank
+}
+
+pub fn rank_pay_since(ov: &Ov) -> Option<i64> {
+    ov.get(KEY_PAY_SINCE).map(|v| read_u64_le(&v) as i64)
+}
+
+pub fn rank_pay_ready(ov: &Ov, at: i64) -> bool {
+    rank_pay_since(ov).map_or(false, |since| at >= since.saturating_add(RANK_PAY_SETTLE_SECS))
+}
+
+pub fn pay_weights(ov: &Ov, addr: &str, period: u64) -> (u64, u64, u64, u64) {
+    (
+        versioned(ov, &pay_base_key(addr)).at(period),
+        versioned(ov, KEY_PAY_BASE_TOTAL).at(period),
+        versioned(ov, &pay_storage_key(addr)).at(period),
+        versioned(ov, KEY_PAY_STORAGE_TOTAL).at(period),
+    )
+}
+
+pub fn storage_points_total(ov: &Ov, period: u64) -> u64 {
+    versioned(ov, KEY_STORAGE_TOTAL).at(period)
+}
+
+pub fn point_parts(rec: &NodeRec, at: i64) -> (u64, u64, u64) {
+    let uptime = (rec.streak as u64).min(UPTIME_CAP);
+    let coverage = if at <= rec.coverage_at.saturating_add(COVERAGE_VALID_SECS) {
+        (rec.coverage as u64).min(COVERAGE_CAP_WITNESSES) * COVERAGE_POINTS_PER_WITNESS
+    } else {
+        0
+    };
+    (uptime, storage_points(rec, at), coverage)
+}
+
+pub fn daily_estimate(ov: &Ov, addr: &str, height: u64, at: i64) -> (u64, u64) {
+    let period = period_of(height);
+    let budget = node_reward_per_day(height, at) as u128;
+    let (b, bt, s, st) = if rank_pay_ready(ov, at) {
+        let (pb, pbt, ps, pst) = pay_weights(ov, addr, period);
+        (pb as u128, pbt as u128, ps as u128, pst as u128)
+    } else {
+        let w = load_rec(ov, addr).map_or(0, |r| r.weight.at(period)) as u128;
+        let tw = total_weight(ov, period) as u128;
+        let st = (versioned(ov, KEY_STORAGE_TOTAL).at(period) as u128).min(tw);
+        let s = (versioned(ov, &storage_w_key(addr)).at(period) as u128).min(w);
+        (w - s, tw - st, s, st)
+    };
+    let both = bt > 0 && st > 0;
+    let share = |x: u128, t: u128| match (t > 0, both) {
+        (false, _) => 0,
+        (true, true) => budget / 2 * x / t,
+        (true, false) => budget * x / t,
+    };
+    (share(b, bt) as u64, share(s, st) as u64)
+}
+
+fn set_pay(ov: &mut Ov, key: &[u8], total_key: &[u8], period: u64, value: u64) {
+    let mut own = versioned(ov, key);
+    if own.next == value {
+        return;
+    }
+    let old = own.next;
+    own.set(period, value);
+    ov.put(key.to_vec(), own.encode());
+    let mut total = versioned(ov, total_key);
+    total.add(period, value as i128 - old as i128);
+    ov.put(total_key.to_vec(), total.encode());
+}
 const KEY_MIGRATED: &[u8] = b"n2migrated";
 
 pub fn period_of(height: u64) -> u64 {
@@ -623,6 +941,18 @@ fn refresh(ov: &mut Ov, addr: &str, rec: &mut NodeRec, at: i64, period: u64) {
             ov.put(KEY_STORAGE_TOTAL.to_vec(), total.encode());
         }
     }
+    if ov.get(KEY_PAY_SINCE).is_some() {
+        let s = if new_w > 0 { storage_points(rec, at).min(new_w) } else { 0 };
+        let m = if new_w > 0 { early_mult_milli(rank_or_assign(ov, addr)) } else { 0 };
+        set_pay(ov, &pay_base_key(addr), KEY_PAY_BASE_TOTAL, period, (new_w - s).saturating_mul(m));
+        set_pay(ov, &pay_storage_key(addr), KEY_PAY_STORAGE_TOTAL, period, s.saturating_mul(m));
+        if let Some(st) = load_staker(ov, addr) {
+            let act = activity_of(rec, at);
+            if act != st.act_milli {
+                set_staker(ov, addr, st.principal, st.lock_days, act);
+            }
+        }
+    }
     if let Some(t) = next_drop(rec, at) {
         ov.put(expiry_key(t, addr), Vec::new());
     }
@@ -1027,6 +1357,15 @@ pub fn apply_block(
     let at = block.timestamp;
     let period = period_of(block.height);
     let mut credits: Vec<(String, u64)> = Vec::new();
+    if block.height >= NODE_PAY_V2_FROM_HEIGHT && ov.get(KEY_PAY_SINCE).is_none() {
+        ov.put(KEY_PAY_SINCE.to_vec(), u64_le(at.max(0) as u64).to_vec());
+        put_stake_acc(ov, 0, at, 0);
+        migrate_stakers(ov, at);
+    }
+    if ov.get(KEY_PAY_SINCE).is_some() {
+        accrue_stake(ov, block.height, at);
+        apply_stake_changes(ov, txs, at);
+    }
     if block.height >= CHECKIN_FROM_HEIGHT {
         process_expiries(ov, at, period);
     }
@@ -1043,7 +1382,10 @@ pub fn apply_block(
             let total_w = total_weight(ov, period) as u128;
             let split = block.height >= SPLIT_FROM_HEIGHT;
             let storage_total = if split { (versioned(ov, KEY_STORAGE_TOTAL).at(period) as u128).min(total_w) } else { 0 };
-            let per_checkin = node_reward_per_day_at(at) as u128 * CHECKIN_INTERVAL_SECS as u128 / 86_400;
+            let per_checkin = node_reward_per_day(block.height, at) as u128 * CHECKIN_INTERVAL_SECS as u128 / 86_400;
+            let rank_pay = rank_pay_ready(ov, at);
+            let pay_base_total = versioned(ov, KEY_PAY_BASE_TOTAL).at(period) as u128;
+            let pay_storage_total = versioned(ov, KEY_PAY_STORAGE_TOTAL).at(period) as u128;
             let mut members: Vec<u64> = batch.groups.iter().filter_map(|g| decode_members(&g.members)).flatten().collect();
             members.sort_unstable();
             members.dedup();
@@ -1055,7 +1397,11 @@ pub fn apply_block(
                     continue;
                 }
                 let w = rec.weight.at(period) as u128;
-                let pay = if split {
+                let pay = if rank_pay {
+                    let pb = versioned(ov, &pay_base_key(&addr)).at(period) as u128;
+                    let ps = versioned(ov, &pay_storage_key(&addr)).at(period) as u128;
+                    split_pay(per_checkin, pb, pay_base_total, ps, pay_storage_total).min(pool_left)
+                } else if split {
                     let s = (versioned(ov, &storage_w_key(&addr)).at(period) as u128).min(w);
                     split_pay(per_checkin, w - s, total_w - storage_total, s, storage_total).min(pool_left)
                 } else if total_w > 0 {
@@ -2566,5 +2912,195 @@ mod tests {
         assert_eq!(weight_of(&rec, 2_001, true, 0), UPTIME_CAP + COVERAGE_CAP_WITNESSES * 2);
         rec.pop_key.clear();
         assert_eq!(weight_of(&rec, 1_500, true, 0), 0);
+    }
+}
+
+
+#[cfg(test)]
+mod node_pay_v2_tests {
+    use super::*;
+
+    const KEY: &str = "aa";
+
+    #[test]
+    fn the_switch_opens_an_epoch_and_only_updated_nodes_are_ready_for_it() {
+        let h = NODE_PAY_V2_FROM_HEIGHT;
+        let e = epoch_of(h);
+        assert_eq!(epoch_start(e), h, "the switch is the first block of an epoch");
+        assert_eq!(ready_version(e), ready_version(e - 1) + 1, "readiness for the switch epoch is signed for the new rules");
+        assert_eq!(ready_version(e - 1), ready_version(e - 50), "nothing changes for old nodes before the switch epoch");
+        assert_ne!(ready_message(e, "s"), format!("ego/ready/v{}:{e}:s", ready_version(e - 1)).into_bytes());
+    }
+
+    fn network(n: usize) -> (Ov<'static>, Vec<String>) {
+        let mut ov = Ov::memory();
+        let mut addrs = Vec::new();
+        for i in 0..n {
+            let addr = format!("egot1paynode{i:06}");
+            let idx = node_count(&ov);
+            ov.put(KEY_COUNT.to_vec(), u64_le(idx + 1).to_vec());
+            ov.put(addr_key(idx), addr.as_bytes().to_vec());
+            ov.put(crate::chain_db::val_dil_key(&addr), vec![1u8; 8]);
+            save_rec(&mut ov, &addr, &NodeRec { idx, pop_key: KEY.into(), ..NodeRec::default() });
+            addrs.push(addr);
+        }
+        ov.commit_memory();
+        (ov, addrs)
+    }
+
+    fn run(ov: &mut Ov, height: u64, ts: i64, ids: &[u64]) -> Vec<(String, u64)> {
+        let batch = CheckinBatch {
+            groups: vec![SignedGroup { anchor: height / EPOCH * EPOCH, sig: "00".into(), members: encode_members(ids) }],
+        };
+        let tx = batch_tx(TX_CHECKIN_BATCH, height, 0, serde_json::to_string(&batch).unwrap());
+        let b = LedgerBlock { height, timestamp: ts, miner: "egot1simminer".into(), ..LedgerBlock::default() };
+        let out = apply_block(ov, &b, &[&tx], u64::MAX, "seed").credits;
+        ov.commit_memory();
+        out
+    }
+
+    #[test]
+    fn node_pay_totals_forty_million_over_thirty_four_year_eras() {
+        let start = CHECKIN_HALVING_START_TS;
+        let h = NODE_PAY_V2_FROM_HEIGHT;
+        let total: u128 = (0..40).map(|e| node_reward_per_day(h, start + e * CHECKIN_HALVING_SECS) as u128 * 1_461).sum();
+        let egoc = total / 1_000_000;
+        assert!((39_990_000..=40_000_000).contains(&egoc), "{egoc} EGOC over all eras");
+        assert_eq!(node_reward_per_day(h, start + 30 * CHECKIN_HALVING_SECS), 0, "nothing is paid after 120 years");
+        assert_eq!(node_reward_per_day(h - 1, start), NODE_REWARD_PER_DAY_UEGOC, "the old rate holds until the switch");
+        assert_eq!(30 * CHECKIN_HALVING_SECS / 86_400 / 1_461 * 4, 120);
+    }
+
+    #[test]
+    fn the_first_hundred_places_earn_ten_times_and_it_tapers_to_one() {
+        assert_eq!(early_mult_milli(0), 10_000);
+        assert_eq!(early_mult_milli(99), 10_000);
+        assert_eq!(early_mult_milli(100), 7_000);
+        assert!(early_mult_milli(999) >= 1_500 && early_mult_milli(999) < 1_510);
+        assert_eq!(early_mult_milli(1_000), 1_500);
+        assert!(early_mult_milli(9_999) <= 1_001);
+        assert_eq!(early_mult_milli(10_000), 1_000);
+        assert_eq!(early_mult_milli(5_000_000), 1_000);
+        let mut last = u64::MAX;
+        for r in (0..12_000).step_by(37) {
+            let m = early_mult_milli(r);
+            assert!(m <= last, "the bonus never grows with a later place");
+            last = m;
+        }
+    }
+
+    #[test]
+    fn places_go_by_join_order_and_an_early_node_out_earns_a_late_one() {
+        let (mut ov, addrs) = network(2);
+        let h0 = NODE_PAY_V2_FROM_HEIGHT;
+        let t0 = CHECKIN_HALVING_START_TS + 86_400;
+        run(&mut ov, h0, t0, &[0]);
+        assert_eq!(rank_pay_since(&ov), Some(t0), "the first block from the switch marks when it began");
+        assert_eq!(rank_of(&ov, &addrs[0]), Some(0));
+        assert_eq!(rank_of(&ov, &addrs[1]), None, "a node that has not checked in has no place yet");
+        ov.put(KEY_RANK_NEXT.to_vec(), u64_le(5_000).to_vec());
+        ov.commit_memory();
+        let mut h = h0 + EPOCH;
+        let mut ts = t0 + CHECKIN_INTERVAL_SECS;
+        while ts < t0 + RANK_PAY_SETTLE_SECS + 2 * CHECKIN_INTERVAL_SECS {
+            run(&mut ov, h, ts, &[0, 1]);
+            h += EPOCH;
+            ts += CHECKIN_INTERVAL_SECS;
+        }
+        assert_eq!(rank_of(&ov, &addrs[1]), Some(5_000));
+        assert!(rank_pay_ready(&ov, ts));
+        let period = period_of(h);
+        let w0 = load_rec(&ov, &addrs[0]).unwrap().weight.at(period) as f64;
+        let w1 = load_rec(&ov, &addrs[1]).unwrap().weight.at(period) as f64;
+        let paid = run(&mut ov, h, ts, &[0, 1]);
+        let pay = |a: &str| paid.iter().find(|(x, _)| x == a).map(|(_, p)| *p).unwrap_or(0);
+        let (early, late) = (pay(&addrs[0]), pay(&addrs[1]));
+        assert!(late > 0, "a late node still earns");
+        let ratio = early as f64 / late as f64;
+        let want = early_mult_milli(0) as f64 / early_mult_milli(5_000) as f64 * w0 / w1;
+        assert!((ratio - want).abs() < 0.05, "early {early} late {late} ratio {ratio} want {want}");
+        let budget = node_reward_per_day(h, ts) as u128 * CHECKIN_INTERVAL_SECS as u128 / 86_400;
+        assert!((early + late) as u128 <= budget, "the half-day budget is never exceeded");
+    }
+
+    fn stake_into(ov: &mut Ov, addr: &str, egoc: u64, lock_days: u32) {
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&0i64.to_le_bytes());
+        meta.extend_from_slice(&lock_days.to_le_bytes());
+        ov.put(format!("stakemeta:{addr}").into_bytes(), meta);
+        ov.put(format!("stake:{addr}").into_bytes(), u64_le(egoc * 1_000_000).to_vec());
+    }
+
+    fn day_of_blocks(ov: &mut Ov, h: &mut u64, ts: &mut i64) {
+        for _ in 0..24 {
+            let b = LedgerBlock { height: *h, timestamp: *ts, miner: "egot1simminer".into(), ..LedgerBlock::default() };
+            apply_block(ov, &b, &[], u64::MAX, "seed");
+            ov.commit_memory();
+            *h += 1;
+            *ts += 3_600;
+        }
+    }
+
+    #[test]
+    fn staking_pays_140_million_over_120_years_at_most() {
+        let h = NODE_PAY_V2_FROM_HEIGHT;
+        let start = CHECKIN_HALVING_START_TS;
+        let total: u128 = (0..40).map(|e| stake_per_day(h, start + e * CHECKIN_HALVING_SECS) as u128 * 1_461).sum();
+        let egoc = total / 1_000_000;
+        assert!((139_990_000..=140_000_000).contains(&egoc), "{egoc} EGOC");
+        assert_eq!(stake_per_day(h - 1, start), 0);
+    }
+
+    #[test]
+    fn a_small_stake_earns_the_normal_rate_and_existing_stakes_carry_over() {
+        let mut ov = Ov::memory();
+        stake_into(&mut ov, "egot1staker", 1_000, 0);
+        ov.commit_memory();
+        let mut h = NODE_PAY_V2_FROM_HEIGHT;
+        let mut ts = CHECKIN_HALVING_START_TS + 86_400;
+        day_of_blocks(&mut ov, &mut h, &mut ts);
+        let st = load_staker(&ov, "egot1staker").expect("a stake from before the switch is counted");
+        assert_eq!(st.principal, 1_000_000_000);
+        let owed = stake_owed(&ov, "egot1staker") as f64 / 1e6;
+        let want = 1_000.0 * 0.125 * 23.0 / 24.0 / 365.0;
+        assert!((owed - want).abs() / want < 0.01, "owed {owed} want {want}");
+    }
+
+    #[test]
+    fn when_staking_outgrows_the_budget_everyone_shares_it_and_it_is_never_exceeded() {
+        let mut ov = Ov::memory();
+        stake_into(&mut ov, "egot1whale1", 300_000_000, 0);
+        stake_into(&mut ov, "egot1whale2", 300_000_000, 365);
+        ov.commit_memory();
+        let mut h = NODE_PAY_V2_FROM_HEIGHT;
+        let mut ts = CHECKIN_HALVING_START_TS + 86_400;
+        day_of_blocks(&mut ov, &mut h, &mut ts);
+        let a = stake_owed(&ov, "egot1whale1") as u128;
+        let b = stake_owed(&ov, "egot1whale2") as u128;
+        let budget = stake_per_day(h, ts) as u128;
+        assert!(a + b <= budget, "{a} + {b} is more than the day's {budget}");
+        assert!((a + b) * 100 >= budget * 94, "nearly the whole budget for 23 of 24 hours goes out");
+        let ratio = b as f64 / a as f64;
+        assert!((ratio - 1.8).abs() < 0.01, "a one-year lock counts 1.8 times: {ratio}");
+        let (_, _, total) = stake_acc(&ov);
+        assert!(stake_point_rate_bps(h, ts, total) < crate::tokenomics::STAKING_APR_BPS, "the rate drops below the ceiling");
+    }
+
+    #[test]
+    fn an_online_node_with_a_terabyte_stakes_at_three_times_the_points() {
+        let rec = NodeRec { streak: MIN_STREAK, last_checkin: 1_000, storage_bytes: 2_000 * GB, storage_until: 10_000, ..NodeRec::default() };
+        assert_eq!(activity_of(&rec, 2_000), 3_000);
+        let offline = NodeRec { last_checkin: 1_000 - 2 * STREAK_GAP_SECS, ..rec };
+        assert_eq!(activity_of(&offline, 2_000), 1_000);
+        assert_eq!(stake_points(1_000_000, 365, 3_000), 5_400_000);
+    }
+
+    #[test]
+    fn before_the_switch_nothing_new_is_written() {
+        let (mut ov, addrs) = network(1);
+        run(&mut ov, NODE_PAY_V2_FROM_HEIGHT - 1, CHECKIN_HALVING_START_TS, &[0]);
+        assert_eq!(rank_pay_since(&ov), None);
+        assert_eq!(rank_of(&ov, &addrs[0]), None);
+        assert_eq!(ranks_given(&ov), 0);
     }
 }

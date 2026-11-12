@@ -2,6 +2,16 @@ const { ethers, network } = require("hardhat");
 
 async function main() {
   const [deployer] = await ethers.getSigners();
+  const mainnet = ["ethereum", "bsc", "polygon"].includes(network.name);
+  if (mainnet && process.env.I_UNDERSTAND_MAINNET !== "yes") {
+    throw new Error(`Refusing to deploy to ${network.name} without I_UNDERSTAND_MAINNET=yes.`);
+  }
+  if (mainnet && !process.env.FEE_RECEIVER) {
+    throw new Error("Set FEE_RECEIVER: the escrow's fee address is fixed forever once it is deployed.");
+  }
+  if (mainnet && process.env.TEST_TOKENS) {
+    throw new Error("Test tokens are never deployed to a main network.");
+  }
   const feeReceiver = process.env.FEE_RECEIVER || deployer.address;
   const escrow = await (await ethers.getContractFactory("EgoEscrow")).deploy(feeReceiver);
   await escrow.waitForDeployment();

@@ -15,7 +15,7 @@ interface DaoProposal {
   stake_vote_count: number; knowledge_vote_count: number;
   questions: TestQuestion[] | null;
   my_stake_vote: number | null; my_knowledge_vote: number | null; my_test_score: number | null;
-  on_chain?: boolean; answers_revealed?: boolean;
+  on_chain?: boolean; answers_revealed?: boolean; target?: string;
 }
 
 interface OptionResult { option: string; stake_power: number; knowledge_power: number; combined_power: number; }
@@ -41,7 +41,10 @@ const TYPE_LABELS: Record<string, { label: string; color: string }> = {
   feature:   { label: 'Feature',   color: 'bg-green-500/20 text-green-300 border-green-500/30' },
   parameter: { label: 'Parameter', color: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/30' },
   tender:    { label: 'Tender',    color: 'bg-orange-500/20 text-orange-300 border-orange-500/30' },
+  arbiter_add:    { label: 'Add P2P arbiter',    color: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' },
+  arbiter_remove: { label: 'Remove P2P arbiter', color: 'bg-red-500/20 text-red-300 border-red-500/30' },
 };
+const ARBITER_TYPES = ['arbiter_add', 'arbiter_remove'];
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
   active:  { label: 'Active',  color: 'bg-green-500/20 text-green-300 border-green-500/30' },
@@ -96,6 +99,17 @@ function CreateProposalModal({ onClose, onCreated }: { onClose: () => void; onCr
   ]);
   const [busy, setBusy]   = useState(false);
   const [error, setError] = useState('');
+  const [target, setTarget] = useState('');
+  const [arbiters, setArbiters] = useState<string[]>([]);
+  const [minStake, setMinStake] = useState(0);
+  const arbiterVote = ARBITER_TYPES.includes(type);
+
+  useEffect(() => {
+    if (!arbiterVote) return;
+    invoke<{ arbiters?: string[]; arbiter_min_stake_uegoc?: number }>('market_params')
+      .then(p => { setArbiters(p.arbiters ?? []); setMinStake((p.arbiter_min_stake_uegoc ?? 0) / 1_000_000); })
+      .catch(() => {});
+  }, [arbiterVote]);
 
   function addOption() { if (options.length < 6) setOptions([...options, '']); }
   function removeOption(i: number) { if (options.length > 2) setOptions(options.filter((_, j) => j !== i)); }
@@ -120,11 +134,14 @@ function CreateProposalModal({ onClose, onCreated }: { onClose: () => void; onCr
       const qs = withTest ? questions.map(q => ({
         question: q.question, options: q.options, correct_index: q.correct_index,
       })) : null;
+      const who = target.trim();
       await invoke('create_dao_proposal', {
-        title, description: desc, proposalType: type,
-        options: options.filter(o => o.trim()),
+        title: arbiterVote && !title.trim() ? `${type === 'arbiter_add' ? 'Add' : 'Remove'} ${who} as a P2P arbiter` : title,
+        description: desc, proposalType: type,
+        options: arbiterVote ? ['Yes', 'No'] : options.filter(o => o.trim()),
         durationDays: days,
-        questions: qs,
+        questions: arbiterVote ? null : qs,
+        target: arbiterVote ? who : null,
       });
       onCreated();
       onClose();
@@ -175,7 +192,23 @@ function CreateProposalModal({ onClose, onCreated }: { onClose: () => void; onCr
             </div>
           </div>
 
-          <div>
+          {arbiterVote && (
+            <div className="space-y-2 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3">
+              <label className="block text-xs text-gray-400">Ego address of the arbiter</label>
+              <input value={target} onChange={e => setTarget(e.target.value.trim())} placeholder="egot1…"
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-emerald-500" />
+              <div className="text-xs text-gray-400 leading-relaxed">
+                Voted Yes or No by stake. It passes with at least 3 voters and 1% of all staked EGOC, and more Yes than No. When the vote ends the network {type === 'arbiter_add' ? `adds the arbiter, if it has at least ${minStake.toLocaleString()} EGOC staked` : 'removes the arbiter, as long as one is left'}. Each new trade gets one arbiter at random, never the buyer or the seller.
+              </div>
+              {arbiters.length > 0 && (
+                <div className="text-xs text-gray-400">
+                  Arbiters now: {arbiters.map(a => <span key={a} className="font-mono text-gray-300 mr-2">{a.slice(0, 12)}…{a.slice(-6)}</span>)}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className={arbiterVote ? 'hidden' : ''}>
             <div className="flex items-center justify-between mb-2">
               <label className="text-xs text-gray-400">Voting Options</label>
               <button onClick={addOption} className="text-xs text-purple-400 hover:text-purple-300">+ Add Option</button>
@@ -440,6 +473,15 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
           {error && <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm">{error}</div>}
           {notice && <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-xl text-green-400 text-sm">{notice}</div>}
 
+          {proposal.target && ARBITER_TYPES.includes(proposal.proposal_type) && (
+            <div className="p-3 bg-gray-900 border border-gray-700/60 rounded-xl">
+              <div className="text-xs text-gray-400 mb-1">
+                {proposal.proposal_type === 'arbiter_add' ? 'Address that would become a P2P arbiter' : 'Arbiter address that would be removed'}
+              </div>
+              <div className="font-mono text-xs text-white break-all">{proposal.target}</div>
+            </div>
+          )}
+
           <p className="text-sm text-gray-300 leading-relaxed">{proposal.description}</p>
 
           {/* Stake Vote */}
@@ -664,6 +706,9 @@ function ProposalCard({ proposal, onClick }: { proposal: DaoProposal; onClick: (
       <h3 className="text-sm font-semibold text-white mb-1 group-hover:text-purple-300 transition-colors leading-snug">
         {proposal.title}
       </h3>
+      {proposal.target && ARBITER_TYPES.includes(proposal.proposal_type) && (
+        <p className="text-xs font-mono text-gray-300 mb-1 truncate" title={proposal.target}>{proposal.target}</p>
+      )}
       <p className="text-xs text-gray-400 line-clamp-2 mb-3">{proposal.description}</p>
 
       <div className="flex items-center justify-between text-xs text-gray-500">

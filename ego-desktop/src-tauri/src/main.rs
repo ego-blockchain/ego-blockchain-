@@ -2,6 +2,7 @@
 
 mod app;
 mod clock;
+mod node_slot;
 mod autostart;
 mod offline_guard;
 mod onetime;
@@ -1080,6 +1081,9 @@ fn main() {
             commands::market::market_cancel,
             commands::market::market_mark_paid,
             commands::market::market_dispute,
+            commands::market::market_freeze,
+            commands::market::market_ready_assets,
+            commands::market::market_reclaim,
             commands::market::market_feedback,
             commands::market::market_settle,
             commands::market::market_chat,
@@ -1108,6 +1112,7 @@ fn main() {
             commands::coverage::get_poc_events,
             commands::coverage::get_network_peers,
             commands::earnings::get_earnings_data,
+            commands::earnings::get_earn_guide,
             commands::earnings::get_hosted_storage,
             commands::earnings::submit_poc_event,
             commands::earnings::get_poc_score,
@@ -1177,6 +1182,7 @@ fn main() {
             commands::consensus::get_chain_drs,
             commands::consensus::resync_chain,
             commands::consensus::get_tokenomics,
+            commands::consensus::get_holders,
             commands::contracts::compile_urego,
             commands::contracts::deploy_contract,
             commands::contracts::preview_contract_deploy,

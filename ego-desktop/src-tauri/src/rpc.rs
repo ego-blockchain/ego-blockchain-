@@ -371,7 +371,11 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             }
         }
 
-        "market.params" => RpcResponse::ok(req.id, crate::market_chain::params_view()),
+        "market.params" => {
+            let mut v = crate::market_chain::params_view();
+            v["ready_assets"] = serde_json::json!(crate::commands::market::ready_assets());
+            RpcResponse::ok(req.id, v)
+        }
 
         "market.offers" => {
             let asset = p["asset"].as_str().unwrap_or(crate::market_chain::EGOC).trim().to_ascii_uppercase();

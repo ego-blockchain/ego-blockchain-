@@ -82,28 +82,70 @@ export function PriceCell({ view, egocUsd }: { view: OfferView; egocUsd: number 
   );
 }
 
+let readyCache: string[] | null = null;
+
+export function useReadyAssets(): Set<string> | null {
+  const [ready, setReady] = React.useState<string[] | null>(readyCache);
+  React.useEffect(() => {
+    if (readyCache) return;
+    api.readyAssets().then(r => { readyCache = r; setReady(r); }).catch(() => setReady(['EGOC']));
+  }, []);
+  return ready ? new Set(ready) : null;
+}
+
 export function AssetSelect({ value, onChange, id }: { value: string; onChange: (asset: string) => void; id: string }) {
+  const ready = useReadyAssets();
+  const [open, setOpen] = React.useState(false);
+  const box = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    if (ready && !ready.has(value)) onChange('EGOC');
+  }, [ready, value, onChange]);
+  React.useEffect(() => {
+    const close = (e: MouseEvent) => {
+      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, []);
+  const name = (a: (typeof ASSETS)[number]) => (a.family === 'ego' ? a.symbol : `${a.symbol} · ${a.chain}`);
+  const works = (a: (typeof ASSETS)[number]) => !ready || ready.has(a.id);
+  const live = ASSETS.filter(works);
+  const soon = ASSETS.filter(a => !works(a));
   return (
-    <select
-      id={id}
-      value={value}
-      onChange={e => onChange(e.target.value)}
-      className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white min-w-[220px]"
-    >
-      <optgroup label="Ego">
-        {ASSETS.filter(a => a.family === 'ego').map(a => <option key={a.id} value={a.id}>{a.symbol}</option>)}
-      </optgroup>
-      <optgroup label="Stablecoins">
-        {ASSETS.filter(a => a.symbol === 'USDT' || a.symbol === 'USDC').map(a => (
-          <option key={a.id} value={a.id}>{a.symbol} · {a.chain}</option>
-        ))}
-      </optgroup>
-      <optgroup label="Coins">
-        {ASSETS.filter(a => a.family !== 'ego' && a.symbol !== 'USDT' && a.symbol !== 'USDC').map(a => (
-          <option key={a.id} value={a.id}>{a.symbol} · {a.chain}</option>
-        ))}
-      </optgroup>
-    </select>
+    <div ref={box} id={id} className="relative inline-block min-w-[220px]">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center justify-between gap-3 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white"
+      >
+        <span>{name(assetMeta(value))}</span>
+        <span className="text-xs text-gray-500">▾</span>
+      </button>
+      {open && (
+        <div className="absolute z-30 mt-1 w-full min-w-[240px] max-h-80 overflow-y-auto rounded-lg border border-gray-700 bg-gray-900 py-1 shadow-xl">
+          {live.map(a => (
+            <button
+              key={a.id}
+              type="button"
+              onClick={() => { onChange(a.id); setOpen(false); }}
+              className={`w-full px-3 py-1.5 text-left text-sm hover:bg-gray-800 ${a.id === value ? 'text-emerald-300' : 'text-white'}`}
+            >
+              {name(a)}
+            </button>
+          ))}
+          {soon.length > 0 && (
+            <div className="mt-1 border-t border-gray-800 pt-1">
+              {soon.map(a => (
+                <div key={a.id} className="flex cursor-not-allowed items-center justify-between gap-3 px-3 py-1.5 text-sm text-white">
+                  <span>{name(a)}</span>
+                  <span className="text-[10px] font-semibold text-yellow-400">coming soon</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 

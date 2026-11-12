@@ -557,13 +557,57 @@ pub async fn market_leaderboard() -> Result<Value, EgoDesktopError> {
 }
 
 #[tauri::command]
-pub async fn market_post_offer(offer: OfferBody, state: State<'_, AppState>) -> Result<String, EgoDesktopError> {
+fn utxo_net(asset: &str) -> Option<(chains::ChainNet, chains::TokenCfg)> {
+    market::asset_info(asset).filter(|a| a.family.presigned())?;
+    let n = chains::networks();
+    n.for_asset(asset).ok().map(|(net, tok)| (net.clone(), tok.clone()))
+}
+
+fn utxo_payout(asset: &str, given: Option<String>) -> Result<Option<String>, EgoDesktopError> {
+    match utxo_net(asset) {
+        Some((net, _)) if net.family == Family::Xrp => crate::commands::escrow_xrp::payout_entry(&net.key_path, given.as_deref())
+            .map(Some)
+            .map_err(EgoDesktopError::InvalidInput),
+        Some((net, _)) => crate::commands::escrow_btc::payout_entry(&net, &net.key_path, given.as_deref())
+            .map(Some)
+            .map_err(EgoDesktopError::InvalidInput),
+        None => Ok(given),
+    }
+}
+
+#[tauri::command]
+pub async fn market_post_offer(mut offer: OfferBody, state: State<'_, AppState>) -> Result<String, EgoDesktopError> {
+    if offer.side == market::Side::Buy {
+        offer.payout_address = utxo_payout(&offer.asset, offer.payout_address.take())?;
+    }
     market::validate_offer_body(&offer).map_err(EgoDesktopError::InvalidInput)?;
     if matches!(offer.price, Price::MarginBps(_)) && !market::is_egoc(&offer.asset) {
         return Err(EgoDesktopError::InvalidInput("Market-linked prices are available for EGOC offers only".into()));
     }
     if !market::is_egoc(&offer.asset) {
-        chains::networks().for_asset(&offer.asset).map_err(EgoDesktopError::InvalidInput)?;
+        let n = chains::networks();
+        let (net, tok) = n.for_asset(&offer.asset).map_err(EgoDesktopError::InvalidInput)?;
+        if offer.side == market::Side::Sell {
+            let owner = outside::wallet_address(net).map_err(EgoDesktopError::InvalidInput)?;
+            let (native, token) = Outside::new(net, tok).balances(&owner).await;
+            let have = if tok.native { native } else { token };
+            let need = chains::to_base_units(offer.max_micro, tok.decimals);
+            match have {
+                Some(h) if h < need => {
+                    return Err(EgoDesktopError::InvalidInput(format!(
+                        "Your {} wallet {owner} holds less {} than this offer sells. Send the coins there first, or lower the most you sell.",
+                        net.label, tok.asset
+                    )))
+                }
+                None => {
+                    return Err(EgoDesktopError::NetworkError(format!(
+                        "Could not read your {} balance right now, so the offer was not posted. Try again in a moment.",
+                        net.label
+                    )))
+                }
+                _ => {}
+            }
+        }
     }
     if let Price::MarginBps(bps) = offer.price {
         margin_price_micro(&offer.fiat, bps, crate::p2p::get_egoc_price_usd()).map_err(EgoDesktopError::InvalidInput)?;
@@ -589,13 +633,15 @@ pub async fn market_open_trade(
         return Err(EgoDesktopError::InvalidInput("Pick one of the offer's payment methods".into()));
     }
     let q = quote(&offer, amount_micro, crate::p2p::get_egoc_price_usd()).map_err(EgoDesktopError::InvalidInput)?;
+    let given = payout_address.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+    let payout_address = if offer.side == market::Side::Sell { utxo_payout(&offer.asset, given)? } else { given };
     let body = TradeOpenBody {
         offer_id: offer.id.clone(),
         amount_micro,
         price_micro: q["price_micro"].as_u64().unwrap_or(0),
         fiat_micro: q["fiat_micro"].as_u64().unwrap_or(0),
         method,
-        payout_address: payout_address.map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
+        payout_address,
     };
     let lock = q["taker_locks_micro"].as_u64().unwrap_or(0);
     submit_op(&state, market::TX_TRADE_OPEN, &body, lock).await
@@ -677,6 +723,61 @@ pub async fn market_fund(trade_id: String, app: AppHandle, state: State<'_, AppS
 }
 
 #[tauri::command]
+pub async fn market_ready_assets() -> Result<Vec<String>, EgoDesktopError> {
+    Ok(ready_assets())
+}
+
+pub fn ready_assets() -> Vec<String> {
+    let n = chains::networks();
+    let mut ready = vec!["EGOC".to_string()];
+    ready.extend(n.tokens.iter().filter(|t| n.for_asset(&t.asset).is_ok()).map(|t| t.asset.clone()));
+    ready
+}
+
+#[tauri::command]
+pub async fn market_freeze(trade_id: String, state: State<'_, AppState>) -> Result<String, EgoDesktopError> {
+    crate::commands::totp::consume("send")?;
+    require_active()?;
+    let trade = known_trade(&trade_id)?;
+    if trade.is_egoc() {
+        return Err(EgoDesktopError::InvalidInput("EGOC trades are held on Ego, so there is nothing to freeze".into()));
+    }
+    if trade.buyer != my_address()? {
+        return Err(EgoDesktopError::PermissionDenied("Only the buyer can freeze the escrow".into()));
+    }
+    if !matches!(trade.state, TradeState::Paid | TradeState::Disputed) {
+        return Err(EgoDesktopError::InvalidInput("Freeze the escrow only after you have marked the trade paid".into()));
+    }
+    let n = chains::networks();
+    let (net, tok) = n.for_asset(&trade.asset).map_err(EgoDesktopError::InvalidInput)?;
+    let tx = Outside::new(net, tok).freeze(&trade).await.map_err(chain_err)?;
+    if trade.state == TradeState::Paid {
+        let body = DisputeBody {
+            trade_id: trade.id.clone(),
+            reason: "The buyer froze the escrow after paying, so the arbiter decides this trade.".into(),
+        };
+        let _ = submit_op(&state, market::TX_DISPUTE, &body, 0).await;
+    }
+    Ok(tx)
+}
+
+#[tauri::command]
+pub async fn market_reclaim(trade_id: String) -> Result<String, EgoDesktopError> {
+    crate::commands::totp::consume("send")?;
+    require_active()?;
+    let trade = known_trade(&trade_id)?;
+    if trade.is_egoc() {
+        return Err(EgoDesktopError::InvalidInput("EGOC trades are taken back on Ego".into()));
+    }
+    if trade.seller != my_address()? {
+        return Err(EgoDesktopError::PermissionDenied("Only the seller can take the coins back".into()));
+    }
+    let n = chains::networks();
+    let (net, tok) = n.for_asset(&trade.asset).map_err(EgoDesktopError::InvalidInput)?;
+    Outside::new(net, tok).reclaim(&trade).await.map_err(chain_err)
+}
+
+#[tauri::command]
 pub async fn market_escrow_status(trade_id: String) -> Result<Value, EgoDesktopError> {
     let trade = known_trade(&trade_id)?;
     if trade.is_egoc() {
@@ -691,7 +792,7 @@ pub async fn market_escrow_status(trade_id: String) -> Result<Value, EgoDesktopE
         return Ok(json!({ "kind": "outside", "configured": true, "funded": false, "network": net.label }));
     };
     let mut problems = Vec::new();
-    if !outside::same_address(net.family, &r.contract, &net.escrow) {
+    if !net.family.presigned() && !outside::same_address(net.family, &r.contract, &net.escrow) {
         problems.push(format!("the seller used an escrow contract this app does not recognise on {}", net.label));
     }
     let chain = Outside::new(net, tok);
@@ -765,6 +866,7 @@ fn native_decimals(family: Family) -> u8 {
     match family {
         Family::Evm => 18,
         Family::Solana => 9,
+        Family::Bitcoin | Family::Dogecoin => 8,
         _ => 6,
     }
 }
@@ -778,11 +880,23 @@ pub fn arbiter_addresses_here() -> Result<ArbiterBody, String> {
             None => Ok(None),
         }
     };
+    let utxo_entry = |family: Family| -> Result<Option<String>, String> {
+        match first(family) {
+            Some(net) => crate::commands::escrow_btc::payout_entry(net, &outside::arbiter_key_path(net), None).map(Some),
+            None => Ok(None),
+        }
+    };
     Ok(ArbiterBody {
         evm: address(Family::Evm)?,
         tron: address(Family::Tron)?,
         sol: address(Family::Solana)?,
         ada: address(Family::Cardano)?,
+        btc: utxo_entry(Family::Bitcoin)?,
+        doge: utxo_entry(Family::Dogecoin)?,
+        xrp: match first(Family::Xrp) {
+            Some(net) => Some(crate::commands::escrow_xrp::payout_entry(&outside::arbiter_key_path(net), None)?),
+            None => None,
+        },
     })
 }
 
@@ -817,8 +931,13 @@ pub async fn market_mark_paid(
         ))
     })?;
     let kp = keypair(&state)?;
+    let release_sig = match utxo_net(&trade.asset) {
+        Some((net, tok)) if net.family == Family::Xrp => Some(crate::commands::escrow_xrp::release_signature(&net, &tok, &trade).await.map_err(chain_err)?),
+        Some((net, tok)) => Some(crate::commands::escrow_btc::release_signature(&net, &tok, &trade).await.map_err(chain_err)?),
+        None => None,
+    };
     post_chat(&trade, &me, &kp, KIND_PAYMENT, body, &app).await?;
-    submit_op(&state, market::TX_PAID, &TradeRef { trade_id: trade.id }, 0).await
+    submit_op(&state, market::TX_PAID, &market::PaidBody { trade_id: trade.id, release_sig }, 0).await
 }
 
 pub fn payment_note_of(trade: &Trade) -> Option<Value> {
@@ -874,7 +993,7 @@ async fn settle_outside(trade: &Trade, outcome: Outcome, by: Role) -> Result<Opt
     let (net, tok) = n.for_asset(&trade.asset).map_err(EgoDesktopError::InvalidInput)?;
     let chain = Outside::new(net, tok);
     let current = chain.read(trade).await.map_err(chain_err)?;
-    let closes_accounts = matches!(net.family, Family::Solana | Family::Cardano);
+    let closes_accounts = matches!(net.family, Family::Solana | Family::Cardano) || net.family.presigned();
     if current.state != chains::STATE_FUNDED {
         let target = match outcome {
             Outcome::Release => chains::STATE_RELEASED,
@@ -895,8 +1014,8 @@ async fn settle_outside(trade: &Trade, outcome: Outcome, by: Role) -> Result<Opt
         }
         (Role::Buyer, Outcome::Refund) => Ok(Some(chain.buyer_cancel(trade).await.map_err(EgoDesktopError::InvalidInput)?)),
         (Role::Arbiter, _) => {
-            chain.resolve(trade, outcome == Outcome::Release).await.map_err(chain_err)?;
-            Ok(None)
+            let done = chain.resolve(trade, outcome == Outcome::Release).await.map_err(chain_err)?;
+            Ok((net.family.presigned() && outcome == Outcome::Refund).then_some(done))
         }
         _ => Err(EgoDesktopError::PermissionDenied("That settlement is not yours to make".into())),
     }
@@ -1655,6 +1774,7 @@ mod tests {
             arbiter_payout: None,
             escrow: None,
             native_sig: None,
+            release_sig: None,
         };
         let (title, _) = status_notice(&t, "awaiting_lock", "egot1seller", None).unwrap();
         assert!(title.contains("New P2P trade"));

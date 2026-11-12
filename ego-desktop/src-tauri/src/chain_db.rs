@@ -454,6 +454,10 @@ fn stake_meta_key(addr: &str) -> Vec<u8> {
     k
 }
 
+pub(crate) fn stake_lock_days_of(tx: &LedgerTx) -> u32 {
+    parse_stake_lock_days(tx)
+}
+
 /// Parse the lock period (days) out of a stake tx memo ("stake:{lock_days}").
 fn parse_stake_lock_days(tx: &LedgerTx) -> u32 {
     tx.memo.as_deref()
@@ -489,6 +493,49 @@ fn node_online_secs_in(db: &DB, addr: &str, at: i64, secs: u64, height: u64) -> 
     crate::drs::node_online_secs(&crate::drs::Ov::new(db), addr, at).min(secs)
 }
 
+pub fn staking_reward_preview(addr: &str, principal: u64, at: i64) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let height = local_chain_height_in(&db).saturating_add(1);
+    let tx = LedgerTx {
+        from: addr.to_string(),
+        to: STAKING_ADDR.to_string(),
+        tx_type: "unstake".to_string(),
+        amount: principal,
+        timestamp: at,
+        ..LedgerTx::default()
+    };
+    staking_reward_for_unstake(&db, &tx, 0, height)
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct StakeShareView {
+    pub live: bool,
+    pub per_day_uegoc: u64,
+    pub point_rate_bps: u64,
+    pub act_milli: u64,
+    pub total_points: u128,
+}
+
+pub fn stake_share_view(addr: &str) -> StakeShareView {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let height = local_chain_height_in(db).saturating_add(1);
+    let now = crate::clock::now();
+    let live = height >= crate::drs::NODE_PAY_V2_FROM_HEIGHT && crate::drs::rank_pay_since(&ov).is_some();
+    let (_, _, total) = crate::drs::stake_acc(&ov);
+    StakeShareView {
+        live,
+        per_day_uegoc: crate::drs::stake_per_day(height, now),
+        point_rate_bps: crate::drs::stake_point_rate_bps(height, now, total),
+        act_milli: crate::drs::activity_milli(&ov, addr, now),
+        total_points: total,
+    }
+}
+
+pub fn stake_rate_bps(view: &StakeShareView, lock_days: u32, act_milli: u64) -> u64 {
+    (view.point_rate_bps as u128 * crate::drs::lock_milli(lock_days) as u128 * act_milli as u128 / 1_000_000) as u64
+}
+
 pub fn node_stake_online_secs(addr: &str, at: i64, secs: u64) -> u64 {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let height = local_chain_height_in(&db).saturating_add(1);
@@ -506,11 +553,16 @@ fn staking_reward_for_unstake(
     height: u64,
 ) -> u64 {
     let Some((start_ts, lock_days)) = get_stake_meta(db, &tx.from) else { return 0; };
-    let secs = (tx.timestamp - start_ts).max(0) as u64;
+    let ov = crate::drs::Ov::new(db);
+    let switched = (height >= crate::drs::NODE_PAY_V2_FROM_HEIGHT).then(|| crate::drs::rank_pay_since(&ov)).flatten();
+    let old_end = switched.map_or(tx.timestamp, |since| since.min(tx.timestamp));
+    let secs = (old_end - start_ts).max(0) as u64;
     let principal = tx.amount;
     let online = node_online_secs_in(db, &tx.from, tx.timestamp, secs, height);
+    let shared = if switched.is_some() { crate::drs::stake_owed(&ov, &tx.from) } else { 0 };
     let entitled = crate::tokenomics::staking_reward_uegoc(principal, lock_days, secs)
-        .saturating_add(crate::tokenomics::node_staking_bonus_uegoc(principal, lock_days, online));
+        .saturating_add(crate::tokenomics::node_staking_bonus_uegoc(principal, lock_days, online))
+        .saturating_add(shared);
     if entitled == 0 { return 0; }
 
     let cf_bal = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return 0 };
@@ -6356,6 +6408,132 @@ pub struct StateStats {
     pub db_size_estimate_mb:  f64,
 }
 
+pub const HOLDERS_TOP: usize = 100;
+const HOLDER_GROUPS_EGOC: [u64; 7] = [0, 1, 100, 1_000, 10_000, 100_000, 1_000_000];
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HolderRow {
+    pub address: String,
+    pub balance_uegoc: u64,
+    pub label: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HolderGroup {
+    pub min_egoc: u64,
+    pub max_egoc: Option<u64>,
+    pub wallets: u64,
+    pub total_uegoc: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HoldersSummary {
+    pub height: u64,
+    pub total_uegoc: u64,
+    pub wallets: u64,
+    pub wallet_total_uegoc: u64,
+    pub shielded_uegoc: u64,
+    pub groups: Vec<HolderGroup>,
+    pub top: Vec<HolderRow>,
+}
+
+pub fn holder_label(addr: &str) -> Option<&'static str> {
+    let named = match addr {
+        NODE_POOL_ADDR => Some("Node rewards pool"),
+        ECOSYSTEM_ADDR => Some("Ecosystem fund"),
+        FOUNDATION_ADDR => Some("Foundation"),
+        STAKING_POOL_ADDR => Some("Staking rewards pool"),
+        STAKING_ADDR => Some("Staked coins"),
+        FAUCET_ADDR_FULL => Some("Testnet faucet"),
+        COMPUTE_ESCROW_ADDR => Some("Compute escrow"),
+        RESERVATION_ESCROW_ADDR => Some("Reservation escrow"),
+        CLUSTER_ESCROW_ADDR => Some("Cluster escrow"),
+        CREDITS_BURN_ADDR => Some("Credits burn"),
+        a if a == crate::shielded_chain::SHIELDED_POOL_ADDR => Some("Shielded pool"),
+        a if a == crate::market_chain::MARKET_ESCROW_ADDR => Some("P2P trade escrow"),
+        _ => None,
+    };
+    if named.is_some() {
+        return named;
+    }
+    if crate::tokenomics::is_testnet() && addr == get_faucet_address() {
+        return Some("Testnet faucet");
+    }
+    (crate::ledger::is_reserved_system_source(addr) || addr.contains("0000000000")).then_some("System address")
+}
+
+pub fn summarize_holders<I: IntoIterator<Item = (String, u64)>>(height: u64, balances: I) -> HoldersSummary {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut heap: BinaryHeap<Reverse<(u64, Reverse<String>)>> = BinaryHeap::new();
+    let mut total: u128 = 0;
+    let mut wallets = 0u64;
+    let mut wallet_total: u128 = 0;
+    let mut shielded = 0u64;
+    let mut groups = vec![(0u64, 0u128); HOLDER_GROUPS_EGOC.len()];
+    for (addr, bal) in balances {
+        if bal == 0 {
+            continue;
+        }
+        total += bal as u128;
+        match holder_label(&addr) {
+            Some("Shielded pool") => shielded = bal,
+            Some(_) => {}
+            None => {
+                wallets += 1;
+                wallet_total += bal as u128;
+                let egoc = bal / crate::tokenomics::UEGOC_PER_EGOC;
+                let g = HOLDER_GROUPS_EGOC.iter().rposition(|lo| egoc >= *lo).unwrap_or(0);
+                groups[g].0 += 1;
+                groups[g].1 += bal as u128;
+            }
+        }
+        heap.push(Reverse((bal, Reverse(addr))));
+        if heap.len() > HOLDERS_TOP {
+            heap.pop();
+        }
+    }
+    let mut top: Vec<(u64, String)> = heap.into_iter().map(|Reverse((b, Reverse(a)))| (b, a)).collect();
+    top.sort_unstable_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+    HoldersSummary {
+        height,
+        total_uegoc: total.min(u64::MAX as u128) as u64,
+        wallets,
+        wallet_total_uegoc: wallet_total.min(u64::MAX as u128) as u64,
+        shielded_uegoc: shielded,
+        groups: HOLDER_GROUPS_EGOC
+            .iter()
+            .enumerate()
+            .map(|(i, lo)| HolderGroup {
+                min_egoc: *lo,
+                max_egoc: HOLDER_GROUPS_EGOC.get(i + 1).copied(),
+                wallets: groups[i].0,
+                total_uegoc: groups[i].1.min(u64::MAX as u128) as u64,
+            })
+            .collect(),
+        top: top
+            .into_iter()
+            .map(|(b, a)| HolderRow { label: holder_label(&a), address: a, balance_uegoc: b })
+            .collect(),
+    }
+}
+
+pub fn holders_summary() -> HoldersSummary {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let height = db
+        .cf_handle(CF_META)
+        .and_then(|cf| db.get_cf(cf, META_LATEST_HEIGHT).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0);
+    let Some(cf) = db.cf_handle(CF_BALANCES) else { return summarize_holders(height, std::iter::empty()) };
+    let rows = db.iterator_cf(cf, rocksdb::IteratorMode::Start).filter_map(|item| {
+        let (k, v) = item.ok()?;
+        let addr = std::str::from_utf8(&k).ok()?;
+        (addr.starts_with("egot1") || addr.starts_with("ego1")).then(|| (addr.to_string(), read_u64_le(&v)))
+    });
+    summarize_holders(height, rows)
+}
+
 pub fn get_state_stats() -> StateStats {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf = match db.cf_handle(CF_BALANCES) {
@@ -6767,6 +6945,8 @@ pub struct DaoProposalPublic {
     pub on_chain:             bool,
     #[serde(default)]
     pub answers_revealed:     bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target:               String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -6830,6 +7010,7 @@ fn proposal_to_public(p: &DaoProposal, voter: Option<&str>) -> DaoProposalPublic
         my_test_score:    voter.and_then(|v| p.knowledge_votes.get(v).map(|kv| kv.test_score)),
         on_chain:         false,
         answers_revealed: false,
+        target: String::new(),
     }
 }
 
@@ -9824,6 +10005,44 @@ pub fn drs_weight_of(addr: &str) -> (u64, u64, u64) {
     let period = crate::drs::period_of(local_chain_height_in(db).saturating_add(1));
     let mine = crate::drs::load_rec(&ov, addr).map(|r| r.weight.at(period)).unwrap_or(0);
     (mine, crate::drs::total_weight(&ov, period), crate::drs::eligible_count(&ov, period))
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DrsPayEstimate {
+    pub daily_pool_uegoc: u64,
+    pub base_uegoc: u64,
+    pub storage_uegoc: u64,
+    pub uptime_points: u64,
+    pub coverage_points: u64,
+    pub rank: Option<u64>,
+    pub ranks_given: u64,
+    pub mult_milli: u64,
+    pub rank_pay: bool,
+    pub online: u64,
+    pub storage_points_total: u64,
+}
+
+pub fn drs_pay_estimate(addr: &str) -> DrsPayEstimate {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let ov = crate::drs::Ov::new(db);
+    let height = local_chain_height_in(db).saturating_add(1);
+    let now = crate::clock::now();
+    let (base, storage) = if addr.is_empty() { (0, 0) } else { crate::drs::daily_estimate(&ov, addr, height, now) };
+    let (uptime, _, coverage) = crate::drs::load_rec(&ov, addr).map_or((0, 0, 0), |r| crate::drs::point_parts(&r, now));
+    let rank = crate::drs::rank_of(&ov, addr);
+    DrsPayEstimate {
+        daily_pool_uegoc: crate::drs::node_reward_per_day(height, now),
+        base_uegoc: base,
+        storage_uegoc: storage,
+        uptime_points: uptime,
+        coverage_points: coverage,
+        rank,
+        ranks_given: crate::drs::ranks_given(&ov),
+        mult_milli: rank.map_or(1_000, crate::drs::early_mult_milli),
+        rank_pay: crate::drs::rank_pay_ready(&ov, now),
+        online: crate::drs::eligible_count(&ov, crate::drs::period_of(height)),
+        storage_points_total: crate::drs::storage_points_total(&ov, crate::drs::period_of(height)),
+    }
 }
 
 pub fn drs_registered_count() -> u64 {
@@ -13183,4 +13402,41 @@ pub fn hold_settle_txs(height: u64, now: i64) -> Vec<LedgerTx> {
     let bal = |a: &str| db.get_cf(cf_bal, a.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     let ov = crate::drs::Ov::new(db);
     crate::hold_chain::settle_txs(&ov, height, now, &bal)
+}
+
+#[cfg(test)]
+mod holders_tests {
+    use super::*;
+
+    #[test]
+    fn holders_are_ranked_pools_named_and_groups_counted() {
+        let rows = vec![
+            (NODE_POOL_ADDR.to_string(), 299_000_000_000_000u64),
+            (crate::shielded_chain::SHIELDED_POOL_ADDR.to_string(), 2_080_000_000),
+            ("egot1alice".to_string(), 150_000_000_000),
+            ("egot1bob".to_string(), 5_000_000),
+            ("egot1carol".to_string(), 0),
+            ("egot1dave".to_string(), 500_000),
+        ];
+        let h = summarize_holders(7, rows);
+        assert_eq!((h.height, h.wallets, h.shielded_uegoc), (7, 3, 2_080_000_000));
+        assert_eq!(h.wallet_total_uegoc, 150_005_500_000);
+        assert_eq!(h.top.len(), 5);
+        assert_eq!(h.top[0].label, Some("Node rewards pool"));
+        assert_eq!(h.top[1].address, "egot1alice");
+        assert_eq!(h.top[2].label, Some("Shielded pool"));
+        let count = |lo: u64| h.groups.iter().find(|g| g.min_egoc == lo).unwrap().wallets;
+        assert_eq!((count(0), count(1), count(100_000)), (1, 1, 1));
+        assert_eq!(h.groups.last().unwrap().max_egoc, None);
+    }
+
+    #[test]
+    fn only_the_largest_holders_are_kept() {
+        let rows = (1..=HOLDERS_TOP as u64 + 50).map(|i| (format!("egot1w{i}"), i * 1_000_000));
+        let h = summarize_holders(1, rows);
+        assert_eq!(h.top.len(), HOLDERS_TOP);
+        assert_eq!(h.top[0].balance_uegoc, (HOLDERS_TOP as u64 + 50) * 1_000_000);
+        assert_eq!(h.top[HOLDERS_TOP - 1].balance_uegoc, 51_000_000);
+        assert_eq!(h.wallets, HOLDERS_TOP as u64 + 50);
+    }
 }

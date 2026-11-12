@@ -55,6 +55,8 @@ pub fn address_for(net: &ChainNet, path: &str) -> Result<String, String> {
         Family::Evm | Family::Tron => chains::address_from_key(net.family, &chains::wallet_key(path)?),
         Family::Solana => Ok(sol::b58(&wallet_ed25519(path)?.verifying_key().to_bytes())),
         Family::Cardano => Ok(ada::format_address(&cardano_key_address(cardano_network(net), &wallet_ed25519(path)?))),
+        Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::wallet_address(net, path),
+        Family::Xrp => crate::commands::escrow_xrp::wallet_address(path),
         Family::Ego => Err("Ego has no outside address".into()),
     }
 }
@@ -68,6 +70,8 @@ pub fn same_address(family: Family, a: &str, b: &str) -> bool {
         Family::Evm | Family::Tron => chains::same_address(family, a, b),
         Family::Solana => matches!((sol::parse_key(a), sol::parse_key(b)), (Ok(x), Ok(y)) if x == y),
         Family::Cardano => matches!((ada::parse_address(a), ada::parse_address(b)), (Ok(x), Ok(y)) if x == y),
+        Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::same(family, a, b),
+        Family::Xrp => crate::commands::escrow_xrp::same(a, b),
         Family::Ego => a == b,
     }
 }
@@ -313,6 +317,33 @@ impl<'a> SolanaClient<'a> {
         ixs.extend(sol::cancel_for_ixs(program, e, signature));
         self.send(relayer, &[], ixs).await
     }
+
+    pub async fn freeze(&self, buyer: &SigningKey, program: &sol::Key, e: &sol::EscrowAccount) -> Result<String, String> {
+        let me = buyer.verifying_key().to_bytes();
+        self.send(buyer, &[], vec![sol::freeze_ix(program, e, &me)]).await
+    }
+
+    pub async fn reclaim(&self, seller: &SigningKey, program: &sol::Key, e: &sol::EscrowAccount) -> Result<String, String> {
+        let mut ixs = sol::payout_token_accounts(&seller.verifying_key().to_bytes(), e, false);
+        ixs.push(sol::reclaim_ix(program, e));
+        self.send(seller, &[], ixs).await
+    }
+}
+
+const FROZEN_NOTE: &str = "the buyer froze this escrow, so only the arbiter can decide where the coins go";
+
+fn when(unix_secs: i64) -> String {
+    chrono::DateTime::from_timestamp(unix_secs, 0)
+        .map(|d| d.format("%d %b %Y, %H:%M UTC").to_string())
+        .unwrap_or_else(|| unix_secs.to_string())
+}
+
+pub fn cardano_slots(net: &ChainNet) -> ada::SlotConfig {
+    ada::SlotConfig::for_network(match net.chain_id {
+        2 => "preview",
+        764_824_073 => "mainnet",
+        _ => "preprod",
+    })
 }
 
 pub struct CardanoClient<'a> {
@@ -528,6 +559,7 @@ impl<'a> CardanoClient<'a> {
         action: ada::Action,
         outputs: Vec<ada::Output>,
         required_signers: Vec<ada::Pkh>,
+        valid_from: Option<u64>,
     ) -> Result<String, String> {
         if found.spent {
             return Err("the escrow on Cardano is already settled".into());
@@ -535,23 +567,49 @@ impl<'a> CardanoClient<'a> {
         let me = cardano_key_address(self.network(), key);
         let funding = self.utxos(&ada::format_address(&me)).await?;
         let tip = self.tip_slot().await?;
-        let plan = cardano_spend_plan(&me, found, action, outputs, required_signers, funding, tip + CARDANO_TTL_SLOTS);
+        let mut plan = cardano_spend_plan(&me, found, action, outputs, required_signers, funding, tip + CARDANO_TTL_SLOTS);
+        plan.valid_from = valid_from;
         self.sign_submit(key, &plan).await
     }
 
     pub async fn release(&self, seller: &SigningKey, found: &FoundEscrow) -> Result<String, String> {
         let seller_pkh = ada::payment_key_hash(&found.datum.seller).ok_or("the escrow's seller is not a key address")?;
-        self.spend(seller, found, ada::Action::Release, released_outputs(&found.datum), vec![seller_pkh]).await
+        self.spend(seller, found, ada::Action::Release, released_outputs(&found.datum), vec![seller_pkh], None).await
     }
 
     pub async fn resolve(&self, arbiter: &SigningKey, found: &FoundEscrow, to_buyer: bool) -> Result<String, String> {
         let outputs = if to_buyer { released_outputs(&found.datum) } else { refunded_outputs(&found.datum) };
-        self.spend(arbiter, found, ada::Action::Resolve { to_buyer }, outputs, vec![found.datum.arbiter]).await
+        self.spend(arbiter, found, ada::Action::Resolve { to_buyer }, outputs, vec![found.datum.arbiter], None).await
     }
 
     pub async fn cancel_for(&self, relayer: &SigningKey, found: &FoundEscrow, vkey: [u8; 32], signature: [u8; 64]) -> Result<String, String> {
         let action = ada::Action::CancelFor { vkey, signature };
-        self.spend(relayer, found, action, refunded_outputs(&found.datum), vec![]).await
+        self.spend(relayer, found, action, refunded_outputs(&found.datum), vec![], None).await
+    }
+
+    pub async fn freeze(&self, buyer: &SigningKey, found: &FoundEscrow, script: Vec<u8>) -> Result<String, String> {
+        if found.datum.frozen {
+            return Err("the escrow on Cardano is already frozen".into());
+        }
+        let buyer_pkh = ada::payment_key_hash(&found.datum.buyer).ok_or("the escrow's buyer is not a key address")?;
+        if ada::payment_key_hash(&cardano_key_address(self.network(), buyer)) != Some(buyer_pkh) {
+            return Err("this wallet is not the buyer named in the escrow".into());
+        }
+        let frozen = ada::EscrowDatum { frozen: true, ..found.datum.clone() };
+        let outputs = vec![ada::Output { address: script, lovelace: found.utxo.lovelace, datum: Some(frozen.to_data()?) }];
+        self.spend(buyer, found, ada::Action::Freeze, outputs, vec![buyer_pkh], None).await
+    }
+
+    pub async fn reclaim(&self, seller: &SigningKey, found: &FoundEscrow) -> Result<String, String> {
+        if found.datum.frozen {
+            return Err(FROZEN_NOTE.into());
+        }
+        if chrono::Utc::now().timestamp_millis() < found.datum.fallback_at {
+            return Err(format!("you can take the coins back from {}", when(found.datum.fallback_at / 1_000)));
+        }
+        let seller_pkh = ada::payment_key_hash(&found.datum.seller).ok_or("the escrow's seller is not a key address")?;
+        let from = cardano_slots(self.net).slot_at_or_after(found.datum.fallback_at);
+        self.spend(seller, found, ada::Action::Reclaim, refunded_outputs(&found.datum), vec![seller_pkh], Some(from)).await
     }
 }
 
@@ -684,6 +742,11 @@ impl<'a> Outside<'a> {
                 let native = CardanoClient::new(self.net).balance(owner).await.ok().map(u128::from);
                 (native, native)
             }
+            Family::Bitcoin | Family::Dogecoin => match crate::commands::escrow_btc::UtxoClient::new(self.net) {
+                Ok(c) => (c.balance(owner).await.ok().map(|v| v as u128), None),
+                Err(_) => (None, None),
+            },
+            Family::Xrp => (crate::commands::escrow_xrp::Rpc::new(self.net).balance(owner).await.ok().map(|v| v as u128), None),
             Family::Ego => (None, None),
         }
     }
@@ -746,6 +809,8 @@ impl<'a> Outside<'a> {
                 let tx = CardanoClient::new(self.net).open(&key, &script, &datum, progress).await?;
                 Ok(EscrowRef { contract: self.net.escrow.clone(), funder: ada::format_address(&seller), tx })
             }
+            Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::open(self.net, self.tok, trade, progress).await,
+            Family::Xrp => crate::commands::escrow_xrp::open(self.net, self.tok, trade, progress).await,
             Family::Ego => Err("EGOC is escrowed on Ego".into()),
         }
     }
@@ -767,6 +832,8 @@ impl<'a> Outside<'a> {
                     _ => closed_escrow(),
                 })
             }
+            Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::read(self.net, self.tok, trade).await,
+            Family::Xrp => crate::commands::escrow_xrp::read(self.net, self.tok, trade).await,
             Family::Ego => Err("EGOC is escrowed on Ego".into()),
         }
     }
@@ -785,6 +852,8 @@ impl<'a> Outside<'a> {
                 let found = self.ada_escrow(trade).await?;
                 CardanoClient::new(self.net).release(&wallet_ed25519(&self.net.key_path)?, &found).await
             }
+            Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::release(self.net, self.tok, trade).await,
+            Family::Xrp => crate::commands::escrow_xrp::release(self.net, self.tok, trade).await,
             Family::Ego => Err("EGOC is escrowed on Ego".into()),
         }
     }
@@ -804,6 +873,8 @@ impl<'a> Outside<'a> {
                 let found = self.ada_escrow(trade).await?;
                 CardanoClient::new(self.net).resolve(&wallet_ed25519(&path)?, &found, to_buyer).await
             }
+            Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::resolve(self.net, self.tok, trade, to_buyer, &path).await,
+            Family::Xrp => crate::commands::escrow_xrp::resolve(self.net, self.tok, trade, to_buyer, &path).await,
             Family::Ego => Err("EGOC is escrowed on Ego".into()),
         }
     }
@@ -831,6 +902,60 @@ impl<'a> Outside<'a> {
                 let (vkey, sig) = ada::sign_auth(&key, &script, &trade_id(trade)?, ada::ACTION_CANCEL);
                 Ok(format!("{}{}", hex::encode(vkey), hex::encode(sig)))
             }
+            Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::buyer_cancel(self.net, trade).await,
+            Family::Xrp => crate::commands::escrow_xrp::buyer_cancel(self.net, self.tok, trade).await,
+            Family::Ego => Err("EGOC is escrowed on Ego".into()),
+        }
+    }
+
+    pub async fn freeze(&self, trade: &Trade) -> Result<String, String> {
+        match self.net.family {
+            Family::Solana => {
+                let (program, e) = self.sol_escrow(trade).await?;
+                if e.frozen {
+                    return Err("the escrow on Solana is already frozen".into());
+                }
+                let key = wallet_ed25519(&self.net.key_path)?;
+                if e.buyer != key.verifying_key().to_bytes() {
+                    return Err("this wallet is not the buyer named in the escrow".into());
+                }
+                SolanaClient::new(self.net).freeze(&key, &program, &e).await
+            }
+            Family::Cardano => {
+                let found = self.ada_escrow(trade).await?;
+                let script = ada::parse_address(&self.reference(trade)?.contract)?;
+                CardanoClient::new(self.net).freeze(&wallet_ed25519(&self.net.key_path)?, &found, script).await
+            }
+            Family::Evm | Family::Tron => Err(format!("freezing is not available on {} yet", self.net.label)),
+            Family::Bitcoin | Family::Dogecoin => Err(format!("a {} escrow cannot be frozen: ask the arbiter to decide before the deadline", self.net.label)),
+            Family::Xrp => crate::commands::escrow_xrp::freeze(self.net, trade).await,
+            Family::Ego => Err("EGOC is escrowed on Ego".into()),
+        }
+    }
+
+    pub async fn reclaim(&self, trade: &Trade) -> Result<String, String> {
+        match self.net.family {
+            Family::Solana => {
+                let (program, e) = self.sol_escrow(trade).await?;
+                if e.frozen {
+                    return Err(FROZEN_NOTE.into());
+                }
+                if chrono::Utc::now().timestamp() < e.fallback_at {
+                    return Err(format!("you can take the coins back from {}", when(e.fallback_at)));
+                }
+                let key = wallet_ed25519(&self.net.key_path)?;
+                if e.seller != key.verifying_key().to_bytes() {
+                    return Err("this wallet is not the seller named in the escrow".into());
+                }
+                SolanaClient::new(self.net).reclaim(&key, &program, &e).await
+            }
+            Family::Cardano => {
+                let found = self.ada_escrow(trade).await?;
+                CardanoClient::new(self.net).reclaim(&wallet_ed25519(&self.net.key_path)?, &found).await
+            }
+            Family::Evm | Family::Tron => Err(format!("taking coins back is not available on {} yet", self.net.label)),
+            Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::reclaim(self.net, trade).await,
+            Family::Xrp => crate::commands::escrow_xrp::reclaim(self.net, self.tok, trade).await,
             Family::Ego => Err("EGOC is escrowed on Ego".into()),
         }
     }
@@ -856,6 +981,8 @@ impl<'a> Outside<'a> {
                 let found = self.ada_escrow(trade).await?;
                 CardanoClient::new(self.net).cancel_for(&wallet_ed25519(&self.net.key_path)?, &found, vkey, signature).await
             }
+            Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::relay_cancel(self.net, trade, sig_hex).await,
+            Family::Xrp => crate::commands::escrow_xrp::relay_cancel(self.net, self.tok, trade, sig_hex).await,
             Family::Ego => Err("EGOC is escrowed on Ego".into()),
         }
     }
@@ -863,6 +990,8 @@ impl<'a> Outside<'a> {
     pub fn verify(&self, trade: &Trade, funder: &str, e: &NativeEscrow) -> Vec<String> {
         match self.net.family {
             Family::Evm | Family::Tron => chains::verify_escrow(trade, self.net, self.tok, funder, e),
+            Family::Bitcoin | Family::Dogecoin => crate::commands::escrow_btc::verify(self.net, self.tok, trade, funder, e),
+            Family::Xrp => crate::commands::escrow_xrp::verify(self.net, self.tok, trade, funder, e),
             _ => verify_ed25519_chain(trade, self.net, self.tok, funder, e),
         }
     }

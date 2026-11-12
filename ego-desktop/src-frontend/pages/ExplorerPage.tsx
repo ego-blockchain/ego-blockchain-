@@ -181,7 +181,119 @@ interface Tokenomics {
   };
 }
 
-type Tab = 'blocks' | 'txs' | 'files' | 'tokenomics';
+interface HolderRow { address: string; balance_uegoc: number; label: string | null; }
+interface HolderGroup { min_egoc: number; max_egoc: number | null; wallets: number; total_uegoc: number; }
+interface Holders {
+  height: number;
+  total_uegoc: number;
+  wallets: number;
+  wallet_total_uegoc: number;
+  shielded_uegoc: number;
+  groups: HolderGroup[];
+  top: HolderRow[];
+}
+
+const egoc = (u: number) => (u / 1_000_000).toLocaleString('en-US', { maximumFractionDigits: 2 });
+const groupName = (g: HolderGroup) =>
+  g.max_egoc == null ? `${g.min_egoc.toLocaleString('en-US')}+ EGOC` : `${g.min_egoc.toLocaleString('en-US')} to ${g.max_egoc.toLocaleString('en-US')} EGOC`;
+
+function HoldersView({ data }: { data: Holders | null }) {
+  const [showAll, setShowAll] = useState(false);
+  if (!data) {
+    return (
+      <div className="py-16 text-center text-gray-500">
+        <div className="text-3xl mb-3 animate-pulse">👥</div>
+        <div className="text-sm">Reading balances from this node…</div>
+      </div>
+    );
+  }
+  const share = (u: number) => {
+    const pct = data.total_uegoc ? (u / data.total_uegoc) * 100 : 0;
+    return pct >= 0.01 ? `${pct.toFixed(2)}%` : '< 0.01%';
+  };
+  const groups = data.groups.filter(g => g.wallets > 0);
+  const maxWallets = Math.max(1, ...groups.map(g => g.wallets));
+  const rows = showAll ? data.top : data.top.slice(0, 25);
+  return (
+    <div className="p-5 space-y-5">
+      <div className="grid grid-cols-3 gap-3">
+        {[
+          { label: 'Wallets holding EGOC', val: data.wallets.toLocaleString('en-US'), sub: 'not counting the pools' },
+          { label: 'Held by those wallets', val: `${egoc(data.wallet_total_uegoc)} EGOC`, sub: 'all of them together' },
+          { label: 'Shielded', val: `${egoc(data.shielded_uegoc)} EGOC`, sub: 'one total, owners stay hidden' },
+        ].map(c => (
+          <div key={c.label} className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
+            <div className="text-xs text-gray-400 mb-1">{c.label}</div>
+            <div className="text-lg font-bold text-white">{c.val}</div>
+            <div className="text-xs text-gray-500 mt-0.5">{c.sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {groups.length > 0 && (
+        <div>
+          <div className="text-xs text-gray-400 mb-3 font-semibold uppercase tracking-wide">Wallets by size</div>
+          <div className="space-y-2">
+            {groups.map(g => (
+              <div key={g.min_egoc} className="flex items-center gap-3" title={`${groupName(g)}: ${g.wallets} wallets holding ${egoc(g.total_uegoc)} EGOC together`}>
+                <div className="w-40 text-xs text-gray-300 shrink-0">{groupName(g)}</div>
+                <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
+                  <div className="h-full bg-blue-500 rounded-full" style={{ width: `${Math.max(2, (g.wallets / maxWallets) * 100)}%` }} />
+                </div>
+                <div className="text-xs w-56 text-right whitespace-nowrap">
+                  <span className="text-white font-semibold">{g.wallets.toLocaleString('en-US')}</span>
+                  <span className="text-gray-400"> wallets · {egoc(g.total_uegoc)} EGOC</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div>
+        <div className="text-xs text-gray-400 mb-3 font-semibold uppercase tracking-wide">Largest holders</div>
+        <div className="overflow-x-auto border border-gray-700/50 rounded-xl">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-700 text-xs text-gray-400">
+                <th className="px-4 py-3 text-left">#</th>
+                <th className="px-4 py-3 text-left">Holder</th>
+                <th className="px-4 py-3 text-right">Balance (EGOC)</th>
+                <th className="px-4 py-3 text-right">Share of all coins</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((h, i) => (
+                <tr key={h.address} className="border-b border-gray-700/40 last:border-0 hover:bg-gray-700/20">
+                  <td className="px-4 py-2.5 text-gray-500">{i + 1}</td>
+                  <td className="px-4 py-2.5">
+                    {h.label && <span className="text-xs bg-gray-700 text-gray-200 rounded-full px-2 py-0.5 mr-2">{h.label}</span>}
+                    <button onClick={openOnWeb(addressUrl(h.address))} title={h.address} className="font-mono text-xs text-blue-400 hover:text-blue-300 hover:underline">
+                      {h.address.length > 24 ? `${h.address.slice(0, 14)}…${h.address.slice(-6)}` : h.address}
+                    </button>
+                  </td>
+                  <td className="px-4 py-2.5 text-right font-semibold whitespace-nowrap">{egoc(h.balance_uegoc)}</td>
+                  <td className="px-4 py-2.5 text-right text-gray-400">{share(h.balance_uegoc)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {data.top.length > 25 && (
+          <button onClick={() => setShowAll(v => !v)} className="mt-3 text-xs bg-gray-700 hover:bg-gray-600 transition rounded-lg px-3 py-1.5">
+            {showAll ? 'Show fewer' : `Show top ${data.top.length}`}
+          </button>
+        )}
+      </div>
+
+      <div className="text-xs text-gray-500 leading-relaxed">
+        Read from this node's own copy of the chain at block #{data.height.toLocaleString('en-US')}. Public balances are visible to everyone, as on any blockchain. Coins in the shielded pool appear only as one total, and their owners stay hidden.
+      </div>
+    </div>
+  );
+}
+
+type Tab = 'blocks' | 'txs' | 'holders' | 'files' | 'tokenomics';
 
 const ExplorerPage: React.FC = () => {
   const [tab, setTab] = useState<Tab>('blocks');
@@ -190,6 +302,7 @@ const ExplorerPage: React.FC = () => {
   const [fileEvents, setFileEvents] = useState<FileEvent[]>([]);
   const [netStats, setNetStats] = useState<NetworkStats | null>(null);
   const [tokenomics, setTokenomics] = useState<Tokenomics | null>(null);
+  const [holders, setHolders] = useState<Holders | null>(null);
   const [selectedBlock, setSelectedBlock] = useState<LedgerBlock | null>(null);
   const blockTimes = shownTimes(blocks);
   const [selectedTx, setSelectedTx] = useState<LedgerTx | null>(null);
@@ -263,6 +376,7 @@ const ExplorerPage: React.FC = () => {
 
       if (n) setNetStats(n);
       invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
+      invoke<Holders>('get_holders').then(setHolders).catch(() => {});
     } finally {
       setLoading(false);
     }
@@ -301,6 +415,7 @@ const ExplorerPage: React.FC = () => {
   const tabs: { key: Tab; label: string; count: number }[] = [
     { key: 'blocks',     label: '🧱 Blocks',       count: totalBlocks        },
     { key: 'txs',        label: '↔️ Transactions', count: totalTxs           },
+    { key: 'holders',    label: '👥 Holders',       count: holders?.wallets ?? 0 },
     { key: 'files',      label: '📁 Files',         count: fileEvents.length  },
     { key: 'tokenomics', label: '💰 Tokenomics',    count: 0                  },
   ];
@@ -545,6 +660,10 @@ const ExplorerPage: React.FC = () => {
             </>
           )}
           </>
+
+        ) : tab === 'holders' ? (
+
+          <HoldersView data={holders} />
 
         ) : tab === 'tokenomics' ? (
 

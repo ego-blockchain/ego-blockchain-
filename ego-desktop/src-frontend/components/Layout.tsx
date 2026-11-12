@@ -6,6 +6,7 @@ import { open as openUrl } from '@tauri-apps/api/shell';
 import { useWallet, useTheme } from '../App';
 import TitleBar from './TitleBar';
 import AuthenticatorReminder from './AuthenticatorReminder';
+import EarnGuide, { EARN_GUIDE_SEEN_KEY } from './EarnGuide';
 import PasswordRules from './PasswordRules';
 import { passwordProblem } from '../lib/password';
 import { useAppVersion, formatVersion } from '../lib/version';
@@ -488,6 +489,17 @@ const Layout: React.FC = () => {
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
   const [unreadCount, setUnreadCount] = useState(0);
+  const { wallet } = useWallet();
+  const [guideOpen, setGuideOpen] = useState(false);
+
+  useEffect(() => {
+    if (wallet?.address && !localStorage.getItem(EARN_GUIDE_SEEN_KEY)) setGuideOpen(true);
+  }, [wallet?.address]);
+
+  const closeGuide = () => {
+    localStorage.setItem(EARN_GUIDE_SEEN_KEY, String(Date.now()));
+    setGuideOpen(false);
+  };
 
   // Global handler: notification click → navigate to Messenger and open that chat
   useEffect(() => {
@@ -555,6 +567,14 @@ const Layout: React.FC = () => {
 
         {}
         <div className="p-3 border-t border-gray-700 space-y-2">
+          <button
+            onClick={() => setGuideOpen(true)}
+            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-300 bg-gray-700/50 hover:bg-gray-700 hover:text-white transition"
+            title="How your computer earns EGOC"
+          >
+            <span>💡</span>
+            <span>How to earn</span>
+          </button>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
@@ -583,6 +603,7 @@ const Layout: React.FC = () => {
         <AuthenticatorReminder />
         <Outlet />
       </main>
+      <EarnGuide open={guideOpen} onClose={closeGuide} />
       </div>
     </div>
   );

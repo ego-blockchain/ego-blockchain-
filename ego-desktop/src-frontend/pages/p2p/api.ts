@@ -5,7 +5,7 @@ export type Side = 'sell' | 'buy';
 export type Price = { fixed: number } | { margin_bps: number };
 export type Rating = 'positive' | 'neutral' | 'negative';
 export type Role = 'buyer' | 'seller' | 'arbiter';
-export type Family = 'ego' | 'evm' | 'tron' | 'solana' | 'cardano';
+export type Family = 'ego' | 'evm' | 'tron' | 'solana' | 'cardano' | 'bitcoin' | 'dogecoin' | 'xrp';
 export type TradeState =
   | 'awaiting_lock' | 'locked' | 'paid' | 'disputed' | 'cancelled' | 'released' | 'refunded';
 export type TradeStatus = TradeState | 'expired' | 'payment_overdue';
@@ -296,6 +296,15 @@ export const api = {
     if (!(await requireConfirm('send'))) throw new Error('Cancelled');
     return invoke<string>('market_settle', { tradeId, outcome });
   },
+  freeze: async (tradeId: string) => {
+    if (!(await requireConfirm('send'))) throw new Error('Cancelled');
+    return invoke<string>('market_freeze', { tradeId });
+  },
+  reclaimEscrow: async (tradeId: string) => {
+    if (!(await requireConfirm('send'))) throw new Error('Cancelled');
+    return invoke<string>('market_reclaim', { tradeId });
+  },
+  readyAssets: () => invoke<string[]>('market_ready_assets'),
   escrowStatus: (tradeId: string) => invoke<EscrowStatus>('market_escrow_status', { tradeId }),
   chainAddress: (asset: string) => invoke<ChainAddress>('market_chain_address', { asset }),
   publishArbiter: () => invoke<string>('market_publish_arbiter'),
@@ -315,7 +324,7 @@ export interface AssetMeta {
 }
 
 export const ASSETS: AssetMeta[] = [
-  { id: 'EGOC', symbol: 'EGOC', chain: 'Ego', family: 'ego', color: '#d2eb2b', digits: 2 },
+  { id: 'EGOC', symbol: 'EGOC', chain: 'Ego test network', family: 'ego', color: '#d2eb2b', digits: 2 },
   { id: 'USDT-TRC20', symbol: 'USDT', chain: 'Tron · TRC-20', family: 'tron', color: '#26A17B', digits: 2 },
   { id: 'USDT-ERC20', symbol: 'USDT', chain: 'Ethereum · ERC-20', family: 'evm', color: '#26A17B', digits: 2 },
   { id: 'USDT-BEP20', symbol: 'USDT', chain: 'BNB Chain · BEP-20', family: 'evm', color: '#26A17B', digits: 2 },
@@ -331,6 +340,9 @@ export const ASSETS: AssetMeta[] = [
   { id: 'USDT-SPL', symbol: 'USDT', chain: 'Solana', family: 'solana', color: '#26A17B', digits: 2 },
   { id: 'SOL', symbol: 'SOL', chain: 'Solana', family: 'solana', color: '#9945FF', digits: 4 },
   { id: 'ADA', symbol: 'ADA', chain: 'Cardano', family: 'cardano', color: '#3CC8C8', digits: 2 },
+  { id: 'BTC', symbol: 'BTC', chain: 'Bitcoin', family: 'bitcoin', color: '#F7931A', digits: 6 },
+  { id: 'DOGE', symbol: 'DOGE', chain: 'Dogecoin', family: 'dogecoin', color: '#C2A633', digits: 2 },
+  { id: 'XRP', symbol: 'XRP', chain: 'XRP Ledger', family: 'xrp', color: '#23292F', digits: 2 },
 ];
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]+$/;
@@ -346,7 +358,13 @@ export function payoutProblem(family: Family, address: string): string | null {
     case 'solana':
       return a.length >= 32 && a.length <= 44 && BASE58.test(a) ? null : 'A Solana address is 32 to 44 base58 characters.';
     case 'cardano':
-      return /^addr_test1[02-9ac-hj-np-z]{50,110}$/.test(a) ? null : 'Use a Cardano testnet address that starts with addr_test1.';
+      return /^addr1[02-9ac-hj-np-z]{50,110}$/.test(a) ? null : 'Use a Cardano address that starts with addr1.';
+    case 'bitcoin':
+      return /^(bc1[02-9ac-hj-np-z]{11,71}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/.test(a) ? null : 'Use a Bitcoin address that starts with bc1, 1 or 3.';
+    case 'xrp':
+      return /^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(a) ? null : 'Use an XRP address that starts with r.';
+    case 'dogecoin':
+      return /^[DA9][1-9A-HJ-NP-Za-km-z]{25,34}$/.test(a) ? null : 'Use a Dogecoin address that starts with D, A or 9.';
     default:
       return null;
   }
@@ -355,6 +373,7 @@ export function payoutProblem(family: Family, address: string): string | null {
 export function nativeDecimals(family: Family): number {
   if (family === 'evm') return 18;
   if (family === 'solana') return 9;
+  if (family === 'bitcoin' || family === 'dogecoin') return 8;
   return 6;
 }
 

@@ -187,6 +187,10 @@ pub struct EarningsData {
     pub storage_earned_24h_uegoc: u64,
     #[serde(default)]
     pub storage_earned_total_uegoc: u64,
+    #[serde(default)]
+    pub early_rank: Option<u64>,
+    #[serde(default)]
+    pub early_places_taken: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

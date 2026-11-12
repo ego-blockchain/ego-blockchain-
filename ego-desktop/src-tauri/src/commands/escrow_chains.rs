@@ -97,7 +97,154 @@ fn token(asset: &str, network: &str, native: bool, address: &str, decimals: u8) 
     TokenCfg { asset: asset.into(), network: network.into(), native, token: address.into(), decimals }
 }
 
+pub const NETWORK_MODE: &str = "mainnet";
+
 pub fn default_networks() -> Networks {
+    mainnet_networks()
+}
+
+pub fn mainnet_networks() -> Networks {
+    Networks {
+        mode: "mainnet".into(),
+        networks: vec![
+            net(
+                "ethereum",
+                Family::Evm,
+                "Ethereum",
+                1,
+                &["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"],
+                "https://etherscan.io/tx/",
+                "https://etherscan.io/address/",
+                "ego:ethereum:0",
+                "ETH",
+            ),
+            net(
+                "bsc",
+                Family::Evm,
+                "BNB Chain",
+                56,
+                &["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.bnbchain.org"],
+                "https://bscscan.com/tx/",
+                "https://bscscan.com/address/",
+                "ego:bnb:0",
+                "BNB",
+            ),
+            net(
+                "polygon",
+                Family::Evm,
+                "Polygon",
+                137,
+                &["https://polygon-bor-rpc.publicnode.com", "https://polygon-rpc.com"],
+                "https://polygonscan.com/tx/",
+                "https://polygonscan.com/address/",
+                "ego:polygon:0",
+                "POL",
+            ),
+            net(
+                "tron",
+                Family::Tron,
+                "Tron",
+                0,
+                &["https://api.trongrid.io"],
+                "https://tronscan.org/#/transaction/",
+                "https://tronscan.org/#/address/",
+                "ego:tron:0",
+                "TRX",
+            ),
+            net(
+                "solana",
+                Family::Solana,
+                "Solana",
+                0,
+                &["https://api.mainnet-beta.solana.com"],
+                "https://explorer.solana.com/tx/",
+                "https://explorer.solana.com/address/",
+                "ego:solana:0",
+                "SOL",
+            ),
+            ChainNet {
+                escrow: UTXO_ESCROW.into(),
+                ..net(
+                    "bitcoin",
+                    Family::Bitcoin,
+                    "Bitcoin",
+                    0,
+                    &["https://mempool.space/api", "https://blockstream.info/api"],
+                    "https://mempool.space/tx/",
+                    "https://mempool.space/address/",
+                    "ego:bitcoin:0",
+                    "BTC",
+                )
+            },
+            ChainNet {
+                escrow: UTXO_ESCROW.into(),
+                ..net(
+                    "dogecoin",
+                    Family::Dogecoin,
+                    "Dogecoin",
+                    0,
+                    &["https://api.blockcypher.com/v1/doge/main"],
+                    "https://blockchair.com/dogecoin/transaction/",
+                    "https://blockchair.com/dogecoin/address/",
+                    "ego:dogecoin:0",
+                    "DOGE",
+                )
+            },
+            ChainNet {
+                escrow: UTXO_ESCROW.into(),
+                ..net(
+                    "xrp",
+                    Family::Xrp,
+                    "XRP Ledger",
+                    0,
+                    &["https://xrplcluster.com", "https://s1.ripple.com:51234"],
+                    "https://livenet.xrpl.org/transactions/",
+                    "https://livenet.xrpl.org/accounts/",
+                    "ego:xrp:0",
+                    "XRP",
+                )
+            },
+            ChainNet {
+                escrow: crate::commands::escrow_outside::cardano_script_address(1),
+                ..net(
+                    "cardano",
+                    Family::Cardano,
+                    "Cardano",
+                    764_824_073,
+                    &["https://api.koios.rest/api/v1"],
+                    "https://cardanoscan.io/transaction/",
+                    "https://cardanoscan.io/address/",
+                    "ego:cardano:0",
+                    "ADA",
+                )
+            },
+        ],
+        tokens: vec![
+            token("USDT-TRC20", "tron", false, "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", 6),
+            token("TRX", "tron", true, "", 6),
+            token("USDT-ERC20", "ethereum", false, "0xdAC17F958D2ee523a2206206994597C13D831ec7", 6),
+            token("USDC-ERC20", "ethereum", false, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6),
+            token("ETH", "ethereum", true, "", 18),
+            token("USDT-BEP20", "bsc", false, "0x55d398326f99059fF775485246999027B3197955", 18),
+            token("USDC-BEP20", "bsc", false, "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", 18),
+            token("BNB", "bsc", true, "", 18),
+            token("USDT-POLYGON", "polygon", false, "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", 6),
+            token("USDC-POLYGON", "polygon", false, "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6),
+            token("POL", "polygon", true, "", 18),
+            token("USDC-SPL", "solana", false, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 6),
+            token("USDT-SPL", "solana", false, "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", 6),
+            token("SOL", "solana", true, "", 9),
+            token("ADA", "cardano", true, "", 6),
+            token("BTC", "bitcoin", true, "", 8),
+            token("DOGE", "dogecoin", true, "", 8),
+            token("XRP", "xrp", true, "", 6),
+        ],
+    }
+}
+
+pub const UTXO_ESCROW: &str = "script";
+
+pub fn testnet_networks() -> Networks {
     Networks {
         mode: "testnet".into(),
         networks: vec![
@@ -203,6 +350,7 @@ pub fn networks() -> Networks {
     std::fs::read(networks_path())
         .ok()
         .and_then(|b| serde_json::from_slice::<Networks>(&b).ok())
+        .filter(|n| n.mode == NETWORK_MODE)
         .unwrap_or_else(default_networks)
 }
 
@@ -297,7 +445,7 @@ pub fn parse_address(family: Family, s: &str) -> Result<[u8; 20], String> {
             a.copy_from_slice(&raw[1..21]);
             Ok(a)
         }
-        Family::Solana | Family::Cardano => Err(format!("{s:.48} is not an EVM or Tron address")),
+        Family::Solana | Family::Cardano | Family::Bitcoin | Family::Dogecoin | Family::Xrp => Err(format!("{s:.48} is not an EVM or Tron address")),
         Family::Ego => Err("Ego addresses have no outside form".into()),
     }
 }
@@ -771,9 +919,22 @@ impl<'a> ChainClient<'a> {
             if have < total {
                 return Err(format!("this wallet holds {have} base units of {} but the escrow needs {total}", token.asset));
             }
-            if self.allowance(&token.token, &funder, &self.net.escrow).await? < total {
+            let allowed = self.allowance(&token.token, &funder, &self.net.escrow).await?;
+            if allowed < total {
                 progress("approve");
                 let escrow20 = self.address(&self.net.escrow)?;
+                if allowed > 0 {
+                    let reset = self
+                        .send(
+                            seller_key,
+                            &token.token,
+                            "approve(address,uint256)",
+                            &[Arg::Word(word_addr(&escrow20)), Arg::Word(word_u128(0))],
+                            0,
+                        )
+                        .await?;
+                    self.wait(&reset).await?;
+                }
                 let tx = self
                     .send(
                         seller_key,

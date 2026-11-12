@@ -116,10 +116,11 @@ pub async fn create_dao_proposal(
     options:       Vec<String>,
     duration_days: Option<u32>,
     questions:     Option<Vec<NewTestQuestion>>,
+    target:        Option<String>,
     state:         State<'_, AppState>,
 ) -> Result<String, EgoDesktopError> {
     if crate::dao_chain::rule_active_at_tip() {
-        return chain_propose(&state, title, description, proposal_type, options, duration_days, questions.unwrap_or_default()).await;
+        return chain_propose(&state, title, description, proposal_type, options, duration_days, questions.unwrap_or_default(), target.unwrap_or_default()).await;
     }
     let ledger = Ledger::load();
     let creator = ledger.address.clone();
@@ -542,6 +543,7 @@ async fn chain_propose(
     options:       Vec<String>,
     duration_days: Option<u32>,
     questions:     Vec<NewTestQuestion>,
+    target:        String,
 ) -> Result<String, EgoDesktopError> {
     for (i, q) in questions.iter().enumerate() {
         if q.correct_index >= q.options.len() {
@@ -561,6 +563,7 @@ async fn chain_propose(
             .map(|q| crate::dao_chain::Question { question: q.question.clone(), options: q.options.clone() })
             .collect(),
         answers_commit: if questions.is_empty() { String::new() } else { crate::dao_chain::answers_commit(&salt, &answers) },
+        target: target.trim().to_string(),
     };
     crate::dao_chain::check_propose(&body).map_err(EgoDesktopError::InvalidInput)?;
 

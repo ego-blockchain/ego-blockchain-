@@ -10,7 +10,7 @@ import {
 } from './api';
 import { AssetBadge, Avatar, Row } from './OfferBook';
 
-const GAS: Partial<Record<Family, string>> = { tron: 'TRX', solana: 'SOL', cardano: 'ADA' };
+const GAS: Partial<Record<Family, string>> = { tron: 'TRX', solana: 'SOL', cardano: 'ADA', bitcoin: 'BTC', dogecoin: 'DOGE', xrp: 'XRP' };
 
 type Tone = 'neutral' | 'yellow' | 'blue' | 'cyan' | 'orange' | 'red' | 'green';
 
@@ -566,6 +566,49 @@ export default function TradeRoom() {
     }
   }
 
+  async function actOutside(label: string, run: () => Promise<string>, ask: [string, string, string]) {
+    const ok = await confirm(ask[0], { detail: ask[1], confirmLabel: ask[2] });
+    if (!ok) return;
+    setBusy(label);
+    setNotice(null);
+    try {
+      await run();
+      setNotice({ ok: true, text: `${label}: sent${where}. It shows here once ${meta.chain} confirms it.` });
+      load();
+    } catch (e) {
+      setNotice({ ok: false, text: errText(e) });
+    } finally {
+      setBusy('');
+    }
+  }
+
+  const esc = outside && escrow?.funded ? escrow.escrow : undefined;
+  const frozen = !!esc?.frozen;
+  const escrowOpen = !!esc && esc.state === 1;
+  const reclaimAt = esc?.fallback_at ?? 0;
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const reclaimReady = escrowOpen && !frozen && reclaimAt > 0 && nowSecs >= reclaimAt;
+  const reclaimDate = reclaimAt > 0 ? new Date(reclaimAt * 1000).toLocaleString() : '';
+  const canFreeze = escrowOpen && !frozen && (meta.family === 'solana' || meta.family === 'cardano' || meta.family === 'xrp');
+  const utxo = meta.family === 'bitcoin' || meta.family === 'dogecoin';
+  const arbiterSigned = (utxo || meta.family === 'xrp') && status === 'refunded' && t.closed_by === 'arbiter';
+  const freezeEscrow = () =>
+    actOutside('Freeze escrow', () => api.freeze(t.id), [
+      'Freeze the escrow?',
+      `Do this only if you really paid. After this the seller can no longer take the ${meta.symbol} back, and only the arbiter decides where it goes. A dispute is opened for you. You pay a small ${GAS[meta.family] ?? 'network'} fee from your ${meta.chain} wallet.`,
+      'Freeze',
+    ]);
+  const reclaimOutside = () =>
+    actOutside('Take back', () => api.reclaimEscrow(t.id), [
+      `Take your ${locked} back${where}?`,
+      `The trade's deadline has passed and the buyer has not frozen the escrow. Do this only if the buyer never paid you. It cannot be undone, and you pay the ${meta.chain} network fee.`,
+      `Take back ${locked}`,
+    ]);
+  const frozenLine = frozen ? <div className="text-xs text-cyan-300 mt-1">The escrow is frozen: only the arbiter can move it now.</div> : null;
+  const reclaimLine = escrowOpen && !frozen && reclaimAt > 0 && !reclaimReady
+    ? <div className="text-xs text-gray-400 mt-1">If nothing else happens, you can take it back yourself from {reclaimDate}.</div>
+    : null;
+
   const fund = () =>
     act('Fund escrow', () => api.fund(t.id), [
       `Lock ${locked}${where}?`,
@@ -734,8 +777,10 @@ export default function TradeRoom() {
         if (role === 'seller') {
           if (outside) {
             return (
-              <Panel tone="orange" title="The buyer did not pay in time" body={`Your ${meta.symbol} stays in escrow${where} until the buyer cancels or the arbiter returns it. Open a dispute and the arbiter sends it back to you.`}>
+              <Panel tone="orange" title="The buyer did not pay in time" body={<>{`Your ${meta.symbol} stays in escrow${where} until the buyer cancels or the arbiter returns it. Open a dispute and the arbiter sends it back to you.`}{reclaimLine}{frozenLine}</>}>
                 <Btn primary onClick={() => setDisputeOpen(true)} disabled={!canAct}>Ask the arbiter to return it</Btn>
+                {reclaimReady && <Btn onClick={reclaimOutside} disabled={!!busy}>Take back {locked} yourself</Btn>}
+                {utxo && <div className="text-xs text-gray-500 mt-1">{meta.chain} escrows cannot be frozen, so the arbiter has to decide before the deadline.</div>}
               </Panel>
             );
           }
@@ -776,13 +821,14 @@ export default function TradeRoom() {
         return (
           <Panel
             title="Waiting for the seller to release"
-            body="The seller is checking your payment. If they stop responding you can ask an arbiter to step in."
+            body={<>The seller is checking your payment. If they stop responding you can ask an arbiter to step in.{role === 'buyer' && canFreeze ? <div className="text-xs text-gray-400 mt-1">You can also freeze the escrow{where} so the seller cannot take the coins back while this is open.</div> : null}{frozenLine}</>}
             timer={disputeWait != null && disputeWait > 0 ? disputeWait : null}
             timerLabel="until you can dispute"
           >
             {role === 'buyer' && (
               <Btn danger onClick={() => setDisputeOpen(true)} disabled={!canAct || (disputeWait ?? 0) > 0}>Open a dispute</Btn>
             )}
+            {role === 'buyer' && canFreeze && <Btn onClick={freezeEscrow} disabled={!!busy}>Freeze the escrow</Btn>}
           </Panel>
         );
       case 'disputed':
@@ -816,9 +862,11 @@ export default function TradeRoom() {
           <Panel
             tone="red"
             title="An arbiter is reviewing this trade"
-            body={<>Arbiter <span className="font-mono">{shortAddr(t.arbiter ?? '')}</span>. Explain what happened in the chat and keep your payment proof ready.{t.dispute_reason ? <> Reason given: <i>“{t.dispute_reason}”</i></> : null}</>}
+            body={<>Arbiter <span className="font-mono">{shortAddr(t.arbiter ?? '')}</span>. Explain what happened in the chat and keep your payment proof ready.{t.dispute_reason ? <> Reason given: <i>“{t.dispute_reason}”</i></> : null}{role === 'seller' ? reclaimLine : null}{frozenLine}</>}
           >
             {role === 'seller' && <Btn onClick={release} disabled={!canAct}>Release to the buyer anyway</Btn>}
+            {role === 'seller' && reclaimReady && <Btn onClick={reclaimOutside} disabled={!!busy}>Take back {locked}</Btn>}
+            {role === 'buyer' && canFreeze && <Btn onClick={freezeEscrow} disabled={!!busy}>Freeze the escrow</Btn>}
             {role === 'buyer' && <Btn onClick={giveBack} disabled={!canAct}>Return the {meta.symbol} to the seller</Btn>}
           </Panel>
         );
@@ -837,6 +885,9 @@ export default function TradeRoom() {
               ? `The trade is closed on Ego. The return${where} is being sent by the seller's app and shows here once it confirms.`
               : `${locked} returned${t.closed_by ? ` (${t.closed_by === 'arbiter' ? 'arbiter ruling' : `by the ${t.closed_by}`})` : ''}.`}
           >
+            {pending && arbiterSigned && role === 'seller' && (
+              <Btn primary onClick={reclaimOutside} disabled={!!busy}>Collect {locked}</Btn>
+            )}
             <FeedbackForm view={room} onDone={load} />
           </Panel>
         );

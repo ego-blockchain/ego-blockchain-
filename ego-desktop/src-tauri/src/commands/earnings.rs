@@ -5,10 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::State;
 
-use crate::tokenomics::{
-    storage_reward_uegoc, consensus_daily_uegoc, coverage_daily_uegoc,
-    retrieval_reward_uegoc, node_reward_scale,
-};
 
 #[tauri::command]
 pub async fn get_earnings_data(
@@ -23,10 +19,8 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
     let now = chrono::Utc::now().timestamp();
 
     // All blocking I/O in one spawn_blocking call.
-    let (ledger, scale, plan, storage_pay) = tokio::task::spawn_blocking(move || {
+    let (ledger, plan, storage_pay) = tokio::task::spawn_blocking(move || {
         let ledger = Ledger::load();
-        let chain  = load_chain();
-        let scale  = node_reward_scale(&chain);
         let plan   = (!ledger.address.is_empty()).then(|| crate::chain_db::plan_hosting(&ledger.address));
         let storage_pay: Vec<(i64, u64)> = if ledger.address.is_empty() {
             Vec::new()
@@ -37,7 +31,7 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
                 .map(|r| (r.timestamp, r.amount_uegoc))
                 .collect()
         };
-        (ledger, scale, plan, storage_pay)
+        (ledger, plan, storage_pay)
     })
     .await
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
@@ -58,16 +52,9 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
         })
         .map(|f| f.encrypted_size)
         .sum();
-    let billable_gb = (hosted_bytes as f64 / 1_000_000_000.0)
-        .min(ledger.storage_allocated_bytes as f64 / 1_000_000_000.0);
 
     let storage_plan_pay = plan.as_ref().map_or(false, |p| p.active);
-    let daily_storage  = match plan.as_ref().filter(|p| p.active) {
-        Some(p) => p.daily_uegoc,
-        None => (storage_reward_uegoc(billable_gb) as f64 * scale) as u64,
-    };
-    let consensus_rate = (consensus_daily_uegoc() as f64 * scale) as u64;
-    let retrieval_rate = (retrieval_reward_uegoc(1.0) as f64 * scale) as u64;
+    let plan_daily = plan.as_ref().filter(|p| p.active).map_or(0, |p| p.daily_uegoc);
 
     let coverage_online = state
         .cache
@@ -78,23 +65,24 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
         .map(|s| s.is_online)
         .unwrap_or(true);
 
-    let coverage_rate = if !coverage_online { 0 }
-                        else { (coverage_daily_uegoc() as f64 * scale) as u64 };
-
-    let daily_total_base = daily_storage
-        .saturating_add(consensus_rate)
-        .saturating_add(coverage_rate)
-        .saturating_add(retrieval_rate);
-
-    let drs_score: f64 = if ledger.address.is_empty() {
-        50.0
-    } else {
-        crate::poc::get_peer_score(&ledger.address) as f64
+    let (drs, paused) = {
+        let addr = ledger.address.clone();
+        tokio::task::spawn_blocking(move || {
+            let paused = crate::commands::coverage::earning_block_reason().is_some();
+            (crate::chain_db::drs_pay_estimate(&addr), paused)
+        })
+        .await
+        .unwrap_or_default()
     };
-    let drs_multiplier = 0.5 + (drs_score / 100.0);
-    let daily_total = (daily_total_base as f64 * drs_multiplier) as u64;
+    let (pool_base, pool_storage) = if paused { (0, 0) } else { (drs.base_uegoc, drs.storage_uegoc) };
+    let points = drs.uptime_points + drs.coverage_points;
+    let coverage_rate = if points == 0 { 0 } else { (pool_base as u128 * drs.coverage_points as u128 / points as u128) as u64 };
+    let consensus_rate = pool_base - coverage_rate;
+    let daily_storage = pool_storage.saturating_add(plan_daily);
+    let retrieval_rate = 0;
+    let drs_multiplier = drs.mult_milli as f64 / 1_000.0;
+    let daily_total = daily_storage.saturating_add(consensus_rate).saturating_add(coverage_rate);
 
-    const MIN_CREDIT_INTERVAL_SECS: i64 = 3_600;
 
     let last_credit = state.get_last_earnings_credit();
     if last_credit == 0 {
@@ -114,45 +102,6 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
         .await
         .unwrap_or(0);
         state.set_cached_total_earned(historical);
-        state.set_last_earnings_credit(now);
-    } else if (now - last_credit) >= MIN_CREDIT_INTERVAL_SECS {
-        let elapsed_secs = (now - last_credit) as f64;
-        let credit = (daily_total as f64 * elapsed_secs / 86_400.0) as u64;
-
-        if credit >= 1_000_000 {
-            let reward_hash = format!(
-                "0x{}",
-                ego_core::hash_data(
-                    format!("reward:{}:{}", ledger.address, now).as_bytes()
-                ).to_hex()
-            );
-            let hash_check = reward_hash.clone();
-            let already_exists = tokio::task::spawn_blocking(move || {
-                crate::chain_db::get_tx_by_hash(&hash_check).is_some()
-            })
-            .await
-            .unwrap_or(false);
-
-            if !already_exists {
-                crate::mempool::get_mempool().push(LedgerTx {
-                    hash:                reward_hash,
-                    from:                crate::chain_db::NODE_POOL_ADDR.into(),
-                    to:                  ledger.address.clone(),
-                    amount:              credit,
-                    memo:                Some("Block & storage rewards".into()),
-                    timestamp:           now,
-                    signature:           "rewards".into(),
-                    status:              "Pending".into(),
-                    nonce:               0,
-                    tx_type:             "reward".into(),
-                    public_key_ed25519:  String::new(),
-                    dilithium_pubkey:    String::new(),
-                    dilithium_signature: String::new(),
-                    ..LedgerTx::default()
-                });
-                state.add_to_cached_total_earned(credit);
-            }
-        }
         state.set_last_earnings_credit(now);
     }
 
@@ -207,6 +156,8 @@ pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDeskt
         storage_reserved_bytes: plan.as_ref().map_or(0, |p| p.reserved_bytes),
         storage_earned_24h_uegoc: storage_pay.iter().filter(|(t, _)| now - t < 86_400).map(|(_, a)| *a).sum(),
         storage_earned_total_uegoc: storage_pay.iter().map(|(_, a)| *a).sum(),
+        early_rank: drs.rank,
+        early_places_taken: drs.ranks_given,
         reward_breakdown: RewardBreakdown {
             storage_rewards:   daily_storage,
             consensus_rewards: consensus_rate,
@@ -510,5 +461,116 @@ mod hosted_tests {
         assert!(!h.files.iter().find(|f| f.cid == "egomfd1d").unwrap().plan_active);
         assert!(!h.files.iter().find(|f| f.cid == "egomfd1e").unwrap().recorded, "a record by someone else is not the owner's");
         assert_eq!((h.earned_24h_uegoc, h.earned_30d_uegoc, h.earned_total_uegoc), (7, 18, 31));
+    }
+}
+
+
+#[derive(Debug, Serialize)]
+pub struct EarnPlan {
+    pub name: &'static str,
+    pub gb: u64,
+    pub monthly_usd: f64,
+    pub host_monthly_usd: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EarnGuide {
+    pub node_pool_per_day_egoc: f64,
+    pub online_nodes: u64,
+    pub registered_nodes: u64,
+    pub checkin_every_hours: u32,
+    pub streak_needed: u32,
+    pub uptime_points_cap: u64,
+    pub storage_points_per_gb: u64,
+    pub storage_points_cap: u64,
+    pub coverage_points_per_witness: u64,
+    pub coverage_witness_cap: u64,
+    pub coverage_valid_days: u32,
+    pub host_share_pct: u32,
+    pub hosts_per_plan: u32,
+    pub plans: Vec<EarnPlan>,
+    pub staking_apr_pct: f64,
+    pub staking_lock_bonus_pct: Vec<(u32, f64)>,
+    pub node_staking_multiplier: u32,
+    pub compute_core_hour_egoc: f64,
+    pub compute_gpu_hour_egoc: f64,
+    pub my_rank: Option<u64>,
+    pub places_taken: u64,
+    pub my_multiplier: f64,
+    pub early_places: u64,
+    pub storage_points_total: u64,
+    pub stake_live: bool,
+    pub stake_budget_per_day_egoc: f64,
+    pub stake_rate_plain_pct: f64,
+    pub stake_rate_best_pct: f64,
+}
+
+#[tauri::command]
+pub async fn get_earn_guide() -> Result<EarnGuide, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let height = crate::chain_db::local_chain_height().saturating_add(1);
+        let (_, _, online) = crate::chain_db::drs_weight_of("");
+        let registered = crate::chain_db::drs_registered_count();
+        let ledger = Ledger::load();
+        let drs = crate::chain_db::drs_pay_estimate(&ledger.address);
+        let stake = crate::chain_db::stake_share_view(&ledger.address);
+        let egoc = |u: u64| u as f64 / crate::tokenomics::UEGOC_PER_EGOC as f64;
+        let share = crate::storage_pay::SHARE_PERCENT as f64 / 100.0 / crate::storage_pay::PLAN_HOSTS as f64;
+        let plans = crate::commands::storage::open_plan_prices(height)
+            .into_iter()
+            .map(|(name, gb, monthly_usd)| EarnPlan { name, gb, monthly_usd, host_monthly_usd: monthly_usd * share })
+            .collect();
+        let apr = |days: u32| crate::tokenomics::effective_apr_bps(days) as f64 / 100.0;
+        EarnGuide {
+            node_pool_per_day_egoc: egoc(drs.daily_pool_uegoc),
+            online_nodes: online,
+            registered_nodes: registered,
+            checkin_every_hours: (crate::drs::CHECKIN_INTERVAL_SECS / 3600) as u32,
+            streak_needed: crate::drs::min_streak(crate::drs::period_of(height)),
+            uptime_points_cap: crate::drs::UPTIME_CAP,
+            storage_points_per_gb: crate::drs::STORAGE_POINTS_PER_GB,
+            storage_points_cap: crate::drs::STORAGE_CAP,
+            coverage_points_per_witness: crate::drs::COVERAGE_POINTS_PER_WITNESS,
+            coverage_witness_cap: crate::drs::COVERAGE_CAP_WITNESSES,
+            coverage_valid_days: (crate::drs::COVERAGE_VALID_SECS / 86_400) as u32,
+            host_share_pct: crate::storage_pay::SHARE_PERCENT as u32,
+            hosts_per_plan: crate::storage_pay::PLAN_HOSTS as u32,
+            plans,
+            staking_apr_pct: apr(0),
+            staking_lock_bonus_pct: [90u32, 180, 365].iter().map(|d| (*d, apr(*d) - apr(0))).collect(),
+            node_staking_multiplier: (crate::tokenomics::node_apr_bps(0) / crate::tokenomics::effective_apr_bps(0).max(1)) as u32,
+            compute_core_hour_egoc: if ledger.compute_price_per_core_hour_uegoc > 0 { egoc(ledger.compute_price_per_core_hour_uegoc) } else { 0.10 },
+            compute_gpu_hour_egoc: if ledger.compute_price_per_gpu_hour_uegoc > 0 { egoc(ledger.compute_price_per_gpu_hour_uegoc) } else { 1.00 },
+            my_rank: drs.rank,
+            places_taken: drs.ranks_given,
+            my_multiplier: drs.mult_milli as f64 / 1_000.0,
+            early_places: crate::drs::EARLY_RANKS,
+            storage_points_total: drs.storage_points_total,
+            stake_live: stake.live,
+            stake_budget_per_day_egoc: egoc(crate::drs::STAKE_PAY_PER_DAY_UEGOC),
+            stake_rate_plain_pct: if stake.live { crate::chain_db::stake_rate_bps(&stake, 0, 1_000) as f64 / 100.0 } else { apr(0) },
+            stake_rate_best_pct: if stake.live { crate::chain_db::stake_rate_bps(&stake, 365, 3_000) as f64 / 100.0 } else { apr(365) * 3.0 },
+        }
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
+}
+
+#[cfg(test)]
+mod earn_guide_tests {
+    #[test]
+    fn a_host_gets_its_part_of_each_plan() {
+        let share = crate::storage_pay::SHARE_PERCENT as f64 / 100.0 / crate::storage_pay::PLAN_HOSTS as f64;
+        let plans = crate::commands::storage::open_plan_prices(crate::commands::storage::BIG_PLANS_FROM_HEIGHT);
+        assert_eq!(plans.len(), 5);
+        let (name, gb, usd) = plans[2];
+        assert_eq!((name, gb), ("Max", 1024));
+        assert!((usd * share - 1.330_666).abs() < 1e-3, "a host of a full Max plan gets about $1.33 a month");
+        assert_eq!(crate::commands::storage::open_plan_prices(0).len(), 3);
+    }
+
+    #[test]
+    fn online_nodes_stake_at_double_the_rate() {
+        assert_eq!(crate::tokenomics::node_apr_bps(0), crate::tokenomics::effective_apr_bps(0) * 2);
     }
 }

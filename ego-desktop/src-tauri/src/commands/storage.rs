@@ -162,6 +162,13 @@ fn plan_at(name: &str, height: u64) -> Option<(u64, f64, f64)> {
         .map(|(_, gb, monthly, annual, _)| (*gb, *monthly, *annual))
 }
 
+pub fn open_plan_prices(height: u64) -> Vec<(&'static str, u64, f64)> {
+    STORAGE_PLANS.iter()
+        .filter(|(.., from)| height >= *from)
+        .map(|(n, gb, monthly, ..)| (*n, *gb, *monthly))
+        .collect()
+}
+
 fn open_plan_names(height: u64) -> Vec<&'static str> {
     STORAGE_PLANS.iter().filter(|(.., from)| height >= *from).map(|(n, ..)| *n).collect()
 }

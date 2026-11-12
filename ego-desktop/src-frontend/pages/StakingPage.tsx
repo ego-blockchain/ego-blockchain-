@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { useNavigate } from 'react-router-dom';
 import { useWallet } from '../App';
 import { useConfirm } from '../hooks/useConfirm';
 import { requireConfirm } from '../lib/totp';
@@ -22,6 +23,12 @@ interface StakingInfo {
   lock_period_days:   number;
   apr:                number;
   node_rate?:         boolean;
+  budget_live?:       boolean;
+  budget_per_day_uegoc?: number;
+  point_rate_bps?:    number;
+  max_rate_bps?:      number;
+  activity_milli?:    number;
+  lock_rates?:        [number, number][];
   pending_rewards:    number;
   unlock_date:        number | null;
   staked_at:          number | null;
@@ -88,6 +95,7 @@ const MIN_STAKE_EGOC = 1000;
 
 const StakingPage: React.FC = () => {
   const { wallet } = useWallet();
+  const navigate = useNavigate();
   const { confirm, ConfirmDialog } = useConfirm();
   const [info, setInfo]           = useState<StakingInfo | null>(null);
   const [balance, setBalance]     = useState<Balance | null>(null);
@@ -120,7 +128,17 @@ const StakingPage: React.FC = () => {
   const selectedLock   = LOCK_OPTIONS.find(o => o.days === lockDays)!;
   const lockBonus      = selectedLock.bonus;
   const nodeRate       = !!info?.node_rate;
-  const effectiveApr   = (BASE_APR + selectedLock.bonusPct) * (nodeRate ? 2 : 1);
+  const rateFor        = (days: number) => info?.lock_rates?.find(([d]) => d === days)?.[1]
+    ?? (BASE_APR + (LOCK_OPTIONS.find(o => o.days === days)?.bonusPct ?? 0)) * (nodeRate ? 2 : 1);
+  const effectiveApr   = +rateFor(lockDays).toFixed(2);
+  const activity       = (info?.activity_milli ?? (nodeRate ? 2000 : 1000)) / 1000;
+  const online         = activity >= 2;
+  const storageBoost   = online ? +(activity - 2).toFixed(2) : 0;
+  const lockFactor     = +((BASE_APR + selectedLock.bonusPct) / BASE_APR).toFixed(2);
+  const baseRate       = (info?.point_rate_bps ?? BASE_APR * 100) / 100;
+  const maxRate        = (info?.max_rate_bps ?? BASE_APR * 100) / 100;
+  const shared         = baseRate < maxRate;
+  const budgetPerDay   = (info?.budget_per_day_uegoc ?? 0) / 1_000_000;
   const projectedYield = stakeAmount
     ? ((parseFloat(stakeAmount) || 0) * (effectiveApr / 100) * (lockDays / 365)).toFixed(2)
     : '0.00';
@@ -269,7 +287,8 @@ const StakingPage: React.FC = () => {
                           }`}
                         >
                           <div>{opt.label}</div>
-                          <div className="text-green-400 mt-0.5">{opt.bonus}</div>
+                          <div className="text-green-400 mt-0.5">{rateFor(opt.days).toFixed(1)}%</div>
+                          <div className="text-[10px] text-gray-500">{opt.bonus === '0%' ? 'no lock bonus' : `${opt.bonus} lock bonus`}</div>
                         </button>
                       ))}
                     </div>
@@ -282,17 +301,26 @@ const StakingPage: React.FC = () => {
                     <div className="bg-gray-900 rounded-xl p-4 space-y-2 text-sm">
                       <div className="font-semibold text-gray-200 mb-2">Projection</div>
                       <div className="flex justify-between">
-                        <span className="text-gray-400">Staking APR</span>
-                        <span className="text-green-400">{effectiveApr}%</span>
+                        <span className="text-gray-400">Your rate now</span>
+                        <span className="text-green-400">{effectiveApr}% a year</span>
                       </div>
                       <div className="flex justify-between">
-                        <span className="text-gray-400">Lock bonus</span>
-                        <span className="text-green-400">{lockBonus}</span>
+                        <span className="text-gray-400">Base rate</span>
+                        <span className="text-gray-200">{baseRate.toFixed(2)}%{shared ? ` (shared, ${maxRate}% at most)` : ''}</span>
                       </div>
                       <div className="flex justify-between">
-                        <span className="text-gray-400">Node bonus</span>
-                        <span className={nodeRate ? 'text-green-400' : 'text-gray-500'}>{nodeRate ? '2× while this computer stays online' : 'Keep this computer online as a node to earn 2×'}</span>
+                        <span className="text-gray-400">Lock</span>
+                        <span className="text-green-400">×{lockFactor} ({lockBonus})</span>
                       </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-400">Online node</span>
+                        <span className={online ? 'text-green-400' : 'text-gray-500'}>{online ? '×2 while this computer stays online' : 'Keep this computer online as a node for ×2'}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-400">Shared storage</span>
+                        <span className={storageBoost > 0 ? 'text-green-400' : 'text-gray-500'}>{storageBoost > 0 ? `+${storageBoost}× from the storage you share` : 'Share up to 1 TB for up to +1×'}</span>
+                      </div>
+                      <div className="text-xs text-gray-500">The rate is worked out at each check-in and can go down as more people stake.</div>
                       <div className="border-t border-gray-700 pt-2 flex justify-between font-bold">
                         <span>Projected yield</span>
                         <span className="text-green-400">{projectedYield} EGOC</span>
@@ -427,56 +455,38 @@ const StakingPage: React.FC = () => {
 
           {}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
-            <h3 className="font-semibold mb-4">Mining Eligibility</h3>
-            <div className="space-y-3">
-              {}
-              <div>
-                <div className="flex justify-between text-xs text-gray-400 mb-1">
-                  <span>Combined DRS</span>
-                  <span className={drs && drs.combined_score >= 0.5 ? 'text-green-400' : 'text-red-400'}>
-                    {drs ? drs.combined_score.toFixed(3) : '—'} {drs && drs.combined_score >= 0.5 ? '✓' : '< 0.5 required'}
-                  </span>
-                </div>
-                <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
-                  <div
-                    className={`h-full rounded-full ${drs && drs.combined_score >= 0.5 ? 'bg-green-500' : 'bg-red-500'}`}
-                    style={{ width: `${Math.min(100, ((drs?.combined_score ?? 0) / 5) * 100)}%` }}
-                  />
-                </div>
+            <h3 className="font-semibold mb-4">How staking pays</h3>
+            <div className="space-y-3 text-sm">
+              <div className="flex justify-between">
+                <span className="text-gray-400">Daily budget</span>
+                <span className="font-mono text-green-400">{budgetPerDay.toLocaleString(undefined, { maximumFractionDigits: 0 })} EGOC</span>
               </div>
-              {}
-              <div>
-                <div className="flex justify-between text-xs text-gray-400 mb-1">
-                  <span>Stake <span className="text-purple-400">(boosts DRS +20%)</span></span>
-                  <span className={hasStake ? 'text-purple-400' : 'text-gray-500'}>
-                    {fmtEgoc(info?.staked_amount ?? 0)} EGOC{hasStake ? ' ✓' : ''}
-                  </span>
-                </div>
-                <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-purple-500"
-                    style={{ width: `${Math.min(100, ((info?.staked_amount ?? 0) / (MIN_STAKE_EGOC * 1_000_000)) * 100)}%` }}
-                  />
-                </div>
-                <p className="text-xs text-gray-500 mt-1">Staking is optional — more stake = higher DRS = larger reward share</p>
+              <p className="text-xs text-gray-500 -mt-1">Halves every 4 years, so it lasts 120 years. Unspent budget stays in the pool.</p>
+              <div className="flex justify-between">
+                <span className="text-gray-400">Base rate now</span>
+                <span className={`font-mono ${shared ? 'text-yellow-400' : 'text-green-400'}`}>{baseRate.toFixed(2)}%</span>
               </div>
-              {}
-              <div className={`mt-1 rounded-xl p-3 text-center text-sm font-semibold ${
-                drs?.is_eligible
-                  ? 'bg-green-500/15 border border-green-500/30 text-green-400'
-                  : 'bg-gray-700/50 border border-gray-600/30 text-gray-400'
-              }`}>
-                {drs?.is_eligible ? '✅ Eligible to mine blocks' : '⏳ Not yet eligible to mine'}
+              <p className="text-xs text-gray-500 -mt-1">
+                {shared
+                  ? `Staking is using the whole daily budget, so it is shared: every rate is lower while this many people stake.`
+                  : `At most ${maxRate}%. Once everyone's staking would use more than the daily budget, every rate goes down as more people stake.`}
+              </p>
+              <div className="border-t border-gray-700 pt-3 space-y-1.5">
+                <div className="text-xs text-gray-400">Your stake counts</div>
+                <div className="flex justify-between text-xs"><span className="text-gray-400">Lock ({selectedLock.label})</span><span className="font-mono">×{lockFactor}</span></div>
+                <div className="flex justify-between text-xs"><span className="text-gray-400">Online node</span><span className={`font-mono ${online ? 'text-green-400' : 'text-gray-500'}`}>{online ? '×2' : '×1'}</span></div>
+                <div className="flex justify-between text-xs"><span className="text-gray-400">Shared storage</span><span className={`font-mono ${storageBoost > 0 ? 'text-green-400' : 'text-gray-500'}`}>+{storageBoost}×</span></div>
+                <div className="flex justify-between text-sm font-semibold border-t border-gray-700 pt-1.5"><span>Your rate</span><span className="text-green-400">{effectiveApr}% a year</span></div>
               </div>
-              {drs?.validator_rank != null && (
-                <div className="text-center text-xs text-purple-400">
-                  Validator rank #{drs.validator_rank}
-                </div>
+              {storageBoost < 1 && (
+                <button onClick={() => navigate('/storage')} className="w-full mt-1 rounded-xl bg-emerald-500/15 border border-emerald-500/30 px-3 py-2 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/25">
+                  {online ? 'Share more storage to raise your rate up to 3×' : 'Run this computer as a node and share storage for up to 3×'}
+                </button>
               )}
+              <p className="text-xs text-gray-500">Stakers also pay 90% less in fees.</p>
             </div>
           </div>
 
-          {}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <h3 className="font-semibold mb-4 flex items-center gap-2">EGOC Tokenomics
               <span className="text-yellow-400 text-[9px] font-bold bg-yellow-400/15 px-1.5 py-px rounded">TEST</span>

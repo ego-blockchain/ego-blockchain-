@@ -619,6 +619,25 @@ pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
+static HOLDERS_CACHE: std::sync::Mutex<Option<(u64, std::time::Instant, crate::chain_db::HoldersSummary)>> = std::sync::Mutex::new(None);
+
+#[tauri::command]
+pub async fn get_holders() -> Result<crate::chain_db::HoldersSummary, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let height = crate::chain_db::block_count().saturating_sub(1);
+        if let Some((h, at, v)) = HOLDERS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if *h == height || at.elapsed() < std::time::Duration::from_secs(30) {
+                return v.clone();
+            }
+        }
+        let summary = crate::chain_db::holders_summary();
+        *HOLDERS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((height, std::time::Instant::now(), summary.clone()));
+        summary
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
+}
+
 #[tauri::command]
 pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
     tokio::task::spawn_blocking(|| {

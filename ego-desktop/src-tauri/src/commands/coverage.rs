@@ -91,6 +91,9 @@ pub fn earning_block_reason() -> Option<String> {
     if crate::genesis::is_member(&crate::ledger::Ledger::load().address) {
         return None;
     }
+    if let Some(reason) = crate::node_slot::blocked_reason() {
+        return Some(reason);
+    }
     let s = NET_CHECK.lock().unwrap_or_else(|e| e.into_inner());
     net_block_reason(s.blocked, &s.reason, s.verified_at, chrono::Utc::now().timestamp())
 }
