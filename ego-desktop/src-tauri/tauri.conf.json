@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "Ego Desktop",
-    "version": "0.3.695"
+    "version": "0.3.696"
   },
   "tauri": {
     "allowlist": {
