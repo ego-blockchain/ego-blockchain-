@@ -17449,6 +17449,9 @@ pub async fn gossip_sealed_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMessag
         return false;
     };
     publish_gossip(DM_TOPIC, data).await;
+    if let Some(mail) = crate::phone_mail::from_p2p(&sealed) {
+        tokio::spawn(crate::phone_mail::deposit(mail));
+    }
     true
 }
 

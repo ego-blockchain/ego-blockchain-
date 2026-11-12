@@ -620,13 +620,19 @@ pub async fn backfill_if_asked(want: i64) {
 }
 
 async fn push_own(me: &str, key: &ed25519_dalek::SigningKey, my_ed: &str, sealed: Sealed) {
-    use ed25519_dalek::Signer;
     let now = chrono::Utc::now();
     let local = sealed.clone();
     let owner = me.to_string();
     let _ = tokio::task::spawn_blocking(move || keep(&local, &owner, now.timestamp_millis())).await;
-    let ts = now.timestamp();
-    let sig = key.sign(&put_bytes(me, me, ts, &sealed.id));
+    put_at_places(me, key, my_ed, sealed).await;
+}
+
+/// Hands `sealed` to the gateways that keep mail for its addressee, signed by `me`.
+async fn put_at_places(me: &str, key: &ed25519_dalek::SigningKey, my_ed: &str, sealed: Sealed) {
+    use ed25519_dalek::Signer;
+    let ts = chrono::Utc::now().timestamp();
+    let sig = key.sign(&put_bytes(me, &sealed.to, ts, &sealed.id));
+    let to = sealed.to.clone();
     let body = json!({
         "mail": sealed,
         "by": me,
@@ -636,13 +642,49 @@ async fn push_own(me: &str, key: &ed25519_dalek::SigningKey, my_ed: &str, sealed
     });
     let nodes = crate::account_record::listed_nodes(ts);
     let names: Vec<String> = nodes.iter().map(|(n, _)| n.clone()).collect();
-    let targets: Vec<String> = crate::account_record::places(me, &names, crate::account_record::PLACES)
+    let own = tokio::task::spawn_blocking(crate::account_record::own_node).await.unwrap_or_default();
+    let targets: Vec<String> = crate::account_record::places(&to, &names, crate::account_record::PLACES)
         .into_iter()
-        .filter(|n| n != me)
+        .filter(|n| n != me && n != &own)
         .filter_map(|n| nodes.iter().find(|(m, _)| m == &n).map(|(_, e)| e.clone()))
         .collect();
     let pushes = targets.iter().map(|t| crate::account_record::call_peer(t, "mail.put", body.clone()));
     futures::future::join_all(pushes).await;
+}
+
+/// Leaves mail you send with the gateways that keep the addressee's mail, and here
+/// too if this computer is one of them. Gossip alone reaches only the computers
+/// connected at that moment and isn't kept by the one sending it, so a phone whose
+/// own desktop was off had nowhere to collect it from.
+pub async fn deposit(sealed: Sealed) {
+    let Ok(Some((me, seed))) = tokio::task::spawn_blocking(|| {
+        let me = crate::ledger::Ledger::load().address;
+        if me.is_empty() {
+            return None;
+        }
+        let seed = crate::ledger::load_seed().ok().flatten()?;
+        Some((me, seed))
+    })
+    .await
+    else {
+        return;
+    };
+    let Ok(key) = crate::account_record::signing_key(&seed) else { return };
+    if crate::market_chain::address_of(&key.verifying_key().to_bytes()) != me || sealed.to == me {
+        return;
+    }
+    let my_ed = hex::encode(key.verifying_key().to_bytes());
+    let local = sealed.clone();
+    let by = me.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let now = chrono::Utc::now();
+        let own = crate::account_record::own_node();
+        if holds(&local.to, &own, now.timestamp()) {
+            keep(&local, &by, now.timestamp_millis());
+        }
+    })
+    .await;
+    put_at_places(&me, &key, &my_ed, sealed).await;
 }
 
 pub async fn mirror(inner: crate::p2p::P2PMessage) {
