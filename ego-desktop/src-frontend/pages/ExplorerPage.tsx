@@ -331,13 +331,11 @@ const ExplorerPage: React.FC = () => {
   useEffect(() => { setBlockPage(1); setTxPage(1); setFilePage(1); }, [tab]);
 
   useEffect(() => {
-    if (!netStats) return;
     const offset = (blockPage - 1) * pageSize;
     invoke<LedgerBlock[]>('get_blocks', { offset, limit: pageSize }).then(setBlocks).catch(() => {});
   }, [blockPage, pageSize, netStats]);
 
   useEffect(() => {
-    if (!netStats) return;
     const offset = (txPage - 1) * pageSize;
     invoke<LedgerTx[]>('get_all_transactions', { offset, limit: pageSize }).then(setTxs).catch(() => {});
   }, [txPage, pageSize, netStats]);

@@ -3367,14 +3367,42 @@ fn activity_page_in(db: &DB, before: u64, limit: usize) -> (Vec<LedgerTx>, Optio
 pub fn local_block_count() -> usize {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_BLOCKS) else { return 0; };
+    let height_of = |k: Option<&[u8]>| k.filter(|k| k.len() == 8).map(|k| u64::from_be_bytes(k.try_into().unwrap_or([0u8; 8])));
     let mut iter = db.raw_iterator_cf(cf);
     iter.seek_to_first();
-    let mut n = 0usize;
-    while iter.valid() && n < 100_000 { n += 1; iter.next(); }
-    n
+    let Some(first) = height_of(iter.key()) else { return 0 };
+    iter.seek_to_last();
+    let last = height_of(iter.key()).unwrap_or(first);
+    (last.saturating_sub(first) + 1) as usize
 }
 
+static LOCAL_TX_COUNT: Mutex<Option<(usize, std::time::Instant)>> = Mutex::new(None);
+static LOCAL_TX_COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const LOCAL_TX_COUNT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub fn local_tx_count() -> usize {
+    let cached = *LOCAL_TX_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = cached.map_or(false, |(_, at)| at.elapsed() < LOCAL_TX_COUNT_TTL);
+    if !fresh && !LOCAL_TX_COUNTING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        std::thread::spawn(|| {
+            let n = count_local_txs();
+            *LOCAL_TX_COUNT.lock().unwrap_or_else(|e| e.into_inner()) = Some((n, std::time::Instant::now()));
+            LOCAL_TX_COUNTING.store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
+    match cached {
+        Some((n, _)) => n,
+        None => {
+            let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+            db.cf_handle(CF_RECENT_TXS)
+                .and_then(|cf| db.property_int_value_cf(cf, "rocksdb.estimate-num-keys").ok().flatten())
+                .unwrap_or(0)
+                .min(100_000) as usize
+        }
+    }
+}
+
+fn count_local_txs() -> usize {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_RECENT_TXS) else { return 0; };
     let Some(cf_txs) = db.cf_handle(CF_TXS) else { return 0; };
@@ -3493,6 +3521,8 @@ pub fn is_protocol_tx(tx: &LedgerTx) -> bool {
     !tx.from.is_empty() && tx.from == tx.to
 }
 
+const PAGED_TX_SCAN_MAX: usize = 20_000;
+
 pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf_recent) = db.cf_handle(CF_RECENT_TXS) else { return vec![]; };
@@ -3500,9 +3530,11 @@ pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
     let mut iter = db.raw_iterator_cf(cf_recent);
     iter.seek_to_last();
     let mut skipped = 0usize;
+    let mut scanned = 0usize;
     let mut out = Vec::with_capacity(limit);
 
-    while iter.valid() && out.len() < limit {
+    while iter.valid() && out.len() < limit && scanned < PAGED_TX_SCAN_MAX {
+        scanned += 1;
         if let Some(k) = iter.key() {
             if k.len() > 8 {
                 let tx_hash = &k[8..];
