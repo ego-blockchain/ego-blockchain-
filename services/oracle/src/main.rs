@@ -355,18 +355,22 @@ impl ChainState {
         }
     }
 
-    fn merge_txs(&mut self, txs: Vec<Value>) {
+    /// Adds the transactions not seen before and returns those.
+    fn merge_txs(&mut self, txs: Vec<Value>) -> Vec<Value> {
+        let mut added = Vec::new();
         for mut tx in txs {
             let hash = tx["hash"].as_str().unwrap_or("").to_string();
             if hash.is_empty() { continue; }
             strip_offchain_display_fields(&mut tx);
             if !self.transactions.iter().any(|t| t["hash"].as_str() == Some(&hash)) {
+                added.push(tx.clone());
                 self.transactions.push(tx);
             }
         }
         if self.transactions.len() > MAX_TRANSACTIONS {
             self.transactions = self.transactions.split_off(self.transactions.len() - MAX_TRANSACTIONS);
         }
+        added
     }
 
     /// Replay confirmed stake/unstake transactions into an address→stake map.
@@ -904,7 +908,9 @@ async fn handle_chain_submit(
             error!("Oracle: rejected batched block: {}", e);
         }
     }
-    chain.merge_txs(payload.transactions);
+    let added = chain.merge_txs(payload.transactions);
+    // Phones hear about their payments as soon as a block carrying them arrives.
+    push::payments(added.into_iter().filter(|t| is_user_tx(t) && t["block_height"].as_u64().is_some()).collect());
 
     let nblocks = chain.blocks.len() as u64;
     let ntxs = chain.transactions.len() as u64;

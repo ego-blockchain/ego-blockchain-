@@ -292,6 +292,104 @@ pub fn alert_payload(n: &Notify) -> serde_json::Value {
     })
 }
 
+/// Older transactions arriving (a desktop filling in history) don't alert.
+const PAYMENT_FRESH_SECS: i64 = 15 * 60;
+
+fn short_address(a: &str) -> String {
+    if a.len() > 16 { format!("{}…{}", &a[..10], &a[a.len() - 4..]) } else { a.to_string() }
+}
+
+fn egoc_text(uegoc: u64) -> String {
+    let whole = uegoc / 1_000_000;
+    let frac = format!("{:06}", uegoc % 1_000_000);
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() { whole.to_string() } else { format!("{whole}.{frac}") }
+}
+
+/// "5 EGOC", or "1.99 EGUSD" for a payment in EGUSD credits; None for anything else.
+pub fn payment_amount(tx: &serde_json::Value) -> Option<String> {
+    match tx["tx_type"].as_str().unwrap_or("") {
+        "" | "transfer" => {
+            let amount = tx["amount"].as_u64().filter(|a| *a > 0)?;
+            Some(format!("{} EGOC", egoc_text(amount)))
+        }
+        "credits_pay" => {
+            let memo = tx["memo"].as_str().unwrap_or("");
+            let cents: u64 = memo.strip_prefix("credits_pay:")?.split(':').next()?.parse().ok().filter(|c| *c > 0)?;
+            Some(format!("{}.{:02} EGUSD", cents / 100, cents % 100))
+        }
+        _ => None,
+    }
+}
+
+/// The alerts a confirmed payment makes: (wallet, the other side, payload) for the
+/// receiver and the sender. The phone's extension puts a contact's name in place
+/// of the address.
+pub fn payment_alerts(tx: &serde_json::Value, now: i64) -> Vec<(String, String, serde_json::Value)> {
+    let field = |k: &str| tx[k].as_str().unwrap_or("").to_string();
+    let (hash, from, to) = (field("hash"), field("from"), field("to"));
+    let ts = tx["timestamp"].as_i64().unwrap_or(0);
+    let Some(amount) = payment_amount(tx) else { return vec![] };
+    if hash.is_empty() || !valid_address(&from) || !valid_address(&to) || from == to || (now - ts).abs() > PAYMENT_FRESH_SECS {
+        return vec![];
+    }
+    let make = |dir: &str, title: String, body: String| {
+        json!({
+            "aps": {
+                "alert": { "title": title, "body": body },
+                "sound": "default",
+                "mutable-content": 1,
+                "thread-id": "wallet",
+            },
+            "open": "wallet",
+            "ego": { "kind": "payment", "dir": dir, "hash": hash, "from": from, "to": to },
+        })
+    };
+    vec![
+        (to.clone(), from.clone(), make("received", format!("Received {amount}"), format!("From {}", short_address(&from)))),
+        (from.clone(), to.clone(), make("sent", format!("Sent {amount}"), format!("To {}. Confirmed on the network.", short_address(&to)))),
+    ]
+}
+
+/// Sends the alerts for newly confirmed payments, in the background.
+pub fn payments(txs: Vec<serde_json::Value>) {
+    if txs.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let now = chrono::Utc::now().timestamp();
+        let mut gone = Vec::new();
+        let mut apple_cfg = None;
+        for tx in &txs {
+            for (owner, other, payload) in payment_alerts(tx, now) {
+                let devices = targets(&*DEVICES.read().await, &owner, &other);
+                let dir = payload["ego"]["dir"].as_str().unwrap_or("").to_string();
+                let hash = payload["ego"]["hash"].as_str().unwrap_or("").to_string();
+                if devices.is_empty() || !first_time(&format!("tx/{hash}/{dir}"), now).await {
+                    continue;
+                }
+                if apple_cfg.is_none() {
+                    apple_cfg = apple();
+                }
+                let Some(apple) = apple_cfg.as_ref() else { return };
+                for d in devices {
+                    if deliver(apple, &d, &payload).await.is_err() {
+                        gone.push(d.token);
+                    }
+                }
+            }
+        }
+        if !gone.is_empty() {
+            let mut map = DEVICES.write().await;
+            for list in map.values_mut() {
+                list.retain(|d| !gone.contains(&d.token));
+            }
+            map.retain(|_, l| !l.is_empty());
+            save(&map).await;
+        }
+    });
+}
+
 struct Apple {
     key_id: String,
     team_id: String,
@@ -467,5 +565,29 @@ mod tests {
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[2]).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn a_fresh_payment_alerts_both_sides_and_old_ones_do_not() {
+        let now = 1_800_000_000;
+        let tx = json!({"hash": "0xab", "from": "egot1alice", "to": "egot1bob", "amount": 2_500_000u64,
+                        "tx_type": "transfer", "timestamp": now - 5, "block_height": 9});
+        let alerts = payment_alerts(&tx, now);
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].0, "egot1bob");
+        assert_eq!(alerts[0].2["aps"]["alert"]["title"], "Received 2.5 EGOC");
+        assert_eq!(alerts[1].0, "egot1alice");
+        assert_eq!(alerts[1].2["ego"]["dir"], "sent");
+        assert_eq!(alerts[1].2["open"], "wallet");
+
+        let mut old = tx.clone();
+        old["timestamp"] = json!(now - 3_600);
+        assert!(payment_alerts(&old, now).is_empty(), "history being filled in");
+
+        let egusd = json!({"hash": "0xcd", "from": "egot1alice", "to": "egot1bob", "amount": 0,
+                           "tx_type": "credits_pay", "memo": "credits_pay:199", "timestamp": now});
+        assert_eq!(payment_alerts(&egusd, now)[0].2["aps"]["alert"]["title"], "Received 1.99 EGUSD");
+        let stake = json!({"hash": "0xef", "from": "egot1alice", "to": "egot1bob", "amount": 5, "tx_type": "stake", "timestamp": now});
+        assert!(payment_alerts(&stake, now).is_empty());
     }
 }
