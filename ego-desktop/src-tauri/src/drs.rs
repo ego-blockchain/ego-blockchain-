@@ -86,6 +86,7 @@ pub fn node_reward_per_day_at(at: i64) -> u64 {
 
 pub const NODE_PAY_V2_FROM_HEIGHT: u64 = 117_781;
 pub const PAY_V2_READY_FROM_HEIGHT: u64 = NODE_PAY_V2_FROM_HEIGHT + SHORT_EPOCH;
+pub const PAY_V2_RESTART_HEIGHT: u64 = 117_786;
 const _: () = assert!((NODE_PAY_V2_FROM_HEIGHT - SHORT_EPOCH_FROM_HEIGHT) % SHORT_EPOCH == 0);
 const PAY_V2_CLEAR_MAX: usize = 1_000_000;
 pub const NODE_REWARD_V2_PER_DAY_UEGOC: u64 = 13_689_253_948;
@@ -1372,7 +1373,7 @@ pub fn apply_block(
     let at = block.timestamp;
     let period = period_of(block.height);
     let mut credits: Vec<(String, u64)> = Vec::new();
-    if block.height == NODE_PAY_V2_FROM_HEIGHT {
+    if block.height == NODE_PAY_V2_FROM_HEIGHT || block.height == PAY_V2_RESTART_HEIGHT {
         clear_pay_v2(ov);
     }
     if block.height >= NODE_PAY_V2_FROM_HEIGHT && ov.get(KEY_PAY_SINCE).is_none() {
@@ -2956,6 +2957,49 @@ mod node_pay_v2_tests {
     }
 
     #[test]
+    fn nodes_that_started_at_different_blocks_agree_from_the_restart_block() {
+        let h = NODE_PAY_V2_FROM_HEIGHT;
+        let r = PAY_V2_RESTART_HEIGHT;
+        assert!(r > h && r < PAY_V2_READY_FROM_HEIGHT, "the restart sits after the switch and before readiness changes");
+        let t = CHECKIN_HALVING_START_TS + 40 * 86_400;
+        let (mut on_time, addrs) = network(4);
+        let (mut late, _) = network(4);
+        run(&mut on_time, h, t, &[]);
+        run(&mut on_time, h + 1, t + 6_700, &[0, 1, 2, 3]);
+        run(&mut late, h + 1, t + 6_700, &[0, 1, 2, 3]);
+        assert_eq!(rank_pay_since(&on_time), Some(t));
+        assert_eq!(rank_pay_since(&late), Some(t + 6_700), "a node that took the switch block on an old version starts one block late");
+        for b in h + 2..r {
+            let at = t + 6_700 + (b - h - 1) as i64 * 60;
+            run(&mut on_time, b, at, &[]);
+            run(&mut late, b, at, &[]);
+        }
+        let at = t + 6_700 + (r - h - 1) as i64 * 60;
+        run(&mut on_time, r, at, &[]);
+        run(&mut late, r, at, &[]);
+        assert_eq!(rank_pay_since(&on_time), Some(at));
+        assert_eq!(rank_pay_since(&late), Some(at));
+        let mut keys: Vec<Vec<u8>> = vec![
+            KEY_PAY_SINCE.to_vec(),
+            KEY_STAKE_ACC.to_vec(),
+            KEY_RANK_NEXT.to_vec(),
+            KEY_PAY_BASE_TOTAL.to_vec(),
+            KEY_PAY_STORAGE_TOTAL.to_vec(),
+        ];
+        for a in &addrs {
+            keys.extend([staker_key(a), rank_key(a), pay_base_key(a), pay_storage_key(a)]);
+        }
+        for k in &keys {
+            assert_eq!(on_time.get(k), late.get(k), "{} matches after the restart block", String::from_utf8_lossy(k));
+        }
+        run(&mut on_time, r + 1, at + 600, &[0, 1, 2, 3]);
+        run(&mut late, r + 1, at + 600, &[0, 1, 2, 3]);
+        for k in &keys {
+            assert_eq!(on_time.get(k), late.get(k), "{} still matches after the next check-ins", String::from_utf8_lossy(k));
+        }
+    }
+
+    #[test]
     fn early_start_marks_are_cleared_at_the_switch_block() {
         let h = NODE_PAY_V2_FROM_HEIGHT;
         let t = CHECKIN_HALVING_START_TS + 30 * 86_400;
@@ -3122,7 +3166,7 @@ mod node_pay_v2_tests {
         let mut ov = Ov::memory();
         stake_into(&mut ov, "egot1staker", 1_000, 0);
         ov.commit_memory();
-        let mut h = NODE_PAY_V2_FROM_HEIGHT;
+        let mut h = PAY_V2_RESTART_HEIGHT;
         let mut ts = CHECKIN_HALVING_START_TS + 86_400;
         day_of_blocks(&mut ov, &mut h, &mut ts);
         let st = load_staker(&ov, "egot1staker").expect("a stake from before the switch is counted");
@@ -3138,7 +3182,7 @@ mod node_pay_v2_tests {
         stake_into(&mut ov, "egot1whale1", 300_000_000, 0);
         stake_into(&mut ov, "egot1whale2", 300_000_000, 365);
         ov.commit_memory();
-        let mut h = NODE_PAY_V2_FROM_HEIGHT;
+        let mut h = PAY_V2_RESTART_HEIGHT;
         let mut ts = CHECKIN_HALVING_START_TS + 86_400;
         day_of_blocks(&mut ov, &mut h, &mut ts);
         let a = stake_owed(&ov, "egot1whale1") as u128;
