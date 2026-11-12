@@ -45,7 +45,7 @@ pub const LIVE_SEATS_FROM_HEIGHT: u64 = 79_841;
 const LIVE_SEAT_EPOCHS: u64 = 3;
 const WIDEN_READY_EPOCHS: u64 = 8;
 const WIDEN_MAX_OUTSIDERS: usize = 512;
-pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT, NODE_PAY_V2_FROM_HEIGHT];
+pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT, PAY_V2_READY_FROM_HEIGHT];
 const KEY_STORAGE_TOTAL: &[u8] = b"n2swt";
 const KEY_LAST_MAKERS: &[u8] = b"n2last";
 
@@ -84,8 +84,10 @@ pub fn node_reward_per_day_at(at: i64) -> u64 {
     if era >= 64 { 0 } else { NODE_REWARD_PER_DAY_UEGOC >> era }
 }
 
-pub const NODE_PAY_V2_FROM_HEIGHT: u64 = 117_701;
+pub const NODE_PAY_V2_FROM_HEIGHT: u64 = 117_781;
+pub const PAY_V2_READY_FROM_HEIGHT: u64 = NODE_PAY_V2_FROM_HEIGHT + SHORT_EPOCH;
 const _: () = assert!((NODE_PAY_V2_FROM_HEIGHT - SHORT_EPOCH_FROM_HEIGHT) % SHORT_EPOCH == 0);
+const PAY_V2_CLEAR_MAX: usize = 1_000_000;
 pub const NODE_REWARD_V2_PER_DAY_UEGOC: u64 = 13_689_253_948;
 pub const NODE_PAY_ERAS: i64 = 30;
 pub const RANK_PAY_SETTLE_SECS: i64 = STREAK_GAP_SECS + 3_600;
@@ -346,6 +348,19 @@ fn rank_or_assign(ov: &mut Ov, addr: &str) -> u64 {
     ov.put(rank_key(addr), u64_le(rank).to_vec());
     ov.put(KEY_RANK_NEXT.to_vec(), u64_le(rank + 1).to_vec());
     rank
+}
+
+fn clear_pay_v2(ov: &mut Ov) {
+    for key in [KEY_PAY_SINCE, KEY_STAKE_ACC, KEY_RANK_NEXT, KEY_PAY_BASE_TOTAL, KEY_PAY_STORAGE_TOTAL] {
+        if ov.get(key).is_some() {
+            ov.del(key.to_vec());
+        }
+    }
+    for prefix in [&b"n2st:"[..], &b"n2rk:"[..], &b"n2pb:"[..], &b"n2ps:"[..]] {
+        for key in ov.committed_keys(prefix, PAY_V2_CLEAR_MAX, |_| false) {
+            ov.del(key);
+        }
+    }
 }
 
 pub fn rank_pay_since(ov: &Ov) -> Option<i64> {
@@ -1357,12 +1372,15 @@ pub fn apply_block(
     let at = block.timestamp;
     let period = period_of(block.height);
     let mut credits: Vec<(String, u64)> = Vec::new();
+    if block.height == NODE_PAY_V2_FROM_HEIGHT {
+        clear_pay_v2(ov);
+    }
     if block.height >= NODE_PAY_V2_FROM_HEIGHT && ov.get(KEY_PAY_SINCE).is_none() {
         ov.put(KEY_PAY_SINCE.to_vec(), u64_le(at.max(0) as u64).to_vec());
         put_stake_acc(ov, 0, at, 0);
         migrate_stakers(ov, at);
     }
-    if ov.get(KEY_PAY_SINCE).is_some() {
+    if block.height >= NODE_PAY_V2_FROM_HEIGHT && ov.get(KEY_PAY_SINCE).is_some() {
         accrue_stake(ov, block.height, at);
         apply_stake_changes(ov, txs, at);
     }
@@ -2923,13 +2941,61 @@ mod node_pay_v2_tests {
     const KEY: &str = "aa";
 
     #[test]
-    fn the_switch_opens_an_epoch_and_only_updated_nodes_are_ready_for_it() {
+    fn readiness_matches_what_the_chain_recorded_around_the_switch() {
         let h = NODE_PAY_V2_FROM_HEIGHT;
         let e = epoch_of(h);
+        assert_eq!(h, 117_781);
         assert_eq!(epoch_start(e), h, "the switch is the first block of an epoch");
-        assert_eq!(ready_version(e), ready_version(e - 1) + 1, "readiness for the switch epoch is signed for the new rules");
-        assert_eq!(ready_version(e - 1), ready_version(e - 50), "nothing changes for old nodes before the switch epoch");
-        assert_ne!(ready_message(e, "s"), format!("ego/ready/v{}:{e}:s", ready_version(e - 1)).into_bytes());
+        assert_eq!(e, 4265);
+        for old in 4255..=4265 {
+            assert_eq!(ready_message(old, "s"), format!("ego/ready/v5:{old}:s").into_bytes(), "blocks up to 117,780 carry readiness signed the old way");
+        }
+        assert_eq!(epoch_start(e + 1), PAY_V2_READY_FROM_HEIGHT);
+        assert_eq!(ready_message(e + 1, "s"), format!("ego/ready/v6:{}:s", e + 1).into_bytes(), "from the next epoch only updated nodes are ready");
+        assert_eq!(ready_version(e + 500), 6);
+    }
+
+    #[test]
+    fn early_start_marks_are_cleared_at_the_switch_block() {
+        let h = NODE_PAY_V2_FROM_HEIGHT;
+        let t = CHECKIN_HALVING_START_TS + 30 * 86_400;
+        let (mut clean, addrs) = network(4);
+        let (mut early, _) = network(4);
+        early.put(KEY_PAY_SINCE.to_vec(), u64_le((t - 900) as u64).to_vec());
+        put_stake_acc(&mut early, 77, t - 900, 123_456);
+        early.put(staker_key(&addrs[0]), vec![9u8; 40]);
+        early.put(rank_key(&addrs[1]), u64_le(3).to_vec());
+        early.put(KEY_RANK_NEXT.to_vec(), u64_le(4).to_vec());
+        early.put(pay_base_key(&addrs[2]), vec![7u8; 16]);
+        early.put(pay_storage_key(&addrs[2]), vec![7u8; 16]);
+        early.put(KEY_PAY_BASE_TOTAL.to_vec(), vec![7u8; 16]);
+        early.put(KEY_PAY_STORAGE_TOTAL.to_vec(), vec![7u8; 16]);
+        early.commit_memory();
+        run(&mut early, h - 1, t - 10, &[]);
+        run(&mut clean, h - 1, t - 10, &[]);
+        assert_eq!(rank_pay_since(&early), Some(t - 900), "nothing is touched before the switch block");
+        run(&mut early, h, t, &[]);
+        run(&mut clean, h, t, &[]);
+        assert_eq!(rank_pay_since(&early), Some(t));
+        assert_eq!(rank_pay_since(&clean), Some(t));
+        let mut keys: Vec<Vec<u8>> = vec![
+            KEY_PAY_SINCE.to_vec(),
+            KEY_STAKE_ACC.to_vec(),
+            KEY_RANK_NEXT.to_vec(),
+            KEY_PAY_BASE_TOTAL.to_vec(),
+            KEY_PAY_STORAGE_TOTAL.to_vec(),
+        ];
+        for a in &addrs {
+            keys.extend([staker_key(a), rank_key(a), pay_base_key(a), pay_storage_key(a)]);
+        }
+        for k in &keys {
+            assert_eq!(early.get(k), clean.get(k), "{} matches a node that never started early", String::from_utf8_lossy(k));
+        }
+        run(&mut early, h + 1, t + 10, &[]);
+        run(&mut clean, h + 1, t + 10, &[]);
+        for k in &keys {
+            assert_eq!(early.get(k), clean.get(k), "{} still matches one block later", String::from_utf8_lossy(k));
+        }
     }
 
     fn network(n: usize) -> (Ov<'static>, Vec<String>) {
