@@ -5,6 +5,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 SITE = "https://egoblockchain.com"
 RPC = "https://rpc.egoblockchain.com"
@@ -18,6 +19,9 @@ NOTICE_SECS = 30
 WELCOME_SECS = 30 * 60
 ADMIN_CACHE_SECS = 600
 STATS_CACHE_SECS = 30
+FAILED_CACHE_SECS = 5
+FETCH_TIMEOUT_SECS = 15
+FETCH_TRIES = 2
 COMMAND_COOLDOWN_SECS = 10
 POLL_SECS = 10
 
@@ -50,7 +54,7 @@ HELP = (
     "<b>What I can do</b>\n"
     "/presale: the EGOC pre-sale price and how to buy\n"
     "/version: the latest Ego Desktop version\n"
-    "/stats: block height, nodes online and price\n"
+    "/stats: blocks, transactions, holders, nodes and price\n"
     "/download: where to get Ego Desktop\n"
     "/rules: the group rules"
 )
@@ -58,7 +62,7 @@ HELP = (
 COMMANDS = [
     {"command": "presale", "description": "EGOC pre-sale price and how to buy"},
     {"command": "version", "description": "Latest Ego Desktop version"},
-    {"command": "stats", "description": "Block height, nodes online and price"},
+    {"command": "stats", "description": "Blocks, transactions, holders, nodes and price"},
     {"command": "download", "description": "Where to get Ego Desktop"},
     {"command": "rules", "description": "Group rules"},
     {"command": "help", "description": "What this bot can do"},
@@ -133,14 +137,32 @@ def usd(value):
     return "${:g}".format(float(value))
 
 
-def format_stats(health, nodes, gateways, presale):
-    lines = ["<b>Ego network</b>"]
-    if health:
-        lines.append("⛓ Block height: {:,}".format(int(health.get("block_height", 0))))
+def egoc(uegoc):
+    return "{:,} EGOC".format(int(uegoc) // 1_000_000)
+
+
+def format_stats(health, nodes, gateways, presale, holders=None, manifest=None):
+    lines = ["<b>Ego network (testnet)</b>"]
+    health = health if isinstance(health, dict) else {}
+    holders = holders if isinstance(holders, dict) else {}
+    height = health.get("block_height") or health.get("chain_tip") or holders.get("height")
+    if height:
+        lines.append("⛓ Blocks: {:,}".format(int(height)))
+    txs = health.get("tx_count") or health.get("chain_txs")
+    if txs:
+        lines.append("🔁 Transactions: {:,}".format(int(txs)))
     if nodes is not None:
         lines.append("🖥 Nodes online: {:,}".format(nodes))
     if gateways is not None:
         lines.append("🌐 Public gateways: {:,}".format(gateways))
+    if holders.get("wallets") is not None:
+        lines.append("👥 Holders: {:,} wallets".format(int(holders["wallets"])))
+        if holders.get("wallet_total_uegoc") is not None:
+            lines.append("💼 Held by holders: " + egoc(holders["wallet_total_uegoc"]))
+        if holders.get("shielded_uegoc"):
+            lines.append("🛡 Shielded: " + egoc(holders["shielded_uegoc"]))
+    if isinstance(manifest, dict) and manifest.get("version"):
+        lines.append("📦 Latest Ego Desktop: v" + html.escape(str(manifest["version"])))
     if presale and presale.get("price_usd") is not None:
         tier = html.escape(str(presale.get("tier_label") or "current"))
         lines.append("💰 EGOC pre-sale price: " + usd(presale["price_usd"]) + " (" + tier + " round)")
@@ -148,6 +170,9 @@ def format_stats(health, nodes, gateways, presale):
             lines.append("🚀 Launch price: " + usd(presale["launch_usd"]))
     if len(lines) == 1:
         lines.append("The network data is not available right now. Try again in a minute.")
+    else:
+        lines.append("")
+        lines.append("🔎 Explorer: " + SITE + "/explorer")
     return "\n".join(lines)
 
 
@@ -225,17 +250,23 @@ class Bot:
     def fetch(self, url):
         now = time.time()
         hit = self.cache.get(url)
-        if hit and now - hit[0] < STATS_CACHE_SECS:
+        if hit and now - hit[0] < (STATS_CACHE_SECS if hit[1] is not None else FAILED_CACHE_SECS):
             return hit[1]
-        try:
-            request = urllib.request.Request(url, headers={"User-Agent": "ego-telegram-bot"})
-            with urllib.request.urlopen(request, timeout=10) as response:
-                value = json.loads(response.read().decode())
-        except Exception as error:
-            print("fetch " + url + " failed: " + str(error), file=sys.stderr, flush=True)
-            value = None
-        self.cache[url] = (now, value)
+        value = None
+        for attempt in range(FETCH_TRIES):
+            try:
+                request = urllib.request.Request(url, headers={"User-Agent": "ego-telegram-bot"})
+                with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_SECS) as response:
+                    value = json.loads(response.read().decode())
+                break
+            except Exception as error:
+                print("fetch " + url + " failed (try " + str(attempt + 1) + "): " + str(error), file=sys.stderr, flush=True)
+        self.cache[url] = (time.time(), value)
         return value
+
+    def fetch_all(self, urls):
+        with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+            return list(pool.map(self.fetch, urls))
 
     def is_admin(self, chat_id, user_id):
         now = time.time()
@@ -330,14 +361,21 @@ class Bot:
         elif command == "presale":
             text = format_presale(self.fetch(PAY + "/presale/config"))
         elif command == "stats":
-            health = self.fetch(RPC + "/health")
-            nodes = self.fetch(RPC + "/nodes")
-            gateways = self.fetch(RPC + "/gateways")
+            health, nodes, gateways, presale, holders, manifest = self.fetch_all([
+                RPC + "/health",
+                RPC + "/nodes",
+                RPC + "/gateways",
+                PAY + "/presale/config",
+                RPC + "/chain/holders",
+                SITE + "/version.json",
+            ])
             text = format_stats(
                 health,
                 len(nodes.get("nodes", [])) if isinstance(nodes, dict) else None,
                 len(gateways.get("gateways", [])) if isinstance(gateways, dict) else None,
-                self.fetch(PAY + "/presale/config"),
+                presale,
+                holders,
+                manifest,
             )
         else:
             return
