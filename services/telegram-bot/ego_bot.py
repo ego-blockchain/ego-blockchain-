@@ -172,7 +172,7 @@ def format_stats(health, nodes, gateways, presale, holders=None, manifest=None):
         lines.append("The network data is not available right now. Try again in a minute.")
     else:
         lines.append("")
-        lines.append("🔎 Explorer: " + SITE + "/explorer")
+        lines.append("🔎 EgoScan: " + SITE + "/egoscan")
     return "\n".join(lines)
 
 
