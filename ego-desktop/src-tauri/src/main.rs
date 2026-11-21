@@ -1101,7 +1101,7 @@ fn main() {
             commands::shielded::shield_withdraw,
             commands::shielded::invariant_report,
             commands::storage::create_public_share,
-            commands::storage::create_secure_share,
+            commands::storage::create_contact_share,
             commands::storage::import_secure_share,
             commands::storage::delete_stored_file,
             commands::storage::retrieve_file_preview,

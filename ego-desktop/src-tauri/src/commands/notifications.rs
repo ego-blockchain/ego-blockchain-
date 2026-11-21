@@ -48,6 +48,7 @@ pub async fn import_shared_file(
     let now = chrono::Utc::now().timestamp();
 
     let mut ledger = Ledger::load();
+    let protected_key = crate::ledger::protect_key_hex(&bundle.key_nonce_hex).unwrap_or_else(|_| bundle.key_nonce_hex.clone());
 
     let stored = StoredFile {
         cid:             bundle.cid.clone(),
@@ -58,18 +59,23 @@ pub async fn import_shared_file(
         stored_at:       now,
         expiry:          now + 30 * 86_400,
         status:          "Received".into(),
-        key_nonce_hex:   bundle.key_nonce_hex.clone(),
+        key_nonce_hex:   protected_key.clone(),
         local_path:      format!("sender:{}", bundle.from_address),
         owner:           ledger.address.clone(),
         from_egosafe:    true,
         ..Default::default()
     };
 
-    if !ledger.stored_files.iter().any(|f| f.cid == bundle.cid) {
-        ledger.stored_files.insert(0, stored.clone());
-        ledger
-            .save()
-            .map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
+    match ledger.stored_files.iter_mut().find(|f| f.cid == bundle.cid) {
+        Some(f) if crate::ledger::unprotect_key_bytes(&f.key_nonce_hex).len() < 32 && !bundle.key_nonce_hex.is_empty() => {
+            f.key_nonce_hex = protected_key;
+            ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
+        }
+        Some(_) => {}
+        None => {
+            ledger.stored_files.insert(0, stored.clone());
+            ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
+        }
     }
 
     // Record a retrieve_file tx on-chain so the import is verifiable.
@@ -136,11 +142,10 @@ pub async fn try_auto_import(app: Option<&AppHandle<tauri::Wry>>, content: &str,
         let parts: Vec<&str> = content.splitn(5, ':').collect();
         if parts.len() < 5 { return; }
         ("egoshare1", parts[1], parts[2].to_string(), parts[3])
-    } else if content.starts_with("egoshare2:") {
-        let parts: Vec<&str> = content.splitn(6, ':').collect();
+    } else if content.starts_with("egoshare2:") || content.starts_with("egoshare3:") {
+        let parts: Vec<&str> = content.split(':').collect();
         if parts.len() < 6 { return; }
-        // key is KEM-encrypted; store empty for now — EgoSafe page decrypts on demand
-        ("egoshare2", parts[1], String::new(), parts[4])
+        ("sealed", parts[1], String::new(), parts[4])
     } else {
         return;
     };
@@ -160,7 +165,7 @@ pub async fn try_auto_import(app: Option<&AppHandle<tauri::Wry>>, content: &str,
         }));
 
         let sender = crate::commands::messenger::contact_display_name(from_addr);
-        let security = if prefix == "egoshare2" { " (encrypted for you)" } else { "" };
+        let security = if prefix == "sealed" { " (sealed for you with Kyber)" } else { "" };
         notify(h, &format!("{} sent you a file", sender), &format!("\"{}\"{}", display_name, security));
     }
 }

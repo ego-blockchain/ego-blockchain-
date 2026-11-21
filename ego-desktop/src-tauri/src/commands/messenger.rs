@@ -1108,6 +1108,10 @@ pub async fn send_message(
 
     let _ = app.emit_all("ego://message-sent", serde_json::json!({ "to": contact_addr }));
     let contact_addr_key = contact_addr.clone();
+    let plain_link = raw_content.starts_with("egoshare1:");
+    let key_to_push = move |file: &crate::ledger::StoredFile| {
+        if plain_link { hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)) } else { String::new() }
+    };
     tokio::spawn(async move {
 
         if is_file_bundle {
@@ -1116,6 +1120,7 @@ pub async fn send_message(
                 let cid    = parts[1].to_string();
                 let ledger = crate::ledger::Ledger::load();
                 if let Some(file) = ledger.stored_files.iter().find(|f| f.cid == cid).cloned() {
+                    let push_key = key_to_push(&file);
 
                     if cid.starts_with("egomfd1") {
 
@@ -1124,7 +1129,7 @@ pub async fn send_message(
                                 let manifest_msg = p2p::P2PMessage::ManifestData {
                                     manifest_cid:  cid.clone(),
                                     manifest_json,
-                                    key_hex64:     hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)),
+                                    key_hex64:     push_key.clone(),
                                     file_name:     file.name.clone(),
                                     from_addr:     my_addr.clone(),
                                 };
@@ -1148,7 +1153,7 @@ pub async fn send_message(
                                         cid:           cid.clone(),
                                         enc_data_b64,
                                         file_name:     file.name.clone(),
-                                        key_nonce_hex: hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)),
+                                        key_nonce_hex: push_key.clone(),
                                     };
                                     crate::commands::outbox::enqueue(
                                         &contact_addr_key, &stored_endpoint, &file_data
@@ -1197,13 +1202,14 @@ pub async fn send_message(
                 let cid    = parts[1].to_string();
                 let ledger = crate::ledger::Ledger::load();
                 if let Some(file) = ledger.stored_files.iter().find(|f| f.cid == cid).cloned() {
+                    let push_key = key_to_push(&file);
                     if cid.starts_with("egomfd1") {
                         if let Ok(manifest) = crate::blocks::load_manifest(&cid) {
                             if let Ok(manifest_json) = serde_json::to_string(&manifest) {
                                 let manifest_msg = p2p::P2PMessage::ManifestData {
                                     manifest_cid:  cid.clone(),
                                     manifest_json,
-                                    key_hex64:     hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)),
+                                    key_hex64:     push_key.clone(),
                                     file_name:     file.name.clone(),
                                     from_addr:     my_addr.clone(),
                                 };
@@ -1220,7 +1226,7 @@ pub async fn send_message(
                                 cid:           cid.clone(),
                                 enc_data_b64,
                                 file_name:     file.name.clone(),
-                                key_nonce_hex: hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)),
+                                key_nonce_hex: push_key.clone(),
                             };
                             if let Ok(()) = p2p::send_message(&endpoint, &file_data).await {
                                 eprintln!("[EgoSafe] FileData sent directly to {} ({} bytes)", contact_addr_key, enc_bytes.len());

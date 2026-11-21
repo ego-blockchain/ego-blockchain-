@@ -11026,7 +11026,7 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
         if cid.starts_with("egomfd1") {
             let ep = requester_endpoint.clone();
             let addr = requester_addr.clone();
-            let key_hex64 = hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex));
+            let key_hex64 = String::new();
             let file_name = file.name.clone();
             tokio::spawn(async move {
                 match crate::blocks::load_manifest(&cid) {
@@ -11063,7 +11063,7 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
             Err(e) => eprintln!("[P2P] FileRequest: read failed {}: {}", file.local_path, e),
             Ok(enc_bytes) => {
                 use base64::Engine as _;
-                let key_nonce_hex = hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex));
+                let key_nonce_hex = String::new();
                 let file_name     = file.name.clone();
                 let cid2          = cid.clone();
                 let ep            = requester_endpoint.clone();
@@ -11190,7 +11190,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
             if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid) {
                 if f.status != "Active" {
                     f.local_path = enc_str.clone();
-                    if !key_nonce_hex.is_empty() {
+                    if !key_nonce_hex.is_empty() && crate::ledger::unprotect_key_bytes(&f.key_nonce_hex).len() < 32 {
                         f.key_nonce_hex = crate::ledger::protect_key_hex(&key_nonce_hex).unwrap_or(key_nonce_hex.clone());
                     }
                     if f.name.is_empty() { f.name = file_name.clone(); }
@@ -11240,7 +11240,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                                     let response = P2PMessage::ManifestData {
                                         manifest_cid: manifest_cid.clone(),
                                         manifest_json,
-                                        key_hex64:   hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)),
+                                        key_hex64:   String::new(),
                                         file_name:   file.name,
                                         from_addr:   my_addr.clone(),
                                     };
@@ -11271,7 +11271,9 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                             .await.unwrap_or_default();
                         let my_addr    = ledger.address.clone();
                         if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == manifest_cid) {
-                            f.key_nonce_hex  = crate::ledger::protect_key_hex(&key_hex64).unwrap_or_else(|_| key_hex64.clone());
+                            if !key_hex64.is_empty() && crate::ledger::unprotect_key_bytes(&f.key_nonce_hex).len() < 32 {
+                                f.key_nonce_hex = crate::ledger::protect_key_hex(&key_hex64).unwrap_or_else(|_| key_hex64.clone());
+                            }
                             f.blocks_total   = blocks_total;
                             f.blocks_received = crate::blocks::blocks_received_count(&manifest);
                             f.manifest_cid   = manifest_cid.clone();
@@ -14490,7 +14492,7 @@ static STATE_CERT_CHAIN: Mutex<Vec<crate::state_cert::StateCert>> = Mutex::new(V
 
 fn known_cert_chain(anchors: &[(u64, String)]) -> Vec<crate::state_cert::StateCert> {
     let chain = STATE_CERT_CHAIN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let start = anchors.first().map(|(i, _)| *i);
+    let start = crate::state_cert::start_index(anchors);
     if chain.first().map(|c| c.body.index) == start { chain } else { Vec::new() }
 }
 
@@ -14500,7 +14502,7 @@ pub async fn request_state_certs() {
         return;
     }
     let anchors = crate::state_cert::anchors_with(crate::commands::updates::refresh_published_state_cert().await);
-    let Some((start, _)) = anchors.first().cloned() else {
+    let Some(start) = crate::state_cert::start_index(&anchors) else {
         static SAID: AtomicI64 = AtomicI64::new(0);
         let now = Utc::now().timestamp();
         if now - SAID.swap(now, Ordering::Relaxed) > 3600 {
@@ -14519,7 +14521,7 @@ async fn receive_state_certs(certs: Vec<crate::state_cert::StateCert>, server: S
         return;
     }
     let anchors = crate::state_cert::anchors_with(crate::commands::updates::published_state_cert());
-    let Some((start, _)) = anchors.first().cloned() else { return };
+    let Some(start) = crate::state_cert::start_index(&anchors) else { return };
     let known = known_cert_chain(&anchors);
     if certs[0].body.index != known.last().map_or(start, |c| c.body.index + 1) {
         return;

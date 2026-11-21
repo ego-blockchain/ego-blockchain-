@@ -532,7 +532,7 @@ mod storage_margin_tests {
 
     /// The plan prices in StoragePage.tsx. Kept here so a change to one without the other
     /// shows up as a failing test rather than as a business losing money per subscriber.
-    const PLANS: [(f64, f64); 5] = [(50.0, 0.79), (200.0, 1.99), (1024.0, 4.99), (2048.0, 7.99), (10240.0, 39.99)];
+    const PLANS: [(f64, f64); 5] = [(50.0, 0.59), (200.0, 1.49), (1024.0, 3.99), (2048.0, 7.99), (10240.0, 39.99)];
 
     #[test]
     fn every_plan_earns_more_than_it_costs_to_serve() {
@@ -623,7 +623,7 @@ mod hosting_margin_tests {
         // that holds the same amount, or the cheaper move is to buy storage and skip
         // hosting entirely.
         let (_, starter_usd, starter_gb) = PLANS[0];
-        let storage_only_50gb = 0.79;
+        let storage_only_50gb = 0.59;
         assert!(
             starter_usd > storage_only_50gb,
             "hosting bundles more than storage so it may cost more, but not by much",

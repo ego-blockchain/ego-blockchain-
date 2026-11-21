@@ -18,6 +18,10 @@ pub const STATE_CERT_ANCHORS: &[(u64, &str)] = &[
     (1, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c"),
     (2, "cffc024048f1b24c2a3dcdb61f9cf763b38ef1f5c5d1548de3b550998ef50785"),
     (3, "40221698858e16745ba554397803beb32bab9e2f5c3e019b4c1933b10e50dbfa"),
+    (11, "2994bb77df372e925d0f02b65639eadcd2f710f29dbe94aa3666b82015d28bd0"),
+    (13, "4a6ae6eba482f8e752c81b3569b0bce02e3aa6860759e1dba94f8327eb2fa819"),
+    (16, "118168372afc04a36fbf19148d6a4f1bb313d0f1b397f943ccb43f4ff61dbfc0"),
+    (20, "cf99c3e41f70588cb9a9481dac2e3cd602f96c222020e705a8651e8334685cc7"),
 ];
 const KEY_DAY: &[u8] = b"sc:day";
 const KEY_OPEN: &[u8] = b"sc:open";
@@ -337,16 +341,24 @@ pub fn anchors_with(published: Option<(u64, String)>) -> Vec<(u64, String)> {
     all
 }
 
+pub fn start_index(anchors: &[(u64, String)]) -> Option<u64> {
+    anchors.last().map(|(i, _)| *i)
+}
+
 pub fn verify_chain(certs: &[StateCert], anchors: &[(u64, String)]) -> Result<Option<StateCert>, String> {
     let Some(first) = certs.first() else { return Ok(None) };
-    let Some((start, _)) = anchors.first() else {
+    let Some(start) = start_index(anchors) else {
         return Err("no official certificate is known yet; egoblockchain.com names one once the first is final".into());
     };
-    if first.body.index != *start {
-        return Err(format!("the certificates offered start at {}, not at the official certificate {start}", first.body.index));
-    }
+    let Some(at) = certs.iter().position(|c| c.body.index == start) else {
+        return Err(if first.body.index > start {
+            format!("the certificates offered start at {}, not at the official certificate {start}", first.body.index)
+        } else {
+            format!("the certificates offered stop before {start}, which is already official")
+        });
+    };
     let mut prev: Option<StateCert> = None;
-    for cert in certs {
+    for cert in &certs[at..] {
         if anchors.iter().any(|(i, h)| *i == cert.body.index && *h != cert.hash()) {
             return Err(format!("certificate {} is not the official one", cert.body.index));
         }
@@ -526,6 +538,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn diag_saved_certificates() {
+        let Ok(path) = std::env::var("EGO_CERTS_BIN") else { return };
+        let data = std::fs::read(path).unwrap();
+        let mut certs = std::collections::BTreeMap::new();
+        let mut i = 0usize;
+        while i < data.len() {
+            i += 1;
+            let kl = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            let k = data[i..i + kl].to_vec();
+            i += kl;
+            let vl = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            let v = data[i..i + vl].to_vec();
+            i += vl;
+            if let Some(rest) = k.strip_prefix(b"sc:cert:") {
+                let idx: u64 = String::from_utf8_lossy(rest).parse().unwrap();
+                certs.insert(idx, serde_json::from_slice::<StateCert>(&v).unwrap());
+            }
+        }
+        for (i, h) in STATE_CERT_ANCHORS {
+            println!("DIAG anchor {i} matches saved cert: {}", certs.get(i).map_or(false, |c| c.hash() == *h));
+        }
+        let all: Vec<StateCert> = certs.values().cloned().collect();
+        println!("DIAG real chain with built-in anchors: {:?}", verify_chain(&all, &anchors_with(None)).map(|c| c.map(|c| c.body.index)));
+        let from_top: Vec<StateCert> = certs.range(20..).map(|(_, c)| c.clone()).collect();
+        println!("DIAG real chain from 20: {:?}", verify_chain(&from_top, &anchors_with(None)).map(|c| c.map(|c| c.body.index)));
+        let old_way = vec![(1u64, STATE_CERT_ANCHORS[0].1.to_string()), (2, STATE_CERT_ANCHORS[1].1.to_string()), (3, STATE_CERT_ANCHORS[2].1.to_string())];
+        println!("DIAG real chain with only 1-3: {:?}", verify_chain(&all, &old_way).map(|c| c.map(|c| c.body.index)));
+    }
+
+    #[test]
     fn every_chunk_of_the_state_proves_itself_against_the_root() {
         for n in [1usize, CHUNK_ENTRIES, CHUNK_ENTRIES + 1, CHUNK_ENTRIES * 5 + 7] {
             let all = entries(n);
@@ -632,12 +677,18 @@ mod tests {
             (1u64, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c".to_string()),
             (2u64, "cffc024048f1b24c2a3dcdb61f9cf763b38ef1f5c5d1548de3b550998ef50785".to_string()),
             (3u64, "40221698858e16745ba554397803beb32bab9e2f5c3e019b4c1933b10e50dbfa".to_string()),
+            (11u64, "2994bb77df372e925d0f02b65639eadcd2f710f29dbe94aa3666b82015d28bd0".to_string()),
+            (13u64, "4a6ae6eba482f8e752c81b3569b0bce02e3aa6860759e1dba94f8327eb2fa819".to_string()),
+            (16u64, "118168372afc04a36fbf19148d6a4f1bb313d0f1b397f943ccb43f4ff61dbfc0".to_string()),
+            (20u64, "cf99c3e41f70588cb9a9481dac2e3cd602f96c222020e705a8651e8334685cc7".to_string()),
         ];
-        assert_eq!(anchors_with(None), built_in, "this release names checkpoints 1, 2 and 3 itself");
-        assert_eq!(
-            anchors_with(Some((4, h.clone()))),
-            built_in.iter().cloned().chain([(4, h.clone())]).collect::<Vec<_>>()
-        );
+        assert_eq!(anchors_with(None), built_in, "this release names checkpoints 1, 2, 3 and the fallback checkpoints 11, 13, 16 and 20 itself");
+        let mut with_four = built_in.clone();
+        with_four.push((4, h.clone()));
+        with_four.sort();
+        assert_eq!(anchors_with(Some((4, h.clone()))), with_four);
+        assert_eq!(start_index(&anchors_with(Some((4, h.clone())))), Some(20), "a new node starts from the newest official checkpoint");
+        assert_eq!(start_index(&anchors_with(Some((23, h.clone())))), Some(23), "the website can name a newer one");
         assert_eq!(anchors_with(Some((1, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c".into()))), built_in, "the website naming the same one adds nothing");
         assert_eq!(anchors_with(Some((0, h.clone()))), built_in);
         assert_eq!(anchors_with(Some((4, "AB".repeat(32)))), built_in);
@@ -762,6 +813,37 @@ mod tests {
         assert!(verify_chain(&[cert1.clone(), by_own_draw.clone()], &[(1, cert1.hash())]).is_err(), "without the website naming it, a certificate signed by others is refused");
         let both = vec![(1, cert1.hash()), (2, by_own_draw.hash())];
         assert_eq!(verify_chain(&[cert1, by_own_draw], &both).unwrap().unwrap().body.index, 2, "once it is official it is taken on the website's word");
+    }
+
+    #[test]
+    fn a_new_node_checks_from_the_newest_official_certificate_so_older_handovers_do_not_matter() {
+        let c1: Vec<blst::min_pk::SecretKey> = (1..5).map(bls).collect();
+        let c2: Vec<blst::min_pk::SecretKey> = (10..14).map(bls).collect();
+        let c3: Vec<blst::min_pk::SecretKey> = (20..24).map(bls).collect();
+        let c4: Vec<blst::min_pk::SecretKey> = (30..34).map(bls).collect();
+        let c5: Vec<blst::min_pk::SecretKey> = (40..44).map(bls).collect();
+        let b1 = body(1, keys(&c2));
+        let cert1 = assemble(&b1, &bls_votes(&b1, &c1), &keys(&c1)).unwrap();
+        let b2 = body(2, keys(&c3));
+        let fallback2 = assemble(&b2, &bls_votes(&b2, &c3), &keys(&c3)).unwrap();
+        let b3 = body(3, keys(&c4));
+        let cert3 = assemble(&b3, &bls_votes(&b3, &c3), &keys(&c3)).unwrap();
+        let b4 = body(4, keys(&c5));
+        let fallback4 = assemble(&b4, &bls_votes(&b4, &c5), &keys(&c5)).unwrap();
+        let b5 = body(5, keys(&c1));
+        let cert5 = assemble(&b5, &bls_votes(&b5, &c5), &keys(&c5)).unwrap();
+        let chain = vec![cert1.clone(), fallback2.clone(), cert3.clone(), fallback4.clone(), cert5.clone()];
+
+        let only_first_and_second = vec![(1, cert1.hash()), (2, fallback2.hash())];
+        assert!(verify_chain(&chain, &only_first_and_second).is_err(), "a later handover nobody named is still refused");
+        let named = vec![(1, cert1.hash()), (2, fallback2.hash()), (4, fallback4.hash())];
+        assert_eq!(verify_chain(&chain, &named).unwrap().unwrap().body.index, 5, "from the newest official one the rest follows");
+        assert_eq!(verify_chain(&chain[3..], &named).unwrap().unwrap().body.index, 5, "a node only needs the certificates from the newest official one on");
+        assert!(verify_chain(&chain[..3], &named).is_err(), "certificates that stop before the newest official one are refused");
+        assert!(verify_chain(&chain[4..], &named).is_err(), "certificates that start after it are refused");
+        let mut forged = cert5.clone();
+        forged.body.state_root = "bb".repeat(32);
+        assert!(verify_chain(&[fallback4, forged], &named).is_err(), "after the official one every signature is checked again");
     }
 
     #[test]

@@ -69,15 +69,27 @@ Requires **Rust 1.85 or newer** (the workspace uses edition 2024) and **Node.js 
 git clone https://github.com/ego-blockchain/ego-blockchain-
 cd ego-blockchain-
 
-# Workspace: node, CLI, relay, compiler and all crates
+# Workspace: CLI, relay, compiler and all crates
 cargo build --release
-
-# Run the headless node
-cargo run --release --bin ego-node
 
 # Command-line wallet
 cargo run --release --bin ego-cli -- --help
 ```
+
+**To run a node on the public test network, use Ego Desktop.** The network's node is built into the desktop app. `bins/ego-node` is a separate research implementation that does not connect to the public test network, so it shows no blocks, rewards or earnings.
+
+- Easiest: download Ego Desktop from [egoblockchain.com/download](https://egoblockchain.com/download). On Linux use the AppImage.
+- Headless (servers, no window): build the desktop crate and start it with `EGO_HEADLESS=1`:
+
+```bash
+sudo apt install build-essential clang libclang-dev pkg-config libssl-dev \
+  libgtk-3-dev libwebkit2gtk-4.0-dev libayatana-appindicator3-dev librsvg2-dev
+cd ego-desktop && npm install && npm run build && cd src-tauri
+cargo build --release --bin ego-desktop
+EGO_HEADLESS=1 ./target/release/ego-desktop
+```
+
+Building needs `clang` and `libclang-dev`; without them RocksDB and zstd fail with `'stddef.h' file not found`. `libwebkit2gtk-4.0-dev` is only packaged up to Ubuntu 22.04, so on Ubuntu 24.04 and newer use the AppImage.
 
 ### Desktop application
 

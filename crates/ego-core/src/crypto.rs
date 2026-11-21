@@ -1528,7 +1528,7 @@ fn slh_dsa_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> EgoRes
 fn kyber_encapsulate(public_key: &[u8]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
     let pk = kyber768::PublicKey::from_bytes(public_key)
         .map_err(|_| EgoError::CryptoError("Invalid Kyber768 public key".to_string()))?;
-    let (ct, ss) = kyber768::encapsulate(&pk);
+    let (ss, ct) = kyber768::encapsulate(&pk);
     Ok((ct.as_bytes().to_vec(), ss.as_bytes().to_vec()))
 }
 
@@ -1544,6 +1544,14 @@ fn kyber_decapsulate(secret_key: &[u8], ciphertext: &[u8]) -> EgoResult<Vec<u8>>
 #[cfg(test)]
 mod address_derivation_tests {
     use super::*;
+
+    #[test]
+    fn kyber_sends_the_ciphertext_and_both_sides_agree_on_the_secret() {
+        let (alice, bob) = (KeyPair::generate(), KeyPair::generate());
+        let (ct, ss) = alice.encapsulate_kyber(&bob.kyber_public_key().key_data).unwrap();
+        assert_eq!((ct.len(), ss.len()), (1088, 32));
+        assert_eq!(bob.decapsulate_kyber(&ct).unwrap(), ss);
+    }
 
     #[test]
     fn ed25519_address_matches_extension() {

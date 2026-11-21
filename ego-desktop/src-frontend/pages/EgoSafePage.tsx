@@ -146,6 +146,22 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
   async function openEgoLink() {
     const link = linkText.trim();
     const parts = link.split(':');
+    if ((parts[0] === 'egoshare3' && parts.length === 8) || (parts[0] === 'egoshare2' && parts.length === 6)) {
+      setLinkBusy(true);
+      setLinkMsg(null);
+      try {
+        const f = await invoke<StoredFile>('import_secure_share', { bundleStr: link });
+        await invoke('request_file_from_contact', { cid: f.cid, fromAddr: parts[5], content: link });
+        setLinkText('');
+        setLinkMsg({ ok: true, text: `Downloading "${f.name}". It appears under Received Files below.` });
+        loadStoredFiles();
+      } catch (e: any) {
+        setLinkMsg({ ok: false, text: `Couldn't open the link: ${e?.message ?? e}` });
+      } finally {
+        setLinkBusy(false);
+      }
+      return;
+    }
     if (parts.length !== 5 || parts[0] !== 'egoshare1' || !parts[1] || !/^[0-9a-fA-F]{64,}$/.test(parts[2])) {
       setLinkMsg({ ok: false, text: "That isn't an Ego link. It starts with egoshare1:" });
       return;
@@ -193,7 +209,7 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
     setSendMsg('');
     setSentToContact(null);
     try {
-      const bundle = await invoke<string>('create_public_share', { cid: sendTarget.cid });
+      const bundle = await invoke<string>('create_contact_share', { cid: sendTarget.cid, contactAddr: contact.address });
       await invoke('send_message', {
         contactAddr: contact.address,
         content: bundle,
@@ -218,8 +234,8 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
     });
     await loadStoredFiles(); 
 
-    const bundle = await invoke<string>('create_public_share', { cid: result.cid });
     for (const c of selectedContacts) {
+      const bundle = await invoke<string>('create_contact_share', { cid: result.cid, contactAddr: c.address });
       await invoke('send_message', {
         contactAddr: c.address,
         content:     bundle,

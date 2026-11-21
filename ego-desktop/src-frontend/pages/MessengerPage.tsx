@@ -877,7 +877,7 @@ useEffect(() => {
       const result = await invoke<{ cid: string }>('store_file', {
         request: { file_path: path, duration_months: 1, free: true, from_egosafe: true },
       });
-      const bundle = await invoke<string>('create_public_share', { cid: result.cid });
+      const bundle = await invoke<string>('create_contact_share', { cid: result.cid, contactAddr: selected.address });
       await invoke('send_message', {
         contactAddr: selected.address,
         content:     bundle,
@@ -1020,15 +1020,20 @@ useEffect(() => {
     }, 60_000);
 
     const parts        = content.trim().split(':');
+    const sealed       = parts[0] === 'egoshare3' || parts[0] === 'egoshare2';
     const cid          = parts[1] ?? '';
-    const key_nonce_hex = parts[2] ?? '';
-    const name64       = parts[3] ?? '';
-    const from_address = parts[4] ?? '';
+    const key_nonce_hex = sealed ? '' : (parts[2] ?? '');
+    const name64       = (sealed ? parts[4] : parts[3]) ?? '';
+    const from_address = (sealed ? parts[5] : parts[4]) ?? '';
     let display_name   = cid.slice(0, 12);
     try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
 
     try {
-      await invoke('import_shared_file', { bundle: { cid, key_nonce_hex, display_name, from_address } });
+      if (sealed) {
+        await invoke('import_secure_share', { bundleStr: content.trim() });
+      } else {
+        await invoke('import_shared_file', { bundle: { cid, key_nonce_hex, display_name, from_address } });
+      }
 
       cidToMsgId.current[cid] = msgId;
       await invoke('request_file_from_contact', { cid, fromAddr: from_address, content: content.trim() });
@@ -1565,7 +1570,7 @@ useEffect(() => {
                       {isFileBundle ? (() => {
                         const parts  = m.content.trim().split(':');
                         const cid    = parts[1] ?? '';
-                        const name64 = parts[3] ?? '';
+                        const name64 = (parts[0] === 'egoshare3' || parts[0] === 'egoshare2' ? parts[4] : parts[3]) ?? '';
                         let display_name = cid.slice(0, 12);
                         try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
 

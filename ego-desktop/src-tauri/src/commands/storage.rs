@@ -156,16 +156,39 @@ const STORAGE_PLANS: [(&str, u64, f64, f64, u64); 5] = [
 ];
 pub const BIG_PLANS_FROM_HEIGHT: u64 = 109_635;
 
+const PLAN_PRICE_CUTS: [(&str, f64, f64); 3] = [
+    ("Basic", 0.59, 5.90),
+    ("Pro", 1.49, 14.90),
+    ("Max", 3.99, 39.90),
+];
+pub const PLAN_PRICE_CUT_FROM_HEIGHT: u64 = 176_000;
+
 fn plan_at(name: &str, height: u64) -> Option<(u64, f64, f64)> {
-    STORAGE_PLANS.iter()
-        .find(|(n, .., from)| *n == name && height >= *from)
-        .map(|(_, gb, monthly, annual, _)| (*gb, *monthly, *annual))
+    let (_, gb, monthly, annual, _) = STORAGE_PLANS.iter().find(|(n, .., from)| *n == name && height >= *from)?;
+    let cut = PLAN_PRICE_CUTS.iter().find(|(n, ..)| *n == name).filter(|_| height >= PLAN_PRICE_CUT_FROM_HEIGHT);
+    Some(match cut {
+        Some((_, m, a)) => (*gb, *m, *a),
+        None => (*gb, *monthly, *annual),
+    })
 }
 
 pub fn open_plan_prices(height: u64) -> Vec<(&'static str, u64, f64)> {
     STORAGE_PLANS.iter()
-        .filter(|(.., from)| height >= *from)
-        .map(|(n, gb, monthly, ..)| (*n, *gb, *monthly))
+        .filter_map(|(n, ..)| plan_at(n, height).map(|(gb, monthly, _)| (*n, gb, monthly)))
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlanPrice {
+    pub name: &'static str,
+    pub gb: u64,
+    pub monthly_usd: f64,
+    pub annual_usd: f64,
+}
+
+fn plan_price_list(height: u64) -> Vec<PlanPrice> {
+    STORAGE_PLANS.iter()
+        .filter_map(|(n, ..)| plan_at(n, height).map(|(gb, monthly_usd, annual_usd)| PlanPrice { name: n, gb, monthly_usd, annual_usd }))
         .collect()
 }
 
@@ -369,6 +392,7 @@ pub struct StoragePlanStatus {
     pub renew_problem: Option<String>,
     pub renew_warning: Option<String>,
     pub open_plans: Vec<&'static str>,
+    pub prices: Vec<PlanPrice>,
 }
 
 static RENEW_STATE: std::sync::Mutex<(i64, Option<String>)> = std::sync::Mutex::new((0, None));
@@ -377,17 +401,19 @@ static RENEW_STATE: std::sync::Mutex<(i64, Option<String>)> = std::sync::Mutex::
 pub async fn get_storage_plan() -> Result<StoragePlanStatus, EgoDesktopError> {
     tokio::task::spawn_blocking(|| {
         let ledger = Ledger::load();
+        let height = crate::chain_db::local_chain_height().saturating_add(1);
         let plan = storage_plan_of(&ledger.address);
         let auto_renew = !ledger.storage_renew_off;
         let renew_warning = plan.as_ref().and_then(|p| {
-            low_balance_warning(p, chrono::Utc::now().timestamp(), auto_renew, crate::chain_db::credits_balance(&ledger.address))
+            low_balance_warning(p, chrono::Utc::now().timestamp(), auto_renew, crate::chain_db::credits_balance(&ledger.address), height)
         });
         StoragePlanStatus {
             plan,
             auto_renew,
             renew_problem: RENEW_STATE.lock().unwrap_or_else(|e| e.into_inner()).1.clone(),
             renew_warning,
-            open_plans: open_plan_names(crate::chain_db::local_chain_height().saturating_add(1)),
+            open_plans: open_plan_names(height),
+            prices: plan_price_list(height),
         }
     })
     .await
@@ -402,11 +428,11 @@ pub async fn set_storage_auto_renew(on: bool) -> Result<bool, EgoDesktopError> {
     Ok(on)
 }
 
-fn low_balance_warning(plan: &ActivePlan, now: i64, auto_renew: bool, have: u64) -> Option<String> {
+fn low_balance_warning(plan: &ActivePlan, now: i64, auto_renew: bool, have: u64, height: u64) -> Option<String> {
     if !auto_renew || now >= plan.expires_at || plan.expires_at - now > LOW_BALANCE_WARN_SECS {
         return None;
     }
-    let (_, price_usd, _) = plan_price_usd(&plan.name, &plan.billing, u64::MAX)?;
+    let (_, price_usd, _) = plan_price_usd(&plan.name, &plan.billing, height)?;
     let price = crate::chain_db::usd_to_credits(price_usd);
     if have >= price {
         return None;
@@ -431,7 +457,8 @@ fn warn_low_balance_once() {
         return;
     }
     let have = crate::chain_db::credits_balance(&ledger.address);
-    let Some(body) = low_balance_warning(&plan, chrono::Utc::now().timestamp(), !ledger.storage_renew_off, have) else { return };
+    let height = crate::chain_db::local_chain_height().saturating_add(1);
+    let Some(body) = low_balance_warning(&plan, chrono::Utc::now().timestamp(), !ledger.storage_renew_off, have, height) else { return };
     let Some(app) = crate::p2p::APP_HANDLE.get() else { return };
     crate::commands::notifications::notify(app, "Not enough EGUSD to renew Storage", &body);
     ledger.storage_low_warned_for = plan.expires_at;
@@ -444,10 +471,8 @@ pub fn plans_view() -> serde_json::Value {
 
 fn plans_view_at(height: u64) -> serde_json::Value {
     let mut plans = Vec::new();
-    for (name, gb, monthly, annual, from) in STORAGE_PLANS {
-        if height < from {
-            continue;
-        }
+    for (name, ..) in STORAGE_PLANS {
+        let Some((gb, monthly, annual)) = plan_at(name, height) else { continue };
         for (billing, price_usd, days) in [("monthly", monthly, 30u64), ("annual", annual, 365u64)] {
             let credits = crate::chain_db::usd_to_credits(price_usd);
             plans.push(serde_json::json!({
@@ -483,7 +508,8 @@ pub fn plan_status_view(owner: &str, now: i64) -> serde_json::Value {
             "egusd_balance": have as f64 / 100.0,
         });
     };
-    let price = plan_price_usd(&p.name, &p.billing, u64::MAX).map(|(_, usd, _)| crate::chain_db::usd_to_credits(usd)).unwrap_or(0);
+    let height = crate::chain_db::local_chain_height().saturating_add(1);
+    let price = plan_price_usd(&p.name, &p.billing, height).map(|(_, usd, _)| crate::chain_db::usd_to_credits(usd)).unwrap_or(0);
     serde_json::json!({
         "owner": owner,
         "plan": p,
@@ -495,7 +521,7 @@ pub fn plan_status_view(owner: &str, now: i64) -> serde_json::Value {
         "egusd_balance": have as f64 / 100.0,
         "renewal_price_egusd": price as f64 / 100.0,
         "can_renew": have >= price,
-        "warning": low_balance_warning(&p, now, true, have),
+        "warning": low_balance_warning(&p, now, true, have, height),
     })
 }
 
@@ -1382,9 +1408,15 @@ pub async fn request_file_from_contact(
     {
         let _guard = crate::ledger::TX_MUTEX.lock().await; 
         use base64::Engine as _;
-        let parts: Vec<&str> = content.splitn(5, ':').collect();
-        let key_nonce_hex = parts.get(2).copied().unwrap_or("").to_string();
-        let name_b64 = parts.get(3).copied().unwrap_or("");
+        let parts: Vec<&str> = content.trim().split(':').collect();
+        let plain = parts.first() == Some(&"egoshare1");
+        let key_nonce_hex = if plain {
+            let raw = parts.get(2).copied().unwrap_or("");
+            crate::ledger::protect_key_hex(raw).unwrap_or_else(|_| raw.to_string())
+        } else {
+            String::new()
+        };
+        let name_b64 = parts.get(if plain { 3 } else { 4 }).copied().unwrap_or("");
         let display_name = base64::engine::general_purpose::STANDARD
             .decode(name_b64).ok()
             .and_then(|b| String::from_utf8(b).ok())
@@ -1593,155 +1625,248 @@ pub fn create_public_share(cid: String) -> Result<String, EgoDesktopError> {
     Ok(format!("egoshare1:{cid}:{raw_key}:{name64}:{}", ledger.address))
 }
 
-// ── Kyber-encrypted secure share ──────────────────────────────────────────────
-//
-// `create_secure_share(cid, recipient_kyber_hex)`
-//   → egoshare2:{cid}:{kem_ct_b64}:{nonce+enc_key_b64}:{name_b64}:{from_addr}
-//
-// Only the holder of the recipient's Kyber secret key can recover the file key.
-// Public "copy link" still uses egoshare1 (plaintext key, anyone can open).
+const SHARE_V3_TAG: &[u8] = b"ego/egoshare3/v1";
+
+fn share_v3_signed_bytes(to_addr: &str, fields: &[&str]) -> Vec<u8> {
+    let mut out = SHARE_V3_TAG.to_vec();
+    for f in std::iter::once(to_addr).chain(fields.iter().copied()) {
+        out.push(b'\n');
+        out.extend_from_slice(f.as_bytes());
+    }
+    out
+}
+
+pub(crate) fn seal_share(
+    me: &ego_core::KeyPair,
+    from_addr: &str,
+    to_addr: &str,
+    recipient_kyber: &[u8],
+    cid: &str,
+    name: &str,
+    file_key: &[u8],
+) -> Result<String, String> {
+    use base64::Engine as _;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let (kem_ct, shared) = me.encapsulate_kyber(recipient_kyber).map_err(|e| format!("Kyber: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(shared.get(..32).ok_or("Kyber secret too short")?).map_err(|e| e.to_string())?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let mut sealed_key = nonce.to_vec();
+    sealed_key.extend(cipher.encrypt(Nonce::from_slice(&nonce), file_key).map_err(|e| e.to_string())?);
+    let fields = [
+        cid.to_string(),
+        b64.encode(&kem_ct),
+        b64.encode(&sealed_key),
+        b64.encode(name.as_bytes()),
+        from_addr.to_string(),
+    ];
+    let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+    let sig = me.sign_dilithium(&share_v3_signed_bytes(to_addr, &refs)).signature_data;
+    let pk = me.dilithium_public_key().key_data;
+    Ok(format!("egoshare3:{}:{}:{}", refs.join(":"), b64.encode(&pk), b64.encode(&sig)))
+}
+
+#[derive(Debug)]
+pub(crate) struct OpenedShare {
+    pub cid: String,
+    pub name: String,
+    pub from_address: String,
+    pub file_key: Vec<u8>,
+}
+
+pub(crate) fn open_share(
+    me: &ego_core::KeyPair,
+    my_addr: &str,
+    bundle: &str,
+    pinned_key: impl Fn(&str) -> Option<[u8; 32]>,
+) -> Result<OpenedShare, String> {
+    use base64::Engine as _;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let parts: Vec<&str> = bundle.trim().split(':').collect();
+    let fields = match (parts.first().copied(), parts.len()) {
+        (Some("egoshare3"), 8) => {
+            let pk = b64.decode(parts[6]).map_err(|_| "This file link has an unreadable Dilithium key.")?;
+            let sig = b64.decode(parts[7]).map_err(|_| "This file link has an unreadable Dilithium signature.")?;
+            let msg = share_v3_signed_bytes(my_addr, &parts[1..6]);
+            if !ego_core::verify_dilithium_signature(&pk, &msg, &sig).unwrap_or(false) {
+                return Err("This file link's Dilithium signature does not match. It was changed on the way or was not made for this wallet.".into());
+            }
+            if pinned_key(parts[5]).is_some_and(|pin| pin != *blake3::hash(&pk).as_bytes()) {
+                return Err("This file link is signed with a Dilithium key that is not the sender's key on chain.".into());
+            }
+            &parts[1..6]
+        }
+        (Some("egoshare2"), 6) => &parts[1..6],
+        _ => return Err("This is not an encrypted Ego file link.".into()),
+    };
+    let kem_ct = b64.decode(fields[1]).map_err(|_| "This file link has an unreadable Kyber part.")?;
+    let sealed = b64.decode(fields[2]).map_err(|_| "This file link has an unreadable key part.")?;
+    if sealed.len() < 13 {
+        return Err("This file link's key part is too short.".into());
+    }
+    let shared = me.decapsulate_kyber(&kem_ct).map_err(|e| format!("Kyber: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(shared.get(..32).ok_or("Kyber secret too short")?).map_err(|e| e.to_string())?;
+    let file_key = cipher
+        .decrypt(Nonce::from_slice(&sealed[..12]), &sealed[12..])
+        .map_err(|_| "This file link was not encrypted for this wallet.".to_string())?;
+    let name = b64
+        .decode(fields[3])
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| fields[0].chars().take(12).collect());
+    Ok(OpenedShare { cid: fields[0].to_string(), name, from_address: fields[4].to_string(), file_key })
+}
+
+fn pinned_dilithium(addr: &str) -> Option<[u8; 32]> {
+    crate::pq_chain::pinned(&crate::drs::Ov::new(crate::chain_db::global_db()), addr)
+}
 
 #[tauri::command]
-pub fn create_secure_share(
+pub fn create_contact_share(
     cid: String,
-    recipient_kyber_hex: String,
+    contact_addr: String,
+    state: State<'_, AppState>,
 ) -> Result<String, EgoDesktopError> {
-    use base64::Engine as _;
-
-    // 1. Load and unprotect the file key from the ledger.
+    let kyber_hex = crate::commands::messenger::load_contacts()
+        .into_iter()
+        .find(|c| c.address == contact_addr)
+        .map(|c| c.kyber_pubkey.trim().to_string())
+        .filter(|k| !k.is_empty());
+    let Some(kyber_hex) = kyber_hex else {
+        return create_public_share(cid);
+    };
+    let recipient = hex::decode(&kyber_hex)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("This contact's Kyber key is unreadable: {e}")))?;
     let ledger = Ledger::load();
     let file = ledger.stored_files.iter()
         .find(|f| f.cid == cid)
         .ok_or_else(|| EgoDesktopError::InvalidInput(format!("File {cid} not in ledger")))?;
-
     let file_key = crate::ledger::unprotect_key_bytes(&file.key_nonce_hex);
     if file_key.len() < 32 {
         return Err(EgoDesktopError::CryptoError("Invalid file key".into()));
     }
-
-    // 2. Kyber KEM: encapsulate with the recipient's public key.
-    let seed_bytes = crate::ledger::load_seed()
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {}", e)))?
-        .ok_or_else(|| EgoDesktopError::CryptoError("No seed".into()))?;
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_bytes);
-    let keypair = ego_core::KeyPair::from_bytes(&seed)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("{e}")))?;
-
-    if recipient_kyber_hex.is_empty() {
-        return Err(EgoDesktopError::CryptoError(
-            "This contact has no Kyber key — they need to re-share their contact card with you using the latest version of Ego Desktop.".into()
-        ));
-    }
-    let recipient_pk = hex::decode(&recipient_kyber_hex)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Bad Kyber pubkey: {e}")))?;
-    let (kem_ct, shared_secret) = keypair.encapsulate_kyber(&recipient_pk)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("KEM encap: {e}")))?;
-
-    // 3. AES-256-GCM encrypt the file key with the KEM shared secret.
-    let mut nonce_bytes = [0u8; 12];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
-    let cipher = Aes256Gcm::new_from_slice(&shared_secret[..32])
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Cipher: {e}")))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let enc_key = cipher.encrypt(nonce, file_key.as_slice())
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Encrypt key: {e}")))?;
-
-    // 4. Build bundle string.
-    let name64      = base64::engine::general_purpose::STANDARD.encode(file.name.as_bytes());
-    let kem_ct_b64  = base64::engine::general_purpose::STANDARD.encode(&kem_ct);
-    let mut nonce_enc = nonce_bytes.to_vec();
-    nonce_enc.extend_from_slice(&enc_key);
-    let enc_key_b64 = base64::engine::general_purpose::STANDARD.encode(&nonce_enc);
-
-    Ok(format!("egoshare2:{cid}:{kem_ct_b64}:{enc_key_b64}:{name64}:{}", ledger.address))
+    let keypair = state.get_keypair()
+        .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+    seal_share(&keypair, &ledger.address, &contact_addr, &recipient, &cid, &file.name, &file_key)
+        .map_err(EgoDesktopError::CryptoError)
 }
 
-/// Import an egoshare2 bundle: decapsulate KEM, decrypt file key, store protected.
 #[tauri::command]
 pub async fn import_secure_share(
     bundle_str: String,
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<crate::ledger::StoredFile, EgoDesktopError> {
-    use base64::Engine as _;
-
-    let parts: Vec<&str> = bundle_str.splitn(6, ':').collect();
-    if parts.len() < 6 || parts[0] != "egoshare2" {
-        return Err(EgoDesktopError::InvalidInput("Not an egoshare2 bundle".into()));
-    }
-    let (cid, kem_ct_b64, enc_key_b64, name_b64, from_address) =
-        (parts[1], parts[2], parts[3], parts[4], parts[5]);
-
-    let kem_ct = base64::engine::general_purpose::STANDARD.decode(kem_ct_b64)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Bad KEM ct: {e}")))?;
-    let nonce_enc = base64::engine::general_purpose::STANDARD.decode(enc_key_b64)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Bad enc key: {e}")))?;
-    let display_name = base64::engine::general_purpose::STANDARD.decode(name_b64).ok()
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| cid[..cid.len().min(12)].to_string());
-
-    if nonce_enc.len() < 13 {
-        return Err(EgoDesktopError::CryptoError("Encrypted key too short".into()));
-    }
-
-    let seed_bytes = crate::ledger::load_seed()
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {e}")))?
-        .ok_or_else(|| EgoDesktopError::CryptoError("No seed".into()))?;
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_bytes);
-    let keypair = ego_core::KeyPair::from_bytes(&seed)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("{e}")))?;
-    let shared_secret = keypair.decapsulate_kyber(&kem_ct)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("KEM decap: {e}")))?;
-
-    let nonce = Nonce::from_slice(&nonce_enc[..12]);
-    let cipher = Aes256Gcm::new_from_slice(&shared_secret[..32])
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Cipher: {e}")))?;
-    let file_key = cipher.decrypt(nonce, &nonce_enc[12..])
-        .map_err(|_| EgoDesktopError::CryptoError(
-            "Decryption failed — this bundle was not encrypted for your key".into()
-        ))?;
-
-    let protected_key = crate::ledger::protect_key_hex(&hex::encode(&file_key))
+    let keypair = state.get_keypair()
+        .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+    let my_addr = Ledger::load().address;
+    let opened = open_share(&keypair, &my_addr, &bundle_str, pinned_dilithium)
+        .map_err(EgoDesktopError::CryptoError)?;
+    let protected_key = crate::ledger::protect_key_hex(&hex::encode(&opened.file_key))
         .map_err(EgoDesktopError::CryptoError)?;
     let now = chrono::Utc::now().timestamp();
 
-    let _guard = crate::ledger::TX_MUTEX.lock().await; 
-    let mut ledger = crate::ledger::Ledger::load();
-
-    let stored = crate::ledger::StoredFile {
-        cid:             cid.to_string(),
-        name:            display_name.clone(),
-        original_size:   0,
-        encrypted_size:  0,
-        duration_months: 1,
-        stored_at:       now,
-        expiry:          now + 30 * 86_400,
-        status:          "Received".into(),
-        key_nonce_hex:   protected_key,
-        local_path:      String::new(),
-        owner:           ledger.address.clone(),
-        from_egosafe:    true,
-        ..Default::default()
-    };
-
-    if !ledger.stored_files.iter().any(|f| f.cid == cid) {
-        ledger.stored_files.insert(0, stored.clone());
+    let stored = {
+        let _guard = crate::ledger::TX_MUTEX.lock().await;
+        let mut ledger = crate::ledger::Ledger::load();
+        let stored = match ledger.stored_files.iter_mut().find(|f| f.cid == opened.cid) {
+            Some(f) => {
+                if crate::ledger::unprotect_key_bytes(&f.key_nonce_hex).len() < 32 {
+                    f.key_nonce_hex = protected_key;
+                }
+                if f.name.is_empty() {
+                    f.name = opened.name.clone();
+                }
+                f.clone()
+            }
+            None => {
+                let s = crate::ledger::StoredFile {
+                    cid:             opened.cid.clone(),
+                    name:            opened.name.clone(),
+                    duration_months: 1,
+                    stored_at:       now,
+                    expiry:          now + 30 * 86_400,
+                    status:          "Received".into(),
+                    key_nonce_hex:   protected_key,
+                    local_path:      format!("sender:{}", opened.from_address),
+                    owner:           ledger.address.clone(),
+                    from_egosafe:    true,
+                    ..Default::default()
+                };
+                ledger.stored_files.insert(0, s.clone());
+                s
+            }
+        };
         ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
-    }
-
-    let from_short = if from_address.len() > 12 {
-        format!("{}…", &from_address[..12])
-    } else {
-        from_address.to_string()
+        stored
     };
+
+    let sender = crate::commands::messenger::contact_display_name(&opened.from_address);
     crate::commands::notifications::notify(
         &app,
         "File Received!",
-        &format!("\"{}\" from {} — open EgoSafe to download", display_name, from_short),
+        &format!("\"{}\" from {} — open EgoSafe to download", opened.name, sender),
     );
 
     Ok(stored)
+}
+
+#[cfg(test)]
+mod share_v3_tests {
+    use super::{open_share, seal_share};
+
+    const ALICE: &str = "egot1alicealicealicealicealicealicealicealice";
+    const BOB: &str = "egot1bobbobbobbobbobbobbobbobbobbobbobbobbob";
+
+    fn link(alice: &ego_core::KeyPair, bob: &ego_core::KeyPair, key: &[u8]) -> String {
+        seal_share(alice, ALICE, BOB, &bob.kyber_public_key().key_data, "egomfd1abc", "cat.jpg", key).unwrap()
+    }
+
+    #[test]
+    fn only_the_recipient_opens_it_and_gets_the_exact_key() {
+        let (alice, bob, eve) = (ego_core::KeyPair::generate(), ego_core::KeyPair::generate(), ego_core::KeyPair::generate());
+        let key = [7u8; 44];
+        let l = link(&alice, &bob, &key);
+        assert!(l.starts_with("egoshare3:egomfd1abc:"));
+        assert!(!l.contains(&hex::encode(key)), "the file key never appears in the link");
+        let got = open_share(&bob, BOB, &l, |_| None).unwrap();
+        assert_eq!((got.cid.as_str(), got.name.as_str(), got.from_address.as_str()), ("egomfd1abc", "cat.jpg", ALICE));
+        assert_eq!(got.file_key, key);
+        assert!(open_share(&eve, BOB, &l, |_| None).is_err(), "someone else's Kyber key cannot open it");
+    }
+
+    #[test]
+    fn a_changed_link_or_a_link_for_someone_else_is_refused() {
+        let (alice, bob) = (ego_core::KeyPair::generate(), ego_core::KeyPair::generate());
+        let l = link(&alice, &bob, &[1u8; 32]);
+        let renamed = l.replacen(":egot1alice", ":egot1mallo", 1);
+        assert!(open_share(&bob, BOB, &renamed, |_| None).unwrap_err().contains("signature"));
+        assert!(open_share(&bob, "egot1carol", &l, |_| None).unwrap_err().contains("signature"), "the signature names the recipient");
+        let mut parts: Vec<String> = l.split(':').map(String::from).collect();
+        parts[4] = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"virus.exe");
+        assert!(open_share(&bob, BOB, &parts.join(":"), |_| None).is_err());
+    }
+
+    #[test]
+    fn a_signer_other_than_the_pinned_key_is_refused() {
+        let (alice, bob, mallory) = (ego_core::KeyPair::generate(), ego_core::KeyPair::generate(), ego_core::KeyPair::generate());
+        let alice_pin = *blake3::hash(&alice.dilithium_public_key().key_data).as_bytes();
+        let pins = |a: &str| (a == ALICE).then_some(alice_pin);
+        assert!(open_share(&bob, BOB, &link(&alice, &bob, &[2u8; 32]), pins).is_ok());
+        let forged = seal_share(&mallory, ALICE, BOB, &bob.kyber_public_key().key_data, "egomfd1abc", "cat.jpg", &[2u8; 32]).unwrap();
+        assert!(open_share(&bob, BOB, &forged, |_| None).is_ok(), "without a pin the signature alone cannot name the sender");
+        assert!(open_share(&bob, BOB, &forged, pins).unwrap_err().contains("not the sender's key"));
+    }
+
+    #[test]
+    fn an_older_unsigned_link_still_opens_and_junk_does_not() {
+        let (alice, bob) = (ego_core::KeyPair::generate(), ego_core::KeyPair::generate());
+        let l = link(&alice, &bob, &[3u8; 32]);
+        let v2 = format!("egoshare2:{}", l.split(':').skip(1).take(5).collect::<Vec<_>>().join(":"));
+        assert_eq!(open_share(&bob, BOB, &v2, |_| None).unwrap().file_key, [3u8; 32]);
+        assert!(open_share(&bob, BOB, "egoshare1:egocid1abc:00:bmFtZQ==:egot1x", |_| None).is_err());
+        assert!(open_share(&bob, BOB, "egoshare3:a:b", |_| None).is_err());
+    }
 }
 
 // ── reset_storage ─────────────────────────────────────────────────────────────
@@ -1862,6 +1987,23 @@ mod plan_egusd_tests {
     }
 
     #[test]
+    fn the_small_plans_cost_less_from_the_cut() {
+        let cut = super::PLAN_PRICE_CUT_FROM_HEIGHT;
+        assert_eq!(plan_paid_in_egusd("credits_pay:59:plan:Basic:monthly", cut - 1), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:59:plan:Basic:monthly", cut), Some((50, 30 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:590:plan:Basic:annual", cut), Some((50, 365 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:149:plan:Pro:monthly", cut), Some((200, 30 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:148:plan:Pro:monthly", cut), None);
+        assert_eq!(plan_paid_in_egusd("credits_pay:399:plan:Max:monthly", cut), Some((1024, 30 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:3990:plan:Max:annual", cut), Some((1024, 365 * 86_400)));
+        assert_eq!(plan_paid_in_egusd("credits_pay:798:plan:Ultra:monthly", cut), None, "Ultra keeps its price");
+        assert_eq!(plan_paid_in_egusd("credits_pay:3999:plan:Mega:monthly", cut), Some((10240, 30 * 86_400)));
+        let listed: Vec<_> = super::plan_price_list(cut).into_iter().map(|p| (p.name, p.monthly_usd, p.annual_usd)).collect();
+        assert_eq!(listed[..3], [("Basic", 0.59, 5.90), ("Pro", 1.49, 14.90), ("Max", 3.99, 39.90)]);
+        assert_eq!(super::plan_price_list(cut - 1)[0].monthly_usd, 0.79);
+    }
+
+    #[test]
     fn an_underpaid_or_made_up_plan_does_not() {
         assert_eq!(plan_paid_in_egusd("credits_pay:198:plan:Pro:monthly", 0), None);
         assert_eq!(plan_paid_in_egusd("credits_pay:99999:plan:Huge:monthly", u64::MAX), None);
@@ -1943,12 +2085,15 @@ mod renewal_tests {
         let plan = ActivePlan { name: "Pro".into(), billing: "monthly".into(), gb: 200, expires_at: 30 * DAY };
         let (_, usd, _) = super::plan_price_usd("Pro", "monthly", 0).unwrap();
         let price = crate::chain_db::usd_to_credits(usd);
-        assert!(low_balance_warning(&plan, 19 * DAY, true, 0).is_none(), "more than 10 days left");
-        let w = low_balance_warning(&plan, 21 * DAY, true, price - 1).unwrap();
+        assert!(low_balance_warning(&plan, 19 * DAY, true, 0, 0).is_none(), "more than 10 days left");
+        let w = low_balance_warning(&plan, 21 * DAY, true, price - 1, 0).unwrap();
         assert!(w.contains("Pro plan (monthly)") && w.contains("EGUSD"), "{w}");
-        assert!(low_balance_warning(&plan, 21 * DAY, true, price).is_none(), "enough to renew");
-        assert!(low_balance_warning(&plan, 21 * DAY, false, 0).is_none(), "auto-renew off");
-        assert!(low_balance_warning(&plan, 30 * DAY, true, 0).is_none(), "the plan has ended");
+        assert!(low_balance_warning(&plan, 21 * DAY, true, price, 0).is_none(), "enough to renew");
+        assert!(low_balance_warning(&plan, 21 * DAY, false, 0, 0).is_none(), "auto-renew off");
+        assert!(low_balance_warning(&plan, 30 * DAY, true, 0, 0).is_none(), "the plan has ended");
+        let cut = super::PLAN_PRICE_CUT_FROM_HEIGHT;
+        assert!(low_balance_warning(&plan, 21 * DAY, true, 149, cut).is_none(), "after the cut 1.49 EGUSD renews Pro");
+        assert!(low_balance_warning(&plan, 21 * DAY, true, 149, cut - 1).is_some(), "before the cut it still costs 1.99");
     }
 
     #[test]

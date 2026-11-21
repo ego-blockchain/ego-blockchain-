@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/api/dialog';
@@ -227,7 +227,13 @@ const StoragePage: React.FC = () => {
   const [renewProblem, setRenewProblem] = useState<string | null>(null);
   const [renewWarning, setRenewWarning] = useState<string | null>(null);
   const [openPlans, setOpenPlans] = useState<string[]>([]);
-  const visiblePlans = PLANS.filter(p => ALWAYS_OPEN.includes(p.id) || openPlans.includes(p.name));
+  const [livePrices, setLivePrices] = useState<{ name: string; monthly_usd: number; annual_usd: number }[]>([]);
+  const plans = useMemo(() => PLANS.map(p => {
+    const live = livePrices.find(l => l.name === p.name);
+    return live ? { ...p, priceMonthlyUsd: live.monthly_usd, priceAnnualUsd: live.annual_usd } : p;
+  }), [livePrices]);
+  const visiblePlans = plans.filter(p => ALWAYS_OPEN.includes(p.id) || openPlans.includes(p.name));
+  const cheapestPaid = visiblePlans.filter(p => p.priceMonthlyUsd > 0).sort((a, b) => a.priceMonthlyUsd - b.priceMonthlyUsd)[0];
   const largestPlanGb = Math.max(...visiblePlans.map(p => p.gb));
 
   async function refreshPlan() {
@@ -238,8 +244,10 @@ const StoragePage: React.FC = () => {
         renew_problem: string | null;
         renew_warning: string | null;
         open_plans?: string[];
+        prices?: { name: string; monthly_usd: number; annual_usd: number }[];
       }>('get_storage_plan');
       setOpenPlans(status.open_plans ?? []);
+      setLivePrices(status.prices ?? []);
       setRenewProblem(status.renew_problem);
       setRenewWarning(status.renew_warning);
       const pending = pendingSubRef.current;
@@ -387,7 +395,7 @@ const StoragePage: React.FC = () => {
   }
 
   async function handleSubscribe() {
-    const plan = PLANS.find(p => p.id === subPlan);
+    const plan = plans.find(p => p.id === subPlan);
     if (!plan || plan.id === 'free') {
       setShowSubModal(false);
       return;
@@ -667,7 +675,7 @@ const StoragePage: React.FC = () => {
             const usedBytes  = files.filter(f => f.status === 'Active' || f.status === 'PendingSync').reduce((s, f) => s + f.original_size, 0);
             const now        = Math.floor(Date.now() / 1000);
             const subValid   = subscription && subscription.expiresAt > now;
-            const planObj    = subValid ? PLANS.find(p => p.id === subscription!.plan) : PLANS[0];
+            const planObj    = subValid ? plans.find(p => p.id === subscription!.plan) : plans[0];
             const capGb      = subValid ? subscription!.gb : FREE_GB;
             const capBytes   = capGb * 1e9;
             const usedPct    = Math.min(100, Math.round((usedBytes / capBytes) * 100));
@@ -742,7 +750,7 @@ const StoragePage: React.FC = () => {
                   )}
                   {!subValid && !nearLimit && (
                     <div className="text-xs text-emerald-400">
-                      Need more room? Plans start at 0.79 EGUSD a month for 50 GB, up to {largestPlanGb >= 1024 ? `${Math.round(largestPlanGb / 1024)} TB` : `${largestPlanGb} GB`}.
+                      Need more room? Plans start at {(cheapestPaid?.priceMonthlyUsd ?? 0.79).toFixed(2)} EGUSD a month for {cheapestPaid?.gb ?? 50} GB, up to {largestPlanGb >= 1024 ? `${Math.round(largestPlanGb / 1024)} TB` : `${largestPlanGb} GB`}.
                     </div>
                   )}
                 </div>
@@ -1176,7 +1184,7 @@ const StoragePage: React.FC = () => {
                     <>
                       <h2 className="text-lg font-bold">Manage Subscription</h2>
                       <p className="text-xs text-gray-300">
-                        Current plan: <span className="text-blue-300 font-semibold">{PLANS.find(p => p.id === subscription.plan)?.name ?? subscription.plan}</span>
+                        Current plan: <span className="text-blue-300 font-semibold">{plans.find(p => p.id === subscription.plan)?.name ?? subscription.plan}</span>
                         {' · '}{subscription.gb >= 1024 ? `${subscription.gb / 1024} TB` : `${subscription.gb} GB`}
                         {' · '}expires {new Date(subscription.expiresAt * 1000).toLocaleDateString()}
                       </p>
@@ -1411,7 +1419,7 @@ const StoragePage: React.FC = () => {
                     : subPlan === 'free'
                     ? 'Continue with Free'
                     : (() => {
-                        const p = PLANS.find(pl => pl.id === subPlan);
+                        const p = plans.find(pl => pl.id === subPlan);
                         if (!p) return manageMode ? 'Switch Plan' : 'Subscribe';
                         const usd      = subBilling === 'annual' ? p.priceAnnualUsd : p.priceMonthlyUsd;
                         const egoc     = (usd / egocPriceUsd).toFixed(2);
