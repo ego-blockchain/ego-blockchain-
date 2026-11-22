@@ -13,6 +13,7 @@ interface Location {
   city?: string;
   region?: string;
   country?: string;
+  source?: string;
 }
 
 interface CoverageStatus {
@@ -949,7 +950,7 @@ const CoveragePage: React.FC = () => {
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-400">Source</span>
-                <span className="text-gray-500 text-xs">IP geolocation</span>
+                <span className="text-gray-500 text-xs">{loc?.source === 'device' ? 'Device location (nearest city)' : 'IP geolocation'}</span>
               </div>
               <div className="flex justify-between items-center pt-1 border-t border-gray-700/50 mt-1">
                 <span className="text-gray-400">VPN / Proxy</span>

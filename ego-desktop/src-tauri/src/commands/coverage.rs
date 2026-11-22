@@ -576,6 +576,7 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap_or_default();
+    let device = crate::device_location::device_city().await;
 
     if let Ok(resp) = client.get("http://ip-api.com/json/?fields=status,message,country,regionName,city,lat,lon,isp,org,proxy,hosting,query").send().await {
         if let Ok(data) = resp.json::<IpApiResponse>().await {
@@ -588,7 +589,9 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
                     city: data.city.clone(),
                     region: data.region_name.clone(),
                     country: data.country.clone(),
+                    source: Some(crate::device_location::SOURCE_IP.to_string()),
                 };
+                let loc = device.unwrap_or(loc);
                 let vpn_reason = detect_vpn(&data);
                 let is_vpn = vpn_reason.is_some() || data.proxy.unwrap_or(false) || data.hosting.unwrap_or(false);
                 let reason_str = vpn_reason.unwrap_or_else(|| {
@@ -603,7 +606,7 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
     }
 
     let public_ip = crate::p2p::get_public_endpoint().await;
-    (None, false, String::new(), public_ip)
+    (device, false, String::new(), public_ip)
 }
 
 #[cfg(test)]

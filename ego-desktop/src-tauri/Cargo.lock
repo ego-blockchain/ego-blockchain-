@@ -2545,6 +2545,7 @@ dependencies = [
  "wat",
  "webkit2gtk",
  "winapi",
+ "windows 0.62.2",
  "winreg 0.52.0",
  "winterfell",
  "x25519-dalek",

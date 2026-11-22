@@ -17,6 +17,7 @@ mod market_chain;
 mod escrow;
 mod storage_proof;
 mod coverage_proof;
+mod device_location;
 mod sideband;
 mod sideband_spool;
 mod sideband_lan;

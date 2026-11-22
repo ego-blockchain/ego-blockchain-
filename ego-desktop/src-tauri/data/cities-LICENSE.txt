@@ -1,0 +1,7 @@
+cities.tsv is built from the GeoNames geographical database (https://www.geonames.org):
+cities15000.txt, admin1CodesASCII.txt and countryInfo.txt, downloaded 22 November 2026.
+
+Licence: Creative Commons Attribution 4.0 (https://creativecommons.org/licenses/by/4.0/).
+
+Changes: dropped neighbourhoods, localities and abandoned or historical places; kept each city's name, first-level region, country and coordinates
+(rounded to 0.01 degrees), and wrote them as tab-separated lines.

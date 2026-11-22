@@ -127,6 +127,8 @@ pub struct Location {
     pub city: Option<String>,
     pub region: Option<String>,
     pub country: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
