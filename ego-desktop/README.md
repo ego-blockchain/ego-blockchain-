@@ -117,12 +117,10 @@ If NAT hole punching fails, messages relay end-to-end through public relay nodes
 
 | Platform | File |
 |----------|------|
-| **Windows** | `Ego Desktop_*_x64_en-US.msi` ← recommended |
-| **Windows** (alt) | `Ego Desktop_*_x64-setup.exe` |
+| **Windows** | `Ego Desktop_*_x64_en-US.msi` |
 | **macOS** (M1/M2/M3/M4) | `Ego Desktop_*_aarch64.dmg` |
 | **macOS** (Intel) | `Ego Desktop_*_x64.dmg` |
-| **Linux** (Debian/Ubuntu) | `Ego Desktop_*_amd64.deb` |
-| **Linux** (universal) | `Ego Desktop_*_amd64.AppImage` |
+| **Linux** | `Ego Desktop_*_amd64.AppImage` |
 
 Installers are attached to each [GitHub Release](../../releases).
 

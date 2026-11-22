@@ -73,7 +73,7 @@
     },
     "bundle": {
       "active": true,
-      "targets": "all",
+      "targets": ["msi", "appimage", "app", "dmg"],
       "identifier": "com.ego.desktop",
       "icon": [
         "icons/32x32.png",

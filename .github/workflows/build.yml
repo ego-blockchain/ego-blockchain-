@@ -35,12 +35,10 @@ env:
 
     | Platform | File |
     |----------|------|
-    | **Windows** | `Ego Desktop_*_x64_en-US.msi` ← recommended |
-    | **Windows** (alt) | `Ego Desktop_*_x64-setup.exe` |
+    | **Windows** | `Ego Desktop_*_x64_en-US.msi` |
     | **macOS** (M1/M2/M3/M4) | `Ego Desktop_*_aarch64.dmg` |
     | **macOS** (Intel) | `Ego Desktop_*_x64.dmg` |
-    | **Linux** (Debian/Ubuntu) | `Ego Desktop_*_amd64.deb` |
-    | **Linux** (universal) | `Ego Desktop_*_amd64.AppImage` |
+    | **Linux** | `Ego Desktop_*_amd64.AppImage` |
 
     ### Windows
     1. Download the `.msi` file and run it — follow the installer wizard.
@@ -55,8 +53,7 @@ env:
        ```
 
     ### Linux
-    1. **Debian/Ubuntu**: `sudo dpkg -i Ego.Desktop_*_amd64.deb`
-    2. **AppImage**: `chmod +x Ego.Desktop_*_amd64.AppImage && ./Ego.Desktop_*_amd64.AppImage`
+    1. `chmod +x Ego.Desktop_*_amd64.AppImage && ./Ego.Desktop_*_amd64.AppImage`
 
 jobs:
   release:
@@ -219,7 +216,7 @@ jobs:
           args: --target x86_64-apple-darwin
           releaseId: ${{ needs.release.outputs.id }}
 
-  # ── Linux (x64 — .deb + .AppImage) ───────────────────────────────────────
+  # ── Linux (x64, .AppImage) ───────────────────────────────────────
   build-linux:
     name: Linux x64
     runs-on: ubuntu-22.04
@@ -321,7 +318,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.release.outputs.id }}
         run: |
-          for f in ego-desktop/src-tauri/target/release/bundle/appimage/*.AppImage ego-desktop/src-tauri/target/release/bundle/deb/*.deb; do
+          for f in ego-desktop/src-tauri/target/release/bundle/appimage/*.AppImage; do
             [ -f "$f" ] || continue
             name=$(basename "$f")
             curl -sSf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
