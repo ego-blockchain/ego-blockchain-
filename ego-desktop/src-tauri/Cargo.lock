@@ -2543,6 +2543,7 @@ dependencies = [
  "urego-compiler",
  "uuid",
  "wat",
+ "webkit2gtk",
  "winapi",
  "winreg 0.52.0",
  "winterfell",

@@ -267,6 +267,35 @@ fn show_main(window: &tauri::Window) {
     let _ = window.set_focus();
 }
 
+const WINDOW_MIN_WIDTH: f64 = 900.0;
+const WINDOW_MIN_HEIGHT: f64 = 605.0;
+
+fn small_window_zoom(width: u32, height: u32, scale: f64) -> Option<f64> {
+    if width == 0 || height == 0 || !(scale > 0.0) {
+        return None;
+    }
+    let fit = (width as f64 / scale / WINDOW_MIN_WIDTH).min(height as f64 / scale / WINDOW_MIN_HEIGHT);
+    Some(((fit * 100.0).floor() / 100.0).clamp(0.5, 1.0))
+}
+
+#[cfg(target_os = "linux")]
+fn fit_small_window(window: &tauri::Window, size: tauri::PhysicalSize<u32>, scale: f64) {
+    static APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(zoom) = small_window_zoom(size.width, size.height, scale) else {
+        return;
+    };
+    if APPLIED.swap(zoom.to_bits(), std::sync::atomic::Ordering::Relaxed) == zoom.to_bits() {
+        return;
+    }
+    let _ = window.with_webview(move |webview| {
+        use webkit2gtk::WebViewExt;
+        webview.inner().set_zoom_level(zoom);
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fit_small_window(_window: &tauri::Window, _size: tauri::PhysicalSize<u32>, _scale: f64) {}
+
 fn acquire_single_instance_lock() -> bool {
     let port: u16 = std::env::var("EGO_LOCK_PORT")
         .ok().and_then(|v| v.parse().ok())
@@ -942,6 +971,13 @@ fn main() {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     hide_main(event.window());
                     api.prevent_close();
+                }
+                tauri::WindowEvent::Resized(size) => {
+                    let scale = event.window().scale_factor().unwrap_or(1.0);
+                    fit_small_window(event.window(), *size, scale);
+                }
+                tauri::WindowEvent::ScaleFactorChanged { scale_factor, new_inner_size, .. } => {
+                    fit_small_window(event.window(), *new_inner_size, *scale_factor);
                 }
                 tauri::WindowEvent::Focused(true) => {
                     use tauri::Manager;
@@ -1855,6 +1891,32 @@ mod log_trim_tests {
         std::io::Write::write_all(&mut appender, b"next").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"next", "a writer in append mode carries on at the new end");
         trim_log(&dir.path().join("missing.log"), 1, 1);
+    }
+}
+
+#[cfg(test)]
+mod small_window_tests {
+    use super::{small_window_zoom, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH};
+
+    #[test]
+    fn a_window_below_the_minimum_shrinks_the_page_to_fit_and_never_below_half() {
+        assert_eq!(small_window_zoom(1200, 805, 1.0), Some(1.0));
+        assert_eq!(small_window_zoom(900, 605, 1.0), Some(1.0));
+        assert_eq!(small_window_zoom(1800, 1210, 2.0), Some(1.0));
+        assert_eq!(small_window_zoom(720, 900, 1.0), Some(0.8));
+        assert_eq!(small_window_zoom(1440, 900, 2.0), Some(0.74));
+        assert_eq!(small_window_zoom(1366, 400, 1.0), Some(0.66));
+        assert_eq!(small_window_zoom(200, 150, 1.0), Some(0.5));
+        assert_eq!(small_window_zoom(0, 600, 1.0), None);
+        assert_eq!(small_window_zoom(900, 605, 0.0), None);
+    }
+
+    #[test]
+    fn the_fit_uses_the_same_minimum_as_the_window_config() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let window = &conf["tauri"]["windows"][0];
+        assert_eq!(window["minWidth"].as_f64(), Some(WINDOW_MIN_WIDTH));
+        assert_eq!(window["minHeight"].as_f64(), Some(WINDOW_MIN_HEIGHT));
     }
 }
 
