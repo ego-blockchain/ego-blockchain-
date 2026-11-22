@@ -50,6 +50,7 @@ bins/
   ego-node             headless full node
   ego-cli              command-line wallet and chain tools
   ego-relay            relay / rendezvous server
+  ego-rigs             one terminal view of the EGOC earned by many computers
   urego                Urego contract compiler CLI
 
 ego-desktop/           Tauri desktop app (Rust backend + React frontend)

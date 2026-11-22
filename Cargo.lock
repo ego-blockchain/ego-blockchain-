@@ -2449,6 +2449,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ego-rigs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "colored",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ego-rollup"
 version = "0.1.0"
 dependencies = [

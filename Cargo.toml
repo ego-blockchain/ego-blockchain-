@@ -15,6 +15,7 @@ members = [
   "crates/ego-stark",
   "bins/ego-cli",
   "bins/ego-relay",
+  "bins/ego-rigs",
   "crates/ego-typed-signing",
   "crates/ego-wallet-core",
 ]
