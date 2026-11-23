@@ -3,21 +3,25 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RPC: &str = "http://127.0.0.1:47395";
 const HOUR: i64 = 3_600;
 const DAY: i64 = 24 * HOUR;
 const WEEK: i64 = 7 * DAY;
+const ONLINE_SECS: i64 = 15 * 60;
 const FIRST_PAGE: u64 = 5_000;
 const MAX_PAGE: u64 = 1_000_000;
 const PARALLEL: usize = 8;
 const BEHIND_BLOCKS: u64 = 30;
+const RESTART_EXIT_CODE: i32 = 75;
 
 #[derive(Parser)]
-#[command(name = "ego-rigs", version, about = "See the EGOC earned by all your Ego Desktop computers as one")]
+#[command(name = "ego-rigs", version, about = "Run Ego nodes on servers and computers without a screen, and see what all of them earn as one")]
 struct Cli {
     #[arg(long, env = "EGO_RPC", default_value = DEFAULT_RPC, global = true, help = "The Ego node to read from")]
     rpc: String,
@@ -27,13 +31,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    #[command(about = "Run the Ego node on this computer with no window, and start it again if it stops to restart")]
+    Start {
+        #[arg(long, env = "EGO_DESKTOP_APP", help = "Path to Ego Desktop (the .exe, the app's binary or the .AppImage)")]
+        app: Option<PathBuf>,
+    },
+    #[command(about = "Show the 24 words that restore this computer's wallet")]
+    Phrase {
+        #[arg(long, env = "EGO_DESKTOP_APP", help = "Path to Ego Desktop (the .exe, the app's binary or the .AppImage)")]
+        app: Option<PathBuf>,
+    },
+    #[command(about = "Print this computer's Ego Desktop wallet address, to add it on your main computer")]
+    Here,
     #[command(about = "Add a computer by a name you choose and its wallet address")]
     Add { name: String, address: String },
     #[command(about = "Remove a computer")]
     Remove { name: String },
     #[command(about = "List the saved computers")]
     List,
-    #[command(about = "Show every computer's balance and rewards, and the total (the default)")]
+    #[command(about = "Show every computer's balance, rewards and state, and the total (the default)")]
     Show {
         #[arg(long, help = "Print JSON instead of a table")]
         json: bool,
@@ -43,8 +59,6 @@ enum Cmd {
         #[arg(long, default_value_t = 60, help = "Seconds between refreshes")]
         every: u64,
     },
-    #[command(about = "Print this computer's Ego Desktop wallet address, to add it on your main computer")]
-    Here,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -66,6 +80,8 @@ struct Report {
     rewards_24h_uegoc: u64,
     rewards_7d_uegoc: u64,
     last_reward_at: Option<i64>,
+    last_seen_at: Option<i64>,
+    version: Option<String>,
     status: &'static str,
     error: Option<String>,
 }
@@ -73,6 +89,7 @@ struct Report {
 #[derive(Serialize, Default)]
 struct Totals {
     computers: usize,
+    online: usize,
     earning: usize,
     balance_uegoc: u64,
     rewards_24h_uegoc: u64,
@@ -82,6 +99,7 @@ struct Totals {
 struct Health {
     height: u64,
     tip: u64,
+    version: Option<String>,
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -90,6 +108,12 @@ struct Sums {
     week: u64,
     last: Option<i64>,
     oldest: Option<i64>,
+}
+
+#[derive(Clone, Default)]
+struct Seen {
+    at: Option<i64>,
+    version: Option<String>,
 }
 
 struct Node {
@@ -168,7 +192,7 @@ impl Node {
 
     fn unreachable(&self) -> String {
         format!(
-            "no Ego node answered at {}. Start Ego Desktop on this computer, or point --rpc at a node you run",
+            "no Ego node answered at {}. Start Ego Desktop on this computer (or `ego-rigs start`), or point --rpc at a node you run",
             self.url
         )
     }
@@ -200,7 +224,25 @@ impl Node {
             .json()
             .context("the node's answer was not JSON")?;
         let height = v["block_height"].as_u64().unwrap_or(0);
-        Ok(Health { height, tip: v["chain_tip"].as_u64().unwrap_or(height) })
+        Ok(Health {
+            height,
+            tip: v["chain_tip"].as_u64().unwrap_or(height),
+            version: v["version"].as_str().map(String::from),
+        })
+    }
+
+    fn seen(&self, rigs: &[Rig]) -> Option<HashMap<String, Seen>> {
+        let addresses: Vec<&str> = rigs.iter().map(|r| r.address.as_str()).collect();
+        let list = self.call("node.seen", json!({ "addresses": addresses })).ok()?;
+        let mut out = HashMap::new();
+        for item in list.as_array()? {
+            let Some(address) = item["address"].as_str() else { continue };
+            out.insert(
+                address.to_string(),
+                Seen { at: item["last_seen"].as_i64().map(seconds), version: item["version"].as_str().map(String::from) },
+            );
+        }
+        Some(out)
     }
 }
 
@@ -219,6 +261,14 @@ fn seconds(t: i64) -> i64 {
 fn valid_address(a: &str) -> bool {
     let Some((hrp, data)) = a.split_once('1') else { return false };
     matches!(hrp, "egot" | "ego") && data.len() >= 20 && data.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+fn version_parts(v: &str) -> Vec<u64> {
+    v.trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect()
+}
+
+fn older_than(v: &str, reference: &str) -> bool {
+    version_parts(v) < version_parts(reference)
 }
 
 fn sum_rewards(txs: &[Value], address: &str, now: i64) -> Sums {
@@ -259,26 +309,45 @@ fn rewards(node: &Node, address: &str, now: i64) -> Result<Sums> {
     }
 }
 
-fn status_of(last: Option<i64>, now: i64) -> &'static str {
-    match last.map(|t| now - t) {
+fn status_of(last_reward: Option<i64>, seen: Option<&Seen>, now: i64) -> &'static str {
+    let rewarded = last_reward.map(|t| now - t);
+    if rewarded.is_some_and(|a| a < 2 * HOUR) {
+        return "earning";
+    }
+    if let Some(seen) = seen {
+        let online = seen.at.is_some_and(|t| now - t < ONLINE_SECS);
+        return match (online, last_reward) {
+            (true, None) => "online, no rewards yet",
+            (true, Some(_)) => "online, not earning",
+            (false, _) => "offline",
+        };
+    }
+    match rewarded {
         None => "no rewards yet",
-        Some(a) if a < 2 * HOUR => "earning",
         Some(a) if a < DAY => "quiet",
         Some(_) => "stopped",
     }
 }
 
-fn report(node: &Node, rig: &Rig, now: i64) -> Report {
-    let mut r = Report {
+fn blank_report(rig: &Rig) -> Report {
+    Report {
         name: rig.name.clone(),
         address: rig.address.clone(),
         balance_uegoc: 0,
         rewards_24h_uegoc: 0,
         rewards_7d_uegoc: 0,
         last_reward_at: None,
+        last_seen_at: None,
+        version: None,
         status: "error",
         error: None,
-    };
+    }
+}
+
+fn report(node: &Node, rig: &Rig, seen: Option<&Seen>, now: i64) -> Report {
+    let mut r = blank_report(rig);
+    r.last_seen_at = seen.and_then(|s| s.at);
+    r.version = seen.and_then(|s| s.version.clone());
     let balance = node.call("wallet.getBalance", json!({ "address": rig.address }));
     let sums = rewards(node, &rig.address, now);
     match (balance, sums) {
@@ -287,36 +356,40 @@ fn report(node: &Node, rig: &Rig, now: i64) -> Report {
             r.rewards_24h_uegoc = s.day;
             r.rewards_7d_uegoc = s.week;
             r.last_reward_at = s.last;
-            r.status = status_of(s.last, now);
+            r.status = status_of(s.last, seen, now);
         }
         (Err(e), _) | (_, Err(e)) => r.error = Some(format!("{e:#}")),
     }
     r
 }
 
-fn fetch_all(node: &Node, rigs: &[Rig], now: i64) -> Vec<Report> {
+fn fetch_all(node: &Node, rigs: &[Rig], now: i64) -> (Vec<Report>, bool) {
+    let seen = node.seen(rigs);
+    let known = seen.is_some();
+    let seen = seen.unwrap_or_default();
     let mut out = Vec::with_capacity(rigs.len());
     for chunk in rigs.chunks(PARALLEL) {
         std::thread::scope(|s| {
-            let handles: Vec<_> = chunk.iter().map(|rig| s.spawn(move || report(node, rig, now))).collect();
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|rig| {
+                    let entry = if known { Some(seen.get(&rig.address).cloned().unwrap_or_default()) } else { None };
+                    s.spawn(move || report(node, rig, entry.as_ref(), now))
+                })
+                .collect();
             for (rig, h) in chunk.iter().zip(handles) {
-                out.push(h.join().unwrap_or_else(|_| Report {
-                    name: rig.name.clone(),
-                    address: rig.address.clone(),
-                    balance_uegoc: 0,
-                    rewards_24h_uegoc: 0,
-                    rewards_7d_uegoc: 0,
-                    last_reward_at: None,
-                    status: "error",
-                    error: Some("the lookup crashed".into()),
+                out.push(h.join().unwrap_or_else(|_| {
+                    let mut r = blank_report(rig);
+                    r.error = Some("the lookup crashed".into());
+                    r
                 }));
             }
         });
     }
-    out
+    (out, known)
 }
 
-fn totals(reports: &[Report]) -> Totals {
+fn totals(reports: &[Report], now: i64) -> Totals {
     let mut t = Totals { computers: reports.len(), ..Totals::default() };
     for r in reports {
         t.balance_uegoc += r.balance_uegoc;
@@ -324,6 +397,9 @@ fn totals(reports: &[Report]) -> Totals {
         t.rewards_7d_uegoc += r.rewards_7d_uegoc;
         if r.status == "earning" {
             t.earning += 1;
+        }
+        if r.last_seen_at.is_some_and(|at| now - at < ONLINE_SECS) {
+            t.online += 1;
         }
     }
     t
@@ -345,8 +421,8 @@ fn egoc(uegoc: u64) -> String {
     format!("{}.{:02}", group(uegoc / 1_000_000), (uegoc % 1_000_000) / 10_000)
 }
 
-fn ago(last: Option<i64>, now: i64) -> String {
-    let Some(t) = last else { return "never".into() };
+fn ago(at: Option<i64>, now: i64) -> String {
+    let Some(t) = at else { return "never".into() };
     let a = (now - t).max(0);
     if a < 60 {
         "just now".into()
@@ -367,23 +443,35 @@ fn short(a: &str) -> String {
     }
 }
 
+fn computers(n: usize) -> String {
+    if n == 1 {
+        "1 computer".into()
+    } else {
+        format!("{n} computers")
+    }
+}
+
 fn paint(status: &str, text: &str) -> String {
     match status {
         "earning" => text.green().to_string(),
+        "online, no rewards yet" | "online, not earning" => text.cyan().to_string(),
         "quiet" => text.yellow().to_string(),
-        "stopped" | "error" => text.red().to_string(),
+        "stopped" | "offline" | "error" => text.red().to_string(),
         _ => text.dimmed().to_string(),
     }
 }
 
+const COLUMNS: usize = 9;
+
 fn render(node: &Node, rigs: &[Rig]) -> Result<String> {
     let health = node.health()?;
     let now = now();
-    let reports = fetch_all(node, rigs, now);
-    let t = totals(&reports);
+    let (reports, seen_known) = fetch_all(node, rigs, now);
+    let t = totals(&reports, now);
 
-    let head: [String; 7] = ["Computer", "Address", "Balance", "Last 24 h", "Last 7 days", "Last reward", "Status"].map(String::from);
-    let rows: Vec<[String; 7]> = reports
+    let head: [String; COLUMNS] =
+        ["Computer", "Address", "Balance", "Last 24 h", "Last 7 days", "Last reward", "Seen", "Version", "Status"].map(String::from);
+    let rows: Vec<[String; COLUMNS]> = reports
         .iter()
         .map(|r| {
             [
@@ -393,28 +481,32 @@ fn render(node: &Node, rigs: &[Rig]) -> Result<String> {
                 egoc(r.rewards_24h_uegoc),
                 egoc(r.rewards_7d_uegoc),
                 ago(r.last_reward_at, now),
+                if seen_known { ago(r.last_seen_at, now) } else { "-".into() },
+                r.version.clone().unwrap_or_else(|| "-".into()),
                 r.status.to_string(),
             ]
         })
         .collect();
-    let total: [String; 7] = [
+    let total: [String; COLUMNS] = [
         "All computers".into(),
         computers(t.computers),
         egoc(t.balance_uegoc),
         egoc(t.rewards_24h_uegoc),
         egoc(t.rewards_7d_uegoc),
         String::new(),
+        if seen_known { format!("{} online", t.online) } else { String::new() },
+        String::new(),
         format!("{} earning", t.earning),
     ];
 
-    let mut w = [0usize; 7];
+    let mut w = [0usize; COLUMNS];
     for row in std::iter::once(&head).chain(rows.iter()).chain(std::iter::once(&total)) {
         for (i, c) in row.iter().enumerate() {
             w[i] = w[i].max(c.chars().count());
         }
     }
-    let right = [false, false, true, true, true, false, false];
-    let cells = |row: &[String; 7]| -> Vec<String> {
+    let right = [false, false, true, true, true, false, false, false, false];
+    let cells = |row: &[String; COLUMNS]| -> Vec<String> {
         row.iter()
             .enumerate()
             .map(|(i, c)| if right[i] { format!("{:>1$}", c, w[i]) } else { format!("{:<1$}", c, w[i]) })
@@ -425,16 +517,28 @@ fn render(node: &Node, rigs: &[Rig]) -> Result<String> {
     out.push_str(&format!("{}\n", cells(&head).join("  ").trim_end().bold()));
     for (r, row) in reports.iter().zip(&rows) {
         let mut c = cells(row);
-        c[6] = paint(r.status, &c[6]);
+        if let (Some(v), Some(main)) = (&r.version, &health.version) {
+            if older_than(v, main) {
+                c[7] = c[7].yellow().to_string();
+            }
+        }
+        c[8] = paint(r.status, &c[8]);
         out.push_str(&format!("{}\n", c.join("  ").trim_end()));
         if let Some(e) = &r.error {
             out.push_str(&format!("  {}\n", e.red()));
         }
     }
-    out.push_str(&format!("{}\n", "-".repeat(w.iter().sum::<usize>() + 2 * (w.len() - 1))));
+    out.push_str(&format!("{}\n", "-".repeat(w.iter().sum::<usize>() + 2 * (COLUMNS - 1))));
     out.push_str(&format!("{}\n\n", cells(&total).join("  ").trim_end().bold()));
     out.push_str(&format!("Amounts are in EGOC. Average over the last 7 days: {} EGOC a day.\n", egoc(t.rewards_7d_uegoc / 7)));
-    out.push_str(&format!("Read from the Ego node at {} (block {}).\n", node.url, group(health.height)));
+    let version = health.version.as_deref().map(|v| format!(", Ego Desktop {v}")).unwrap_or_default();
+    out.push_str(&format!("Read from the Ego node at {} (block {}{}).\n", node.url, group(health.height), version));
+    if !seen_known {
+        out.push_str(&format!(
+            "{}\n",
+            "That node is older than Ego Desktop 0.3.701, so Seen and Version stay empty until it is updated.".dimmed()
+        ));
+    }
     if health.tip > health.height + BEHIND_BLOCKS {
         out.push_str(&format!(
             "{}\n",
@@ -481,7 +585,10 @@ fn here() -> Result<()> {
         }
     }
     if wallets.is_empty() {
-        bail!("no Ego Desktop wallet found in {}. Open Ego Desktop on this computer and create a wallet first", dir.display());
+        bail!(
+            "no Ego Desktop wallet found in {}. Run `ego-rigs start` once (or open Ego Desktop) to create one",
+            dir.display()
+        );
     }
     for (name, addr, active) in &wallets {
         let label = if *active { " (in use)" } else { "" };
@@ -492,12 +599,86 @@ fn here() -> Result<()> {
     Ok(())
 }
 
-fn computers(n: usize) -> String {
-    if n == 1 {
-        "1 computer".into()
+fn app_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if cfg!(windows) {
+        for base in ["ProgramFiles", "ProgramW6432", "LOCALAPPDATA"].iter().filter_map(|v| env_dir(v)) {
+            out.push(base.join("Ego Desktop").join("Ego Desktop.exe"));
+            out.push(base.join("Programs").join("Ego Desktop").join("Ego Desktop.exe"));
+        }
+    } else if cfg!(target_os = "macos") {
+        for base in [PathBuf::from("/Applications"), home().join("Applications")] {
+            out.push(base.join("Ego Desktop.app").join("Contents").join("MacOS").join("Ego Desktop"));
+            out.push(base.join("Ego Desktop.app").join("Contents").join("MacOS").join("ego-desktop"));
+        }
     } else {
-        format!("{n} computers")
+        let dirs = [std::env::current_dir().unwrap_or_default(), home().join("Applications"), home().join("Downloads"), home(), PathBuf::from("/opt/ego")];
+        let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
+        for d in dirs {
+            let Ok(entries) = fs::read_dir(&d) else { continue };
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                if name.contains("ego") && name.ends_with(".appimage") {
+                    let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
+                    found.push((modified, e.path()));
+                }
+            }
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0));
+        out.extend(found.into_iter().map(|(_, p)| p));
+        out.push(PathBuf::from("/usr/bin/ego-desktop"));
     }
+    out
+}
+
+fn find_app(given: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = given {
+        if p.is_file() {
+            return Ok(p);
+        }
+        bail!("{} is not a file", p.display());
+    }
+    app_candidates().into_iter().find(|p| p.is_file()).context(
+        "Ego Desktop was not found on this computer. Install it from egoblockchain.com/download, or pass its path with --app (on Linux, the .AppImage)",
+    )
+}
+
+fn app_command(app: &Path) -> Command {
+    let mut cmd = Command::new(app);
+    if app.extension().is_some_and(|e| e.eq_ignore_ascii_case("appimage")) {
+        cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
+    }
+    cmd
+}
+
+fn start(app: Option<PathBuf>) -> Result<()> {
+    let app = find_app(app)?;
+    println!("Starting {} with no window. Press Ctrl+C to stop.", app.display());
+    loop {
+        let status = app_command(&app)
+            .arg("--server")
+            .env("EGO_HEADLESS", "1")
+            .status()
+            .with_context(|| format!("cannot start {}", app.display()))?;
+        if status.code() == Some(RESTART_EXIT_CODE) {
+            println!("The node asked to restart. Starting it again in 3 seconds.");
+            std::thread::sleep(Duration::from_secs(3));
+            continue;
+        }
+        if status.success() {
+            return Ok(());
+        }
+        bail!("the node stopped ({status})");
+    }
+}
+
+fn phrase(app: Option<PathBuf>) -> Result<()> {
+    let app = find_app(app)?;
+    let status = app_command(&app).arg("--recovery-phrase").status().with_context(|| format!("cannot start {}", app.display()))?;
+    if !status.success() {
+        bail!("Ego Desktop could not show the recovery phrase ({status}). It needs Ego Desktop 0.3.701 or newer");
+    }
+    Ok(())
 }
 
 fn no_rigs() {
@@ -508,6 +689,9 @@ fn no_rigs() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd.unwrap_or(Cmd::Show { json: false }) {
+        Cmd::Start { app } => start(app)?,
+        Cmd::Phrase { app } => phrase(app)?,
+        Cmd::Here => here()?,
         Cmd::Add { name, address } => {
             let name = name.trim().to_string();
             let address = address.trim().to_string();
@@ -559,13 +743,14 @@ fn run() -> Result<()> {
             if json {
                 let health = node.health()?;
                 let now = now();
-                let reports = fetch_all(&node, &store.rigs, now);
-                let t = totals(&reports);
+                let (reports, _) = fetch_all(&node, &store.rigs, now);
+                let t = totals(&reports, now);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "node": node.url,
                         "block": health.height,
+                        "node_version": health.version,
                         "checked_at": now,
                         "computers": reports,
                         "total": t,
@@ -591,7 +776,6 @@ fn run() -> Result<()> {
                 std::thread::sleep(Duration::from_secs(every));
             }
         }
-        Cmd::Here => here()?,
     }
     Ok(())
 }
@@ -636,12 +820,33 @@ mod tests {
     }
 
     #[test]
-    fn status_follows_the_time_since_the_last_reward() {
+    fn without_node_sightings_the_status_follows_the_last_reward() {
         let now = 1_800_000_000;
-        assert_eq!(status_of(None, now), "no rewards yet");
-        assert_eq!(status_of(Some(now - 300), now), "earning");
-        assert_eq!(status_of(Some(now - 5 * HOUR), now), "quiet");
-        assert_eq!(status_of(Some(now - 2 * DAY), now), "stopped");
+        assert_eq!(status_of(None, None, now), "no rewards yet");
+        assert_eq!(status_of(Some(now - 300), None, now), "earning");
+        assert_eq!(status_of(Some(now - 5 * HOUR), None, now), "quiet");
+        assert_eq!(status_of(Some(now - 2 * DAY), None, now), "stopped");
+    }
+
+    #[test]
+    fn with_node_sightings_online_and_offline_are_told_apart() {
+        let now = 1_800_000_000;
+        let online = Seen { at: Some(now - 120), version: Some("0.3.701".into()) };
+        let gone = Seen { at: Some(now - 2 * HOUR), version: Some("0.3.700".into()) };
+        let never = Seen::default();
+        assert_eq!(status_of(Some(now - 300), Some(&gone), now), "earning");
+        assert_eq!(status_of(None, Some(&online), now), "online, no rewards yet");
+        assert_eq!(status_of(Some(now - 5 * HOUR), Some(&online), now), "online, not earning");
+        assert_eq!(status_of(Some(now - 5 * HOUR), Some(&gone), now), "offline");
+        assert_eq!(status_of(None, Some(&never), now), "offline");
+    }
+
+    #[test]
+    fn versions_compare_as_numbers() {
+        assert!(older_than("0.3.699", "0.3.701"));
+        assert!(older_than("0.3.99", "0.3.621"));
+        assert!(!older_than("0.3.701", "0.3.701"));
+        assert!(!older_than("0.4.0", "0.3.999"));
     }
 
     #[test]
@@ -654,17 +859,23 @@ mod tests {
 
     #[test]
     fn totals_add_up_every_computer() {
-        let r = |b, d, w, s| Report {
+        let now = 1_800_000_000;
+        let r = |b, d, w, s, seen: Option<i64>| Report {
             name: "a".into(),
             address: ME.into(),
             balance_uegoc: b,
             rewards_24h_uegoc: d,
             rewards_7d_uegoc: w,
             last_reward_at: None,
+            last_seen_at: seen,
+            version: None,
             status: s,
             error: None,
         };
-        let t = totals(&[r(1, 2, 3, "earning"), r(10, 20, 30, "stopped")]);
-        assert_eq!((t.computers, t.earning, t.balance_uegoc, t.rewards_24h_uegoc, t.rewards_7d_uegoc), (2, 1, 11, 22, 33));
+        let t = totals(&[r(1, 2, 3, "earning", Some(now - 60)), r(10, 20, 30, "offline", Some(now - DAY))], now);
+        assert_eq!(
+            (t.computers, t.online, t.earning, t.balance_uegoc, t.rewards_24h_uegoc, t.rewards_7d_uegoc),
+            (2, 1, 1, 11, 22, 33)
+        );
     }
 }

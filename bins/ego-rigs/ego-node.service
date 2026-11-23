@@ -1,0 +1,14 @@
+[Unit]
+Description=Ego node (Ego Desktop with no window)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=ego
+Environment=APPIMAGE_EXTRACT_AND_RUN=1
+ExecStart=/opt/ego/ego-desktop.AppImage --server
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
