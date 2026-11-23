@@ -13132,6 +13132,69 @@ pub fn maybe_emit_validator_registration() {
     }
 }
 
+pub fn maybe_send_machine_bind() {
+    static LAST_SENT: AtomicI64 = AtomicI64::new(0);
+    if is_observer() { return; }
+    if !crate::drs::machine_rule_active(crate::chain_db::latest_block_info().0.saturating_add(1)) { return; }
+    let seed = match get_ed25519_seed() { Some(s) => s, None => return };
+    let ledger = crate::ledger::Ledger::load();
+    let addr = ledger.address.clone();
+    if addr.is_empty() || crate::chain_db::drs_node(&addr).is_none() { return; }
+    let machine = crate::commands::coverage::machine_place_id();
+    let (named, placed) = crate::chain_db::machine_place_of(&addr);
+    if named.as_deref() == Some(machine.as_str()) && placed { return; }
+    let now = Utc::now().timestamp();
+    if now - LAST_SENT.load(Ordering::Relaxed) < crate::drs::MACHINE_REBIND_SECS + 60 { return; }
+
+    if let Some(pending) = crate::mempool::get_mempool().peek_all().into_iter().find(|t| {
+        t.from == addr && t.tx_type == crate::drs::TX_MACHINE_BIND && t.call_args == machine
+    }) {
+        tauri::async_runtime::spawn(async move { broadcast_pending_tx(pending).await; });
+        return;
+    }
+
+    use ed25519_dalek::{SigningKey, Signer};
+    let sk = SigningKey::from_bytes(&seed);
+    let nonce = crate::ledger::next_nonce_for(&ledger.address, ledger.nonce);
+    let mut tx = crate::ledger::LedgerTx {
+        from: addr.clone(),
+        to: addr.clone(),
+        amount: 0,
+        fee_uegoc: 0,
+        timestamp: now,
+        status: "Pending".into(),
+        nonce,
+        public_key_ed25519: hex::encode(sk.verifying_key().as_bytes()),
+        tx_type: crate::drs::TX_MACHINE_BIND.into(),
+        tx_version: crate::ledger::signing_tx_version(),
+        chain_id: 1,
+        call_args: machine,
+        ..crate::ledger::LedgerTx::default()
+    };
+    let sign_bytes = crate::ledger::tx_signing_bytes_for(&tx);
+    tx.signature = hex::encode(sk.sign(&sign_bytes).to_bytes());
+    if let Ok(kp) = ego_core::KeyPair::from_bytes(&seed) {
+        tx.dilithium_pubkey = hex::encode(&kp.dilithium_public_key().key_data);
+        tx.dilithium_signature = hex::encode(&kp.sign_dilithium(&sign_bytes).signature_data);
+    }
+    tx.hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+
+    match crate::mempool::get_mempool().push(tx.clone()) {
+        Ok(()) => {
+            LAST_SENT.store(now, Ordering::Relaxed);
+            let mut l = crate::ledger::Ledger::load();
+            l.nonce = nonce;
+            let _ = l.save();
+            tauri::async_runtime::spawn(async move { broadcast_pending_tx(tx).await; });
+            eprintln!("[Machine] Named this computer on chain for {}", &addr[..addr.len().min(16)]);
+        }
+        Err(e) => {
+            LAST_SENT.store(now - crate::drs::MACHINE_REBIND_SECS + 540, Ordering::Relaxed);
+            eprintln!("[Machine] Machine registration NOT sent: {e}");
+        }
+    }
+}
+
 /// Sends this node's uptime check-in once it is due. Only a staked node checks in, at most
 /// once per payout interval, and a pending check-in is re-sent rather than replaced.
 pub fn maybe_send_uptime_checkin() {

@@ -45,7 +45,7 @@ pub const LIVE_SEATS_FROM_HEIGHT: u64 = 79_841;
 const LIVE_SEAT_EPOCHS: u64 = 3;
 const WIDEN_READY_EPOCHS: u64 = 8;
 const WIDEN_MAX_OUTSIDERS: usize = 512;
-pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT, PAY_V2_READY_FROM_HEIGHT];
+pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT, PAY_V2_READY_FROM_HEIGHT, MACHINE_READY_FROM_HEIGHT];
 const KEY_STORAGE_TOTAL: &[u8] = b"n2swt";
 const KEY_LAST_MAKERS: &[u8] = b"n2last";
 
@@ -95,6 +95,40 @@ pub const RANK_PAY_SETTLE_SECS: i64 = STREAK_GAP_SECS + 3_600;
 pub const EARLY_RANKS: u64 = 100;
 pub const MIDDLE_RANKS: u64 = 1_000;
 pub const LATE_RANKS: u64 = 10_000;
+
+pub const MACHINE_RULE_FROM_HEIGHT: u64 = 192_341;
+pub const MACHINE_READY_FROM_HEIGHT: u64 = MACHINE_RULE_FROM_HEIGHT.saturating_add(SHORT_EPOCH);
+const _: () = assert!(MACHINE_RULE_FROM_HEIGHT == u64::MAX || (MACHINE_RULE_FROM_HEIGHT - SHORT_EPOCH_FROM_HEIGHT) % SHORT_EPOCH == 0);
+pub const TX_MACHINE_BIND: &str = "machine_bind";
+pub const NODES_PAID_PER_MACHINE: usize = 2;
+pub const MACHINE_IDLE_SECS: i64 = 7 * 86_400;
+pub const MACHINE_REBIND_SECS: i64 = CHECKIN_INTERVAL_SECS;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MACHINE_RULE_FROM: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+fn machine_rule_from() -> u64 {
+    #[cfg(test)]
+    {
+        let from = TEST_MACHINE_RULE_FROM.with(|c| c.get());
+        if from != u64::MAX {
+            return from;
+        }
+    }
+    MACHINE_RULE_FROM_HEIGHT
+}
+
+pub fn machine_rule_active(height: u64) -> bool {
+    let from = machine_rule_from();
+    from != u64::MAX && height >= from
+}
+
+fn machine_rule_in_period(period: u64) -> bool {
+    let from = machine_rule_from();
+    from != u64::MAX && period > period_of(from)
+}
 
 pub fn node_reward_per_day(height: u64, at: i64) -> u64 {
     if height < NODE_PAY_V2_FROM_HEIGHT {
@@ -904,11 +938,18 @@ fn has_consensus_key(ov: &Ov, addr: &str) -> bool {
 }
 
 pub fn weight_of(rec: &NodeRec, at: i64, keys_ok: bool, period: u64) -> u64 {
+    weight_with_base(rec, at, keys_ok, period, true)
+}
+
+pub fn weight_with_base(rec: &NodeRec, at: i64, keys_ok: bool, period: u64, base: bool) -> u64 {
     if !keys_ok || rec.pop_key.is_empty() || rec.streak < min_streak(period) || at.saturating_sub(rec.last_checkin) > STREAK_GAP_SECS {
         return 0;
     }
-    let uptime = (rec.streak as u64).min(UPTIME_CAP);
     let storage = storage_points(rec, at);
+    if !base {
+        return storage;
+    }
+    let uptime = (rec.streak as u64).min(UPTIME_CAP);
     let coverage = if at <= rec.coverage_at.saturating_add(COVERAGE_VALID_SECS) {
         (rec.coverage as u64).min(COVERAGE_CAP_WITNESSES) * COVERAGE_POINTS_PER_WITNESS
     } else {
@@ -933,7 +974,8 @@ fn next_drop(rec: &NodeRec, at: i64) -> Option<i64> {
 
 fn refresh(ov: &mut Ov, addr: &str, rec: &mut NodeRec, at: i64, period: u64) {
     let keys_ok = has_consensus_key(ov, addr);
-    let new_w = weight_of(rec, at, keys_ok, period);
+    let base = earns_base(ov, addr, period);
+    let new_w = weight_with_base(rec, at, keys_ok, period, base);
     let old_w = rec.weight.next;
     if new_w != old_w {
         rec.weight.set(period, new_w);
@@ -959,7 +1001,13 @@ fn refresh(ov: &mut Ov, addr: &str, rec: &mut NodeRec, at: i64, period: u64) {
     }
     if ov.get(KEY_PAY_SINCE).is_some() {
         let s = if new_w > 0 { storage_points(rec, at).min(new_w) } else { 0 };
-        let m = if new_w > 0 { early_mult_milli(rank_or_assign(ov, addr)) } else { 0 };
+        let m = if new_w == 0 {
+            0
+        } else if base {
+            early_mult_milli(rank_or_assign(ov, addr))
+        } else {
+            rank_of(ov, addr).map_or(1_000, early_mult_milli)
+        };
         set_pay(ov, &pay_base_key(addr), KEY_PAY_BASE_TOTAL, period, (new_w - s).saturating_mul(m));
         set_pay(ov, &pay_storage_key(addr), KEY_PAY_STORAGE_TOTAL, period, s.saturating_mul(m));
         if let Some(st) = load_staker(ov, addr) {
@@ -1030,6 +1078,137 @@ fn apply_registrations(ov: &mut Ov, txs: &[&LedgerTx], at: i64, period: u64) {
         rec.pop_key = reg.pop_key.unwrap_or_default();
         refresh(ov, &reg.addr, &mut rec, at, period);
         save_rec(ov, &reg.addr, &rec);
+    }
+}
+
+fn machine_key(addr: &str) -> Vec<u8> {
+    format!("n2mach:{addr}").into_bytes()
+}
+
+fn machine_paid_key(machine: &str) -> Vec<u8> {
+    format!("n2mpaid:{machine}").into_bytes()
+}
+
+fn machine_bound_key(addr: &str) -> Vec<u8> {
+    format!("n2mbt:{addr}").into_bytes()
+}
+
+pub fn machine_of(ov: &Ov, addr: &str) -> Option<String> {
+    ov.get(&machine_key(addr)).and_then(|v| String::from_utf8(v).ok())
+}
+
+fn machine_bound_at(ov: &Ov, addr: &str) -> Option<i64> {
+    ov.get(&machine_bound_key(addr)).map(|v| read_u64_le(&v) as i64)
+}
+
+pub fn machine_paid_nodes(ov: &Ov, machine: &str) -> Vec<String> {
+    ov.get(&machine_paid_key(machine)).and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
+}
+
+pub fn has_machine_place(ov: &Ov, addr: &str) -> bool {
+    machine_of(ov, addr).is_some_and(|m| machine_paid_nodes(ov, &m).iter().any(|a| a == addr))
+}
+
+fn earns_base(ov: &Ov, addr: &str, period: u64) -> bool {
+    !machine_rule_in_period(period) || has_machine_place(ov, addr)
+}
+
+pub fn is_machine_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn parse_machine_bind(tx: &LedgerTx) -> Option<&str> {
+    (tx.tx_type == TX_MACHINE_BIND && !tx.from.is_empty() && tx.from == tx.to && tx.amount == 0 && is_machine_id(&tx.call_args))
+        .then_some(tx.call_args.as_str())
+}
+
+pub fn machine_bind_check(ov: &Ov, tx: &LedgerTx, height: u64, at: i64) -> Result<(), String> {
+    if !machine_rule_active(height) {
+        return Err("machine registration has not started yet".into());
+    }
+    if parse_machine_bind(tx).is_none() {
+        return Err("a machine registration names the machine as 64 lowercase hex characters and moves no coins".into());
+    }
+    if load_rec(ov, &tx.from).is_none() {
+        return Err("only a registered node can name its machine".into());
+    }
+    if machine_bound_at(ov, &tx.from).is_some_and(|t| at.saturating_sub(t) < MACHINE_REBIND_SECS) {
+        return Err("a node can name its machine once every 12 hours".into());
+    }
+    Ok(())
+}
+
+pub fn validate_machine_binds(ov: &Ov, block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for tx in txs.iter().filter(|t| t.tx_type == TX_MACHINE_BIND) {
+        machine_bind_check(ov, tx, block.height, block.timestamp).map_err(|e| format!("machine_bind {} refused: {e}", tx.hash))?;
+        if !seen.insert(tx.from.as_str()) {
+            return Err(format!("block {} names the machine of {} more than once", block.height, tx.from));
+        }
+    }
+    Ok(())
+}
+
+pub fn admit_machine_bind(tx: &LedgerTx) -> Result<(), String> {
+    if tx.tx_type != TX_MACHINE_BIND {
+        return Ok(());
+    }
+    let height = crate::chain_db::local_chain_height().saturating_add(1);
+    let ov = Ov::new(crate::chain_db::global_db());
+    machine_bind_check(&ov, tx, height, chrono::Utc::now().timestamp())
+}
+
+fn machine_last_active(ov: &Ov, addr: &str) -> i64 {
+    let checkin = load_rec(ov, addr).map_or(0, |r| r.last_checkin);
+    checkin.max(machine_bound_at(ov, addr).unwrap_or(0))
+}
+
+fn put_machine_paid(ov: &mut Ov, machine: &str, nodes: &[String]) {
+    if nodes.is_empty() {
+        ov.del(machine_paid_key(machine));
+    } else if let Ok(v) = serde_json::to_vec(nodes) {
+        ov.put(machine_paid_key(machine), v);
+    }
+}
+
+fn bind_machine(ov: &mut Ov, addr: &str, machine: &str, at: i64) {
+    if let Some(old) = machine_of(ov, addr).filter(|m| m != machine) {
+        let mut nodes = machine_paid_nodes(ov, &old);
+        nodes.retain(|a| a != addr);
+        put_machine_paid(ov, &old, &nodes);
+    }
+    ov.put(machine_key(addr), machine.as_bytes().to_vec());
+    ov.put(machine_bound_key(addr), u64_le(at.max(0) as u64).to_vec());
+    let mut nodes = machine_paid_nodes(ov, machine);
+    if nodes.iter().any(|a| a == addr) {
+        return;
+    }
+    nodes.retain(|a| machine_of(ov, a).as_deref() == Some(machine) && at.saturating_sub(machine_last_active(ov, a)) <= MACHINE_IDLE_SECS);
+    if nodes.len() < NODES_PAID_PER_MACHINE {
+        nodes.push(addr.to_string());
+    }
+    put_machine_paid(ov, machine, &nodes);
+}
+
+fn apply_machine_binds(ov: &mut Ov, txs: &[&LedgerTx], at: i64, period: u64, height: u64) {
+    if !machine_rule_active(height) {
+        return;
+    }
+    let mut binds: Vec<(&str, &str, &str)> =
+        txs.iter().filter_map(|tx| Some((tx.hash.as_str(), tx.from.as_str(), parse_machine_bind(tx)?))).collect();
+    binds.sort_unstable();
+    let mut seen = BTreeSet::new();
+    for (_, addr, machine) in binds {
+        if !seen.insert(addr) {
+            continue;
+        }
+        let Some(mut rec) = load_rec(ov, addr) else { continue };
+        if machine_bound_at(ov, addr).is_some_and(|t| at.saturating_sub(t) < MACHINE_REBIND_SECS) {
+            continue;
+        }
+        bind_machine(ov, addr, machine, at);
+        refresh(ov, addr, &mut rec, at, period);
+        save_rec(ov, addr, &rec);
     }
 }
 
@@ -1389,6 +1568,7 @@ pub fn apply_block(
         process_expiries(ov, at, period);
     }
     apply_registrations(ov, txs, at, period);
+    apply_machine_binds(ov, txs, at, period, block.height);
     if block.height == FAST_START_HEIGHT || block.height == SPLIT_FROM_HEIGHT {
         recount_all(ov, at, period);
     }
@@ -3212,5 +3392,188 @@ mod node_pay_v2_tests {
         assert_eq!(rank_pay_since(&ov), None);
         assert_eq!(rank_of(&ov, &addrs[0]), None);
         assert_eq!(ranks_given(&ov), 0);
+    }
+
+    fn machine_node(ov: &mut Ov, addr: &str, idx: u64, at: i64) {
+        ov.put(crate::chain_db::val_dil_key(addr), vec![1]);
+        let rec = NodeRec { idx, pop_key: "ab".repeat(48), streak: 20, last_checkin: at, coverage: 10, coverage_at: at, ..NodeRec::default() };
+        save_rec(ov, addr, &rec);
+    }
+
+    fn bind_tx(addr: &str, machine: &str, hash: &str) -> LedgerTx {
+        LedgerTx {
+            hash: hash.into(),
+            from: addr.into(),
+            to: addr.into(),
+            tx_type: TX_MACHINE_BIND.into(),
+            call_args: machine.into(),
+            ..LedgerTx::default()
+        }
+    }
+
+    fn bind_all(ov: &mut Ov, txs: &[LedgerTx], at: i64, height: u64) {
+        let refs: Vec<&LedgerTx> = txs.iter().collect();
+        apply_machine_binds(ov, &refs, at, period_of(height), height);
+    }
+
+    fn with_machine_rule(from: u64, f: impl FnOnce()) {
+        TEST_MACHINE_RULE_FROM.with(|c| c.set(from));
+        f();
+        TEST_MACHINE_RULE_FROM.with(|c| c.set(u64::MAX));
+    }
+
+    const FULL_BASE: u64 = 20 + 10 * COVERAGE_POINTS_PER_WITNESS;
+
+    #[test]
+    fn only_two_nodes_on_one_machine_earn_base_points() {
+        with_machine_rule(1_000, || {
+            let mut ov = Ov::memory();
+            let at = 1_800_000_000;
+            let m = "a".repeat(64);
+            for (i, a) in ["egot1ma", "egot1mb", "egot1mc"].iter().enumerate() {
+                machine_node(&mut ov, a, i as u64, at);
+            }
+            ov.put(KEY_PAY_SINCE.to_vec(), u64_le(at as u64).to_vec());
+            bind_all(&mut ov, &[bind_tx("egot1mc", &m, "0x03"), bind_tx("egot1ma", &m, "0x01"), bind_tx("egot1mb", &m, "0x02")], at, 2_000);
+            assert_eq!(machine_paid_nodes(&ov, &m), vec!["egot1ma".to_string(), "egot1mb".to_string()], "places go in transaction hash order");
+            assert_eq!(load_rec(&ov, "egot1ma").unwrap().weight.next, FULL_BASE);
+            assert_eq!(load_rec(&ov, "egot1mb").unwrap().weight.next, FULL_BASE);
+            assert_eq!(load_rec(&ov, "egot1mc").unwrap().weight.next, 0, "the third node keeps only storage points, and it has none");
+            assert!(rank_of(&ov, "egot1ma").is_some());
+            assert_eq!(rank_of(&ov, "egot1mc"), None, "a node without a place takes no early rank");
+        });
+    }
+
+    #[test]
+    fn a_node_without_a_place_still_earns_for_stored_files() {
+        with_machine_rule(1_000, || {
+            let mut ov = Ov::memory();
+            let at = 1_800_000_000;
+            let m = "b".repeat(64);
+            for (i, a) in ["egot1sa", "egot1sb", "egot1sc"].iter().enumerate() {
+                machine_node(&mut ov, a, i as u64, at);
+            }
+            let mut rec = load_rec(&ov, "egot1sc").unwrap();
+            rec.storage_bytes = 5 * GB;
+            rec.storage_until = at + 86_400;
+            save_rec(&mut ov, "egot1sc", &rec);
+            bind_all(&mut ov, &[bind_tx("egot1sa", &m, "0x01"), bind_tx("egot1sb", &m, "0x02"), bind_tx("egot1sc", &m, "0x03")], at, 2_000);
+            assert!(!has_machine_place(&ov, "egot1sc"));
+            assert_eq!(load_rec(&ov, "egot1sc").unwrap().weight.next, 5 * STORAGE_POINTS_PER_GB);
+        });
+    }
+
+    #[test]
+    fn an_idle_node_gives_its_place_up_after_a_week() {
+        with_machine_rule(1_000, || {
+            let mut ov = Ov::memory();
+            let t0 = 1_800_000_000;
+            let m = "c".repeat(64);
+            machine_node(&mut ov, "egot1ia", 0, t0);
+            machine_node(&mut ov, "egot1ib", 1, t0);
+            bind_all(&mut ov, &[bind_tx("egot1ia", &m, "0x01"), bind_tx("egot1ib", &m, "0x02")], t0, 2_000);
+            let later = t0 + MACHINE_IDLE_SECS + 60;
+            let mut b = load_rec(&ov, "egot1ib").unwrap();
+            b.last_checkin = later - 3_600;
+            save_rec(&mut ov, "egot1ib", &b);
+            machine_node(&mut ov, "egot1ic", 2, later);
+            bind_all(&mut ov, &[bind_tx("egot1ic", &m, "0x03")], later, 9_000);
+            assert_eq!(machine_paid_nodes(&ov, &m), vec!["egot1ib".to_string(), "egot1ic".to_string()]);
+            assert!(!has_machine_place(&ov, "egot1ia"));
+            assert_eq!(load_rec(&ov, "egot1ic").unwrap().weight.next, FULL_BASE);
+        });
+    }
+
+    #[test]
+    fn a_fresh_place_is_not_taken_before_its_first_check_in() {
+        with_machine_rule(1_000, || {
+            let mut ov = Ov::memory();
+            let t0 = 1_800_000_000;
+            let m = "d".repeat(64);
+            for (i, a) in ["egot1fa", "egot1fb"].iter().enumerate() {
+                ov.put(crate::chain_db::val_dil_key(a), vec![1]);
+                save_rec(&mut ov, a, &NodeRec { idx: i as u64, pop_key: "ab".repeat(48), ..NodeRec::default() });
+            }
+            bind_all(&mut ov, &[bind_tx("egot1fa", &m, "0x01"), bind_tx("egot1fb", &m, "0x02")], t0, 2_000);
+            machine_node(&mut ov, "egot1fc", 2, t0 + 3_600);
+            bind_all(&mut ov, &[bind_tx("egot1fc", &m, "0x03")], t0 + 3_600, 2_400);
+            assert_eq!(machine_paid_nodes(&ov, &m), vec!["egot1fa".to_string(), "egot1fb".to_string()]);
+        });
+    }
+
+    #[test]
+    fn moving_to_another_machine_frees_the_old_place() {
+        with_machine_rule(1_000, || {
+            let mut ov = Ov::memory();
+            let t0 = 1_800_000_000;
+            let (m1, m2) = ("e".repeat(64), "f".repeat(64));
+            for (i, a) in ["egot1va", "egot1vb", "egot1vc"].iter().enumerate() {
+                machine_node(&mut ov, a, i as u64, t0);
+            }
+            bind_all(&mut ov, &[bind_tx("egot1va", &m1, "0x01"), bind_tx("egot1vb", &m1, "0x02")], t0, 2_000);
+            let t1 = t0 + MACHINE_REBIND_SECS;
+            bind_all(&mut ov, &[bind_tx("egot1vb", &m2, "0x04"), bind_tx("egot1vc", &m1, "0x05")], t1, 3_000);
+            assert_eq!(machine_paid_nodes(&ov, &m2), vec!["egot1vb".to_string()]);
+            assert_eq!(machine_paid_nodes(&ov, &m1), vec!["egot1va".to_string(), "egot1vc".to_string()]);
+        });
+    }
+
+    #[test]
+    fn a_node_names_its_machine_at_most_once_every_12_hours() {
+        with_machine_rule(1_000, || {
+            let mut ov = Ov::memory();
+            let t0 = 1_800_000_000;
+            let (m1, m2) = ("1".repeat(64), "2".repeat(64));
+            machine_node(&mut ov, "egot1ra", 0, t0);
+            bind_all(&mut ov, &[bind_tx("egot1ra", &m1, "0x01")], t0, 2_000);
+            let again = bind_tx("egot1ra", &m2, "0x02");
+            assert!(machine_bind_check(&ov, &again, 2_010, t0 + 600).is_err());
+            bind_all(&mut ov, &[again.clone()], t0 + 600, 2_010);
+            assert_eq!(machine_of(&ov, "egot1ra"), Some(m1.clone()), "a refused rebind changes nothing");
+            assert!(machine_bind_check(&ov, &again, 3_000, t0 + MACHINE_REBIND_SECS).is_ok());
+        });
+    }
+
+    #[test]
+    fn before_the_switch_nothing_changes() {
+        let mut ov = Ov::memory();
+        let at = 1_800_000_000;
+        let m = "3".repeat(64);
+        machine_node(&mut ov, "egot1pa", 0, at);
+        let tx = bind_tx("egot1pa", &m, "0x01");
+        assert!(machine_bind_check(&ov, &tx, 2_000, at).is_err(), "no registration before the switch");
+        bind_all(&mut ov, &[tx], at, 2_000);
+        assert_eq!(machine_of(&ov, "egot1pa"), None);
+        let mut rec = load_rec(&ov, "egot1pa").unwrap();
+        refresh(&mut ov, "egot1pa", &mut rec, at, period_of(2_000));
+        assert_eq!(rec.weight.next, FULL_BASE, "a node without a machine keeps its base points");
+    }
+
+    #[test]
+    fn base_points_are_withheld_only_from_the_period_after_the_switch() {
+        with_machine_rule(1_000, || {
+            let ov = Ov::memory();
+            assert!(earns_base(&ov, "egot1x", period_of(1_000)), "nodes get a whole period to register first");
+            assert!(!earns_base(&ov, "egot1x", period_of(1_000) + 1));
+        });
+    }
+
+    #[test]
+    fn a_block_may_name_a_node_machine_once_and_only_in_the_right_form() {
+        with_machine_rule(1_000, || {
+            let mut ov = Ov::memory();
+            let at = 1_800_000_000;
+            machine_node(&mut ov, "egot1ka", 0, at);
+            let block = LedgerBlock { height: 2_000, timestamp: at, ..LedgerBlock::default() };
+            let m = "4".repeat(64);
+            assert!(validate_machine_binds(&ov, &block, &[bind_tx("egot1ka", &m, "0x01")]).is_ok());
+            assert!(validate_machine_binds(&ov, &block, &[bind_tx("egot1ka", &m, "0x01"), bind_tx("egot1ka", &m, "0x02")]).is_err());
+            assert!(validate_machine_binds(&ov, &block, &[bind_tx("egot1ka", &"A".repeat(64), "0x01")]).is_err(), "upper case is refused");
+            assert!(validate_machine_binds(&ov, &block, &[bind_tx("egot1ka", "short", "0x01")]).is_err());
+            assert!(validate_machine_binds(&ov, &block, &[bind_tx("egot1nobody", &m, "0x01")]).is_err(), "only registered nodes");
+            let mut moves = bind_tx("egot1ka", &m, "0x01");
+            moves.amount = 5;
+            assert!(validate_machine_binds(&ov, &block, &[moves]).is_err(), "it moves no coins");
+        });
     }
 }

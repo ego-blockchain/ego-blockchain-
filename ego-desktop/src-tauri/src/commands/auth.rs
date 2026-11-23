@@ -437,18 +437,17 @@ fn create_wallet_files_with(address_override: Option<&str>, extra: &str) -> Resu
 /// Headless bootstrap: a validator started with EGO_HEADLESS=1 has no GUI to run
 /// init_wallet, so self-provision a fresh identity on first run if none exists.
 /// Idempotent — returns the existing address once a wallet is present.
-pub fn ensure_wallet_exists() -> Result<String, EgoDesktopError> {
-    let existing = Ledger::load().address;
-    if !existing.is_empty() {
-        return Ok(existing);
-    }
-    create_wallet_files(None)
-}
-
 #[tauri::command]
 pub async fn init_wallet(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
+) -> Result<WalletInfo, EgoDesktopError> {
+    open_wallet(&state, Some(app_handle)).await
+}
+
+pub async fn open_wallet(
+    state: &AppState,
+    app_handle: Option<tauri::AppHandle>,
 ) -> Result<WalletInfo, EgoDesktopError> {
     let legacy_seed = base_data_dir().join("wallet.seed");
     if legacy_seed.exists() && !registry_path().exists() {
@@ -532,8 +531,8 @@ pub async fn init_wallet(
             true
         }).await.unwrap_or(false);
 
-        if migrated {
-            let _ = migration_handle.emit_all("ego://chain-updated", ());
+        if let (true, Some(h)) = (migrated, migration_handle) {
+            let _ = h.emit_all("ego://chain-updated", ());
         }
     });
 
@@ -555,7 +554,7 @@ pub async fn init_wallet(
         });
         save_registry(&registry).map_err(EgoDesktopError::WalletError)?;
 
-        return load_active_wallet(&state, true, Some(app_handle)).await;
+        return load_active_wallet(state, true, app_handle).await;
     }
 
     // check if seed exists and is valid
@@ -576,7 +575,7 @@ pub async fn init_wallet(
             .map_err(|e| EgoDesktopError::CryptoError(format!("Wallet creation panicked: {e}")))??;
     }
 
-    load_active_wallet(&state, is_new, Some(app_handle)).await
+    load_active_wallet(state, is_new, app_handle).await
 }
 
 #[tauri::command]
@@ -1272,7 +1271,19 @@ pub async fn get_recovery_info(pin: String) -> Result<RecoveryInfo, EgoDesktopEr
         upgrade_legacy_pin_hash_if_needed(&mut ledger, &pin_val)?;
     }
     crate::commands::totp::consume("reveal")?;
+    recovery_info_from_seed(ledger)
+}
 
+pub fn recovery_info_without_pin() -> Result<RecoveryInfo, EgoDesktopError> {
+    let ledger = Ledger::load();
+    if !ledger.security_pin_hash.is_empty() {
+        return Err(EgoDesktopError::WalletError("this wallet has a PIN".into()));
+    }
+    crate::commands::totp::consume("reveal")?;
+    recovery_info_from_seed(ledger)
+}
+
+fn recovery_info_from_seed(ledger: Ledger) -> Result<RecoveryInfo, EgoDesktopError> {
     let seed_bytes = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {}", e)))?
         .ok_or_else(|| EgoDesktopError::CryptoError("Corrupt or missing seed file".into()))?;

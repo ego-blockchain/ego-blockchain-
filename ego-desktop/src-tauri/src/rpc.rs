@@ -55,6 +55,8 @@ impl RpcResponse {
 /// Subscribers waiting for chain events over WebSocket.
 type Subscribers = Arc<tokio::sync::broadcast::Sender<Value>>;
 
+const NODE_SEEN_MAX: usize = 1_000;
+
 fn rpc_bind_ip() -> IpAddr {
     std::env::var("EGO_RPC_BIND")
         .ok()
@@ -227,6 +229,7 @@ async fn health() -> Json<Value> {
         "chain_tip":        tip,
         "finalized_height": fin,
         "tx_count":         txc,
+        "version":          env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -326,6 +329,28 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             let bal  = crate::chain_db::balance_of(addr);
             let height = (crate::chain_db::local_chain_height() == before).then_some(before);
             RpcResponse::ok(req.id, json!({ "uegoc": bal, "egoc": bal as f64 / 1_000_000.0, "height": height }))
+        }
+
+        "node.seen" => {
+            let me = crate::ledger::Ledger::load().address;
+            let now = chrono::Utc::now().timestamp();
+            let state = crate::app::global_app_state();
+            let list: Vec<Value> = p["addresses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .take(NODE_SEEN_MAX)
+                .map(|a| {
+                    if !me.is_empty() && a == me {
+                        return json!({ "address": a, "last_seen": now, "version": env!("CARGO_PKG_VERSION"), "this_node": true });
+                    }
+                    let version = crate::commands::updates::peer_version(a);
+                    let seen = [state.peer_last_seen(a), version.as_ref().map(|v| v.1)].into_iter().flatten().max();
+                    json!({ "address": a, "last_seen": seen, "version": version.map(|v| v.0), "this_node": false })
+                })
+                .collect();
+            RpcResponse::ok(req.id, json!(list))
         }
 
         "wallet.getNonce" => {

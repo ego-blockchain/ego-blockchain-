@@ -22,6 +22,7 @@ pub const STATE_CERT_ANCHORS: &[(u64, &str)] = &[
     (13, "4a6ae6eba482f8e752c81b3569b0bce02e3aa6860759e1dba94f8327eb2fa819"),
     (16, "118168372afc04a36fbf19148d6a4f1bb313d0f1b397f943ccb43f4ff61dbfc0"),
     (20, "cf99c3e41f70588cb9a9481dac2e3cd602f96c222020e705a8651e8334685cc7"),
+    (23, "151431b1ab7c8118d054ab83cefe0b61e9ab24e9ab94ee1a27300b92ac5eb627"),
 ];
 const KEY_DAY: &[u8] = b"sc:day";
 const KEY_OPEN: &[u8] = b"sc:open";
@@ -681,14 +682,15 @@ mod tests {
             (13u64, "4a6ae6eba482f8e752c81b3569b0bce02e3aa6860759e1dba94f8327eb2fa819".to_string()),
             (16u64, "118168372afc04a36fbf19148d6a4f1bb313d0f1b397f943ccb43f4ff61dbfc0".to_string()),
             (20u64, "cf99c3e41f70588cb9a9481dac2e3cd602f96c222020e705a8651e8334685cc7".to_string()),
+            (23u64, "151431b1ab7c8118d054ab83cefe0b61e9ab24e9ab94ee1a27300b92ac5eb627".to_string()),
         ];
-        assert_eq!(anchors_with(None), built_in, "this release names checkpoints 1, 2, 3 and the fallback checkpoints 11, 13, 16 and 20 itself");
+        assert_eq!(anchors_with(None), built_in, "this release names checkpoints 1, 2, 3 and the fallback checkpoints 11, 13, 16, 20 and 23 itself");
         let mut with_four = built_in.clone();
         with_four.push((4, h.clone()));
         with_four.sort();
         assert_eq!(anchors_with(Some((4, h.clone()))), with_four);
-        assert_eq!(start_index(&anchors_with(Some((4, h.clone())))), Some(20), "a new node starts from the newest official checkpoint");
-        assert_eq!(start_index(&anchors_with(Some((23, h.clone())))), Some(23), "the website can name a newer one");
+        assert_eq!(start_index(&anchors_with(Some((4, h.clone())))), Some(23), "a new node starts from the newest official checkpoint");
+        assert_eq!(start_index(&anchors_with(Some((25, h.clone())))), Some(25), "the website can name a newer one");
         assert_eq!(anchors_with(Some((1, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c".into()))), built_in, "the website naming the same one adds nothing");
         assert_eq!(anchors_with(Some((0, h.clone()))), built_in);
         assert_eq!(anchors_with(Some((4, "AB".repeat(32)))), built_in);

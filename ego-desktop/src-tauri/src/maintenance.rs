@@ -161,7 +161,7 @@ fn is_node_busy() -> bool {
     })
 }
 
-pub fn start_health_watchdog(app: tauri::AppHandle) {
+pub fn start_health_watchdog() {
     let max_rss_mb: u64 = std::env::var("EGO_MAX_RSS_MB")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(3072);
     let max_uptime_days: i64 = std::env::var("EGO_RESTART_AFTER_DAYS")
@@ -199,7 +199,7 @@ pub fn start_health_watchdog(app: tauri::AppHandle) {
             }
 
             eprintln!("[Maintenance] Graceful self-restart: {}", reason);
-            app.restart();
+            crate::ui::restart();
         }
     });
 }

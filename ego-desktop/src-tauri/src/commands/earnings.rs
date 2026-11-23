@@ -391,7 +391,7 @@ pub async fn get_hosted_storage() -> Result<HostedStorage, EgoDesktopError> {
         let view = ChainView { recorded: &recorded, plan_active: &plan_active, last_proof: &last_proof };
         let mut out = hosted_storage(&ledger.stored_files, &me, now, &view, &pay);
         out.registered = !me.is_empty() && crate::chain_db::is_registered_node(&me);
-        out.paused_reason = crate::commands::coverage::earning_block_reason();
+        out.paused_reason = crate::commands::coverage::earning_block_reason().or_else(crate::commands::coverage::machine_place_note);
         if !me.is_empty() {
             let hosting = crate::chain_db::plan_hosting(&me);
             out.plan_pay = hosting.active;

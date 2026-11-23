@@ -18,6 +18,7 @@ mod escrow;
 mod storage_proof;
 mod coverage_proof;
 mod device_location;
+mod ui;
 mod sideband;
 mod sideband_spool;
 mod sideband_lan;
@@ -486,153 +487,534 @@ fn register_suspend_listeners() {
     }
 }
 
-fn headless_main() {
-    tracing::info!("Ego full node — P2P + BFT + RPC + Mempool");
-    tracing::info!("Starting in headless full-node mode (EGO_HEADLESS=1)");
-    tracing::info!("All GUI components disabled — blockchain services only");
+const SERVER_FLAGS: [&str; 2] = ["--server", "--headless"];
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CliCommand {
+    Address,
+    RecoveryPhrase,
+    Help,
+}
+
+fn wants_server(args: &[String]) -> bool {
+    args.iter().any(|a| SERVER_FLAGS.contains(&a.as_str())) || std::env::var("EGO_HEADLESS").as_deref() == Ok("1")
+}
+
+fn cli_command(args: &[String]) -> Option<CliCommand> {
+    args.iter().find_map(|a| match a.as_str() {
+        "--address" => Some(CliCommand::Address),
+        "--recovery-phrase" => Some(CliCommand::RecoveryPhrase),
+        "--help" | "-h" => Some(CliCommand::Help),
+        _ => None,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn console_for_output() -> bool {
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn GetConsoleWindow() -> isize;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 || GetConsoleWindow() != 0 }
+}
+
+fn phrase_rows(words: &[String]) -> String {
+    words
+        .chunks(6)
+        .enumerate()
+        .map(|(row, chunk)| {
+            chunk
+                .iter()
+                .enumerate()
+                .map(|(i, w)| format!("{:>2}. {:<10}", row * 6 + i + 1, w))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn node_running_here() -> bool {
+    let port: u16 = std::env::var("EGO_LOCK_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47391);
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
+
+fn run_cli(command: CliCommand) -> i32 {
+    match command {
+        CliCommand::Help => {
+            println!("Ego Desktop {}", env!("CARGO_PKG_VERSION"));
+            println!();
+            println!("  (no options)        open the app with its window");
+            println!("  --server            run the full node with no window, for servers and computers without a screen");
+            println!("  --address           print this computer's wallet address");
+            println!("  --recovery-phrase   print the 24 words that restore this computer's wallet");
+            println!();
+            println!("EGO_DATA_DIR sets the data folder. Press Ctrl+C to stop a node started with --server.");
+            0
+        }
+        CliCommand::Address => {
+            let address = crate::ledger::Ledger::load().address;
+            if address.is_empty() {
+                eprintln!("This computer has no Ego wallet yet. Start the node once with --server, or open Ego Desktop, to create one.");
+                return 1;
+            }
+            println!("{address}");
+            0
+        }
+        CliCommand::RecoveryPhrase => {
+            let ledger = crate::ledger::Ledger::load();
+            if ledger.address.is_empty() {
+                eprintln!("This computer has no Ego wallet yet. Start the node once with --server, or open Ego Desktop, to create one.");
+                return 1;
+            }
+            let shown = if ledger.security_pin_hash.is_empty() {
+                crate::commands::auth::recovery_info_without_pin()
+            } else {
+                if node_running_here() {
+                    eprintln!("This wallet has a PIN, and checking a PIN needs the node's database. Stop the node first, then run this again.");
+                    return 1;
+                }
+                eprint!("This wallet has a PIN. Type it and press Enter: ");
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_err() {
+                    return 1;
+                }
+                tauri::async_runtime::block_on(crate::commands::auth::get_recovery_info(line.trim().to_string()))
+            };
+            match shown {
+                Ok(info) => {
+                    println!("Recovery phrase for {}\n", info.address);
+                    println!("{}\n", phrase_rows(&info.recovery_phrase));
+                    println!("Write these 24 words on paper, in order, and keep them somewhere safe.");
+                    println!("Anyone who has them can take the coins in this wallet, and nobody can give them back to you if they are lost.");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("The recovery phrase could not be shown: {e}");
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn server_main() {
+    eprintln!("Ego Desktop {} server mode: the full node, with no window", env!("CARGO_PKG_VERSION"));
+    eprintln!("Data folder: {}", crate::ledger::base_data_dir().display());
 
     crate::app::init_global_app_state(std::sync::Arc::new(crate::app::AppState::new()));
-    match crate::commands::auth::ensure_wallet_exists() {
-        Ok(addr) => tracing::info!("Headless wallet ready: {}", addr),
-        Err(e)   => tracing::error!("Headless wallet init failed: {}", e),
+    let state = crate::app::global_app_state();
+    match tauri::async_runtime::block_on(crate::commands::auth::open_wallet(&state, None)) {
+        Ok(wallet) => {
+            eprintln!("Wallet: {}", wallet.address);
+            if wallet.is_new_wallet {
+                eprintln!("This computer got a new wallet. Write down its 24 words now: in another terminal, run this program with --recovery-phrase.");
+                eprintln!("Without them the wallet and everything it earns cannot be recovered.");
+            }
+        }
+        Err(e) => {
+            eprintln!("The wallet could not be opened: {e}");
+            std::process::exit(1);
+        }
     }
-    crate::commands::storage::provision_free_share();
-    crate::p2p::prime_ed25519_seed_cache();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    crate::ledger::reconcile_stake_state();
+    crate::chain_db::repair_finality_marker();
+    start_node_services();
 
-    rt.block_on(async {
-        crate::ledger::reconcile_stake_state();
-        crate::chain_db::restore_in_memory_state_from_db();
-        crate::chain_db::repair_finality_marker();
-        crate::genesis::announce_on_start();
-        crate::shielded_chain::repair_pool_state();
-        crate::sharding::load_agreed_shard_count_from_db();
+    let rpc_port: u16 = std::env::var("EGO_RPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47395);
+    eprintln!("Node running. RPC on port {rpc_port}. Press Ctrl+C to stop.");
+    tauri::async_runtime::block_on(async {
+        tokio::signal::ctrl_c().await.ok();
+    });
+    eprintln!("Shutting down");
+}
 
-        tokio::spawn(async {
-            use futures::FutureExt;
-            if std::panic::AssertUnwindSafe(crate::p2p::start_p2p_server(None)).catch_unwind().await.is_err() {
-                eprintln!("[P2P] networking stopped after an internal error; exiting so the service manager restarts the node");
-                std::process::exit(70);
+fn start_node_services() {
+    // Offline transaction transport, always available.
+    //
+    // Someone whose connection has just been cut is the last person able
+    // to set an environment variable and restart, so this arms itself and
+    // waits. Registering costs a directory and a two second poll of an
+    // empty folder; a transaction is only ever handed to it when gossip
+    // has nowhere to go, so a working connection never touches it.
+    //
+    // The spool is a directory inside the node's own data folder, so it
+    // opens no path that a process could not already reach by writing to
+    // the wallet directly, and everything arriving through it is validated
+    // exactly as gossip is. Radio hardware still takes a deliberate act:
+    // somebody has to run the bridge against the spool.
+    //
+    // EGO_SIDEBAND_SPOOL=0 turns it off.
+    if std::env::var("EGO_SIDEBAND_SPOOL").as_deref() != Ok("0") {
+        let spool = crate::sideband_spool::SpoolTransport::default_spool();
+        eprintln!("[Sideband] spool at {}", spool.inbox().display());
+        crate::sideband::register(Box::new(spool));
+
+        // The link that needs nobody to set it up. Being cut off usually means the
+        // router is up and the internet behind it is not, or everyone is on one
+        // hotspot with no data — the machines can still reach each other, and a
+        // broadcast needs no relay, no discovery and no configuration to arrive.
+        match crate::sideband_lan::LanTransport::bind() {
+            Ok(lan) => {
+                eprintln!("[Sideband] local link on UDP {}", lan.port());
+                crate::sideband::register(Box::new(lan));
             }
-        });
-
-        tokio::spawn(async {
-            crate::mempool::run_batch_loop().await;
-        });
-
-        // Same offline transport the desktop app arms. A headless node is often
-        // the one relaying for people whose connection is cut, so it should be
-        // listening on the spool without being told.
-        if std::env::var("EGO_SIDEBAND_SPOOL").as_deref() != Ok("0") {
-            let spool = crate::sideband_spool::SpoolTransport::default_spool();
-            eprintln!("[Sideband] spool at {}", spool.inbox().display());
-            crate::sideband::register(Box::new(spool));
-
-            // A headless node is often the one with the connection, relaying for people who
-            // have lost theirs, so it listens on the local link without being asked.
-            match crate::sideband_lan::LanTransport::bind() {
-                Ok(lan) => {
-                    eprintln!("[Sideband] local link on UDP {}", lan.port());
-                    crate::sideband::register(Box::new(lan));
-                }
-                Err(e) => eprintln!("[Sideband] local link unavailable: {e}"),
-            }
-            tokio::spawn(async {
-                loop {
-                    crate::sideband::poll_once(None).await;
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-            });
+            Err(e) => eprintln!("[Sideband] local link unavailable: {e}"),
         }
 
+        tauri::async_runtime::spawn(async move {
+            loop {
+                crate::sideband::poll_once(crate::ui::handle()).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
+
+    crate::commands::updates::spawn_update_notifier();
+    crate::commands::updates::spawn_chain_anchor_watch();
+
+    // Runtime freeze detector. A task on the async runtime bumps a counter every
+    // second; this plain OS thread, which a frozen runtime cannot stop, reports when
+    // the counter stops moving. Paired with the [Stall] slow step lines it names
+    // whatever is holding the runtime.
+    {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static HEARTBEAT: AtomicI64 = AtomicI64::new(0);
+        let now_ms = || chrono::Utc::now().timestamp_millis();
+        HEARTBEAT.store(now_ms(), Ordering::Relaxed);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                HEARTBEAT.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+        std::thread::spawn(move || {
+            let mut frozen_since: Option<i64> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let lag = now_ms() - HEARTBEAT.load(Ordering::Relaxed);
+                match (lag >= 5_000, frozen_since) {
+                    (true, None) => {
+                        frozen_since = Some(now_ms() - lag);
+                        eprintln!("[Stall] async runtime not responding ({} ms so far)", lag);
+                    }
+                    (false, Some(start)) => {
+                        eprintln!("[Stall] async runtime was frozen for {:.1}s", (now_ms() - start) as f64 / 1000.0);
+                        frozen_since = None;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    std::thread::spawn(|| {
+        eprintln!("[Startup] RocksDB pre-warm thread started");
+        let _ = crate::chain_db::get_db();
+        eprintln!("[Startup] RocksDB pre-warm thread done");
+    });
+
+    std::thread::spawn(|| {
+        eprintln!("[Startup] Seed+PQ cache thread started");
+        crate::p2p::prime_ed25519_seed_cache();
+        eprintln!("[Startup] Seed cache primed");
+        crate::commands::auth::ensure_pq_cache();
+        eprintln!("[Startup] PQ cache ready");
+    });
+
+    tauri::async_runtime::spawn(async {
+        tokio::task::spawn_blocking(crate::poc::init_session_start)
+            .await.ok();
+    });
+
+    tauri::async_runtime::spawn(async move {
+        use futures::FutureExt;
+        let ran = std::panic::AssertUnwindSafe(crate::p2p::start_p2p_server(crate::ui::handle().cloned())).catch_unwind().await;
+        if ran.is_err() {
+            eprintln!("[P2P] networking stopped after an internal error; restarting Ego Desktop so the node reconnects");
+            crate::ui::restart();
+        }
+    });
+
+    tauri::async_runtime::spawn(async move {
+        let my_endpoint = crate::p2p::wait_for_public_endpoint(60).await;
+
+        if my_endpoint.contains("/p2p-circuit") {
+            tracing::info!("Relay circuit confirmed: {}", my_endpoint);
+        } else if !my_endpoint.is_empty() {
+            tracing::warn!("Relay not confirmed in 20s — using: {}", my_endpoint);
+        } else {
+            tracing::warn!("No endpoint — check network");
+        }
+
+        tokio::task::spawn_blocking(|| {
+            crate::chain_db::restore_in_memory_state_from_db();
+            crate::genesis::announce_on_start();
+            crate::shielded_chain::repair_pool_state();
+            crate::sharding::load_agreed_shard_count_from_db();
+
+            let my_addr = crate::ledger::Ledger::load().address;
+            if !my_addr.is_empty() {
+                crate::p2p::set_local_validator(&my_addr);
+                tracing::info!("Registered local validator: {}", &my_addr[..my_addr.len().min(20)]);
+            }
+        }).await.ok();
+
+        crate::p2p::fetch_and_cache_egoc_price().await;
+
+        crate::p2p::sync_chain_from_peers().await;
+
+        // Restore pending TXs after oracle sync so confirmed nonces are populated.
+        tokio::task::spawn_blocking(|| crate::commands::tx_pending::restore_to_mempool()).await.ok();
+
+        crate::p2p::broadcast_peer_announce(crate::ui::handle()).await;
+        tracing::info!("Peer announce sent (endpoint: {})", my_endpoint);
+        // Tell the network how much space we share, so every node's
+        // "Network Storage Available" adds ours in.
+        crate::p2p::broadcast_data_manifest().await;
+
+        // Oracle-backed peer rendezvous: register our relayed endpoint and
+        // dial peers the oracle knows about, so two NAT'd nodes behind one
+        // relay actually connect (DHT discovery alone left them isolated at
+        // "Active Nodes: 1" on separate solo chains). Re-run periodically so
+        // a node that joins later is discovered and the relay circuit (which
+        // may not be confirmed at first tick) is retried.
+        crate::p2p::oracle_peer_discovery_tick().await;
         tokio::spawn(async {
-            crate::rpc::start_rpc_server().await;
+            loop {
+                tokio::time::sleep(crate::p2p::discovery_pause()).await;
+                crate::p2p::oracle_peer_discovery_tick().await;
+            }
         });
 
-        tokio::spawn(async {
-            let _ = crate::tls::ensure_tls_certs();
-            crate::rpc::start_https_server().await;
-        });
-
-        tokio::spawn(crate::gateway::supervise());
-        tokio::spawn(crate::account_record::run());
-        tokio::spawn(crate::phone_mail::run_catch_up());
-        tokio::spawn(crate::commands::storage::renew_loop());
-
-        tokio::spawn(async {
-            crate::commands::consensus::run_post_loop().await;
-        });
-
-        tokio::spawn(async {
-            crate::p2p::run_shard_rebalance_monitor().await;
-        });
-
-        tokio::spawn(async {
-            crate::p2p::run_view_change_monitor().await;
-        });
-
-        tokio::spawn(async {
-            crate::p2p::run_solo_liveness_watchdog().await;
-        });
-
-        tokio::spawn(async {
-            crate::p2p::run_sync_status_watcher().await;
-        });
-
-        crate::contract_exec::start();
-        crate::clock::start();
-
-        tokio::spawn(async {
-            crate::p2p::run_power_event_loop().await;
-        });
-
+        // Publish this validator's address↔BLS binding on-chain so the
+        // oracle/peers can stake-weight its QC votes. Retries periodically:
+        // the fn skips itself once registered, and under emission v2 it
+        // defers until the node has staked the floor — so a node that
+        // stakes later still registers without a restart.
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
             loop {
                 tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
+                tokio::task::spawn_blocking(crate::p2p::maybe_send_machine_bind).await.ok();
                 tokio::task::spawn_blocking(crate::p2p::maybe_send_uptime_checkin).await.ok();
                 tokio::task::spawn_blocking(crate::p2p::maybe_send_state_vote).await.ok();
+                tokio::task::spawn_blocking(crate::p2p::maybe_send_hold_votes).await.ok();
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             }
         });
 
         tokio::spawn(crate::p2p::run_state_sync_loop());
 
-        tokio::spawn(async {
-            crate::p2p::run_porep_challenge_loop().await;
-        });
+        crate::p2p::restore_dht_cache().await;
 
-        tokio::spawn(async {
-            let mut tick: u32 = 0;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                tick = tick.wrapping_add(1);
-                crate::p2p::oracle_archive_tick().await;
-                if tick % 20 == 3 {
-                    crate::p2p::push_snapshot_to_oracle().await;
+        crate::p2p::dht_publish_self(&{
+            let l = crate::ledger::Ledger::load(); l.address
+        }, &my_endpoint, "Ego Node").await;
+        crate::p2p::dht_discover_peers().await;
+
+        crate::p2p::dht_discover_relays().await;
+
+        let peers = crate::p2p::get_live_peers();
+        let ledger_addr = { let l = crate::ledger::Ledger::load(); l.address };
+        crate::sharding::run_shard_startup(&ledger_addr, &my_endpoint, &peers, 0).await;
+        crate::p2p::broadcast_shard_announce().await;
+        tracing::info!("Shard announce sent");
+
+        crate::p2p::dht_publish_shard_assignments(&ledger_addr, &my_endpoint).await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        crate::p2p::sync_chain_from_peers().await;
+        tracing::info!("Chain sync requested");
+
+        crate::p2p::register_with_relay_as_ego_node().await;
+
+        // PoSt check runs every 6 h — track iteration count (30s × 720 = 6h).
+        const SNAPSHOT_EVERY_N_TICKS: u32 = 20;
+        let mut loop_tick: u32 = 0;
+        const POST_EVERY_N_TICKS: u32 = 720;  // 720 × 30s = 6 h
+        // Once the network has enough independent nodes the RPC oracle
+        // is no longer needed — pure P2P gossip takes over.
+        const P2P_SELF_SUFFICIENT_PEERS: usize = 50;
+
+        let mut last_tick_wall = std::time::SystemTime::now();
+
+        // Stuck-detection: if our tip stops advancing while the oracle is
+        // ahead, we're likely wedged on a hole in the oracle's block feed
+        // (a block the paginated endpoint is missing). Force a snapshot jump.
+        let mut last_seen_tip = crate::chain_db::latest_block_info().0;
+        let mut tip_stuck_since = std::time::Instant::now();
+
+        // Every network call below is bounded so one hung P2P/DHT/relay
+        // request can never stall the loop for minutes. A stalled loop
+        // used to trip the wall-clock "wake-from-sleep" heuristic, which
+        // then fired an even more expensive re-sync — a runaway spiral
+        // that left the node solo-forking instead of following the chain.
+        macro_rules! bounded {
+            ($secs:expr, $fut:expr) => {
+                let step_started = std::time::Instant::now();
+                let timed_out = tokio::time::timeout(std::time::Duration::from_secs($secs), $fut).await.is_err();
+                let took = step_started.elapsed();
+                if timed_out {
+                    tracing::warn!("loop step timed out after {}s (skipping, will retry next tick): {}", $secs, stringify!($fut));
+                }
+                if took.as_millis() >= 2_000 {
+                    eprintln!("[Stall] slow step ({:.1}s): {}", took.as_secs_f64(), stringify!($fut));
+                }
+            };
+        }
+
+        loop {
+            for _ in 0..6 {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    bounded!(20, crate::p2p::sync_chain_from_peers());
                 }
             }
-        });
+            loop_tick = loop_tick.wrapping_add(1);
 
-        tokio::spawn(async {
-            loop {
-                crate::p2p::oracle_peer_discovery_tick().await;
-                tokio::time::sleep(crate::p2p::discovery_pause()).await;
+            let now_wall = std::time::SystemTime::now();
+            let wall_elapsed = now_wall.duration_since(last_tick_wall).unwrap_or_default().as_secs();
+            last_tick_wall = now_wall;
+            // Only treat a large gap as a genuine suspend/resume — with the
+            // bounded calls below the loop can no longer drift past ~60s on
+            // its own, so a gap this big really is a sleep/hibernate.
+            if wall_elapsed > 120 {
+                tracing::info!("Wake-from-sleep detected ({}s gap) — reconnecting P2P", wall_elapsed);
+
+                bounded!(15, crate::p2p::sync_chain_from_peers());
+                bounded!(15, crate::p2p::restore_dht_cache());
+                bounded!(15, crate::p2p::dht_discover_peers());
+                bounded!(15, crate::p2p::oracle_peer_discovery_tick());
+                bounded!(15, crate::p2p::register_with_relay_as_ego_node());
+                crate::p2p::touch_proposal_timestamp();
             }
-        });
 
-        let rpc_port: u16 = std::env::var("EGO_RPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47395);
-        tracing::info!("All services started. RPC on port {}. P2P on port {}", rpc_port, crate::p2p::p2p_port());
-        tracing::info!("Chain data: {:?}", crate::ledger::base_data_dir());
-        tracing::info!("Press Ctrl+C to stop.");
+            let _ = crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed);
+            bounded!(15, crate::p2p::broadcast_peer_announce(crate::ui::handle()));
+            // Re-announce our free space every ~2.5 min; peers drop
+            // reports older than 30 min from the network total.
+            if loop_tick % 5 == 0 {
+                bounded!(15, crate::p2p::broadcast_data_manifest());
+                // Repeat this week's deletes for nodes that were offline.
+                bounded!(15, crate::file_delete::repeat_mine());
+            }
+            bounded!(15, crate::p2p::sync_chain_from_peers());
+            bounded!(15, crate::p2p::dht_discover_relays());
 
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Shutting down");
+            let cur_tip = crate::chain_db::latest_block_info().0;
+            if cur_tip > last_seen_tip {
+                last_seen_tip = cur_tip;
+                tip_stuck_since = std::time::Instant::now();
+            } else if tip_stuck_since.elapsed().as_secs() > 100 {
+                bounded!(25, crate::p2p::request_snapshot_from_peers(cur_tip));
+                last_seen_tip = crate::chain_db::latest_block_info().0;
+                tip_stuck_since = std::time::Instant::now();
+            }
+
+            let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+                .await.unwrap_or_default();
+            if !my_addr.is_empty() {
+                bounded!(15, crate::commands::messenger::poll_relay_inbox(&my_addr, crate::ui::handle()));
+            }
+
+            bounded!(20, crate::commands::messenger::resend_pending_contact_requests());
+
+            bounded!(15, crate::p2p::fetch_and_cache_egoc_price());
+
+            bounded!(15, crate::commands::outbox::flush_pending());
+
+            bounded!(20, crate::p2p::check_file_replication());
+
+            bounded!(15, crate::commands::compute::compute_node_heartbeat());
+
+            if loop_tick % POST_EVERY_N_TICKS == 1 {
+                bounded!(30, crate::proof::run_post_checks(crate::ui::handle()));
+            }
+
+            bounded!(30, crate::p2p::oracle_archive_tick());
+
+            if loop_tick % SNAPSHOT_EVERY_N_TICKS == 3 {
+                bounded!(90, crate::p2p::push_snapshot_to_oracle());
+            }
+
+            let shard_peers = crate::p2p::get_live_peers();
+            let ledger_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+                .await.unwrap_or_default();
+            let endpoint = crate::p2p::get_public_endpoint().await;
+            bounded!(20, crate::sharding::run_shard_startup(&ledger_addr, &endpoint, &shard_peers, 0));
+            bounded!(15, crate::p2p::broadcast_shard_announce());
+            bounded!(15, crate::sharding::check_master_health(&ledger_addr, &endpoint, 0));
+
+            bounded!(20, crate::p2p::push_shard_data_to_slaves());
+
+            let ep3 = crate::p2p::get_public_endpoint().await;
+            bounded!(15, crate::p2p::dht_publish_shard_assignments(&ledger_addr, &ep3));
+            bounded!(15, crate::p2p::broadcast_vacancy_notices());
+            bounded!(120, crate::p2p::history_tick());
+            bounded!(60, crate::p2p::wallet_history_tick(false));
+            bounded!(60, crate::commands::governance::dao_reveal_tick());
+        }
     });
+
+    tauri::async_runtime::spawn(async move {
+        crate::commands::consensus::run_post_loop().await;
+    });
+
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::run_shard_rebalance_monitor().await;
+    });
+
+    tauri::async_runtime::spawn(async move {
+        crate::mempool::run_batch_loop().await;
+    });
+
+    tauri::async_runtime::spawn(async move {
+        crate::commands::coverage::run_background_coverage_loop().await;
+    });
+
+    tauri::async_runtime::spawn(async move {
+        crate::rpc::start_rpc_server().await;
+    });
+
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::tls::ensure_tls_certs();
+        crate::rpc::start_https_server().await;
+    });
+
+    tauri::async_runtime::spawn(crate::gateway::supervise());
+    tauri::async_runtime::spawn(crate::account_record::run());
+    tauri::async_runtime::spawn(crate::phone_mail::run_catch_up());
+    tauri::async_runtime::spawn(crate::commands::storage::renew_loop());
+
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::run_view_change_monitor().await;
+    });
+
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::run_solo_liveness_watchdog().await;
+    });
+
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::run_sync_status_watcher().await;
+    });
+
+    crate::contract_exec::start();
+    crate::clock::start();
+
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::run_power_event_loop().await;
+    });
+
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::run_porep_challenge_loop().await;
+    });
+
+    crate::maintenance::start_health_watchdog();
 }
 
 /// Default log filter, used when EGO_LOG is unset.
@@ -645,6 +1027,11 @@ const DEFAULT_LOG_FILTER: &str =
     "ego_desktop=info,warn,libp2p_gossipsub=error,libp2p_dcutr=error,libp2p_relay=error";
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let server = wants_server(&args);
+    let command = cli_command(&args);
+    #[cfg(target_os = "windows")]
+    let has_console = (server || command.is_some()) && console_for_output();
     crate::utils::open_file_limit();
     {
         use tracing_subscriber::{fmt, EnvFilter, prelude::*};
@@ -665,6 +1052,9 @@ fn main() {
             .with(fmt::layer().with_target(false))
             .with(filter)
             .init();
+    }
+    if let Some(command) = command {
+        std::process::exit(run_cli(command));
     }
     tracing::info!("Ego Desktop starting");
 
@@ -689,13 +1079,8 @@ fn main() {
         }
     }
 
-    if std::env::var("EGO_HEADLESS").as_deref() == Ok("1") {
-        headless_main();
-        return;
-    }
-
     #[cfg(target_os = "windows")]
-    {
+    if !(server && has_console) {
         extern "system" {
             fn SetStdHandle(nStdHandle: u32, hHandle: isize) -> i32;
         }
@@ -718,7 +1103,9 @@ fn main() {
     }
 
     #[cfg(target_os = "windows")]
-    register_windows_notifications();
+    if !server {
+        register_windows_notifications();
+    }
 
     maintenance::init_process_start();
     maintenance::start_power_source_watcher();
@@ -907,10 +1294,19 @@ fn main() {
     }
 
     if !acquire_single_instance_lock() {
+        if server {
+            eprintln!("Ego Desktop is already running on this computer. Stop it first, then start the node with --server.");
+            std::process::exit(1);
+        }
         std::process::exit(0);
     }
 
     register_suspend_listeners();
+
+    if server {
+        server_main();
+        return;
+    }
 
     let quit = CustomMenuItem::new("quit".to_string(), "Quit");
     let hide = CustomMenuItem::new("hide".to_string(), "Hide");
@@ -1376,98 +1772,9 @@ fn main() {
             eprintln!("[Startup] setup() called — spawning background init threads");
             std::thread::spawn(crate::desktop_entry::ensure_launchers);
 
-            // Offline transaction transport, always available.
-            //
-            // Someone whose connection has just been cut is the last person able
-            // to set an environment variable and restart, so this arms itself and
-            // waits. Registering costs a directory and a two second poll of an
-            // empty folder; a transaction is only ever handed to it when gossip
-            // has nowhere to go, so a working connection never touches it.
-            //
-            // The spool is a directory inside the node's own data folder, so it
-            // opens no path that a process could not already reach by writing to
-            // the wallet directly, and everything arriving through it is validated
-            // exactly as gossip is. Radio hardware still takes a deliberate act:
-            // somebody has to run the bridge against the spool.
-            //
-            // EGO_SIDEBAND_SPOOL=0 turns it off.
-            if std::env::var("EGO_SIDEBAND_SPOOL").as_deref() != Ok("0") {
-                let spool = crate::sideband_spool::SpoolTransport::default_spool();
-                eprintln!("[Sideband] spool at {}", spool.inbox().display());
-                crate::sideband::register(Box::new(spool));
+            crate::ui::set_handle(app.handle());
+            start_node_services();
 
-                // The link that needs nobody to set it up. Being cut off usually means the
-                // router is up and the internet behind it is not, or everyone is on one
-                // hotspot with no data — the machines can still reach each other, and a
-                // broadcast needs no relay, no discovery and no configuration to arrive.
-                match crate::sideband_lan::LanTransport::bind() {
-                    Ok(lan) => {
-                        eprintln!("[Sideband] local link on UDP {}", lan.port());
-                        crate::sideband::register(Box::new(lan));
-                    }
-                    Err(e) => eprintln!("[Sideband] local link unavailable: {e}"),
-                }
-
-                let handle = app.handle();
-                tauri::async_runtime::spawn(async move {
-                    loop {
-                        crate::sideband::poll_once(Some(&handle)).await;
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                });
-            }
-
-            crate::commands::updates::spawn_update_notifier(app.handle());
-            crate::commands::updates::spawn_chain_anchor_watch(app.handle());
-
-            // Runtime freeze detector. A task on the async runtime bumps a counter every
-            // second; this plain OS thread, which a frozen runtime cannot stop, reports when
-            // the counter stops moving. Paired with the [Stall] slow step lines it names
-            // whatever is holding the runtime.
-            {
-                use std::sync::atomic::{AtomicI64, Ordering};
-                static HEARTBEAT: AtomicI64 = AtomicI64::new(0);
-                let now_ms = || chrono::Utc::now().timestamp_millis();
-                HEARTBEAT.store(now_ms(), Ordering::Relaxed);
-                tauri::async_runtime::spawn(async move {
-                    loop {
-                        HEARTBEAT.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                });
-                std::thread::spawn(move || {
-                    let mut frozen_since: Option<i64> = None;
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        let lag = now_ms() - HEARTBEAT.load(Ordering::Relaxed);
-                        match (lag >= 5_000, frozen_since) {
-                            (true, None) => {
-                                frozen_since = Some(now_ms() - lag);
-                                eprintln!("[Stall] async runtime not responding ({} ms so far)", lag);
-                            }
-                            (false, Some(start)) => {
-                                eprintln!("[Stall] async runtime was frozen for {:.1}s", (now_ms() - start) as f64 / 1000.0);
-                                frozen_since = None;
-                            }
-                            _ => {}
-                        }
-                    }
-                });
-            }
-
-            std::thread::spawn(|| {
-                eprintln!("[Startup] RocksDB pre-warm thread started");
-                let _ = crate::chain_db::get_db();
-                eprintln!("[Startup] RocksDB pre-warm thread done");
-            });
-
-            std::thread::spawn(|| {
-                eprintln!("[Startup] Seed+PQ cache thread started");
-                crate::p2p::prime_ed25519_seed_cache();
-                eprintln!("[Startup] Seed cache primed");
-                crate::commands::auth::ensure_pq_cache();
-                eprintln!("[Startup] PQ cache ready");
-            });
 
             let window = app.get_window("main").unwrap();
 
@@ -1540,303 +1847,10 @@ fn main() {
                 });
             }
 
-            tauri::async_runtime::spawn(async {
-                tokio::task::spawn_blocking(crate::poc::init_session_start)
-                    .await.ok();
-            });
-
-            let handle_p2p = app.handle();
-            tauri::async_runtime::spawn(async move {
-                use futures::FutureExt;
-                let restart = handle_p2p.clone();
-                let ran = std::panic::AssertUnwindSafe(crate::p2p::start_p2p_server(Some(handle_p2p))).catch_unwind().await;
-                if ran.is_err() {
-                    eprintln!("[P2P] networking stopped after an internal error; restarting Ego Desktop so the node reconnects");
-                    restart.restart();
-                }
-            });
-
-            let handle_startup = app.handle();
-            tauri::async_runtime::spawn(async move {
-                let my_endpoint = crate::p2p::wait_for_public_endpoint(60).await;
-
-                if my_endpoint.contains("/p2p-circuit") {
-                    tracing::info!("Relay circuit confirmed: {}", my_endpoint);
-                } else if !my_endpoint.is_empty() {
-                    tracing::warn!("Relay not confirmed in 20s — using: {}", my_endpoint);
-                } else {
-                    tracing::warn!("No endpoint — check network");
-                }
-
-                tokio::task::spawn_blocking(|| {
-                    crate::chain_db::restore_in_memory_state_from_db();
-                    crate::genesis::announce_on_start();
-                    crate::shielded_chain::repair_pool_state();
-                    crate::sharding::load_agreed_shard_count_from_db();
-
-                    let my_addr = crate::ledger::Ledger::load().address;
-                    if !my_addr.is_empty() {
-                        crate::p2p::set_local_validator(&my_addr);
-                        tracing::info!("Registered local validator: {}", &my_addr[..my_addr.len().min(20)]);
-                    }
-                }).await.ok();
-
-                crate::p2p::fetch_and_cache_egoc_price().await;
-
-                crate::p2p::sync_chain_from_peers().await;
-
-                // Restore pending TXs after oracle sync so confirmed nonces are populated.
-                tokio::task::spawn_blocking(|| crate::commands::tx_pending::restore_to_mempool()).await.ok();
-
-                crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
-                tracing::info!("Peer announce sent (endpoint: {})", my_endpoint);
-                // Tell the network how much space we share, so every node's
-                // "Network Storage Available" adds ours in.
-                crate::p2p::broadcast_data_manifest().await;
-
-                // Oracle-backed peer rendezvous: register our relayed endpoint and
-                // dial peers the oracle knows about, so two NAT'd nodes behind one
-                // relay actually connect (DHT discovery alone left them isolated at
-                // "Active Nodes: 1" on separate solo chains). Re-run periodically so
-                // a node that joins later is discovered and the relay circuit (which
-                // may not be confirmed at first tick) is retried.
-                crate::p2p::oracle_peer_discovery_tick().await;
-                tokio::spawn(async {
-                    loop {
-                        tokio::time::sleep(crate::p2p::discovery_pause()).await;
-                        crate::p2p::oracle_peer_discovery_tick().await;
-                    }
-                });
-
-                // Publish this validator's address↔BLS binding on-chain so the
-                // oracle/peers can stake-weight its QC votes. Retries periodically:
-                // the fn skips itself once registered, and under emission v2 it
-                // defers until the node has staked the floor — so a node that
-                // stakes later still registers without a restart.
-                tokio::spawn(async {
-                    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-                    loop {
-                        tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
-                        tokio::task::spawn_blocking(crate::p2p::maybe_send_uptime_checkin).await.ok();
-                        tokio::task::spawn_blocking(crate::p2p::maybe_send_state_vote).await.ok();
-                        tokio::task::spawn_blocking(crate::p2p::maybe_send_hold_votes).await.ok();
-                        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                    }
-                });
-
-                tokio::spawn(crate::p2p::run_state_sync_loop());
-
-                crate::p2p::restore_dht_cache().await;
-
-                crate::p2p::dht_publish_self(&{
-                    let l = crate::ledger::Ledger::load(); l.address
-                }, &my_endpoint, "Ego Node").await;
-                crate::p2p::dht_discover_peers().await;
-
-                crate::p2p::dht_discover_relays().await;
-
-                let peers = crate::p2p::get_live_peers();
-                let ledger_addr = { let l = crate::ledger::Ledger::load(); l.address };
-                crate::sharding::run_shard_startup(&ledger_addr, &my_endpoint, &peers, 0).await;
-                crate::p2p::broadcast_shard_announce().await;
-                tracing::info!("Shard announce sent");
-
-                crate::p2p::dht_publish_shard_assignments(&ledger_addr, &my_endpoint).await;
-
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                crate::p2p::sync_chain_from_peers().await;
-                tracing::info!("Chain sync requested");
-
-                crate::p2p::register_with_relay_as_ego_node().await;
-
-                // PoSt check runs every 6 h — track iteration count (30s × 720 = 6h).
-                const SNAPSHOT_EVERY_N_TICKS: u32 = 20;
-                let mut loop_tick: u32 = 0;
-                const POST_EVERY_N_TICKS: u32 = 720;  // 720 × 30s = 6 h
-                // Once the network has enough independent nodes the RPC oracle
-                // is no longer needed — pure P2P gossip takes over.
-                const P2P_SELF_SUFFICIENT_PEERS: usize = 50;
-
-                let mut last_tick_wall = std::time::SystemTime::now();
-
-                // Stuck-detection: if our tip stops advancing while the oracle is
-                // ahead, we're likely wedged on a hole in the oracle's block feed
-                // (a block the paginated endpoint is missing). Force a snapshot jump.
-                let mut last_seen_tip = crate::chain_db::latest_block_info().0;
-                let mut tip_stuck_since = std::time::Instant::now();
-
-                // Every network call below is bounded so one hung P2P/DHT/relay
-                // request can never stall the loop for minutes. A stalled loop
-                // used to trip the wall-clock "wake-from-sleep" heuristic, which
-                // then fired an even more expensive re-sync — a runaway spiral
-                // that left the node solo-forking instead of following the chain.
-                macro_rules! bounded {
-                    ($secs:expr, $fut:expr) => {
-                        let step_started = std::time::Instant::now();
-                        let timed_out = tokio::time::timeout(std::time::Duration::from_secs($secs), $fut).await.is_err();
-                        let took = step_started.elapsed();
-                        if timed_out {
-                            tracing::warn!("loop step timed out after {}s (skipping, will retry next tick): {}", $secs, stringify!($fut));
-                        }
-                        if took.as_millis() >= 2_000 {
-                            eprintln!("[Stall] slow step ({:.1}s): {}", took.as_secs_f64(), stringify!($fut));
-                        }
-                    };
-                }
-
-                loop {
-                    for _ in 0..6 {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        if crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                            bounded!(20, crate::p2p::sync_chain_from_peers());
-                        }
-                    }
-                    loop_tick = loop_tick.wrapping_add(1);
-
-                    let now_wall = std::time::SystemTime::now();
-                    let wall_elapsed = now_wall.duration_since(last_tick_wall).unwrap_or_default().as_secs();
-                    last_tick_wall = now_wall;
-                    // Only treat a large gap as a genuine suspend/resume — with the
-                    // bounded calls below the loop can no longer drift past ~60s on
-                    // its own, so a gap this big really is a sleep/hibernate.
-                    if wall_elapsed > 120 {
-                        tracing::info!("Wake-from-sleep detected ({}s gap) — reconnecting P2P", wall_elapsed);
-
-                        bounded!(15, crate::p2p::sync_chain_from_peers());
-                        bounded!(15, crate::p2p::restore_dht_cache());
-                        bounded!(15, crate::p2p::dht_discover_peers());
-                        bounded!(15, crate::p2p::oracle_peer_discovery_tick());
-                        bounded!(15, crate::p2p::register_with_relay_as_ego_node());
-                        crate::p2p::touch_proposal_timestamp();
-                    }
-
-                    let _ = crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed);
-                    bounded!(15, crate::p2p::broadcast_peer_announce(Some(&handle_startup)));
-                    // Re-announce our free space every ~2.5 min; peers drop
-                    // reports older than 30 min from the network total.
-                    if loop_tick % 5 == 0 {
-                        bounded!(15, crate::p2p::broadcast_data_manifest());
-                        // Repeat this week's deletes for nodes that were offline.
-                        bounded!(15, crate::file_delete::repeat_mine());
-                    }
-                    bounded!(15, crate::p2p::sync_chain_from_peers());
-                    bounded!(15, crate::p2p::dht_discover_relays());
-
-                    let cur_tip = crate::chain_db::latest_block_info().0;
-                    if cur_tip > last_seen_tip {
-                        last_seen_tip = cur_tip;
-                        tip_stuck_since = std::time::Instant::now();
-                    } else if tip_stuck_since.elapsed().as_secs() > 100 {
-                        bounded!(25, crate::p2p::request_snapshot_from_peers(cur_tip));
-                        last_seen_tip = crate::chain_db::latest_block_info().0;
-                        tip_stuck_since = std::time::Instant::now();
-                    }
-
-                    let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
-                        .await.unwrap_or_default();
-                    if !my_addr.is_empty() {
-                        bounded!(15, crate::commands::messenger::poll_relay_inbox(&my_addr, Some(&handle_startup)));
-                    }
-
-                    bounded!(20, crate::commands::messenger::resend_pending_contact_requests());
-
-                    bounded!(15, crate::p2p::fetch_and_cache_egoc_price());
-
-                    bounded!(15, crate::commands::outbox::flush_pending());
-
-                    bounded!(20, crate::p2p::check_file_replication());
-
-                    bounded!(15, crate::commands::compute::compute_node_heartbeat());
-
-                    if loop_tick % POST_EVERY_N_TICKS == 1 {
-                        bounded!(30, crate::proof::run_post_checks(Some(&handle_startup)));
-                    }
-
-                    bounded!(30, crate::p2p::oracle_archive_tick());
-
-                    if loop_tick % SNAPSHOT_EVERY_N_TICKS == 3 {
-                        bounded!(90, crate::p2p::push_snapshot_to_oracle());
-                    }
-
-                    let shard_peers = crate::p2p::get_live_peers();
-                    let ledger_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
-                        .await.unwrap_or_default();
-                    let endpoint = crate::p2p::get_public_endpoint().await;
-                    bounded!(20, crate::sharding::run_shard_startup(&ledger_addr, &endpoint, &shard_peers, 0));
-                    bounded!(15, crate::p2p::broadcast_shard_announce());
-                    bounded!(15, crate::sharding::check_master_health(&ledger_addr, &endpoint, 0));
-
-                    bounded!(20, crate::p2p::push_shard_data_to_slaves());
-
-                    let ep3 = crate::p2p::get_public_endpoint().await;
-                    bounded!(15, crate::p2p::dht_publish_shard_assignments(&ledger_addr, &ep3));
-                    bounded!(15, crate::p2p::broadcast_vacancy_notices());
-                    bounded!(120, crate::p2p::history_tick());
-                    bounded!(60, crate::p2p::wallet_history_tick(false));
-                    bounded!(60, crate::commands::governance::dao_reveal_tick());
-                }
-            });
-
-            tauri::async_runtime::spawn(async move {
-                crate::commands::consensus::run_post_loop().await;
-            });
-
-            tauri::async_runtime::spawn(async move {
-                crate::p2p::run_shard_rebalance_monitor().await;
-            });
-
-            tauri::async_runtime::spawn(async move {
-                crate::mempool::run_batch_loop().await;
-            });
-
             let handle_market = app.handle();
             tauri::async_runtime::spawn(async move {
                 crate::commands::market::run_market_loop(handle_market).await;
             });
-
-            let handle_coverage = app.handle();
-            tauri::async_runtime::spawn(async move {
-                crate::commands::coverage::run_background_coverage_loop(handle_coverage).await;
-            });
-
-            tauri::async_runtime::spawn(async move {
-                crate::rpc::start_rpc_server().await;
-            });
-
-            tauri::async_runtime::spawn(async move {
-                let _ = crate::tls::ensure_tls_certs();
-                crate::rpc::start_https_server().await;
-            });
-
-            tauri::async_runtime::spawn(crate::gateway::supervise());
-            tauri::async_runtime::spawn(crate::account_record::run());
-            tauri::async_runtime::spawn(crate::phone_mail::run_catch_up());
-            tauri::async_runtime::spawn(crate::commands::storage::renew_loop());
-
-            tauri::async_runtime::spawn(async move {
-                crate::p2p::run_view_change_monitor().await;
-            });
-
-            tauri::async_runtime::spawn(async move {
-                crate::p2p::run_solo_liveness_watchdog().await;
-            });
-
-            tauri::async_runtime::spawn(async move {
-                crate::p2p::run_sync_status_watcher().await;
-            });
-
-            crate::contract_exec::start();
-            crate::clock::start();
-
-            tauri::async_runtime::spawn(async move {
-                crate::p2p::run_power_event_loop().await;
-            });
-
-            tauri::async_runtime::spawn(async move {
-                crate::p2p::run_porep_challenge_loop().await;
-            });
-
-            crate::maintenance::start_health_watchdog(app.handle());
 
             #[cfg(debug_assertions)]
             app.get_window("main").unwrap().open_devtools();

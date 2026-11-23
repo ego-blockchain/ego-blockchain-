@@ -2,12 +2,48 @@ use crate::app::{AppState, CoverageStatus, Location, NetworkQuality};
 use crate::error::EgoDesktopError;
 use once_cell::sync::OnceCell;
 use serde::Deserialize;
-use tauri::{Manager, State};
+use tauri::State;
 
 static MACHINE_ID: OnceCell<String> = OnceCell::new();
 
 pub fn get_machine_id_cached() -> String {
     MACHINE_ID.get_or_init(get_machine_id).clone()
+}
+
+pub fn machine_place_id() -> String {
+    static ID: OnceCell<String> = OnceCell::new();
+    ID.get_or_init(|| {
+        let raw = machine_place_source();
+        hex::encode(blake3::hash(format!("ego/machine/v1:{}", raw.trim().to_lowercase()).as_bytes()).as_bytes())
+    })
+    .clone()
+}
+
+fn machine_place_source() -> String {
+    #[cfg(target_os = "linux")]
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id", "/sys/class/dmi/id/product_uuid", "/proc/sys/kernel/random/boot_id"] {
+        if let Ok(v) = std::fs::read_to_string(path) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    get_machine_id_cached()
+}
+
+pub fn machine_place_note() -> Option<String> {
+    let me = crate::ledger::Ledger::load().address;
+    if me.is_empty() || !crate::drs::machine_rule_active(crate::chain_db::local_chain_height().saturating_add(1)) {
+        return None;
+    }
+    let (named, placed) = crate::chain_db::machine_place_of(&me);
+    (named.is_some() && !placed).then(|| {
+        format!(
+            "{} other Ego nodes already earn check-in pay on this computer. This node still earns for the files it stores.",
+            crate::drs::NODES_PAID_PER_MACHINE
+        )
+    })
 }
 
 fn cached_machine_id() -> String {
@@ -302,7 +338,7 @@ fn maybe_record_poc_event(status: &CoverageStatus, witnesses: Option<Vec<crate::
 //
 // Why 60 s?  PoC events require 240 s between them, so 60 s gives us
 // 4 checks per window — enough resolution without hammering the relay.
-pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
+pub async fn run_background_coverage_loop() {
     let machine_id = tokio::task::spawn_blocking(cached_machine_id)
         .await
         .unwrap_or_default();
@@ -313,7 +349,7 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
     // Showing Offline in the placeholder causes a misleading flash whenever the
     // wallet file hasn't been read yet at the exact moment this runs.
     {
-        let state = app.state::<AppState>();
+        let state = crate::app::global_app_state();
         let placeholder = CoverageStatus {
             location:              None,
             coverage_synced_count: 0,
@@ -326,7 +362,7 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
         };
         state.update_coverage_status(placeholder);
     }
-    let _ = app.emit_all("ego://coverage-updated", ());
+    crate::ui::emit_all("ego://coverage-updated", ());
 
     // Wait for relay circuit before first real probe.
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
@@ -342,7 +378,7 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
     let mut last_ip      = init_ip;
 
     {
-        let state = app.state::<AppState>();
+        let state = crate::app::global_app_state();
         let node_active = tokio::task::spawn_blocking(|| !crate::ledger::Ledger::load().address.is_empty())
             .await
             .unwrap_or(false);
@@ -359,7 +395,7 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
         };
         state.update_coverage_status(placeholder);
     }
-    let _ = app.emit_all("ego://coverage-updated", ());
+    crate::ui::emit_all("ego://coverage-updated", ());
 
     // Re-check VPN every tick (60 s). Catches enabling/disabling VPN while the app is open.
     let mut tick: u32 = 0;
@@ -385,14 +421,14 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
                     ip_changed, vpn_detected, vpn_reason
                 );
                 // Emit immediately so the UI updates without waiting for the next tick.
-                let _ = app.emit_all("ego://vpn-status-changed", serde_json::json!({
+                crate::ui::emit_all("ego://vpn-status-changed", serde_json::json!({
                     "vpn_detected": vpn_detected,
                     "vpn_reason":   &vpn_reason,
                 }));
             }
         }
 
-        tick_coverage(&app, &location, vpn_detected, &vpn_reason).await;
+        tick_coverage(&location, vpn_detected, &vpn_reason).await;
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         tick += 1;
     }
@@ -400,12 +436,11 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
 
 /// One coverage tick: probe peers, count, record PoC event, announce.
 async fn tick_coverage(
-    app:          &tauri::AppHandle,
     location:     &Option<Location>,
     vpn_detected: bool,
     vpn_reason:   &str,
 ) {
-    let state = app.state::<AppState>();
+    let state = crate::app::global_app_state();
 
     let (node_active, machine_id) = tokio::task::spawn_blocking(|| {
         (!crate::ledger::Ledger::load().address.is_empty(), cached_machine_id())
@@ -417,11 +452,11 @@ async fn tick_coverage(
     // PeerListRequest so they announce back to us. This actively discovers
     // new nodes even if they haven't sent a PeerAnnounce to us yet.
     if is_online {
-        probe_peers_from_relay(app).await;
+        probe_peers_from_relay().await;
     }
 
     if is_online {
-        crate::p2p::broadcast_peer_announce(Some(app)).await;
+        crate::p2p::broadcast_peer_announce(crate::ui::handle()).await;
     }
 
     let active_peers = state.get_active_peers(600);
@@ -443,7 +478,7 @@ async fn tick_coverage(
     };
 
     state.update_coverage_status(status.clone());
-    let _ = app.emit_all("ego://coverage-updated", ());
+    crate::ui::emit_all("ego://coverage-updated", ());
 
     if is_online {
         let now = chrono::Utc::now().timestamp();
@@ -470,11 +505,11 @@ async fn tick_coverage(
     }
 }
 
-async fn probe_peers_from_relay(app: &tauri::AppHandle) {
+async fn probe_peers_from_relay() {
 
     crate::p2p::dht_discover_peers().await;
 
-    let state        = app.state::<AppState>();
+    let state        = crate::app::global_app_state();
     let my_endpoint  = crate::p2p::get_public_endpoint().await;
     let active_peers = state.get_active_peers(300);
     let active_eps:  std::collections::HashSet<String> =

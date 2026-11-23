@@ -1725,6 +1725,9 @@ pub fn fee_exempt(tx: &LedgerTx) -> bool {
     if tx.tx_type == crate::storage_proof::POST_PROOF_TX && tx.from == tx.to && tx.amount == 0 {
         return registered();
     }
+    if crate::drs::parse_machine_bind(tx).is_some() {
+        return registered();
+    }
     if crate::chain_db::is_price_report(tx) {
         return crate::chain_db::may_report_price(&tx.from);
     }
@@ -1840,6 +1843,7 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     crate::vault_chain::admit(tx)?;
     crate::hold_chain::admit(tx)?;
     crate::pq_chain::admit(tx)?;
+    crate::drs::admit_machine_bind(tx)?;
 
     let dilithium_disabled = crate::chain_db::is_feature_disabled(
         crate::chain_db::FEATURE_DILITHIUM_DISABLED,

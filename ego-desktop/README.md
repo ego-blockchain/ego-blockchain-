@@ -126,6 +126,20 @@ Installers are attached to each [GitHub Release](../../releases).
 
 ---
 
+## Servers and computers without a screen
+
+`--server` runs the same full node with no window, so a server, an old PC or any computer without a monitor earns like the app does:
+
+```bash
+"Ego Desktop" --server              # the node, no window; Ctrl+C stops it
+"Ego Desktop" --address             # this computer's wallet address
+"Ego Desktop" --recovery-phrase     # the 24 words that restore it
+```
+
+On Linux, run the AppImage with `APPIMAGE_EXTRACT_AND_RUN=1`. [`bins/ego-rigs`](../bins/ego-rigs) starts the node for you, runs it as a service at boot on Linux, and shows what all your computers earn in one table.
+
+---
+
 ## Build from Source
 
 **Prerequisites**: Rust 1.85+ (the workspace uses edition 2024), Node.js 20+

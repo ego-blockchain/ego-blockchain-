@@ -268,6 +268,10 @@ impl AppState {
         self.public_endpoint.lock().unwrap().clone()
     }
 
+    pub fn peer_last_seen(&self, address: &str) -> Option<i64> {
+        self.peers.lock().unwrap().get(address).map(|p| p.last_seen)
+    }
+
     pub fn upsert_peer(&self, mut info: PeerInfo) {
         let mut peers = self.peers.lock().unwrap();
         if let Some(prev) = peers.get(&info.address) {

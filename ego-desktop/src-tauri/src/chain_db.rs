@@ -4455,6 +4455,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     let mut blocked_senders: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut held_back: Vec<LedgerTx> = Vec::new();
     let mut free_count = 0usize;
+    let mut machine_binders: std::collections::HashSet<String> = std::collections::HashSet::new();
     let dao_ov = crate::drs::Ov::new(db);
     let dao_unstakers: std::collections::BTreeSet<String> =
         sorted_txs.iter().filter(|t| is_unstake_tx(t)).map(|t| t.from.clone()).collect();
@@ -4490,6 +4491,16 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         if height >= CHECKIN_FROM_HEIGHT && !tx_age_ok(tx, timestamp) {
             eprintln!("[TX] {:.12} Rejected — dated outside the {}-day window", tx.hash, TX_MAX_AGE_SECS / 86_400);
             return false;
+        }
+        if tx.tx_type == crate::drs::TX_MACHINE_BIND {
+            if let Err(e) = crate::drs::machine_bind_check(&dao_ov, tx, height, timestamp) {
+                eprintln!("[TX] {:.12} Rejected — {e}", tx.hash);
+                return false;
+            }
+            if !machine_binders.insert(tx.from.clone()) {
+                held_back.push((*tx).clone());
+                return false;
+            }
         }
         if height >= CHECKIN_FROM_HEIGHT && is_free_housekeeping(tx) {
             if free_count >= MAX_FREE_TXS_PER_BLOCK {
@@ -5444,6 +5455,7 @@ fn validate_peer_block_checked(
             crate::hold_chain::validate(&crate::drs::Ov::new(db), block, txs, &bal)?;
         }
         crate::pq_chain::validate(&crate::drs::Ov::new(db), block, txs)?;
+        crate::drs::validate_machine_binds(&crate::drs::Ov::new(db), block, txs)?;
         if block.height >= CHECKIN_FROM_HEIGHT {
             if let Some(tx) = txs.iter().find(|t| t.tx_type == crate::coverage_proof::POC_PROOF_TX) {
                 return Err(format!("coverage proof {} refused: coverage is proven in coverage batches now", tx.hash));
@@ -10026,6 +10038,11 @@ pub(crate) fn val_bls_in(db: &DB, addr: &str) -> Option<Vec<u8>> {
         .filter(|k| k.len() == 48)
 }
 
+pub fn machine_place_of(addr: &str) -> (Option<String>, bool) {
+    let ov = crate::drs::Ov::new(global_db());
+    (crate::drs::machine_of(&ov, addr), crate::drs::has_machine_place(&ov, addr))
+}
+
 pub fn drs_node(addr: &str) -> Option<crate::drs::NodeRec> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     crate::drs::load_rec(&crate::drs::Ov::new(db), addr)
@@ -11160,6 +11177,7 @@ pub fn is_free_housekeeping(tx: &LedgerTx) -> bool {
             || is_uptime_checkin(tx)
             || tx.tx_type == crate::storage_proof::POST_PROOF_TX
             || is_price_report(tx)
+            || crate::drs::parse_machine_bind(tx).is_some()
             || crate::storage_pay::is_storage_claim(tx))
 }
 

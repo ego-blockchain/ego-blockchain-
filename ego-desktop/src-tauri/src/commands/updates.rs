@@ -103,6 +103,10 @@ const PEER_VERSION_MAX_TRACKED: usize = 4096;
 static PEER_VERSIONS: std::sync::Mutex<std::collections::BTreeMap<String, (String, i64)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+pub fn peer_version(address: &str) -> Option<(String, i64)> {
+    PEER_VERSIONS.lock().unwrap_or_else(|e| e.into_inner()).get(address).cloned()
+}
+
 pub fn note_peer_version(address: &str, version: &str) {
     let version = version.trim();
     if address.is_empty() || parse_version(version) == (0, 0, 0) {
@@ -271,7 +275,7 @@ fn started_over_recently(now: i64) -> bool {
         .map_or(false, |at| now - at < ANCHOR_RESYNC_SPACING_SECS)
 }
 
-pub fn spawn_chain_anchor_watch(app: tauri::AppHandle) {
+pub fn spawn_chain_anchor_watch() {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(ANCHOR_FIRST_CHECK_SECS)).await;
         loop {
@@ -293,13 +297,12 @@ pub fn spawn_chain_anchor_watch(app: tauri::AppHandle) {
                         anchor.0
                     );
                     let _ = std::fs::write(crate::ledger::base_data_dir().join(ANCHOR_RESYNC_MARKER), now.to_string());
-                    crate::commands::notifications::notify(
-                        &app,
+                    crate::ui::notify(
                         "Switching to the current chain",
                         "This node was following an old copy of the chain. It is downloading the current one now. Your wallet is not affected.",
                     );
                     if crate::chain_db::request_resync().is_ok() {
-                        app.restart();
+                        crate::ui::restart();
                     }
                 }
             }
@@ -323,15 +326,14 @@ fn remember_notified(version: &str) {
     let _ = std::fs::write(p, version);
 }
 
-pub fn spawn_update_notifier(app: tauri::AppHandle) {
+pub fn spawn_update_notifier() {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(FIRST_CHECK_SECS)).await;
         loop {
             let mut wait = RECHECK_SECS;
             if let Ok(info) = check_for_update().await {
                 if info.required {
-                    crate::commands::notifications::notify(
-                        &app,
+                    crate::ui::notify(
                         &format!("Required update: Ego Desktop {}", info.latest),
                         &format!(
                             "Your node can no longer make blocks or earn until you install version {}. {}",
@@ -345,8 +347,7 @@ pub fn spawn_update_notifier(app: tauri::AppHandle) {
                     } else {
                         info.notes.clone()
                     };
-                    crate::commands::notifications::notify(
-                        &app,
+                    crate::ui::notify(
                         &format!("Ego Desktop {} available", info.latest),
                         &body,
                     );
