@@ -13144,7 +13144,8 @@ pub fn maybe_send_machine_bind() {
     let (named, placed) = crate::chain_db::machine_place_of(&addr);
     if named.as_deref() == Some(machine.as_str()) && placed { return; }
     let now = Utc::now().timestamp();
-    if now - LAST_SENT.load(Ordering::Relaxed) < crate::drs::MACHINE_REBIND_SECS + 60 { return; }
+    let wait = if named.is_some() { crate::drs::MACHINE_REBIND_SECS + 60 } else { crate::drs::MACHINE_BIND_RETRY_SECS };
+    if now - LAST_SENT.load(Ordering::Relaxed) < wait { return; }
 
     if let Some(pending) = crate::mempool::get_mempool().peek_all().into_iter().find(|t| {
         t.from == addr && t.tx_type == crate::drs::TX_MACHINE_BIND && t.call_args == machine
@@ -13189,7 +13190,7 @@ pub fn maybe_send_machine_bind() {
             eprintln!("[Machine] Named this computer on chain for {}", &addr[..addr.len().min(16)]);
         }
         Err(e) => {
-            LAST_SENT.store(now - crate::drs::MACHINE_REBIND_SECS + 540, Ordering::Relaxed);
+            LAST_SENT.store(now - wait + 540, Ordering::Relaxed);
             eprintln!("[Machine] Machine registration NOT sent: {e}");
         }
     }

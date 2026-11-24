@@ -60,7 +60,7 @@ The wallet then lives in `/home/ego/.local/share/EgoDesktop`. Show its address w
 ### Things that stop a computer from earning
 
 - **A datacenter, VPN or proxy connection.** Rented cloud servers do not earn; the network refuses those connections so nobody can fake thousands of nodes. Computers on a normal home or office connection earn.
-- **More than 2 nodes on one computer.** From block 192,341 (Ego Desktop 0.3.701) each node names its computer on the chain, as a one-way hash of the computer's ID, never the ID itself. Only 2 nodes per computer then earn check-in pay and the full chance to be drawn as a block maker. A third node on the same computer only earns for the files it stores, and is drawn only for those. This also covers several data folders and Docker containers on one server. A place frees up when one of the 2 nodes has been offline for a week.
+- **More than 2 nodes on one computer.** From block 192,341 (Ego Desktop 0.3.701) each node names its computer on the chain, as a one-way hash of the computer's ID, never the ID itself. Only 2 nodes per computer then earn check-in pay and the full chance to be drawn as a block maker. A third node on the same computer only earns for the files it stores. From block 193,781 (Ego Desktop 0.3.702) it keeps one point in the block maker draw, so a small network keeps making blocks when a computer goes offline, but it is still not paid for check-ins. This also covers several data folders and Docker containers on one server. A place frees up when one of the 2 nodes has been offline for a week.
 - **An old version.** When a new version is required, the node stops making blocks until it is updated.
 
 ## 2. Add the computers on your main one

@@ -45,7 +45,7 @@ pub const LIVE_SEATS_FROM_HEIGHT: u64 = 79_841;
 const LIVE_SEAT_EPOCHS: u64 = 3;
 const WIDEN_READY_EPOCHS: u64 = 8;
 const WIDEN_MAX_OUTSIDERS: usize = 512;
-pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT, PAY_V2_READY_FROM_HEIGHT, MACHINE_READY_FROM_HEIGHT];
+pub const RULE_CHANGES: &[u64] = &[32_801, 32_901, DRAW_V3_FROM_HEIGHT, SPLIT_FROM_HEIGHT, PAY_V2_READY_FROM_HEIGHT, MACHINE_READY_FROM_HEIGHT, MACHINE_RESERVE_READY_FROM_HEIGHT];
 const KEY_STORAGE_TOTAL: &[u8] = b"n2swt";
 const KEY_LAST_MAKERS: &[u8] = b"n2last";
 
@@ -103,10 +103,16 @@ pub const TX_MACHINE_BIND: &str = "machine_bind";
 pub const NODES_PAID_PER_MACHINE: usize = 2;
 pub const MACHINE_IDLE_SECS: i64 = 7 * 86_400;
 pub const MACHINE_REBIND_SECS: i64 = CHECKIN_INTERVAL_SECS;
+pub const MACHINE_BIND_RETRY_SECS: i64 = 600;
+pub const MACHINE_RESERVE_FROM_HEIGHT: u64 = 193_781;
+pub const MACHINE_RESERVE_READY_FROM_HEIGHT: u64 = MACHINE_RESERVE_FROM_HEIGHT.saturating_add(SHORT_EPOCH);
+const _: () = assert!(MACHINE_RESERVE_FROM_HEIGHT == u64::MAX || (MACHINE_RESERVE_FROM_HEIGHT - SHORT_EPOCH_FROM_HEIGHT) % SHORT_EPOCH == 0);
+pub const MACHINE_RESERVE_WEIGHT: u64 = 1;
 
 #[cfg(test)]
 thread_local! {
     static TEST_MACHINE_RULE_FROM: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+    static TEST_MACHINE_RESERVE_FROM: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 }
 
 fn machine_rule_from() -> u64 {
@@ -123,6 +129,22 @@ fn machine_rule_from() -> u64 {
 pub fn machine_rule_active(height: u64) -> bool {
     let from = machine_rule_from();
     from != u64::MAX && height >= from
+}
+
+fn machine_reserve_from() -> u64 {
+    #[cfg(test)]
+    {
+        let from = TEST_MACHINE_RESERVE_FROM.with(|c| c.get());
+        if from != u64::MAX {
+            return from;
+        }
+    }
+    MACHINE_RESERVE_FROM_HEIGHT
+}
+
+fn machine_reserve_in_period(period: u64) -> bool {
+    let from = machine_reserve_from();
+    from != u64::MAX && period > period_of(from)
 }
 
 fn machine_rule_in_period(period: u64) -> bool {
@@ -958,6 +980,17 @@ pub fn weight_with_base(rec: &NodeRec, at: i64, keys_ok: bool, period: u64, base
     uptime + storage + coverage
 }
 
+fn draw_weight(rec: &NodeRec, at: i64, keys_ok: bool, period: u64, base: bool, paid: u64) -> u64 {
+    if base || !machine_reserve_in_period(period) || weight_with_base(rec, at, keys_ok, period, true) == 0 {
+        return paid;
+    }
+    paid.saturating_add(MACHINE_RESERVE_WEIGHT)
+}
+
+fn counted_key(addr: &str) -> Vec<u8> {
+    format!("n2cnt:{addr}").into_bytes()
+}
+
 fn next_drop(rec: &NodeRec, at: i64) -> Option<i64> {
     let mut times = Vec::new();
     if rec.streak > 0 {
@@ -975,19 +1008,25 @@ fn next_drop(rec: &NodeRec, at: i64) -> Option<i64> {
 fn refresh(ov: &mut Ov, addr: &str, rec: &mut NodeRec, at: i64, period: u64) {
     let keys_ok = has_consensus_key(ov, addr);
     let base = earns_base(ov, addr, period);
-    let new_w = weight_with_base(rec, at, keys_ok, period, base);
+    let paid_w = weight_with_base(rec, at, keys_ok, period, base);
+    let new_w = draw_weight(rec, at, keys_ok, period, base, paid_w);
     let old_w = rec.weight.next;
+    let ckey = counted_key(addr);
+    let was_counted = ov.get(&ckey).map_or(old_w > 0, |v| v.first() == Some(&1));
     if new_w != old_w {
         rec.weight.set(period, new_w);
         tree_add(ov, rec.idx, period, new_w as i128 - old_w as i128);
-        if (old_w == 0) != (new_w == 0) {
-            let mut elig = versioned(ov, KEY_ELIGIBLE);
-            elig.add(period, if new_w > 0 { 1 } else { -1 });
-            ov.put(KEY_ELIGIBLE.to_vec(), elig.encode());
-        }
+    }
+    if was_counted != (paid_w > 0) {
+        let mut elig = versioned(ov, KEY_ELIGIBLE);
+        elig.add(period, if paid_w > 0 { 1 } else { -1 });
+        ov.put(KEY_ELIGIBLE.to_vec(), elig.encode());
+    }
+    if machine_reserve_in_period(period) && ov.get(&ckey).map(|v| v.first() == Some(&1)) != Some(paid_w > 0) {
+        ov.put(ckey, vec![u8::from(paid_w > 0)]);
     }
     if period >= period_of(SPLIT_FROM_HEIGHT) {
-        let new_s = if new_w > 0 { storage_points(rec, at).min(new_w) } else { 0 };
+        let new_s = if paid_w > 0 { storage_points(rec, at).min(paid_w) } else { 0 };
         let key = storage_w_key(addr);
         let mut sw = versioned(ov, &key);
         if sw.next != new_s {
@@ -1000,15 +1039,15 @@ fn refresh(ov: &mut Ov, addr: &str, rec: &mut NodeRec, at: i64, period: u64) {
         }
     }
     if ov.get(KEY_PAY_SINCE).is_some() {
-        let s = if new_w > 0 { storage_points(rec, at).min(new_w) } else { 0 };
-        let m = if new_w == 0 {
+        let s = if paid_w > 0 { storage_points(rec, at).min(paid_w) } else { 0 };
+        let m = if paid_w == 0 {
             0
         } else if base {
             early_mult_milli(rank_or_assign(ov, addr))
         } else {
             rank_of(ov, addr).map_or(1_000, early_mult_milli)
         };
-        set_pay(ov, &pay_base_key(addr), KEY_PAY_BASE_TOTAL, period, (new_w - s).saturating_mul(m));
+        set_pay(ov, &pay_base_key(addr), KEY_PAY_BASE_TOTAL, period, (paid_w - s).saturating_mul(m));
         set_pay(ov, &pay_storage_key(addr), KEY_PAY_STORAGE_TOTAL, period, s.saturating_mul(m));
         if let Some(st) = load_staker(ov, addr) {
             let act = activity_of(rec, at);
@@ -3420,6 +3459,72 @@ mod node_pay_v2_tests {
         TEST_MACHINE_RULE_FROM.with(|c| c.set(from));
         f();
         TEST_MACHINE_RULE_FROM.with(|c| c.set(u64::MAX));
+    }
+
+    fn with_machine_reserve(from: u64, f: impl FnOnce()) {
+        TEST_MACHINE_RESERVE_FROM.with(|c| c.set(from));
+        f();
+        TEST_MACHINE_RESERVE_FROM.with(|c| c.set(u64::MAX));
+    }
+
+    fn three_on_one_machine(ov: &mut Ov, at: i64, m: &str) {
+        for (i, a) in ["egot1ra", "egot1rb", "egot1rc"].iter().enumerate() {
+            machine_node(ov, a, i as u64, at);
+        }
+        ov.put(KEY_PAY_SINCE.to_vec(), u64_le(at as u64).to_vec());
+        bind_all(ov, &[bind_tx("egot1ra", m, "0x01"), bind_tx("egot1rb", m, "0x02"), bind_tx("egot1rc", m, "0x03")], at, 2_000);
+    }
+
+    #[test]
+    fn a_node_without_a_place_keeps_one_draw_point_but_no_pay() {
+        with_machine_rule(1_000, || {
+            with_machine_reserve(1_000, || {
+                let mut ov = Ov::memory();
+                let at = 1_800_000_000;
+                three_on_one_machine(&mut ov, at, &"5".repeat(64));
+                let next = period_of(2_000) + 1;
+                assert_eq!(load_rec(&ov, "egot1rc").unwrap().weight.next, MACHINE_RESERVE_WEIGHT, "it can still be drawn to make blocks");
+                assert_eq!(load_rec(&ov, "egot1ra").unwrap().weight.next, FULL_BASE);
+                assert_eq!(total_weight(&ov, next), 2 * FULL_BASE + MACHINE_RESERVE_WEIGHT);
+                assert_eq!(eligible_count(&ov, next), 2, "the block reward counts only nodes with a place");
+                let (pb, _, ps, _) = pay_weights(&ov, "egot1rc", next);
+                assert_eq!((pb, ps), (0, 0), "the draw point pays nothing");
+                assert_eq!(rank_of(&ov, "egot1rc"), None);
+            });
+        });
+    }
+
+    #[test]
+    fn the_draw_point_ends_with_the_streak_and_the_count_stays_right() {
+        with_machine_rule(1_000, || {
+            with_machine_reserve(1_000, || {
+                let mut ov = Ov::memory();
+                let at = 1_800_000_000;
+                three_on_one_machine(&mut ov, at, &"6".repeat(64));
+                let later = at + STREAK_GAP_SECS + 60;
+                let p = period_of(3_000);
+                for a in ["egot1ra", "egot1rc"] {
+                    let mut rec = load_rec(&ov, a).unwrap();
+                    refresh(&mut ov, a, &mut rec, later, p);
+                    save_rec(&mut ov, a, &rec);
+                    assert_eq!(rec.weight.next, 0, "{a} went quiet");
+                }
+                assert_eq!(total_weight(&ov, p + 1), FULL_BASE);
+                assert_eq!(eligible_count(&ov, p + 1), 1, "only egot1rb is still counted");
+            });
+        });
+    }
+
+    #[test]
+    fn before_the_reserve_switch_a_node_without_a_place_is_not_drawn() {
+        with_machine_rule(1_000, || {
+            let mut ov = Ov::memory();
+            let at = 1_800_000_000;
+            three_on_one_machine(&mut ov, at, &"7".repeat(64));
+            assert_eq!(load_rec(&ov, "egot1rc").unwrap().weight.next, 0);
+            assert_eq!(ov.get(&counted_key("egot1rc")), None, "nothing new is written before the switch");
+            assert_eq!(eligible_count(&ov, period_of(2_000) + 1), 2);
+        });
     }
 
     const FULL_BASE: u64 = 20 + 10 * COVERAGE_POINTS_PER_WITNESS;

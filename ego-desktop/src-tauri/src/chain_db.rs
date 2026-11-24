@@ -4502,6 +4502,18 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
                 return false;
             }
         }
+        if tx.tx_type == crate::storage_proof::POST_PROOF_TX {
+            if let Err(e) = crate::storage_proof::validate_against_chain(tx, latest_height, |h| block_hash_at_in(&db, h)) {
+                eprintln!("[TX] {:.12} Rejected — storage proof: {e}", tx.hash);
+                return false;
+            }
+        }
+        if tx.tx_type == crate::coverage_proof::POC_PROOF_TX {
+            if let Err(e) = crate::coverage_proof::validate_against_chain(tx, latest_height, |h| block_hash_at_in(&db, h)) {
+                eprintln!("[TX] {:.12} Rejected — coverage proof: {e}", tx.hash);
+                return false;
+            }
+        }
         if height >= CHECKIN_FROM_HEIGHT && is_free_housekeeping(tx) {
             if free_count >= MAX_FREE_TXS_PER_BLOCK {
                 held_back.push((*tx).clone());
@@ -9981,6 +9993,30 @@ mod storage_pay_tests {
         let mut bare = body;
         bare.proofs[0].chunk.clear();
         assert!(!crate::storage_proof::chunks_match(&bare));
+    }
+
+    #[test]
+    fn a_storage_proof_the_chain_would_refuse_is_left_out_of_the_block() {
+        let a = vec![5u8; 2_000];
+        let ca = "egoblk1storagepaytest0000000000000000000000000000000000000000000cccc";
+        crate::blocks::save_block(ca, &a).unwrap();
+        let manifest = crate::blocks::FileManifest {
+            manifest_cid: "egomfd1buildertest".into(),
+            file_name: "t".into(),
+            total_size: 2_000,
+            blocks: vec![crate::blocks::BlockEntry { block_cid: ca.into(), nonce_hex: String::new(), size: 2_000, comm_r: String::new() }],
+        };
+        let body = crate::storage_proof::manifest_proof(&manifest, "egomfd1buildertest", "egot1host", u64::MAX / 2, "hashx").unwrap();
+        let proof = LedgerTx {
+            hash: "0xbuilderstaleproof".into(),
+            from: "egot1host".into(),
+            to: "egot1host".into(),
+            tx_type: crate::storage_proof::POST_PROOF_TX.into(),
+            call_args: serde_json::to_string(&body).unwrap(),
+            ..LedgerTx::default()
+        };
+        let (_, txs) = build_block_proposal(&[proof], "egot1miner", "", 0);
+        assert!(txs.iter().all(|t| t.hash != "0xbuilderstaleproof"), "a block carrying it would be refused by every node");
     }
 }
 
