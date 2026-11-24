@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 const CITIES: &str = include_str!("../data/cities.tsv");
 const RECHECK: Duration = Duration::from_secs(30 * 60);
 const FAILED_RECHECK: Duration = Duration::from_secs(10 * 60);
+const IP_RECHECK: Duration = Duration::from_secs(6 * 3600);
 const MAX_CITY_KM: f64 = 250.0;
 pub const SOURCE_DEVICE: &str = "device";
 pub const SOURCE_IP: &str = "ip";
@@ -104,6 +105,62 @@ fn read_position() -> Option<(f64, f64)> {
     None
 }
 
+fn number(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+fn ipinfo_point(v: &serde_json::Value) -> Option<(f64, f64)> {
+    let (lat, lon) = v.get("loc")?.as_str()?.split_once(',')?;
+    Some((lat.trim().parse().ok()?, lon.trim().parse().ok()?))
+}
+
+fn latlon_point(v: &serde_json::Value) -> Option<(f64, f64)> {
+    if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
+        return None;
+    }
+    Some((number(v.get("latitude")?)?, number(v.get("longitude")?)?))
+}
+
+async fn fetch_point(client: &reqwest::Client, url: &str, read: fn(&serde_json::Value) -> Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let v: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+    read(&v)
+}
+
+pub fn agreed_city(points: &[(f64, f64)]) -> Option<Location> {
+    let mut tally: Vec<(Location, usize)> = Vec::new();
+    for &(lat, lon) in points {
+        let Some(loc) = nearest_city(lat, lon) else { continue };
+        match tally.iter_mut().find(|(l, _)| l.city == loc.city && l.region == loc.region && l.country == loc.country) {
+            Some((_, n)) => *n += 1,
+            None => tally.push((loc, 1)),
+        }
+    }
+    let best = tally.iter().map(|(_, n)| *n).max()?;
+    let (mut loc, _) = tally.into_iter().find(|(_, n)| *n == best)?;
+    loc.source = Some(SOURCE_IP.to_string());
+    Some(loc)
+}
+
+pub async fn ip_city(client: &reqwest::Client, ip: &str, ip_api: Option<(f64, f64)>) -> Option<Location> {
+    static LAST: Mutex<Option<(String, Instant, Location)>> = Mutex::new(None);
+    if let Some((seen, at, loc)) = LAST.lock().ok().and_then(|g| g.clone()) {
+        if seen == ip && at.elapsed() < IP_RECHECK {
+            return Some(loc);
+        }
+    }
+    let (a, b, c) = tokio::join!(
+        fetch_point(client, "https://ipinfo.io/json", ipinfo_point),
+        fetch_point(client, "https://get.geojs.io/v1/ip/geo.json", latlon_point),
+        fetch_point(client, "https://ipwho.is/", latlon_point),
+    );
+    let points: Vec<(f64, f64)> = [a, b, c, ip_api].into_iter().flatten().collect();
+    let found = agreed_city(&points)?;
+    if let Ok(mut g) = LAST.lock() {
+        *g = Some((ip.to_string(), Instant::now(), found.clone()));
+    }
+    Some(found)
+}
+
 pub async fn device_city() -> Option<Location> {
     static LAST: Mutex<Option<(Instant, Option<Location>)>> = Mutex::new(None);
     if let Some((at, found)) = LAST.lock().ok().and_then(|g| g.clone()) {
@@ -162,6 +219,37 @@ mod tests {
     fn print_this_computers_city() {
         let found = read_position().and_then(|(lat, lon)| nearest_city(lat, lon));
         println!("device city: {:?}", found.map(|l| (l.city, l.region, l.country)));
+    }
+
+    #[test]
+    fn the_ip_city_is_the_one_most_lookups_agree_on() {
+        let edmonton = (53.4593, -113.6546);
+        let calgary = (51.0501, -114.0853);
+        let loc = agreed_city(&[calgary, (51.1564, -114.0566), calgary, edmonton]).expect("a city");
+        assert_eq!(loc.city.as_deref(), Some("Calgary"));
+        assert_eq!(loc.source.as_deref(), Some(SOURCE_IP));
+        assert_eq!(agreed_city(&[calgary, edmonton]).and_then(|l| l.city).as_deref(), Some("Calgary"), "a tie goes to the first lookup");
+        assert_eq!(agreed_city(&[edmonton]).and_then(|l| l.city).as_deref(), Some("Edmonton"));
+        assert!(agreed_city(&[]).is_none());
+    }
+
+    #[test]
+    fn each_lookup_answer_is_read_in_its_own_shape() {
+        let info = serde_json::json!({"city": "Calgary", "loc": "51.0501,-114.0853"});
+        assert_eq!(ipinfo_point(&info), Some((51.0501, -114.0853)));
+        let geojs = serde_json::json!({"latitude": "51.1564", "longitude": "-114.0566"});
+        assert_eq!(latlon_point(&geojs), Some((51.1564, -114.0566)));
+        let who = serde_json::json!({"success": true, "latitude": 51.05, "longitude": -114.08});
+        assert_eq!(latlon_point(&who), Some((51.05, -114.08)));
+        assert_eq!(latlon_point(&serde_json::json!({"success": false, "latitude": 1.0, "longitude": 2.0})), None);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn print_this_connections_ip_city() {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let found = ip_city(&client, "test", None).await;
+        println!("ip city: {:?}", found.map(|l| (l.city, l.region, l.country)));
     }
 
     #[test]

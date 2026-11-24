@@ -626,7 +626,12 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
                     country: data.country.clone(),
                     source: Some(crate::device_location::SOURCE_IP.to_string()),
                 };
-                let loc = device.unwrap_or(loc);
+                let loc = match device {
+                    Some(d) => d,
+                    None => crate::device_location::ip_city(&client, data.query.as_deref().unwrap_or_default(), data.lat.zip(data.lon))
+                        .await
+                        .unwrap_or(loc),
+                };
                 let vpn_reason = detect_vpn(&data);
                 let is_vpn = vpn_reason.is_some() || data.proxy.unwrap_or(false) || data.hosting.unwrap_or(false);
                 let reason_str = vpn_reason.unwrap_or_else(|| {
