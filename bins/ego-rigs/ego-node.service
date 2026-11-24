@@ -1,5 +1,5 @@
 [Unit]
-Description=Ego node (Ego Desktop with no window)
+Description=Ego node (Ego Desktop server mode)
 Wants=network-online.target
 After=network-online.target
 

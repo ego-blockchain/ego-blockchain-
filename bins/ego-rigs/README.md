@@ -1,6 +1,6 @@
 # ego-rigs
 
-Run Ego nodes on servers, old PCs and any computer without a screen, then see what all of them earn as one: each computer's balance, its rewards in the last 24 hours and 7 days, whether it is online, which version it runs, and the total for all of them.
+Run Ego nodes on servers, old PCs and any other computer, then see what all of them earn as one: each computer's balance, its rewards in the last 24 hours and 7 days, whether it is online, which version it runs, and the total for all of them.
 
 ```
 Computer       Address                Balance  Last 24 h  Last 7 days  Last reward  Seen       Version  Status
@@ -12,14 +12,14 @@ old-laptop     egot1m3j7y...q5w2xe       0.00       0.00         0.00  never    
 All computers  4 computers           4,986.29     239.51     1,630.95               3 online            2 earning
 
 Amounts are in EGOC. Average over the last 7 days: 232.99 EGOC a day.
-Read from the Ego node at http://127.0.0.1:47395 (block 190,520, Ego Desktop 0.3.701).
+Read from the Ego node at http://127.0.0.1:47395 (block 190,520).
 ```
 
-Every computer runs the real Ego node, the one inside Ego Desktop, in its server mode: no window, nothing to click. `ego-rigs` only reads. It never sees a key or a recovery phrase, and you do not open any ports: nodes announce themselves to the network with a signed message, and the main computer's node keeps the last one it heard from each, so it knows when each computer was last online and which version it runs, even when they are in different houses.
+Every computer runs the real Ego node, the one inside Ego Desktop, in its server mode. `ego-rigs` only reads. It never sees a key or a recovery phrase, and you do not open any ports: nodes announce themselves to the network with a signed message, and the main computer's node keeps the last one it heard from each, so it knows when each computer was last online and which version it runs, even when they are in different houses.
 
 ## 1. Run the node on each computer
 
-Install Ego Desktop 0.3.701 or newer from [egoblockchain.com/download](https://egoblockchain.com/download), then start it with no window. The first start creates a wallet for that computer.
+Install Ego Desktop from [egoblockchain.com/download](https://egoblockchain.com/download), then start it in server mode. The first start creates a wallet for that computer.
 
 **With ego-rigs** (Windows, macOS or Linux):
 
@@ -27,7 +27,7 @@ Install Ego Desktop 0.3.701 or newer from [egoblockchain.com/download](https://e
 ego-rigs start
 ```
 
-It finds Ego Desktop where the installer put it (on Linux, the newest `.AppImage` in the current folder, `~/Applications`, `~/Downloads`, your home folder or `/opt/ego`), runs it with no window, and starts it again whenever the node stops to restart itself. Use `--app <path>` if it is somewhere else.
+It finds Ego Desktop where the installer put it (on Linux, the newest `.AppImage` in the current folder, `~/Applications`, `~/Downloads`, your home folder or `/opt/ego`), runs it in server mode, and starts it again whenever the node stops to restart itself. Use `--app <path>` if it is somewhere else.
 
 **Without ego-rigs:**
 
@@ -35,7 +35,7 @@ It finds Ego Desktop where the installer put it (on Linux, the newest `.AppImage
 | --- | --- |
 | Windows | `& "C:\Program Files\Ego Desktop\Ego Desktop.exe" --server` |
 | macOS | `"/Applications/Ego Desktop.app/Contents/MacOS/Ego Desktop" --server` |
-| Linux | `APPIMAGE_EXTRACT_AND_RUN=1 ./ego-desktop_0.3.701_amd64.AppImage --server` |
+| Linux | `APPIMAGE_EXTRACT_AND_RUN=1 ./ego-desktop_*_amd64.AppImage --server` |
 
 Press Ctrl+C to stop it.
 
@@ -48,7 +48,7 @@ Press Ctrl+C to stop it.
 ```bash
 sudo useradd --system --create-home ego
 sudo mkdir -p /opt/ego
-sudo cp ego-desktop_0.3.701_amd64.AppImage /opt/ego/ego-desktop.AppImage
+sudo cp ego-desktop_*_amd64.AppImage /opt/ego/ego-desktop.AppImage
 sudo chmod +x /opt/ego/ego-desktop.AppImage
 sudo cp ego-node.service /etc/systemd/system/
 sudo systemctl enable --now ego-node
@@ -60,12 +60,12 @@ The wallet then lives in `/home/ego/.local/share/EgoDesktop`. Show its address w
 ### Things that stop a computer from earning
 
 - **A datacenter, VPN or proxy connection.** Rented cloud servers do not earn; the network refuses those connections so nobody can fake thousands of nodes. Computers on a normal home or office connection earn.
-- **More than 2 nodes on one computer.** From block 192,341 (Ego Desktop 0.3.701) each node names its computer on the chain, as a one-way hash of the computer's ID, never the ID itself. Only 2 nodes per computer then earn check-in pay and the full chance to be drawn as a block maker. A third node on the same computer only earns for the files it stores. From block 193,781 (Ego Desktop 0.3.702) it keeps one point in the block maker draw, so a small network keeps making blocks when a computer goes offline, but it is still not paid for check-ins. This also covers several data folders and Docker containers on one server. A place frees up when one of the 2 nodes has been offline for a week.
+- **More than 2 nodes on one computer.** From block 192,341 each node names its computer on the chain, as a one-way hash of the computer's ID, never the ID itself. Only 2 nodes per computer then earn check-in pay and the full chance to be drawn as a block maker. A third node on the same computer only earns for the files it stores. From block 193,781 it keeps one point in the block maker draw, so a small network keeps making blocks when a computer goes offline, but it is still not paid for check-ins. This also covers several data folders and Docker containers on one server. A place frees up when one of the 2 nodes has been offline for a week.
 - **An old version.** When a new version is required, the node stops making blocks until it is updated.
 
 ## 2. Add the computers on your main one
 
-On each computer, run `ego-rigs here`. It prints that computer's wallet address and the exact line to copy. On your main computer, which runs Ego Desktop too (with its window or with `ego-rigs start`), add each one:
+On each computer, run `ego-rigs here`. It prints that computer's wallet address and the exact line to copy. On your main computer, which runs Ego Desktop too (opened as usual or with `ego-rigs start`), add each one:
 
 ```bash
 ego-rigs add rig-01 egot1...
@@ -78,7 +78,7 @@ Run `ego-rigs` for the table, or `ego-rigs watch` to keep it on screen. It refre
 
 | Command | What it does |
 | --- | --- |
-| `ego-rigs start` | Run the node on this computer with no window |
+| `ego-rigs start` | Run the node on this computer in server mode |
 | `ego-rigs phrase` | Show this computer's 24 words |
 | `ego-rigs here` | Show this computer's wallet address |
 | `ego-rigs add <name> <address>` | Add a computer, or change the address of one you already added |
@@ -95,7 +95,7 @@ Run `ego-rigs` for the table, or `ego-rigs watch` to keep it on screen. It refre
 | online, no rewards yet | The node is online and has never been paid |
 | offline | The node has not been heard for 15 minutes. Check that the computer is on, online and running the node |
 
-A version shown in yellow is older than the main computer's. If the main computer runs a version older than 0.3.701, Seen and Version stay empty and the status falls back to the time since the last reward (quiet after 2 hours, stopped after a day).
+A version shown in yellow is older than the main computer's. If the main computer runs an older Ego Desktop, Seen and Version stay empty and the status falls back to the time since the last reward (quiet after 2 hours, stopped after a day).
 
 Rewards are what the network paid to the address: block rewards, fee shares and node pay. Payments between people are not counted.
 

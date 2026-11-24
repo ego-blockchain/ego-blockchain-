@@ -21,7 +21,7 @@ const BEHIND_BLOCKS: u64 = 30;
 const RESTART_EXIT_CODE: i32 = 75;
 
 #[derive(Parser)]
-#[command(name = "ego-rigs", version, about = "Run Ego nodes on servers and computers without a screen, and see what all of them earn as one")]
+#[command(name = "ego-rigs", version, about = "Run Ego nodes on servers and other computers, and see what all of them earn as one")]
 struct Cli {
     #[arg(long, env = "EGO_RPC", default_value = DEFAULT_RPC, global = true, help = "The Ego node to read from")]
     rpc: String,
@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    #[command(about = "Run the Ego node on this computer with no window, and start it again if it stops to restart")]
+    #[command(about = "Run the Ego node on this computer in server mode, and start it again if it stops to restart")]
     Start {
         #[arg(long, env = "EGO_DESKTOP_APP", help = "Path to Ego Desktop (the .exe, the app's binary or the .AppImage)")]
         app: Option<PathBuf>,
@@ -536,7 +536,7 @@ fn render(node: &Node, rigs: &[Rig]) -> Result<String> {
     if !seen_known {
         out.push_str(&format!(
             "{}\n",
-            "That node is older than Ego Desktop 0.3.701, so Seen and Version stay empty until it is updated.".dimmed()
+            "That node runs an older Ego Desktop, so Seen and Version stay empty until it is updated.".dimmed()
         ));
     }
     if health.tip > health.height + BEHIND_BLOCKS {
@@ -653,7 +653,7 @@ fn app_command(app: &Path) -> Command {
 
 fn start(app: Option<PathBuf>) -> Result<()> {
     let app = find_app(app)?;
-    println!("Starting {} with no window. Press Ctrl+C to stop.", app.display());
+    println!("Starting {} in server mode. Press Ctrl+C to stop.", app.display());
     loop {
         let status = app_command(&app)
             .arg("--server")
@@ -676,7 +676,7 @@ fn phrase(app: Option<PathBuf>) -> Result<()> {
     let app = find_app(app)?;
     let status = app_command(&app).arg("--recovery-phrase").status().with_context(|| format!("cannot start {}", app.display()))?;
     if !status.success() {
-        bail!("Ego Desktop could not show the recovery phrase ({status}). It needs Ego Desktop 0.3.701 or newer");
+        bail!("Ego Desktop could not show the recovery phrase ({status}). Update Ego Desktop and try again");
     }
     Ok(())
 }
