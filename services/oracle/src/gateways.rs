@@ -161,18 +161,22 @@ pub fn cert_request_bytes(domain: &str, ts: i64, csr_hex: &str) -> Vec<u8> {
 
 pub fn may_issue_signed(domain: &str, csr_hex: &str, pubkey_hex: &str, sig_hex: &str, ts: i64, now: i64) -> Result<String, &'static str> {
     let label = gateway_label(domain).ok_or("Certificates are issued only for gateway names under gw.egoblockchain.com.")?;
+    if signed_cert_request(domain, csr_hex, pubkey_hex, sig_hex, ts, now)? != label {
+        return Err("A gateway can only ask for a certificate for its own name.");
+    }
+    Ok(label.to_string())
+}
+
+pub fn signed_cert_request(domain: &str, csr_hex: &str, pubkey_hex: &str, sig_hex: &str, ts: i64, now: i64) -> Result<String, &'static str> {
     if (ts - now).abs() > CLOCK_SKEW_SECS {
         return Err("The request's time is off by more than five minutes.");
     }
     let pk: [u8; 32] = hex::decode(pubkey_hex).ok().and_then(|v| v.try_into().ok()).ok_or("The public key is not 32 bytes of hex.")?;
     let sig: [u8; 64] = hex::decode(sig_hex).ok().and_then(|v| v.try_into().ok()).ok_or("The signature is not 64 bytes of hex.")?;
-    if address_of(&pk) != label {
-        return Err("A gateway can only ask for a certificate for its own name.");
-    }
     let key = VerifyingKey::from_bytes(&pk).map_err(|_| "The public key is not valid.")?;
     key.verify_strict(&cert_request_bytes(domain, ts, csr_hex), &Signature::from_bytes(&sig))
-        .map_err(|_| "The request is not signed by that gateway.")?;
-    Ok(label.to_string())
+        .map_err(|_| "The request is not signed by that key.")?;
+    Ok(address_of(&pk))
 }
 
 pub async fn listed(node: &str, pubkey_hex: &str, now: i64) -> bool {

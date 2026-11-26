@@ -87,6 +87,9 @@ axum-server = { version = "0.5", features = ["tls-rustls"] }
 igd-next = { version = "0.16", features = ["aio_tokio"] }
 tower       = "0.4"
 rcgen       = "0.12"
+rustls      = "0.21"
+rustls-pemfile = "1"
+x509-parser = "0.16"
 mdns-sd     = "0.21"
 futures = "0.3"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "tokio1-rustls-tls", "builder"] }

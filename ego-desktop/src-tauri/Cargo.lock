@@ -2523,6 +2523,8 @@ dependencies = [
  "ripemd",
  "rocksdb",
  "rusqlite",
+ "rustls 0.21.12",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha1",
@@ -2549,6 +2551,7 @@ dependencies = [
  "winreg 0.52.0",
  "winterfell",
  "x25519-dalek",
+ "x509-parser 0.16.0",
  "zeroize",
 ]
 

@@ -63,6 +63,7 @@ mod mempool;
 mod p2p;
 mod poc;
 mod proof;
+mod public_sites;
 mod python_host;
 mod rpc;
 mod sandbox;
@@ -987,6 +988,7 @@ fn start_node_services() {
     });
 
     tauri::async_runtime::spawn(crate::gateway::supervise());
+    tauri::async_runtime::spawn(crate::public_sites::run());
     tauri::async_runtime::spawn(crate::account_record::run());
     tauri::async_runtime::spawn(crate::phone_mail::run_catch_up());
     tauri::async_runtime::spawn(crate::commands::storage::renew_loop());
@@ -1705,6 +1707,8 @@ fn main() {
             commands::hosting::get_hosting_nodes,
             commands::hosting::check_domain_available,
             commands::hosting::check_domain_status,
+            commands::hosting::public_sites_status,
+            commands::hosting::public_sites_refresh,
             commands::hosting::get_hosting_plans,
             commands::hosting::get_my_hosting_plan,
             commands::hosting::purchase_hosting_plan,

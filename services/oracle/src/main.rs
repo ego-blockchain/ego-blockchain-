@@ -1006,7 +1006,7 @@ async fn handle_hosting_nodes(
     let matching: Vec<&HostingNodeRecord> = nodes.values()
         .filter(|n| n.last_seen >= now - hosting::ONLINE_SECS)
         .filter(|n| {
-            (owner.as_deref() == Some(n.node_id.as_str()) && n.domains.iter().any(|d| d == &domain))
+            (owner.as_deref() == Some(n.node_id.as_str()) && hosting::serves(&n.domains, &domain))
                 || (!domain.contains('.') && n.sites.iter().any(|s| s == &domain))
         })
         .collect();
@@ -1377,13 +1377,25 @@ async fn handle_cert_request(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid domain" })));
     }
     let now = Utc::now().timestamp();
-    let node = match gateways::may_issue_signed(&domain, &body.csr, &body.pubkey, &body.sig, body.ts, now) {
-        Ok(node) => node,
-        Err(e) => return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))),
+    let identifiers = if gateways::gateway_label(&domain).is_some() {
+        let node = match gateways::may_issue_signed(&domain, &body.csr, &body.pubkey, &body.sig, body.ts, now) {
+            Ok(node) => node,
+            Err(e) => return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))),
+        };
+        if !gateways::listed(&node, &body.pubkey, now).await {
+            return (StatusCode::FORBIDDEN, Json(json!({ "error": "Only a gateway on the public list can ask for its name's certificate." })));
+        }
+        vec![domain.clone()]
+    } else {
+        let signer = match gateways::signed_cert_request(&domain, &body.csr, &body.pubkey, &body.sig, body.ts, now) {
+            Ok(a) => a,
+            Err(e) => return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))),
+        };
+        match hosting::cert_names(&*state.hosting_domains.read().await, &domain, &signer) {
+            Ok(names) => names,
+            Err(e) => return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))),
+        }
     };
-    if !gateways::listed(&node, &body.pubkey, now).await {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Only a gateway on the public list can ask for its name's certificate." })));
-    }
     let Ok(csr_der) = hex::decode(&body.csr) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "the certificate request must be hex" })));
     };
@@ -1407,7 +1419,7 @@ async fn handle_cert_request(
         }
         rate.insert(domain.clone(), now);
     }
-    state.acme.request(domain.clone(), csr_der).await;
+    state.acme.request(domain.clone(), identifiers, csr_der).await;
     (StatusCode::ACCEPTED, Json(json!({ "domain": domain, "status": "pending" })))
 }
 
@@ -1591,7 +1603,11 @@ async fn main() {
     let mut initial_prices: PriceMap = HashMap::new();
     initial_prices.insert("EGOC".to_string(), PriceEntry { usd: EGOC_USD, updated_at: Utc::now().timestamp(), stale: false });
 
-    let acme_state = acme::AcmeState::new();
+    let acme_state = acme::AcmeState::new(Some(
+        std::env::var("ORACLE_ACME_ACCOUNT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| chain_data_path().with_file_name("acme-account.json")),
+    ));
 
     let loaded_chain = load_chain();
     let init_tip = loaded_chain.blocks.iter().map(|b| b["height"].as_u64().unwrap_or(0)).max().unwrap_or(0);

@@ -985,7 +985,7 @@ async fn handle_ws(mut socket: WebSocket, subs: Subscribers) {
 
 // ── Web3 Hosting Gateway ──────────────────────────────────────────────────────
 
-fn mime_from_path(path: &std::path::Path) -> &'static str {
+pub(crate) fn mime_from_path(path: &std::path::Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "html" | "htm" => "text/html; charset=utf-8",
         "css"          => "text/css; charset=utf-8",
@@ -1017,7 +1017,7 @@ fn mime_from_path(path: &std::path::Path) -> &'static str {
     }
 }
 
-fn read_site_file(path: &std::path::Path, site_name: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_site_file(path: &std::path::Path, site_name: &str) -> Option<Vec<u8>> {
     let raw = std::fs::read(path).ok()?;
     let key_hex = crate::chain_db::get_hosted_site_raw(site_name)
         .and_then(|v| v["site_key_hex"].as_str().map(|s| s.to_string()))
@@ -1061,7 +1061,7 @@ fn serve_ranged_file(path: &std::path::Path, range_header: Option<&str>) -> Resp
     ).into_response()
 }
 
-fn serve_ranged_bytes(data: Vec<u8>, mime: &'static str, range_header: Option<&str>) -> Response {
+pub(crate) fn serve_ranged_bytes(data: Vec<u8>, mime: &'static str, range_header: Option<&str>) -> Response {
     let total = data.len();
     if let Some(range_str) = range_header {
         if let Some((start, end)) = parse_byte_range(range_str, total) {
@@ -1266,7 +1266,7 @@ fn serve_js_injected(path: &std::path::Path, site_name: &str) -> Response {
     }
 }
 
-fn resolve_site_base(name: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_site_base(name: &str) -> Option<std::path::PathBuf> {
     let hosting_dir = crate::commands::hosting::hosting_base_dir();
 
     let owner = crate::chain_db::get_hosted_site_raw(name)
@@ -1550,10 +1550,9 @@ async fn gateway_file(
     }
 
     let rel   = file_path.trim_start_matches('/');
-    let full  = base.join(rel);
-    if !full.starts_with(&base) {
+    let Some(full) = crate::public_sites::site_path(&base, rel) else {
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
-    }
+    };
     if full.exists() {
         let range = headers.get(header::RANGE)
             .and_then(|v| v.to_str().ok())
@@ -1642,10 +1641,9 @@ async fn vhost_handler(headers: HeaderMap, uri: Uri) -> Response {
         return (StatusCode::NOT_FOUND, "Site not found").into_response();
     }
 
-    let full = base.join(path);
-    if !full.starts_with(&base) {
+    let Some(full) = crate::public_sites::percent_decode(path).and_then(|p| crate::public_sites::site_path(&base, &p)) else {
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
-    }
+    };
     if full.exists() { return serve_disk_file(&full); }
     let index = base.join("index.html");
     if index.exists() { return serve_disk_file(&index); }
@@ -1724,10 +1722,9 @@ async fn https_eo_handler(headers: HeaderMap, uri: Uri) -> Response {
         return (StatusCode::NOT_FOUND, "Site not found").into_response();
     }
 
-    let full = base.join(path);
-    if !full.starts_with(&base) {
+    let Some(full) = crate::public_sites::percent_decode(path).and_then(|p| crate::public_sites::site_path(&base, &p)) else {
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
-    }
+    };
     if full.exists() {
         return serve_disk_file(&full);
     }

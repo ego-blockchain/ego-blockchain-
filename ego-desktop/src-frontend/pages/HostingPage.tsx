@@ -139,20 +139,131 @@ function flattenDir(entries: any[], _folderPath: string, base: string): FlatFile
 
 const MAX_SITE_SIZE = 2 * 1024 * 1024 * 1024;
 
-function NsCard({ domain }: { domain: string }) {
+interface DomainStatus {
+  domain: string;
+  nameservers: boolean | null;
+  certificate: 'none' | 'requested' | 'ready' | 'failed';
+  certificate_expires: number | null;
+  certificate_error: string | null;
+}
+
+interface PublicStatus {
+  serving: boolean;
+  serving_error: string | null;
+  http_port: number;
+  https_port: number;
+  router: 'unknown' | 'open' | 'failed';
+  router_error: string | null;
+  public_ip: string | null;
+  local_ip: string | null;
+  carrier_nat: boolean;
+  nameservers: string[];
+  domains: DomainStatus[];
+}
+
+function Step({ n, state, title, children }: { n: number; state: 'done' | 'wait' | 'error'; title: string; children?: React.ReactNode }) {
+  const badge = state === 'done'
+    ? 'bg-green-500/15 text-green-300 border-green-500/30'
+    : state === 'error'
+      ? 'bg-red-500/15 text-red-300 border-red-500/30'
+      : 'bg-gray-700/40 text-gray-300 border-gray-600';
   return (
-    <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-4 space-y-3 text-sm">
-      <div className="font-semibold text-yellow-300">
-        Keep your current nameservers for now
+    <div className="flex gap-3">
+      <span className={`shrink-0 w-6 h-6 rounded-full border text-xs flex items-center justify-center ${badge}`}>
+        {state === 'done' ? '✓' : n}
+      </span>
+      <div className="flex-1 space-y-1.5">
+        <div className="text-sm font-medium text-white">{title}</div>
+        {children}
       </div>
-      <div className="text-xs text-gray-400 leading-relaxed">
-        Your site is saved and reserved for <span className="text-white font-mono">{domain}</span> on
-        the Ego network, but Ego Desktop can't serve it to the public internet yet.
-        If you point <span className="text-white font-mono">{domain}</span> at Ego's nameservers today,
-        visitors will see nothing.
+    </div>
+  );
+}
+
+function NsCard({ domain }: { domain: string }) {
+  const [status, setStatus] = useState<PublicStatus | null>(null);
+  const [copied, setCopied] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    const load = () => invoke<PublicStatus>('public_sites_status').then(s => { if (alive) setStatus(s); }).catch(() => {});
+    load();
+    const id = setInterval(load, 10_000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
+  function copy(val: string) {
+    navigator.clipboard.writeText(val).catch(() => {});
+    setCopied(val);
+    setTimeout(() => setCopied(''), 2000);
+  }
+
+  const d = status?.domains.find(x => x.domain === domain);
+  const nsState = d?.nameservers ? 'done' : 'wait';
+  const certState = d?.certificate === 'ready' ? 'done' : d?.certificate === 'failed' ? 'error' : 'wait';
+  const routerState = status?.carrier_nat ? 'error' : status?.router === 'open' ? 'done' : status?.router === 'failed' ? 'error' : 'wait';
+  const nameservers = status?.nameservers ?? ['ns1.egoblockchain.com', 'ns2.egoblockchain.com'];
+
+  return (
+    <div className="bg-blue-500/5 border border-blue-500/20 rounded-xl p-4 space-y-4 text-sm">
+      <div className="font-semibold text-blue-300">
+        Put <span className="font-mono">{domain}</span> online
       </div>
-      <div className="text-xs text-gray-500 leading-relaxed">
-        This step will show the nameservers to use once public serving is ready.
+
+      <Step n={1} state={nsState} title="Point your domain to Ego">
+        <div className="text-xs text-gray-400 leading-relaxed">
+          Where you bought <span className="text-white font-mono">{domain}</span>, open Nameservers and replace them with:
+        </div>
+        <div className="space-y-1.5">
+          {nameservers.map(ns => (
+            <div key={ns} className="bg-gray-900 rounded-lg flex items-center overflow-hidden font-mono text-xs">
+              <span className="px-3 py-2 text-green-300 flex-1">{ns}</span>
+              <button onClick={() => copy(ns)} className="px-3 py-2 text-gray-400 hover:text-white hover:bg-gray-700 transition-colors border-l border-gray-700">
+                {copied === ns ? '✓' : 'Copy'}
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="text-xs text-gray-500">
+          {d?.nameservers ? 'Your domain now points to Ego.' : 'Not pointing to Ego yet. Changes can take from a few minutes to 48 hours.'}
+        </div>
+      </Step>
+
+      <Step n={2} state={certState} title="Secure connection (HTTPS)">
+        <div className="text-xs text-gray-500 leading-relaxed">
+          {d?.certificate === 'ready' && d.certificate_expires
+            ? `Certificate from Let's Encrypt, renews automatically before ${new Date(d.certificate_expires * 1000).toLocaleDateString()}.`
+            : d?.certificate === 'requested'
+              ? "Asking Let's Encrypt for a certificate. This takes a few minutes."
+              : d?.certificate === 'failed'
+                ? `The certificate could not be issued: ${d.certificate_error ?? 'unknown reason'}. Ego tries again within the hour.`
+                : 'Starts on its own once step 1 is done.'}
+        </div>
+      </Step>
+
+      <Step n={3} state={routerState} title="Let visitors reach this computer">
+        <div className="text-xs text-gray-500 leading-relaxed">
+          {status?.carrier_nat
+            ? 'Your internet provider shares one public address between many customers, so visitors cannot reach this computer. Ask your provider for a public IP address, or host from another connection.'
+            : status?.router === 'open'
+              ? 'Your router sends website visitors (ports 80 and 443) to this computer.'
+              : status?.router === 'failed'
+                ? `Your router did not open the ports by itself (${status.router_error}). In your router settings, forward port 80 to ${status.local_ip ?? 'this computer'} port ${status.http_port}, and port 443 to port ${status.https_port}.`
+                : 'Checking your router…'}
+        </div>
+        {status?.serving_error && <div className="text-xs text-red-300">{status.serving_error}</div>}
+      </Step>
+
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-xs text-gray-500 leading-relaxed">
+          This computer serves the site, so it is offline while this computer is off or Ego Desktop is closed.
+        </div>
+        <button
+          onClick={() => invoke('public_sites_refresh').catch(() => {})}
+          className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors"
+        >
+          Check again
+        </button>
       </div>
     </div>
   );
@@ -593,7 +704,7 @@ const HostingPage: React.FC = () => {
           />
           {isValidDomain && (
             <div className="mt-1.5 text-xs text-gray-500">
-              Publishing saves the site and reserves this domain for your Ego address. Public serving of custom domains is not ready yet.
+              After publishing, you point the domain's nameservers to Ego and this computer serves the site.
             </div>
           )}
         </div>

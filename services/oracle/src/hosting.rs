@@ -82,6 +82,21 @@ pub fn owner_of<'a>(bindings: &'a HashMap<String, String>, name: &str) -> Option
     bindings.get(registrable(name)?).map(String::as_str)
 }
 
+pub fn serves(record_domains: &[String], name: &str) -> bool {
+    record_domains.iter().any(|d| d == name || name.strip_prefix("www.") == Some(d.as_str()))
+}
+
+pub fn cert_names(bindings: &HashMap<String, String>, domain: &str, signer: &str) -> Result<Vec<String>, &'static str> {
+    if !valid_domain(domain) || domain.starts_with("www.") {
+        return Err("Ask for the plain domain, like example.com; www is added for you.");
+    }
+    if owner_of(bindings, domain) != Some(signer) {
+        return Err("This domain belongs to another Ego address, or nobody has claimed it yet.");
+    }
+    let www = format!("www.{domain}");
+    Ok(if valid_domain(&www) { vec![domain.to_string(), www] } else { vec![domain.to_string()] })
+}
+
 pub struct Claimed {
     pub domains: Vec<String>,
     pub new_bindings: Vec<String>,
@@ -201,7 +216,7 @@ mod tests {
     fn only_a_record_signed_by_the_node_itself_is_accepted() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let now = 1_800_000_000;
-        let r = signed(&key, "http://57.1.2.3:47395", now, &["kosovacoin.net"]);
+        let r = signed(&key, "http://57.1.2.3:47395", now, &["myshop.com"]);
         assert_eq!(verify(&r, now), Ok(()));
 
         let mut moved = r.clone();
@@ -222,10 +237,10 @@ mod tests {
 
     #[test]
     fn domains_must_be_plain_lowercase_names() {
-        for good in ["kosovacoin.net", "blog.example.co.uk", "a-b.io"] {
+        for good in ["myshop.com", "blog.example.co.uk", "a-b.io"] {
             assert!(valid_domain(good), "{good}");
         }
-        for bad in ["", "net", "Kosovacoin.net", "kosovacoin.net.", "-a.com", "a..com", "a,b.com", "xn--\n.com"] {
+        for bad in ["", "net", "MyShop.com", "myshop.com.", "-a.com", "a..com", "a,b.com", "xn--\n.com"] {
             assert!(!valid_domain(bad), "{bad:?}");
         }
     }
@@ -233,19 +248,32 @@ mod tests {
     #[test]
     fn the_first_owner_keeps_a_domain_and_its_subdomains() {
         let mut b: HashMap<String, String> = HashMap::new();
-        let c = claim(&b, "alice", &["kosovacoin.net".to_string(), "blog.kosovacoin.net".to_string()], 20);
-        assert_eq!(c.domains, vec!["kosovacoin.net", "blog.kosovacoin.net"]);
-        assert_eq!(c.new_bindings, vec!["kosovacoin.net"]);
+        let c = claim(&b, "alice", &["myshop.com".to_string(), "blog.myshop.com".to_string()], 20);
+        assert_eq!(c.domains, vec!["myshop.com", "blog.myshop.com"]);
+        assert_eq!(c.new_bindings, vec!["myshop.com"]);
         for nb in c.new_bindings {
             b.insert(nb, "alice".to_string());
         }
 
-        let m = claim(&b, "mallory", &["kosovacoin.net".to_string(), "www.kosovacoin.net".to_string()], 20);
+        let m = claim(&b, "mallory", &["myshop.com".to_string(), "www.myshop.com".to_string()], 20);
         assert!(m.domains.is_empty() && m.new_bindings.is_empty(), "nobody else can take it or a subdomain");
 
-        let again = claim(&b, "alice", &["kosovacoin.net".to_string()], 0);
-        assert_eq!(again.domains, vec!["kosovacoin.net"], "the owner keeps it without spending new claims");
-        assert_eq!(owner_of(&b, "www.kosovacoin.net"), Some("alice"));
+        let again = claim(&b, "alice", &["myshop.com".to_string()], 0);
+        assert_eq!(again.domains, vec!["myshop.com"], "the owner keeps it without spending new claims");
+        assert_eq!(owner_of(&b, "www.myshop.com"), Some("alice"));
+    }
+
+    #[test]
+    fn only_the_owner_gets_a_certificate_and_it_covers_www() {
+        let b = HashMap::from([("myshop.com".to_string(), "alice".to_string())]);
+        assert_eq!(cert_names(&b, "myshop.com", "alice"), Ok(vec!["myshop.com".to_string(), "www.myshop.com".to_string()]));
+        assert_eq!(cert_names(&b, "blog.myshop.com", "alice").unwrap()[1], "www.blog.myshop.com");
+        assert!(cert_names(&b, "myshop.com", "mallory").is_err());
+        assert!(cert_names(&b, "www.myshop.com", "alice").is_err());
+        assert!(cert_names(&b, "unclaimed.org", "alice").is_err());
+        let listed = vec!["myshop.com".to_string()];
+        assert!(serves(&listed, "myshop.com") && serves(&listed, "www.myshop.com"));
+        assert!(!serves(&listed, "blog.myshop.com") && !serves(&listed, "www.www.myshop.com"));
     }
 
     #[test]
@@ -276,7 +304,7 @@ mod tests {
     fn bindings_survive_a_restart() {
         let dir = std::env::temp_dir().join(format!("ego-oracle-bindings-{}", std::process::id()));
         let path = dir.join("hosting-domains.json");
-        let b = HashMap::from([("kosovacoin.net".to_string(), "alice".to_string())]);
+        let b = HashMap::from([("myshop.com".to_string(), "alice".to_string())]);
         save_bindings(&path, &b).unwrap();
         assert_eq!(load_bindings(&path), b);
         let _ = std::fs::remove_dir_all(dir);

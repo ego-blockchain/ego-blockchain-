@@ -77,7 +77,7 @@ async fn handle_dns_query(
     if qtype == QTYPE_A {
         let now = chrono::Utc::now().timestamp();
         let ip = hosting_nodes.read().await.get(&owner).and_then(|n| {
-            (n.last_seen >= now - crate::hosting::ONLINE_SECS && n.domains.iter().any(|d| d == &domain))
+            (n.last_seen >= now - crate::hosting::ONLINE_SECS && crate::hosting::serves(&n.domains, &domain))
                 .then(|| extract_ip(&n.endpoint))
                 .flatten()
         });
@@ -226,14 +226,14 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         World {
             nodes: [
-                node("alice", "http://57.1.2.3:47395", &["kosovacoin.net", "blog.kosovacoin.net"], now),
-                node("mallory", "http://6.6.6.6:47395", &["kosovacoin.net", "old-site.org"], now),
+                node("alice", "http://57.1.2.3:47395", &["myshop.com", "blog.myshop.com"], now),
+                node("mallory", "http://6.6.6.6:47395", &["myshop.com", "old-site.org"], now),
                 node("bob", "http://57.1.2.4:47395", &["old-site.org"], now - 10_000),
             ]
             .into_iter()
             .collect(),
             owners: HashMap::from([
-                ("kosovacoin.net".to_string(), "alice".to_string()),
+                ("myshop.com".to_string(), "alice".to_string()),
                 ("old-site.org".to_string(), "bob".to_string()),
             ]),
             challenges: HashMap::new(),
@@ -267,12 +267,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_domain_answers_only_with_its_owners_node() {
-        let r = ask("kosovacoin.net", QTYPE_A, world()).await;
+        let r = ask("myshop.com", QTYPE_A, world()).await;
         assert_eq!(rcode(&r), RCODE_OK);
         assert!(authoritative(&r));
         assert_eq!(answers(&r), 1, "another node claiming the same domain is never answered");
         assert_eq!(&r[r.len() - 4..], &[57, 1, 2, 3]);
-        let r = ask("blog.kosovacoin.net", QTYPE_A, world()).await;
+        let r = ask("blog.myshop.com", QTYPE_A, world()).await;
         assert_eq!(&r[r.len() - 4..], &[57, 1, 2, 3]);
     }
 
@@ -285,11 +285,13 @@ mod tests {
 
     #[tokio::test]
     async fn other_record_types_and_unlisted_subdomains_of_an_owned_domain_get_an_empty_answer() {
-        for (name, qtype) in [("kosovacoin.net", 28), ("kosovacoin.net", 257), ("www.kosovacoin.net", QTYPE_A), ("_acme-challenge.kosovacoin.net", QTYPE_TXT)] {
+        let r = ask("www.myshop.com", QTYPE_A, world()).await;
+        assert_eq!(&r[r.len() - 4..], &[57, 1, 2, 3], "www of a served domain goes to the same node");
+        for (name, qtype) in [("myshop.com", 28), ("myshop.com", 257), ("shop.myshop.com", QTYPE_A), ("_acme-challenge.myshop.com", QTYPE_TXT)] {
             let r = ask(name, qtype, world()).await;
             assert_eq!((rcode(&r), answers(&r)), (RCODE_OK, 0), "{name} type {qtype}");
         }
-        let r = ask("notkosovacoin.net", QTYPE_A, world()).await;
+        let r = ask("notmyshop.com", QTYPE_A, world()).await;
         assert_eq!(rcode(&r), RCODE_REFUSED, "a name that only ends with the same letters is not covered");
     }
 

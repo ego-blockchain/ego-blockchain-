@@ -220,7 +220,7 @@ const HOSTING_CLOCK_SKEW_SECS: i64 = 600;
 const HOSTING_MAX_SITES: usize = 256;
 const HOSTING_MAX_DOMAINS: usize = 64;
 
-fn hosting_keypair() -> Option<ego_core::KeyPair> {
+pub(crate) fn hosting_keypair() -> Option<ego_core::KeyPair> {
     crate::ledger::load_seed().ok().flatten().and_then(|seed| {
         let arr: [u8; 32] = seed.get(..32)?.try_into().ok()?;
         ego_core::KeyPair::from_bytes(&arr).ok()
@@ -511,6 +511,7 @@ pub async fn finalize_deploy(name: String, files: Vec<FinalizeFileEntry>) -> Res
         .await.map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
 
     tokio::spawn(announce_hosting_record());
+    crate::public_sites::wake_now();
 
     Ok(site)
 }
@@ -577,6 +578,7 @@ pub fn undeploy_site(name: String) -> Result<(), EgoDesktopError> {
     crate::chain_db::delete_hosted_site(&name);
     crate::python_host::stop(&name);
     tauri::async_runtime::spawn(announce_hosting_record());
+    crate::public_sites::wake_now();
     Ok(())
 }
 
@@ -705,6 +707,7 @@ pub fn set_custom_domain(name: String, domain: String) -> Result<(), EgoDesktopE
     }
     crate::chain_db::save_hosted_site(&name, &raw);
     tauri::async_runtime::spawn(announce_hosting_record());
+    crate::public_sites::wake_now();
     Ok(())
 }
 
@@ -891,6 +894,16 @@ pub fn cancel_hosting_plan() -> Result<(), EgoDesktopError> {
 }
 
 #[tauri::command]
+pub fn public_sites_status() -> crate::public_sites::PublicStatus {
+    crate::public_sites::status()
+}
+
+#[tauri::command]
+pub fn public_sites_refresh() {
+    crate::public_sites::wake_now();
+}
+
+#[tauri::command]
 pub async fn check_domain_status(domain: String) -> String {
     let domain = domain.trim().to_lowercase()
         .replace("https://", "").replace("http://", "");
@@ -995,7 +1008,7 @@ mod tests {
         let mut r = HostingNodeRecord {
             node_id: crate::market_chain::address_of(&pk),
             endpoint: "http://57.1.2.3:47395".to_string(),
-            sites: vec!["kosovacoin-net".to_string()],
+            sites: vec!["myshop-com".to_string()],
             domains: domains.iter().map(|d| d.to_string()).collect(),
             last_seen: ts,
             signature: String::new(),
@@ -1025,7 +1038,7 @@ mod tests {
     fn only_the_node_itself_can_sign_its_domains() {
         let kp = ego_core::KeyPair::from_bytes(&[7; 32]).unwrap();
         let now = 1_800_000_000;
-        let r = record(&kp, now, &["kosovacoin.net"]);
+        let r = record(&kp, now, &["myshop.com"]);
         assert_eq!(verify_hosting_record(&r, now), Ok(()));
         assert!(!r.signature.is_empty(), "older nodes still get their v1 signature");
 
@@ -1034,7 +1047,7 @@ mod tests {
         assert_eq!(verify_hosting_record(&moved, now), Err("sig"));
 
         let other = ego_core::KeyPair::from_bytes(&[8; 32]).unwrap();
-        let mut stolen = record(&other, now, &["kosovacoin.net"]);
+        let mut stolen = record(&other, now, &["myshop.com"]);
         stolen.node_id = r.node_id.clone();
         assert_eq!(verify_hosting_record(&stolen, now), Err("node"));
 
@@ -1048,12 +1061,12 @@ mod tests {
 
     #[test]
     fn custom_domains_are_cleaned_before_they_are_saved() {
-        assert_eq!(normalize_custom_domain(" https://www.KosovaCoin.net/about?x=1 "), "kosovacoin.net");
-        assert_eq!(normalize_custom_domain("kosovacoin.net."), "kosovacoin.net");
+        assert_eq!(normalize_custom_domain(" https://www.MyShop.com/about?x=1 "), "myshop.com");
+        assert_eq!(normalize_custom_domain("myshop.com."), "myshop.com");
         assert_eq!(normalize_custom_domain("awww.com"), "awww.com");
         assert_eq!(normalize_custom_domain("shop.www.example.com"), "shop.www.example.com");
-        assert!(valid_hosting_domain("kosovacoin.net"));
-        for bad in ["kosovacoin", "kosova coin.net", "kosovä.net", "-x.com", "a..b"] {
+        assert!(valid_hosting_domain("myshop.com"));
+        for bad in ["myshop", "my shop.com", "shöp.com", "-x.com", "a..b"] {
             assert!(!valid_hosting_domain(bad), "{bad}");
         }
     }

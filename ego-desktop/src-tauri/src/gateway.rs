@@ -222,7 +222,7 @@ pub fn announcement_bytes(endpoint: &str, cert_sha256: &str, ts: i64) -> Vec<u8>
     format!("{ANNOUNCE_DOMAIN}\n{endpoint}\n{cert_sha256}\n{ts}").into_bytes()
 }
 
-fn is_public(ip: &Ipv4Addr) -> bool {
+pub(crate) fn is_public(ip: &Ipv4Addr) -> bool {
     let o = ip.octets();
     !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()
         || ip.is_multicast() || ip.is_documentation() || o[0] == 0 || (o[0] == 100 && (64..128).contains(&o[1])) || o[0] >= 240)
@@ -1200,7 +1200,7 @@ async fn announce_v6_loop(cert_sha256: String) {
     }
 }
 
-async fn find_router() -> Result<igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>, String> {
+pub(crate) async fn find_router() -> Result<igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>, String> {
     igd_next::aio::tokio::search_gateway(igd_next::SearchOptions {
         timeout: Some(Duration::from_secs(5)),
         ..Default::default()
@@ -1209,7 +1209,7 @@ async fn find_router() -> Result<igd_next::aio::Gateway<igd_next::aio::tokio::To
     .map_err(|e| format!("no UPnP router answered: {e}"))
 }
 
-async fn local_ipv4_toward(router: SocketAddr) -> Option<Ipv4Addr> {
+pub(crate) async fn local_ipv4_toward(router: SocketAddr) -> Option<Ipv4Addr> {
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
     socket.connect(router).await.ok()?;
     match socket.local_addr().ok()?.ip() {
