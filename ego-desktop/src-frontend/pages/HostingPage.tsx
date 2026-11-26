@@ -65,8 +65,6 @@ interface HostingAccess {
   plan_expires_at: number | null;
 }
 
-const NS1 = 'ns1.egoblockchain.com';
-const NS2 = 'ns2.egoblockchain.com';
 
 function slugFromDomain(domain: string): string {
   return domain
@@ -142,44 +140,19 @@ function flattenDir(entries: any[], _folderPath: string, base: string): FlatFile
 const MAX_SITE_SIZE = 2 * 1024 * 1024 * 1024;
 
 function NsCard({ domain }: { domain: string }) {
-  const [copied, setCopied] = useState('');
-
-  function copy(val: string, key: string) {
-    navigator.clipboard.writeText(val).catch(() => {});
-    setCopied(key);
-    setTimeout(() => setCopied(''), 2000);
-  }
-
   return (
-    <div className="bg-blue-500/5 border border-blue-500/20 rounded-xl p-4 space-y-4 text-sm">
-      <div className="font-semibold text-blue-300">
-        One step — change your nameservers
+    <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-4 space-y-3 text-sm">
+      <div className="font-semibold text-yellow-300">
+        Keep your current nameservers for now
       </div>
       <div className="text-xs text-gray-400 leading-relaxed">
-        Log in to wherever you bought <span className="text-white font-mono">{domain}</span> (GoDaddy, Namecheap, etc.),
-        find <strong className="text-white">Nameservers</strong> or <strong className="text-white">NS records</strong>, and replace them with:
-      </div>
-      <div className="space-y-1.5">
-        {[NS1, NS2].map((ns, i) => (
-          <div key={ns} className="bg-gray-900 rounded-lg flex items-center overflow-hidden font-mono text-xs">
-            <span className="px-3 py-2.5 text-yellow-400 w-10 text-center border-r border-gray-700">{i + 1}</span>
-            <span className="px-3 py-2.5 text-green-300 flex-1">{ns}</span>
-            <button
-              onClick={() => copy(ns, ns)}
-              className="px-3 py-2.5 text-gray-400 hover:text-white hover:bg-gray-700 transition-colors border-l border-gray-700"
-            >
-              {copied === ns ? '✓' : 'Copy'}
-            </button>
-          </div>
-        ))}
+        Your site is saved and reserved for <span className="text-white font-mono">{domain}</span> on
+        the Ego network, but Ego Desktop can't serve it to the public internet yet.
+        If you point <span className="text-white font-mono">{domain}</span> at Ego's nameservers today,
+        visitors will see nothing.
       </div>
       <div className="text-xs text-gray-500 leading-relaxed">
-        That's it. Ego's network resolves your domain — files are stored and served
-        by Ego nodes across the network, not from any single server.
-        DNS changes take a few minutes to 48h to propagate.
-      </div>
-      <div className="text-xs text-gray-600">
-        Once done, <span className="text-white font-mono">https://{domain}</span> goes live.
+        This step will show the nameservers to use once public serving is ready.
       </div>
     </div>
   );
@@ -463,9 +436,6 @@ const HostingPage: React.FC = () => {
           <div className="text-xs text-gray-400">
             Your 7-day free trial has ended. Subscribe to a plan below to deploy new sites and keep your domains active.
           </div>
-          <div className="text-xs text-gray-500 mt-1">
-            Existing nameserver settings (<span className="font-mono text-gray-400">ns1/ns2.egoblockchain.com</span>) will stop resolving until you subscribe.
-          </div>
         </div>
       )}
 
@@ -623,7 +593,7 @@ const HostingPage: React.FC = () => {
           />
           {isValidDomain && (
             <div className="mt-1.5 text-xs text-gray-500">
-              After publishing, you'll just change your nameservers to Ego's — one step, no technical setup.
+              Publishing saves the site and reserves this domain for your Ego address. Public serving of custom domains is not ready yet.
             </div>
           )}
         </div>

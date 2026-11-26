@@ -3,6 +3,7 @@ mod archive;
 mod comments;
 mod dns;
 mod gateways;
+mod hosting;
 mod push;
 
 use axum::{
@@ -108,6 +109,12 @@ pub struct HostingNodeRecord {
     pub sites:     Vec<String>,
     pub domains:   Vec<String>,
     pub last_seen: i64,
+    #[serde(default)]
+    pub pubkey:    String,
+    #[serde(default)]
+    pub signature_v2: String,
+    #[serde(default, skip_serializing)]
+    pub signature: String,
 }
 
 type HostingNodes = HashMap<String, HostingNodeRecord>;
@@ -596,6 +603,8 @@ pub struct AppState {
     pub chain:          Arc<RwLock<ChainState>>,
     pub client:         Client,
     pub hosting_nodes:  Arc<RwLock<HostingNodes>>,
+    pub hosting_domains: Arc<RwLock<HashMap<String, String>>>,
+    pub hosting_claims: Arc<RwLock<HashMap<String, (i64, u32)>>>,
     /// Peer rendezvous: dialable node endpoint → last-seen unix ts. Nodes POST
     /// their relayed /p2p-circuit address to /nodes/register and GET /nodes to
     /// discover and dial each other (so two NAT'd nodes behind one relay meet).
@@ -935,11 +944,55 @@ async fn handle_chain_submit(
 
 async fn handle_hosting_announce(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(record): Json<HostingNodeRecord>,
-) -> impl IntoResponse {
-    let mut nodes = state.hosting_nodes.write().await;
-    nodes.insert(record.node_id.clone(), record);
-    StatusCode::OK
+) -> axum::response::Response {
+    let now = Utc::now().timestamp();
+    if let Err(reason) = hosting::verify(&record, now) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": reason }))).into_response();
+    }
+    if state.hosting_nodes.read().await.get(&record.node_id).is_some_and(|old| old.last_seen > record.last_seen) {
+        return (StatusCode::CONFLICT, Json(json!({ "error": "A newer record from this node is already known." }))).into_response();
+    }
+    let ip = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("direct")
+        .to_string();
+    let claimed = {
+        let mut counts = state.hosting_claims.write().await;
+        let allowed = hosting::allow_new_bindings(&mut counts, &ip, now);
+        let mut bindings = state.hosting_domains.write().await;
+        let claimed = hosting::claim(&bindings, &record.node_id, &record.domains, allowed);
+        if !claimed.new_bindings.is_empty() {
+            hosting::spend_new_bindings(&mut counts, &ip, now, claimed.new_bindings.len() as u32);
+            for name in &claimed.new_bindings {
+                bindings.insert(name.clone(), record.node_id.clone());
+                info!("[Hosting] {} now belongs to {}", name, record.node_id);
+            }
+            let path = hosting::bindings_path(&chain_data_path());
+            if let Err(e) = tokio::task::block_in_place(|| hosting::save_bindings(&path, &bindings)) {
+                error!("[Hosting] Saving domain owners to {} FAILED: {}", path.display(), e);
+            }
+        }
+        claimed
+    };
+    let refused: Vec<&String> = record.domains.iter().filter(|d| !claimed.domains.contains(d)).collect();
+    let refused = json!(refused);
+    {
+        let mut nodes = state.hosting_nodes.write().await;
+        if nodes.get(&record.node_id).is_some_and(|old| old.last_seen > record.last_seen) {
+            return (StatusCode::CONFLICT, Json(json!({ "error": "A newer record from this node is already known." }))).into_response();
+        }
+        if !nodes.contains_key(&record.node_id) && nodes.len() >= hosting::MAX_RECORDS {
+            hosting::prune_stale(&mut nodes, now);
+            if nodes.len() >= hosting::MAX_RECORDS {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Too many hosting nodes right now. Try again later." }))).into_response();
+            }
+        }
+        nodes.insert(record.node_id.clone(), record);
+    }
+    (StatusCode::OK, Json(json!({ "ok": true, "domains": claimed.domains, "refused": refused }))).into_response()
 }
 
 async fn handle_hosting_nodes(
@@ -947,10 +1000,15 @@ async fn handle_hosting_nodes(
     Path(domain): Path<String>,
 ) -> impl IntoResponse {
     let now = Utc::now().timestamp();
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let owner = hosting::owner_of(&*state.hosting_domains.read().await, &domain).map(str::to_string);
     let nodes = state.hosting_nodes.read().await;
     let matching: Vec<&HostingNodeRecord> = nodes.values()
-        .filter(|n| n.last_seen > now - 900)
-        .filter(|n| n.domains.iter().any(|d| d == &domain) || n.sites.iter().any(|s| s == &domain))
+        .filter(|n| n.last_seen >= now - hosting::ONLINE_SECS)
+        .filter(|n| {
+            (owner.as_deref() == Some(n.node_id.as_str()) && n.domains.iter().any(|d| d == &domain))
+                || (!domain.contains('.') && n.sites.iter().any(|s| s == &domain))
+        })
         .collect();
     Json(json!({ "domain": domain, "nodes": matching }))
 }
@@ -1545,6 +1603,13 @@ async fn main() {
         chain:           Arc::new(RwLock::new(loaded_chain)),
         client,
         hosting_nodes:   Arc::new(RwLock::new(HashMap::new())),
+        hosting_domains: Arc::new(RwLock::new({
+            let path = hosting::bindings_path(&chain_data_path());
+            let loaded = hosting::load_bindings(&path);
+            info!("[Hosting] {} domain owner(s) loaded from {}", loaded.len(), path.display());
+            loaded
+        })),
+        hosting_claims:  Arc::new(RwLock::new(HashMap::new())),
         ego_nodes:       Arc::new(RwLock::new(HashMap::new())),
         acme:            acme_state,
         post_approvals:  Arc::new(RwLock::new(HashMap::new())),
@@ -1635,16 +1700,16 @@ async fn main() {
     }
 
     let relay_ip_str = std::env::var("RELAY_PUBLIC_IP").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let dns_upstream  = std::env::var("DNS_UPSTREAM").unwrap_or_else(|_| "8.8.8.8:53".to_string());
     let relay_ip: [u8; 4] = relay_ip_str.split('.')
         .map(|p| p.parse::<u8>().unwrap_or(0))
         .collect::<Vec<_>>()
         .try_into()
         .unwrap_or([127, 0, 0, 1]);
     let dns_nodes      = state.hosting_nodes.clone();
+    let dns_owners     = state.hosting_domains.clone();
     let dns_challenges = state.acme.challenges.clone();
     tokio::spawn(async move {
-        dns::run_dns_server(relay_ip, dns_upstream, dns_nodes, dns_challenges).await;
+        dns::run_dns_server(relay_ip, dns_nodes, dns_owners, dns_challenges).await;
     });
 
     let comments_path = std::env::var("BLOG_COMMENTS_DATA")

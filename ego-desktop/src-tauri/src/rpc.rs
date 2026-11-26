@@ -71,10 +71,6 @@ fn https_bind_ip() -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
-fn rpc_is_public() -> bool {
-    !rpc_bind_ip().is_loopback()
-}
-
 fn is_allowed_cors_origin(origin: &str) -> bool {
     matches!(origin, "tauri://localhost" | "https://tauri.localhost")
         || origin == "http://localhost"
@@ -149,30 +145,10 @@ async fn hosting_nodes(Path(domain): Path<String>) -> Response {
 }
 
 async fn hosting_announce(Json(record): Json<crate::chain_db::HostingNodeRecord>) -> Response {
-    if record.node_id.is_empty() || record.endpoint.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing fields"}))).into_response();
+    if let Err(reason) = crate::commands::hosting::verify_hosting_record(&record, chrono::Utc::now().timestamp()) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": reason}))).into_response();
     }
-    if rpc_is_public() && record.signature.is_empty() {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"missing signature"}))).into_response();
-    }
-    let sign_msg = format!("ego/hosting/v1:{}:{}:{}", record.node_id, record.endpoint, record.last_seen);
-    if !record.signature.is_empty() {
-        let sig_valid = crate::p2p::get_peer_ed25519_pubkey(&record.node_id)
-            .map(|pk| {
-                use ed25519_dalek::{Signature, VerifyingKey, Verifier};
-                let vk = VerifyingKey::from_bytes(&pk);
-                let sb = hex::decode(&record.signature).unwrap_or_default();
-                match (vk, <[u8;64]>::try_from(sb.as_slice())) {
-                    (Ok(vk), Ok(s)) => vk.verify(sign_msg.as_bytes(), &Signature::from_bytes(&s)).is_ok(),
-                    _ => false,
-                }
-            })
-            .unwrap_or(false);
-        if !sig_valid {
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid signature"}))).into_response();
-        }
-    }
-    crate::chain_db::upsert_hosting_node(&record);
+    tokio::task::spawn_blocking(move || crate::chain_db::upsert_hosting_node(&record)).await.ok();
     StatusCode::OK.into_response()
 }
 

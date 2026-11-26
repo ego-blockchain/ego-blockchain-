@@ -216,17 +216,105 @@ fn local_site_url(name: &str) -> String {
     format!("http://localhost:{}/site/{}", rpc_port(), name)
 }
 
-fn sign_hosting_record(node_id: &str, endpoint: &str, last_seen: i64) -> String {
-    let sign_msg = format!("ego/hosting/v1:{}:{}:{}", node_id, endpoint, last_seen);
-    crate::ledger::load_seed()
-        .ok()
-        .flatten()
-        .and_then(|seed| {
-            let arr: [u8; 32] = seed.get(..32)?.try_into().ok()?;
-            ego_core::KeyPair::from_bytes(&arr).ok()
+const HOSTING_CLOCK_SKEW_SECS: i64 = 600;
+const HOSTING_MAX_SITES: usize = 256;
+const HOSTING_MAX_DOMAINS: usize = 64;
+
+fn hosting_keypair() -> Option<ego_core::KeyPair> {
+    crate::ledger::load_seed().ok().flatten().and_then(|seed| {
+        let arr: [u8; 32] = seed.get(..32)?.try_into().ok()?;
+        ego_core::KeyPair::from_bytes(&arr).ok()
+    })
+}
+
+pub fn hosting_signing_bytes(r: &crate::chain_db::HostingNodeRecord) -> Vec<u8> {
+    format!(
+        "ego/hosting/v2\n{}\n{}\n{}\n{}\n{}",
+        r.node_id,
+        r.endpoint,
+        r.last_seen,
+        r.sites.join(","),
+        r.domains.join(",")
+    )
+    .into_bytes()
+}
+
+pub fn valid_hosting_domain(d: &str) -> bool {
+    if d.is_empty() || d.len() > 253 {
+        return false;
+    }
+    let labels: Vec<&str> = d.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
-        .map(|kp| hex::encode(kp.sign_ed25519(sign_msg.as_bytes()).as_bytes()))
-        .unwrap_or_default()
+}
+
+fn valid_hosting_site(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 63 && !s.contains(',') && !s.contains('\n') && !s.contains('.')
+}
+
+fn sign_hosting_record(record: &mut crate::chain_db::HostingNodeRecord, kp: &ego_core::KeyPair) {
+    let legacy = format!("ego/hosting/v1:{}:{}:{}", record.node_id, record.endpoint, record.last_seen);
+    record.signature = hex::encode(kp.sign_ed25519(legacy.as_bytes()).as_bytes());
+    record.pubkey = hex::encode(&kp.ed25519_public_key().as_bytes()[..32]);
+    record.signature_v2 = hex::encode(kp.sign_ed25519(&hosting_signing_bytes(record)).as_bytes());
+}
+
+pub fn verify_hosting_record(r: &crate::chain_db::HostingNodeRecord, now: i64) -> Result<(), &'static str> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    if (r.last_seen - now).abs() > HOSTING_CLOCK_SKEW_SECS {
+        return Err("time");
+    }
+    if r.endpoint.is_empty() || r.endpoint.len() > 200 || r.endpoint.contains('\n') {
+        return Err("endpoint");
+    }
+    if r.sites.len() > HOSTING_MAX_SITES || !r.sites.iter().all(|s| valid_hosting_site(s)) {
+        return Err("site");
+    }
+    if r.domains.len() > HOSTING_MAX_DOMAINS || !r.domains.iter().all(|d| valid_hosting_domain(d)) {
+        return Err("domain");
+    }
+    let pk: [u8; 32] = hex::decode(&r.pubkey).ok().and_then(|v| v.try_into().ok()).ok_or("pubkey")?;
+    let sig: [u8; 64] = hex::decode(&r.signature_v2).ok().and_then(|v| v.try_into().ok()).ok_or("sig")?;
+    if crate::market_chain::address_of(&pk) != r.node_id {
+        return Err("node");
+    }
+    VerifyingKey::from_bytes(&pk)
+        .map_err(|_| "pubkey")?
+        .verify_strict(&hosting_signing_bytes(r), &Signature::from_bytes(&sig))
+        .map_err(|_| "sig")
+}
+
+fn current_hosting_names(owner: &str) -> (Vec<String>, Vec<String>) {
+    let mut sites: Vec<String> = Vec::new();
+    let mut domains: Vec<String> = Vec::new();
+    for raw in crate::chain_db::list_hosted_sites_raw(owner) {
+        if let Some(n) = raw["name"].as_str() {
+            if valid_hosting_site(n) && !sites.iter().any(|s| s == n) {
+                sites.push(n.to_string());
+            }
+        }
+        if let Some(d) = raw["custom_domain"].as_str() {
+            if valid_hosting_domain(d) && !domains.iter().any(|x| x == d) {
+                domains.push(d.to_string());
+            }
+        }
+    }
+    sites.truncate(HOSTING_MAX_SITES);
+    domains.truncate(HOSTING_MAX_DOMAINS);
+    (sites, domains)
+}
+
+pub fn normalize_custom_domain(input: &str) -> String {
+    let d = input.trim().to_lowercase();
+    let d = d.trim_start_matches("https://").trim_start_matches("http://");
+    let d = d.split(['/', '?', '#']).next().unwrap_or("").trim_end_matches('.');
+    d.strip_prefix("www.").unwrap_or(d).to_string()
 }
 
 fn sanitize_site_relative_path(path: &str) -> Result<std::path::PathBuf, EgoDesktopError> {
@@ -422,11 +510,7 @@ pub async fn finalize_deploy(name: String, files: Vec<FinalizeFileEntry>) -> Res
     tokio::task::spawn_blocking(move || crate::chain_db::save_hosted_site(&name_clone2, &site_val))
         .await.map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
 
-    let announce_name   = name.clone();
-    let announce_domain = site.custom_domain.clone();
-    tokio::spawn(async move {
-        announce_self_as_hosting_node(announce_name, announce_domain).await;
-    });
+    tokio::spawn(announce_hosting_record());
 
     Ok(site)
 }
@@ -492,53 +576,74 @@ pub fn undeploy_site(name: String) -> Result<(), EgoDesktopError> {
     let _ = std::fs::remove_dir_all(site_dir(&owner, &name));
     crate::chain_db::delete_hosted_site(&name);
     crate::python_host::stop(&name);
+    tauri::async_runtime::spawn(announce_hosting_record());
     Ok(())
 }
 
-async fn announce_self_as_hosting_node(site_name: String, custom_domain: Option<String>) {
-    let owner = Ledger::load().address;
-    let port  = rpc_port();
-
-    // Discover public IP so oracle DNS returns the correct address.
-    let public_ip = discover_public_ip().await.unwrap_or_else(|| "127.0.0.1".to_string());
-    let endpoint  = format!("http://{}:{}", public_ip, port);
-    eprintln!("[Hosting] Announcing with endpoint: {}", endpoint);
-
-    let mut record = crate::chain_db::get_hosting_node(&owner)
-        .unwrap_or_else(|| crate::chain_db::HostingNodeRecord {
-            node_id:   owner.clone(),
-            endpoint:  endpoint.clone(),
-            sites:     vec![],
-            domains:   vec![],
-            last_seen: 0,
-            signature: String::new(),
-        });
-
-    record.endpoint  = endpoint;
-    record.last_seen = chrono::Utc::now().timestamp();
-    if !record.sites.contains(&site_name) {
-        record.sites.push(site_name);
-    }
-    if let Some(d) = custom_domain {
-        if !d.is_empty() && !record.domains.contains(&d) {
-            record.domains.push(d);
+async fn announce_hosting_record() {
+    let Ok((owner, names, stored)) = tokio::task::spawn_blocking(|| {
+        let owner = Ledger::load().address;
+        if owner.is_empty() {
+            return (owner, (Vec::new(), Vec::new()), None);
         }
+        let names = current_hosting_names(&owner);
+        let stored = crate::chain_db::get_hosting_node(&owner);
+        (owner, names, stored)
+    })
+    .await
+    else {
+        return;
+    };
+    let (sites, domains) = names;
+    if sites.is_empty() && domains.is_empty() {
+        return;
     }
-    record.signature = sign_hosting_record(&record.node_id, &record.endpoint, record.last_seen);
+    let endpoint = match discover_public_ip().await {
+        Some(ip) => format!("http://{}:{}", ip, rpc_port()),
+        None => match stored {
+            Some(s) => s.endpoint,
+            None => {
+                eprintln!("[Hosting] Could not find this computer's public address; announcing later");
+                return;
+            }
+        },
+    };
+    let Some(kp) = hosting_keypair() else {
+        eprintln!("[Hosting] No wallet key to sign the hosting announcement");
+        return;
+    };
+    let mut record = crate::chain_db::HostingNodeRecord {
+        node_id: owner,
+        endpoint,
+        sites,
+        domains,
+        last_seen: chrono::Utc::now().timestamp(),
+        signature: String::new(),
+        pubkey: String::new(),
+        signature_v2: String::new(),
+    };
+    sign_hosting_record(&mut record, &kp);
+    let saved = record.clone();
+    tokio::task::spawn_blocking(move || crate::chain_db::upsert_hosting_node(&saved)).await.ok();
 
-    crate::chain_db::upsert_hosting_node(&record);
-
-    // Push directly to all oracle RPCs so DNS resolves immediately.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .unwrap_or_default();
     for oracle in crate::p2p::ORACLE_RPCS {
         let url = format!("{}/hosting/announce", oracle);
-        if let Err(e) = client.post(&url).json(&record).send().await {
-            eprintln!("[Hosting] Oracle announce to {} failed: {}", oracle, e);
-        } else {
-            eprintln!("[Hosting] Announced to oracle {}", oracle);
+        match client.post(&url).json(&record).send().await {
+            Err(e) => eprintln!("[Hosting] Announce to {} failed: {}", oracle, e),
+            Ok(resp) if !resp.status().is_success() => {
+                let status = resp.status();
+                eprintln!("[Hosting] {} refused the announcement ({}): {}", oracle, status, resp.text().await.unwrap_or_default());
+            }
+            Ok(resp) => {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                for d in body["refused"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+                    eprintln!("[Hosting] {} belongs to another Ego address on {}; it will not point here", d, oracle);
+                }
+            }
         }
     }
 
@@ -565,35 +670,7 @@ async fn discover_public_ip() -> Option<String> {
 
 #[tauri::command]
 pub async fn hosting_heartbeat() {
-    let (owner, record_opt) = tokio::task::spawn_blocking(|| {
-        let owner = Ledger::load().address;
-        let record = if owner.is_empty() { None } else { crate::chain_db::get_hosting_node(&owner) };
-        (owner, record)
-    }).await.unwrap_or_default();
-
-    if owner.is_empty() {
-        tokio::task::spawn_blocking(crate::chain_db::prune_stale_hosting_nodes).await.ok();
-        return;
-    }
-
-    if let Some(mut record) = record_opt {
-        record.last_seen = chrono::Utc::now().timestamp();
-        if let Some(ip) = discover_public_ip().await {
-            record.endpoint = format!("http://{}:{}", ip, rpc_port());
-        }
-        record.signature = sign_hosting_record(&record.node_id, &record.endpoint, record.last_seen);
-        let record_clone = record.clone();
-        tokio::task::spawn_blocking(move || crate::chain_db::upsert_hosting_node(&record_clone)).await.ok();
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-        for oracle in crate::p2p::ORACLE_RPCS {
-            let url = format!("{}/hosting/announce", oracle);
-            let _ = client.post(&url).json(&record).send().await;
-        }
-        crate::p2p::gossip_hosting_node(&record);
-    }
+    announce_hosting_record().await;
     tokio::task::spawn_blocking(crate::chain_db::prune_stale_hosting_nodes).await.ok();
 }
 
@@ -606,7 +683,12 @@ pub fn get_hosting_nodes(domain: String) -> Vec<crate::chain_db::HostingNodeReco
 #[tauri::command]
 pub fn set_custom_domain(name: String, domain: String) -> Result<(), EgoDesktopError> {
     let name   = name.trim().to_lowercase();
-    let domain = domain.trim().to_lowercase().replace("https://", "").replace("http://", "").replace("www.", "");
+    let domain = normalize_custom_domain(&domain);
+    if !domain.is_empty() && !valid_hosting_domain(&domain) {
+        return Err(EgoDesktopError::InvalidInput(
+            "That domain can't be served by Ego. Use a plain name like example.com: letters, numbers, hyphens and dots.".into(),
+        ));
+    }
     let owner  = Ledger::load().address;
 
     let mut raw = crate::chain_db::get_hosted_site_raw(&name)
@@ -622,6 +704,7 @@ pub fn set_custom_domain(name: String, domain: String) -> Result<(), EgoDesktopE
         raw["custom_domain"] = serde_json::json!(domain);
     }
     crate::chain_db::save_hosted_site(&name, &raw);
+    tauri::async_runtime::spawn(announce_hosting_record());
     Ok(())
 }
 
@@ -900,4 +983,78 @@ pub fn setup_eo_certificates() -> Result<String, crate::error::EgoDesktopError> 
     crate::tls::install_ca_to_store()
         .map_err(|e| crate::error::EgoDesktopError::InvalidInput(e))?;
     Ok("Ego Local CA installed. .eo domains will work after browser restart.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain_db::HostingNodeRecord;
+
+    fn record(kp: &ego_core::KeyPair, ts: i64, domains: &[&str]) -> HostingNodeRecord {
+        let pk: [u8; 32] = kp.ed25519_public_key().as_bytes()[..32].try_into().unwrap();
+        let mut r = HostingNodeRecord {
+            node_id: crate::market_chain::address_of(&pk),
+            endpoint: "http://57.1.2.3:47395".to_string(),
+            sites: vec!["kosovacoin-net".to_string()],
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+            last_seen: ts,
+            signature: String::new(),
+            pubkey: String::new(),
+            signature_v2: String::new(),
+        };
+        sign_hosting_record(&mut r, kp);
+        r
+    }
+
+    #[test]
+    fn the_signed_text_matches_what_the_oracle_checks() {
+        let r = HostingNodeRecord {
+            node_id: "egot1abc".into(),
+            endpoint: "http://1.2.3.4:5".into(),
+            sites: vec!["a".into(), "b".into()],
+            domains: vec!["x.com".into(), "y.org".into()],
+            last_seen: 7,
+            signature: String::new(),
+            pubkey: String::new(),
+            signature_v2: String::new(),
+        };
+        assert_eq!(hosting_signing_bytes(&r), b"ego/hosting/v2\negot1abc\nhttp://1.2.3.4:5\n7\na,b\nx.com,y.org".to_vec());
+    }
+
+    #[test]
+    fn only_the_node_itself_can_sign_its_domains() {
+        let kp = ego_core::KeyPair::from_bytes(&[7; 32]).unwrap();
+        let now = 1_800_000_000;
+        let r = record(&kp, now, &["kosovacoin.net"]);
+        assert_eq!(verify_hosting_record(&r, now), Ok(()));
+        assert!(!r.signature.is_empty(), "older nodes still get their v1 signature");
+
+        let mut moved = r.clone();
+        moved.domains = vec!["bank.com".into()];
+        assert_eq!(verify_hosting_record(&moved, now), Err("sig"));
+
+        let other = ego_core::KeyPair::from_bytes(&[8; 32]).unwrap();
+        let mut stolen = record(&other, now, &["kosovacoin.net"]);
+        stolen.node_id = r.node_id.clone();
+        assert_eq!(verify_hosting_record(&stolen, now), Err("node"));
+
+        let mut legacy = r.clone();
+        legacy.pubkey.clear();
+        legacy.signature_v2.clear();
+        assert!(verify_hosting_record(&legacy, now).is_err());
+
+        assert_eq!(verify_hosting_record(&r, now + 3600), Err("time"));
+    }
+
+    #[test]
+    fn custom_domains_are_cleaned_before_they_are_saved() {
+        assert_eq!(normalize_custom_domain(" https://www.KosovaCoin.net/about?x=1 "), "kosovacoin.net");
+        assert_eq!(normalize_custom_domain("kosovacoin.net."), "kosovacoin.net");
+        assert_eq!(normalize_custom_domain("awww.com"), "awww.com");
+        assert_eq!(normalize_custom_domain("shop.www.example.com"), "shop.www.example.com");
+        assert!(valid_hosting_domain("kosovacoin.net"));
+        for bad in ["kosovacoin", "kosova coin.net", "kosovä.net", "-x.com", "a..b"] {
+            assert!(!valid_hosting_domain(bad), "{bad}");
+        }
+    }
 }

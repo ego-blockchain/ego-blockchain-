@@ -33,3 +33,4 @@ blake2        = "0.10"
 bech32        = "0.9"
 p256          = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 base64        = "0.22"
+psl = "2"

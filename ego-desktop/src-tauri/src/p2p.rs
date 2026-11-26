@@ -9402,22 +9402,11 @@ async fn handle_event(
                 if let Ok(P2PMessage::HostingAnnounce { record }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
-                    let r2 = record.clone();
-                    tokio::spawn(async move {
-                        tokio::task::spawn_blocking(move || crate::chain_db::upsert_hosting_node(&r2)).await.ok();
-                    });
-                    tokio::spawn(async move {
-                        let client = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(5))
-                            .build()
-                            .unwrap_or_default();
-                        if !offline_mode() {
-                            for oracle in ORACLE_RPCS {
-                                let url = format!("{}/hosting/announce", oracle);
-                                let _ = client.post(&url).json(&record).send().await;
-                            }
-                        }
-                    });
+                    if crate::commands::hosting::verify_hosting_record(&record, chrono::Utc::now().timestamp()).is_ok() {
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || crate::chain_db::upsert_hosting_node(&record)).await.ok();
+                        });
+                    }
                 }
             } else if topic == "ego-compute-v1" {
                 match serde_json::from_slice::<P2PMessage>(&message.data) {

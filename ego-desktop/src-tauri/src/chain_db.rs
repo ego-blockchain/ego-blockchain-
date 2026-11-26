@@ -7596,6 +7596,10 @@ pub struct HostingNodeRecord {
     pub last_seen: i64,
     #[serde(default)]
     pub signature: String,
+    #[serde(default)]
+    pub pubkey: String,
+    #[serde(default)]
+    pub signature_v2: String,
 }
 
 pub fn upsert_hosting_node(record: &HostingNodeRecord) {
