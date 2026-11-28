@@ -831,6 +831,9 @@ pub struct StoredFile {
 
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub replica_endpoints: std::collections::HashMap<String, String>,
+
+    #[serde(default)]
+    pub proof_checked_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

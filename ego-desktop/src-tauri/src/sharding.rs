@@ -46,6 +46,97 @@ pub const REPLICATION_FACTOR: u32 = 3;
 pub const PHASE2_NODE_THRESHOLD: u32 = 10;
 pub const PHASE3_NODE_THRESHOLD: u32 = 100;
 pub const MASTER_TIMEOUT_SECS: i64 = 120;
+pub const MAX_SHARDS: u32 = 256;
+pub const MAX_HOLDERS_PER_SHARD: usize = 16;
+pub const SHARD_MSG_SKEW_SECS: i64 = 600;
+const MAX_ENDPOINT_LEN: usize = 256;
+
+pub fn fresh(ts: i64, now: i64) -> bool {
+    (ts - now).abs() <= SHARD_MSG_SKEW_SECS
+}
+
+pub fn announce_signing_bytes(
+    from_addr: &str,
+    from_endpoint: &str,
+    held_shards: &[u32],
+    uptime_secs: u64,
+    network_node_count: u32,
+    shard_count: u32,
+    ts: i64,
+) -> Vec<u8> {
+    let held: Vec<String> = held_shards.iter().map(|s| s.to_string()).collect();
+    format!(
+        "ego/shard-announce/v1\n{from_addr}\n{from_endpoint}\n{}\n{uptime_secs}\n{network_node_count}\n{shard_count}\n{ts}",
+        held.join(",")
+    )
+    .into_bytes()
+}
+
+pub fn promotion_signing_bytes(shard_id: u32, new_master: &str, new_endpoint: &str, former_master: &str, ts: i64) -> Vec<u8> {
+    format!("ego/shard-promotion/v1\n{shard_id}\n{new_master}\n{new_endpoint}\n{former_master}\n{ts}").into_bytes()
+}
+
+pub fn sign_as_node(msg: &[u8]) -> Option<(String, String)> {
+    let kp = crate::commands::hosting::hosting_keypair()?;
+    Some((hex::encode(&kp.ed25519_public_key().as_bytes()[..32]), hex::encode(kp.sign_ed25519(msg).as_bytes())))
+}
+
+pub fn signed_by(addr: &str, pubkey_hex: &str, sig_hex: &str, msg: &[u8]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let Some(pk) = hex::decode(pubkey_hex).ok().and_then(|v| <[u8; 32]>::try_from(v).ok()) else { return false };
+    let Some(sig) = hex::decode(sig_hex).ok().and_then(|v| <[u8; 64]>::try_from(v).ok()) else { return false };
+    crate::market_chain::address_of(&pk) == addr
+        && VerifyingKey::from_bytes(&pk).map_or(false, |k| k.verify_strict(msg, &Signature::from_bytes(&sig)).is_ok())
+}
+
+pub fn limit_holders(map: &mut ShardMap) {
+    map.assignments.retain(|a| a.shard_id < MAX_SHARDS);
+    map.assignments.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    let mut per_shard: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    map.assignments.retain(|a| {
+        let n = per_shard.entry(a.shard_id).or_insert(0);
+        *n += 1;
+        *n <= MAX_HOLDERS_PER_SHARD
+    });
+}
+
+pub fn apply_promotion(
+    map: &mut ShardMap,
+    shard_id: u32,
+    new_master: &str,
+    new_endpoint: &str,
+    former_master: &str,
+    ts: i64,
+    now: i64,
+) -> bool {
+    if shard_id >= MAX_SHARDS || new_master == former_master || !fresh(ts, now) || new_endpoint.len() > MAX_ENDPOINT_LEN {
+        return false;
+    }
+    if !map.assignments.iter().any(|a| a.shard_id == shard_id && a.node_address == new_master) {
+        return false;
+    }
+    let live = |a: &ShardAssignment| now - a.last_seen <= MASTER_TIMEOUT_SECS;
+    if map.assignments.iter().any(|a| a.shard_id == shard_id && a.node_address == former_master && live(a)) {
+        return false;
+    }
+    if map.assignments.iter().any(|a| {
+        a.shard_id == shard_id && a.role == ShardRole::Master && a.node_address != former_master && a.node_address != new_master && live(a)
+    }) {
+        return false;
+    }
+    for a in map.assignments.iter_mut().filter(|a| a.shard_id == shard_id) {
+        if a.node_address == former_master {
+            a.role = ShardRole::Observer;
+        } else if a.node_address == new_master {
+            a.role = ShardRole::Master;
+            if !new_endpoint.is_empty() {
+                a.node_endpoint = new_endpoint.to_string();
+            }
+            a.last_seen = a.last_seen.max(ts.min(now));
+        }
+    }
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ShardRole {
@@ -195,6 +286,7 @@ pub async fn run_shard_startup(my_address: &str, my_endpoint: &str, peer_address
     }
 
     map.assignments.retain(|a| now - a.last_seen < 600);
+    limit_holders(&mut map);
 
     let _ = save_shard_map(&map);
 
@@ -269,17 +361,13 @@ pub fn handle_shard_announce_update(
     peer_endpoint: &str,
     held_shards: &[u32],
     uptime_secs: u64,
-    network_node_count: u32,
-    shard_count: u32,
 ) {
+    if peer_endpoint.len() > MAX_ENDPOINT_LEN {
+        return;
+    }
     let now = chrono::Utc::now().timestamp();
     let mut map = load_shard_map();
-
-    if network_node_count > map.network_node_count {
-        map.network_node_count = network_node_count;
-        map.shard_count = compute_shard_count(network_node_count);
-        map.updated_at = now;
-    }
+    let held: std::collections::BTreeSet<u32> = held_shards.iter().copied().filter(|s| *s < MAX_SHARDS).collect();
 
     map.assignments.retain(|a| a.node_address != peer_addr);
 
@@ -291,7 +379,7 @@ pub fn handle_shard_announce_update(
         all_nodes.push(peer_addr.to_string());
     }
 
-    for &shard_id in held_shards {
+    for shard_id in held {
         let responsible = consistent_hash_assign(shard_id, &all_nodes);
         let role = if responsible.get(0).map(|a| a.as_str()) == Some(peer_addr) {
             ShardRole::Master
@@ -308,6 +396,7 @@ pub fn handle_shard_announce_update(
         });
     }
 
+    limit_holders(&mut map);
     let _ = save_shard_map(&map);
 }
 
@@ -453,5 +542,91 @@ mod node_count_tests {
             256,
             "which is what a month of remembered addresses added up to while four nodes ran",
         );
+    }
+}
+
+#[cfg(test)]
+mod signed_shard_message_tests {
+    use super::*;
+
+    fn key(n: u8) -> (ego_core::KeyPair, String, String) {
+        let kp = ego_core::KeyPair::from_bytes(&[n; 32]).unwrap();
+        let pk: [u8; 32] = kp.ed25519_public_key().as_bytes()[..32].try_into().unwrap();
+        (kp, hex::encode(pk), crate::market_chain::address_of(&pk))
+    }
+
+    fn holder(shard_id: u32, addr: &str, role: ShardRole, last_seen: i64) -> ShardAssignment {
+        ShardAssignment { shard_id, role, node_address: addr.into(), node_endpoint: format!("/ip4/10.0.0.1/tcp/1/{addr}"), last_seen, uptime_secs: 0 }
+    }
+
+    #[test]
+    fn an_announce_counts_only_when_its_own_address_signed_it() {
+        let (kp, pk, addr) = key(7);
+        let (_, _, other) = key(8);
+        let msg = announce_signing_bytes(&addr, "/ip4/1.2.3.4/tcp/4001", &[1, 2], 0, 5, 256, 1_000);
+        let sig = hex::encode(kp.sign_ed25519(&msg).as_bytes());
+        assert!(signed_by(&addr, &pk, &sig, &msg));
+        assert!(!signed_by(&other, &pk, &sig, &msg), "a key cannot speak for another address");
+        let moved = announce_signing_bytes(&addr, "/ip4/6.6.6.6/tcp/4001", &[1, 2], 0, 5, 256, 1_000);
+        assert!(!signed_by(&addr, &pk, &sig, &moved), "the endpoint is covered by the signature");
+        let more = announce_signing_bytes(&addr, "/ip4/1.2.3.4/tcp/4001", &[1, 2, 3], 0, 5, 256, 1_000);
+        assert!(!signed_by(&addr, &pk, &sig, &more), "so are the shards it claims");
+        assert!(!signed_by(&addr, "", "", &msg), "an unsigned message from an older node is refused");
+    }
+
+    #[test]
+    fn a_takeover_is_accepted_only_from_a_known_holder_after_the_master_went_quiet() {
+        let now = 10_000;
+        let base = ShardMap {
+            shard_count: 256,
+            assignments: vec![holder(140, "old", ShardRole::Master, now - 500), holder(140, "next", ShardRole::Slave, now - 10)],
+            ..Default::default()
+        };
+
+        let mut m = base.clone();
+        assert!(apply_promotion(&mut m, 140, "next", "/ip4/9.9.9.9/tcp/1", "old", now, now));
+        assert_eq!(m.assignments.len(), 2, "a takeover never adds entries");
+        assert!(m.assignments.iter().any(|a| a.node_address == "next" && a.role == ShardRole::Master && a.node_endpoint == "/ip4/9.9.9.9/tcp/1"));
+        assert!(m.assignments.iter().any(|a| a.node_address == "old" && a.role == ShardRole::Observer));
+
+        let mut m = base.clone();
+        assert!(!apply_promotion(&mut m, 140, "stranger", "/ip4/6.6.6.6/tcp/1", "old", now, now), "an address that holds nothing of the shard cannot take it");
+
+        let mut m = base.clone();
+        m.assignments[0].last_seen = now - 30;
+        assert!(!apply_promotion(&mut m, 140, "next", "/ip4/9.9.9.9/tcp/1", "old", now, now), "a master heard from recently keeps its shard");
+
+        let mut m = base.clone();
+        m.assignments.push(holder(140, "third", ShardRole::Master, now - 5));
+        assert!(!apply_promotion(&mut m, 140, "next", "/ip4/9.9.9.9/tcp/1", "old", now, now), "nor can it push aside a different live master");
+
+        let mut m = base.clone();
+        assert!(!apply_promotion(&mut m, 140, "next", "/ip4/9.9.9.9/tcp/1", "old", now - 3_600, now), "an old takeover message replayed later is refused");
+        assert!(!apply_promotion(&mut m, 999, "next", "/ip4/9.9.9.9/tcp/1", "old", now, now));
+        assert!(!apply_promotion(&mut m, 140, "next", &"x".repeat(300), "old", now, now));
+        assert!(!apply_promotion(&mut m, 140, "old", "/ip4/9.9.9.9/tcp/1", "old", now, now));
+    }
+
+    #[test]
+    fn the_shard_map_stays_bounded_however_many_holders_announce() {
+        let mut m = ShardMap::default();
+        for i in 0..100 {
+            m.assignments.push(holder(5, &format!("n{i}"), ShardRole::Slave, i));
+        }
+        m.assignments.push(holder(MAX_SHARDS, "far", ShardRole::Slave, 1_000));
+        m.assignments.push(holder(6, "solo", ShardRole::Master, 0));
+        limit_holders(&mut m);
+        assert_eq!(m.assignments.iter().filter(|a| a.shard_id == 5).count(), MAX_HOLDERS_PER_SHARD);
+        assert!(m.assignments.iter().filter(|a| a.shard_id == 5).all(|a| a.last_seen >= 100 - MAX_HOLDERS_PER_SHARD as i64), "the most recently heard holders stay");
+        assert!(!m.assignments.iter().any(|a| a.shard_id >= MAX_SHARDS));
+        assert!(m.assignments.iter().any(|a| a.node_address == "solo"));
+    }
+
+    #[test]
+    fn shard_messages_must_be_recent() {
+        assert!(fresh(1_000, 1_000));
+        assert!(fresh(1_000 - SHARD_MSG_SKEW_SECS, 1_000));
+        assert!(!fresh(1_000 - SHARD_MSG_SKEW_SECS - 1, 1_000));
+        assert!(!fresh(1_000 + SHARD_MSG_SKEW_SECS + 1, 1_000));
     }
 }

@@ -4458,6 +4458,12 @@ pub enum P2PMessage {
         uptime_secs:        u64,
         network_node_count: u32,
         shard_count:        u32,
+        #[serde(default)]
+        ts:                 i64,
+        #[serde(default)]
+        pubkey:             String,
+        #[serde(default)]
+        signature:          String,
     },
     /// Slave promotes itself to master after detecting master is offline.
     MasterPromotion {
@@ -4466,6 +4472,10 @@ pub enum P2PMessage {
         new_endpoint:  String,
         former_master: String,
         timestamp:     i64,
+        #[serde(default)]
+        pubkey:        String,
+        #[serde(default)]
+        signature:     String,
     },
     /// Slave asks master to send blocks for a specific shard starting from `from_height`.
     ShardDataRequest {
@@ -6743,17 +6753,111 @@ pub async fn broadcast_shard_announce() {
         .into_iter().collect();
     let held: Vec<u32> = crate::sharding::my_shards(&my_addr, &map, &all_nodes)
         .into_iter().map(|(id, _)| id).collect();
+    let held_shards = if held.is_empty() { vec![0] } else { held };
+    let network_node_count = map.network_node_count.max(1);
+    let shard_count = map.shard_count.max(1);
+    let ts = chrono::Utc::now().timestamp();
+    let signed = crate::sharding::announce_signing_bytes(&my_addr, &endpoint, &held_shards, 0, network_node_count, shard_count, ts);
+    let Some((pubkey, signature)) = crate::sharding::sign_as_node(&signed) else { return };
     let msg = crate::p2p::P2PMessage::ShardAnnounce {
         from_addr:          my_addr,
         from_endpoint:      endpoint,
-        held_shards:        if held.is_empty() { vec![0] } else { held },
+        held_shards,
         uptime_secs:        0,
-        network_node_count: map.network_node_count.max(1),
-        shard_count:        map.shard_count.max(1),
+        network_node_count,
+        shard_count,
+        ts,
+        pubkey,
+        signature,
     };
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-shards-v1", data).await;
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn on_shard_announce(
+    from_addr: String,
+    from_endpoint: String,
+    held_shards: Vec<u32>,
+    uptime_secs: u64,
+    network_node_count: u32,
+    shard_count: u32,
+    ts: i64,
+    pubkey: String,
+    signature: String,
+) {
+    tokio::task::spawn_blocking(move || {
+        if !crate::sharding::fresh(ts, chrono::Utc::now().timestamp()) {
+            return;
+        }
+        let signed = crate::sharding::announce_signing_bytes(&from_addr, &from_endpoint, &held_shards, uptime_secs, network_node_count, shard_count, ts);
+        if !crate::sharding::signed_by(&from_addr, &pubkey, &signature, &signed) {
+            return;
+        }
+        if crate::chain_db::drs_node(&from_addr).is_none() {
+            return;
+        }
+        crate::sharding::handle_shard_announce_update(&from_addr, &from_endpoint, &held_shards, uptime_secs);
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn on_master_promotion(
+    shard_id: u32,
+    new_master: String,
+    new_endpoint: String,
+    former_master: String,
+    timestamp: i64,
+    pubkey: String,
+    signature: String,
+    fetch_shard: bool,
+) {
+    let signed = crate::sharding::promotion_signing_bytes(shard_id, &new_master, &new_endpoint, &former_master, timestamp);
+    if !crate::sharding::signed_by(&new_master, &pubkey, &signature, &signed) {
+        return;
+    }
+    let (nm, ne, fm) = (new_master.clone(), new_endpoint.clone(), former_master.clone());
+    let accepted = tokio::task::spawn_blocking(move || {
+        if crate::chain_db::drs_node(&nm).is_none() {
+            return false;
+        }
+        let mut map = crate::sharding::load_shard_map();
+        let ok = crate::sharding::apply_promotion(&mut map, shard_id, &nm, &ne, &fm, timestamp, chrono::Utc::now().timestamp());
+        if ok {
+            let _ = crate::sharding::save_shard_map(&map);
+        }
+        ok
+    })
+    .await
+    .unwrap_or(false);
+    if !accepted {
+        return;
+    }
+    tracing::info!("MasterPromotion: shard {} → new master {} (was {})", shard_id, new_master, former_master);
+    if !fetch_shard || new_endpoint.is_empty() {
+        return;
+    }
+    let my_addr = crate::ledger::Ledger::load().address;
+    let my_ep = get_public_endpoint().await;
+    let updated = crate::sharding::load_shard_map();
+    let all_nodes: Vec<String> = updated.assignments.iter()
+        .map(|a| a.node_address.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter().collect();
+    let is_slave = crate::sharding::my_shards(&my_addr, &updated, &all_nodes)
+        .iter().any(|(sid, role)| *sid == shard_id && *role == crate::sharding::ShardRole::Slave);
+    if !is_slave {
+        return;
+    }
+    let from_height = crate::sharding::last_shard_height(shard_id, &load_chain(), &updated);
+    let req = P2PMessage::ShardDataRequest {
+        shard_id,
+        from_height,
+        requester_address:  my_addr,
+        requester_endpoint: my_ep,
+    };
+    let _ = send_message_any(&[new_endpoint], &req).await;
 }
 
 pub async fn broadcast_compute_msg(msg: P2PMessage) {
@@ -6763,12 +6867,17 @@ pub async fn broadcast_compute_msg(msg: P2PMessage) {
 }
 
 pub async fn broadcast_master_promotion(shard_id: u32, new_master: &str, new_endpoint: &str, former_master: &str) {
+    let timestamp = chrono::Utc::now().timestamp();
+    let signed = crate::sharding::promotion_signing_bytes(shard_id, new_master, new_endpoint, former_master, timestamp);
+    let Some((pubkey, signature)) = crate::sharding::sign_as_node(&signed) else { return };
     let msg = crate::p2p::P2PMessage::MasterPromotion {
         shard_id,
         new_master:    new_master.to_string(),
         new_endpoint:  new_endpoint.to_string(),
         former_master: former_master.to_string(),
-        timestamp:     chrono::Utc::now().timestamp(),
+        timestamp,
+        pubkey,
+        signature,
     };
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-shards-v1", data).await;
@@ -9717,56 +9826,11 @@ async fn handle_event(
                     Ok(P2PMessage::FileDelete { notice }) => {
                         tokio::spawn(crate::file_delete::handle(notice, false));
                     }
-                    Ok(P2PMessage::ShardAnnounce { from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count }) => {
-                        crate::sharding::handle_shard_announce_update(&from_addr, &from_endpoint, &held_shards, uptime_secs, network_node_count, shard_count);
+                    Ok(P2PMessage::ShardAnnounce { from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count, ts, pubkey, signature }) => {
+                        on_shard_announce(from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count, ts, pubkey, signature);
                     }
-                    Ok(P2PMessage::MasterPromotion { shard_id, new_master, new_endpoint, former_master, timestamp }) => {
-                        tracing::info!("MasterPromotion: shard {} → new master {} (was {})", shard_id, new_master, former_master);
-                        let mut map = crate::sharding::load_shard_map();
-                        if let Some(old) = map.assignments.iter_mut().find(|a| a.shard_id == shard_id && a.node_address == former_master) {
-                            old.role = crate::sharding::ShardRole::Observer;
-                        }
-                        if let Some(new_m) = map.assignments.iter_mut().find(|a| a.shard_id == shard_id && a.node_address == new_master) {
-                            new_m.role = crate::sharding::ShardRole::Master;
-                            new_m.node_endpoint = new_endpoint.clone();
-                            new_m.last_seen = timestamp;
-                        } else {
-                            map.assignments.push(crate::sharding::ShardAssignment {
-                                shard_id,
-                                role: crate::sharding::ShardRole::Master,
-                                node_address: new_master.clone(),
-                                node_endpoint: new_endpoint.clone(),
-                                last_seen: timestamp,
-                                uptime_secs: 0,
-                            });
-                        }
-                        let _ = crate::sharding::save_shard_map(&map);
-
-                        let my_addr = crate::ledger::Ledger::load().address;
-                        let my_ep   = get_public_endpoint().await;
-                        let updated = crate::sharding::load_shard_map();
-                        let all_nodes: Vec<String> = updated.assignments.iter()
-                            .map(|a| a.node_address.clone())
-                            .collect::<std::collections::HashSet<_>>()
-                            .into_iter().collect();
-                        let is_slave = crate::sharding::my_shards(&my_addr, &updated, &all_nodes)
-                            .iter().any(|(sid, role)| *sid == shard_id && *role == crate::sharding::ShardRole::Slave);
-                        if is_slave && !new_endpoint.is_empty() {
-                            let my_ep2 = my_ep.clone();
-                            let my_a2  = my_addr.clone();
-                            let ep2    = new_endpoint.clone();
-                            let chain  = load_chain();
-                            let from_h = crate::sharding::last_shard_height(shard_id, &chain, &updated);
-                            tokio::spawn(async move {
-                                let req = P2PMessage::ShardDataRequest {
-                                    shard_id,
-                                    from_height:        from_h,
-                                    requester_address:  my_a2,
-                                    requester_endpoint: my_ep2,
-                                };
-                                let _ = send_message_any(&[ep2], &req).await;
-                            });
-                        }
+                    Ok(P2PMessage::MasterPromotion { shard_id, new_master, new_endpoint, former_master, timestamp, pubkey, signature }) => {
+                        tokio::spawn(on_master_promotion(shard_id, new_master, new_endpoint, former_master, timestamp, pubkey, signature, true));
                     }
                     _ => {}
                 }
@@ -9781,7 +9845,8 @@ async fn handle_event(
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     let current = crate::sharding::get_agreed_shard_count();
-                    if proposed_shard_count != current && proposed_shard_count >= 1 {
+                    let ours = crate::sharding::compute_shard_count(get_known_validators_snapshot().len() as u32 + 1);
+                    if proposed_shard_count != current && proposed_shard_count == ours {
                         tracing::info!("Shard rebalance proposal: {} shards (from {}), effective at block {}",
                             proposed_shard_count, &proposer[..16.min(proposer.len())], effective_at_height);
                         crate::sharding::set_agreed_shard_count(proposed_shard_count, effective_at_height);
@@ -11052,7 +11117,7 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
             Err(e) => eprintln!("[P2P] FileRequest: read failed {}: {}", file.local_path, e),
             Ok(enc_bytes) => {
                 use base64::Engine as _;
-                let key_nonce_hex = String::new();
+                let key_nonce_hex = if file.key_nonce_hex == "public" { "public".to_string() } else { String::new() };
                 let file_name     = file.name.clone();
                 let cid2          = cid.clone();
                 let ep            = requester_endpoint.clone();
@@ -11092,31 +11157,12 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
     }
 }
 
-        P2PMessage::ShardAnnounce { from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count } => {
-            crate::sharding::handle_shard_announce_update(&from_addr, &from_endpoint, &held_shards, uptime_secs, network_node_count, shard_count);
+        P2PMessage::ShardAnnounce { from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count, ts, pubkey, signature } => {
+            on_shard_announce(from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count, ts, pubkey, signature);
         }
 
-        P2PMessage::MasterPromotion { shard_id, new_master, new_endpoint, former_master, timestamp } => {
-            eprintln!("[Sharding] MasterPromotion (direct): shard {} → new master {} (was {})", shard_id, new_master, former_master);
-            let mut map = crate::sharding::load_shard_map();
-            if let Some(old) = map.assignments.iter_mut().find(|a| a.shard_id == shard_id && a.node_address == former_master) {
-                old.role = crate::sharding::ShardRole::Observer;
-            }
-            if let Some(new_m) = map.assignments.iter_mut().find(|a| a.shard_id == shard_id && a.node_address == new_master) {
-                new_m.role = crate::sharding::ShardRole::Master;
-                new_m.node_endpoint = new_endpoint.clone();
-                new_m.last_seen = timestamp;
-            } else {
-                map.assignments.push(crate::sharding::ShardAssignment {
-                    shard_id,
-                    role: crate::sharding::ShardRole::Master,
-                    node_address: new_master,
-                    node_endpoint: new_endpoint,
-                    last_seen: timestamp,
-                    uptime_secs: 0,
-                });
-            }
-            let _ = crate::sharding::save_shard_map(&map);
+        P2PMessage::MasterPromotion { shard_id, new_master, new_endpoint, former_master, timestamp, pubkey, signature } => {
+            tokio::spawn(on_master_promotion(shard_id, new_master, new_endpoint, former_master, timestamp, pubkey, signature, false));
         }
 
 P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
@@ -11184,6 +11230,9 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                     }
                     if f.name.is_empty() { f.name = file_name.clone(); }
                     f.status = "Received".to_string();
+                } else if f.local_path.is_empty() || f.local_path.starts_with("sender:") {
+                    f.local_path = enc_str.clone();
+                    if f.encrypted_size == 0 { f.encrypted_size = enc_bytes.len() as u64; }
                 }
             } else {
                 let now = chrono::Utc::now().timestamp();
@@ -11251,7 +11300,13 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
             match serde_json::from_str::<crate::blocks::FileManifest>(&manifest_json) {
                 Err(e) => eprintln!("[Blocks] ManifestData parse error: {}", e),
                 Ok(manifest) => {
-                    let _ = crate::blocks::save_manifest(&manifest);
+                    if manifest.manifest_cid != manifest_cid {
+                        eprintln!("[Blocks] ManifestData names {} but carries {}", &manifest_cid[..16.min(manifest_cid.len())], &manifest.manifest_cid[..16.min(manifest.manifest_cid.len())]);
+                        return;
+                    }
+                    if crate::blocks::load_manifest(&manifest_cid).is_err() {
+                        let _ = crate::blocks::save_manifest(&manifest);
+                    }
                     let blocks_total = manifest.blocks.len() as u32;
 
                     {
@@ -11669,6 +11724,8 @@ async fn update_ledger_for_block(manifest_cid: &str, app: Option<&tauri::AppHand
     let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
         .await.unwrap_or_default();
+    let my_addr = ledger.address.clone();
+    let mut rebind: Option<Vec<String>> = None;
     if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == manifest_cid) {
         if f.status == "Failed" { return; } // already timed out; don't overwrite
         let prev = f.blocks_received;
@@ -11682,10 +11739,15 @@ async fn update_ledger_for_block(manifest_cid: &str, app: Option<&tauri::AppHand
                 f.status     = "Received".to_string();
                 f.local_path = path;
             } else if f.local_path.is_empty() || f.local_path.starts_with("sender:") {
+                rebind = Some(crate::proof::earlier_binders(f));
                 f.local_path = path;
             }
         }
         let _ = tokio::task::spawn_blocking(move || ledger.save()).await;
+    }
+    if let Some(binders) = rebind {
+        let cid = manifest_cid.to_string();
+        let _ = tokio::task::spawn_blocking(move || crate::proof::rebind_manifest(&cid, &my_addr, &binders)).await;
     }
 
     if let Some(h) = app {
@@ -11733,9 +11795,11 @@ async fn process_received_manifest(manifest_cid: &str, app: Option<&tauri::AppHa
     let total    = manifest.blocks.len() as u32;
     let received = crate::blocks::blocks_received_count(&manifest);
 
+    let mut rebind: Option<(String, Vec<String>)> = None;
     {
         let _guard = crate::ledger::TX_MUTEX.lock().await;
         let mut ledger = crate::ledger::Ledger::load();
+        let my_addr = ledger.address.clone();
         if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == manifest_cid) {
             if f.status != "Failed" {
                 let now = chrono::Utc::now().timestamp();
@@ -11755,10 +11819,18 @@ async fn process_received_manifest(manifest_cid: &str, app: Option<&tauri::AppHa
                     f.status     = "Received".to_string();
                     f.local_path = crate::blocks::manifest_path(manifest_cid)
                         .to_string_lossy().to_string();
+                } else if received >= total && (f.local_path.is_empty() || f.local_path.starts_with("sender:")) {
+                    rebind = Some((my_addr, crate::proof::earlier_binders(f)));
+                    f.local_path = crate::blocks::manifest_path(manifest_cid)
+                        .to_string_lossy().to_string();
                 }
                 let _ = ledger.save();
             }
         }
+    }
+    if let Some((me, binders)) = rebind {
+        let cid = manifest_cid.to_string();
+        let _ = tokio::task::spawn_blocking(move || crate::proof::rebind_manifest(&cid, &me, &binders)).await;
     }
 
     if let Some(h) = app {

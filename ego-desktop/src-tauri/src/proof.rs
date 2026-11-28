@@ -301,17 +301,16 @@ pub async fn run_post_checks(app: Option<&tauri::AppHandle<tauri::Wry>>) {
         if file.local_path.is_empty() || file.local_path.starts_with("sender:") { continue; }
         if file.key_nonce_hex == "public" { continue; }
 
-        // Not time for another challenge yet?
-        let last = file.last_proved.unwrap_or(0);
-        if now - last < POST_CHECK_INTERVAL_SECS { continue; }
+        if !check_due(file, now) { continue; }
+        file.proof_checked_at = now;
+        need_save = true;
 
-        let proof_ok = challenge_file(file, now);
+        let proof_ok = challenge_file(file, &my_addr, now);
 
         if proof_ok {
             file.last_proved           = Some(now);
             file.proof_strikes         = 0;
             file.proof_suspended_until = 0;
-            need_save = true;
             eprintln!("[PoSt] ✓  {} proved at slot {}", &file.cid[..16.min(file.cid.len())], now / POST_CHECK_INTERVAL_SECS);
 
             // Deal expiry: if slave's hosting deal has ended and file is still good,
@@ -326,10 +325,9 @@ pub async fn run_post_checks(app: Option<&tauri::AppHandle<tauri::Wry>>) {
             }
         } else {
             file.proof_strikes += 1;
-            need_save = true;
             eprintln!("[PoSt] ✗  {} FAILED — strike {} of 2", &file.cid[..16.min(file.cid.len())], file.proof_strikes);
 
-            if file.proof_strikes >= 2 {
+            if file.proof_strikes >= 2 && file.proof_suspended_until <= now {
                 file.proof_suspended_until = now + POST_SUSPEND_SECS;
 
                 // Re-derive which block was challenged so we can include it in the broadcast.
@@ -403,10 +401,11 @@ pub async fn run_post_checks(app: Option<&tauri::AppHandle<tauri::Wry>>) {
         }
 
         if let Some(h) = app {
+            let label = if name.trim().is_empty() { cid[..16.min(cid.len())].to_string() } else { name };
             crate::commands::notifications::notify(
                 h,
                 "Storage Proof Failed",
-                &format!("\"{}\" — rewards suspended 7 days (strike {}). Check your storage folder.", name, strikes),
+                &format!("\"{}\" — rewards suspended 7 days (strike {}). Check your storage folder.", label, strikes),
             );
         }
     }
@@ -417,9 +416,55 @@ pub async fn run_post_checks(app: Option<&tauri::AppHandle<tauri::Wry>>) {
 
 /// Sample one block from `file` using a deterministic challenge and verify it.
 /// Returns true if the file passes, false if data is missing or corrupt.
-fn challenge_file(file: &crate::ledger::StoredFile, now: i64) -> bool {
+fn check_due(file: &crate::ledger::StoredFile, now: i64) -> bool {
+    let last = file.last_proved.unwrap_or(0).max(file.proof_checked_at);
+    now - last >= POST_CHECK_INTERVAL_SECS
+}
+
+pub fn earlier_binders(file: &crate::ledger::StoredFile) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let sender = file.local_path.strip_prefix("sender:").unwrap_or("");
+    let candidates = [file.owner.as_str(), file.replica_master.as_str(), sender].into_iter()
+        .chain(file.replica_grace.keys().map(|a| a.as_str()))
+        .chain(file.replica_peers.iter().map(|a| a.as_str()))
+        .chain(file.replica_provisional.values().map(|a| a.as_str()));
+    for a in candidates {
+        if !a.is_empty() && !out.iter().any(|x| x == a) {
+            out.push(a.to_string());
+        }
+    }
+    out
+}
+
+pub fn rebind_manifest(manifest_cid: &str, my_addr: &str, binders: &[String]) -> usize {
+    if my_addr.is_empty() { return 0; }
+    let Ok(mut manifest) = crate::blocks::load_manifest(manifest_cid) else { return 0 };
+    let mut changed = 0;
+    for b in manifest.blocks.iter_mut() {
+        if b.comm_r.is_empty() { continue; }
+        let Ok(enc) = crate::blocks::load_block(&b.block_cid) else { continue };
+        let mine = crate::blocks::compute_block_comm_r(&enc, my_addr, &b.block_cid);
+        if mine == b.comm_r { continue; }
+        if binders.iter().any(|a| a != my_addr && crate::blocks::compute_block_comm_r(&enc, a, &b.block_cid) == b.comm_r) {
+            b.comm_r = mine;
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        let _ = crate::blocks::save_manifest(&manifest);
+    }
+    changed
+}
+
+fn single_file_present(file: &crate::ledger::StoredFile) -> bool {
+    std::fs::metadata(&file.local_path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+fn challenge_file(file: &crate::ledger::StoredFile, my_addr: &str, now: i64) -> bool {
     if !file.cid.starts_with("egomfd1") {
-        return false;
+        return single_file_present(file);
     }
 
     let manifest = match crate::blocks::load_manifest(&file.cid) {
@@ -456,12 +501,17 @@ fn challenge_file(file: &crate::ledger::StoredFile, now: i64) -> bool {
     // at upload time and are bound to our address — a node can't fake this by
     // fetching blocks on demand unless they also have the exact enc_bytes.
     if !entry.comm_r.is_empty() {
-        let my_addr = crate::ledger::Ledger::load().address;
-        let expected_comm_r = crate::blocks::compute_block_comm_r(&enc_bytes, &my_addr, &entry.block_cid);
-        if expected_comm_r != entry.comm_r {
-            return false;  // replica commitment mismatch — data replaced or corrupted
+        if crate::blocks::compute_block_comm_r(&enc_bytes, my_addr, &entry.block_cid) == entry.comm_r {
+            return true;
         }
-        return true;  // comm_r verified — data is intact and bound to this prover
+        let binders = earlier_binders(file);
+        let intact = binders.iter().any(|a| {
+            a != my_addr && crate::blocks::compute_block_comm_r(&enc_bytes, a, &entry.block_cid) == entry.comm_r
+        });
+        if intact {
+            rebind_manifest(&file.cid, my_addr, &binders);
+        }
+        return intact;
     }
 
     // ── Legacy fallback: decrypt + hash verify (no comm_r stored) ────────────
@@ -650,5 +700,72 @@ mod tests {
 
         proofs[0].leaf[0] ^= 0xFF;
         assert!(!verify_post_proofs(&proofs, &tree.root, &seed, tree.n_real, tree.n_padded));
+    }
+}
+
+#[cfg(test)]
+mod self_check_tests {
+    use super::*;
+    use crate::blocks::{compute_block_comm_r, BlockEntry, FileManifest};
+    use crate::ledger::StoredFile;
+
+    fn block(tag: &str) -> (String, Vec<u8>) {
+        let bytes = format!("sealed bytes {tag}").into_bytes();
+        (format!("egoblk1{}", blake3::hash(tag.as_bytes()).to_hex()), bytes)
+    }
+
+    fn manifest_bound_to(cid: &str, binder: &str, tags: &[&str]) -> Vec<(String, Vec<u8>)> {
+        let blocks: Vec<(String, Vec<u8>)> = tags.iter().map(|t| block(t)).collect();
+        let entries = blocks.iter().map(|(c, b)| {
+            crate::blocks::save_block(c, b).unwrap();
+            BlockEntry { block_cid: c.clone(), nonce_hex: String::new(), size: b.len() as u64, comm_r: compute_block_comm_r(b, binder, c) }
+        }).collect();
+        crate::blocks::save_manifest(&FileManifest { manifest_cid: cid.into(), file_name: String::new(), total_size: 0, blocks: entries }).unwrap();
+        blocks
+    }
+
+    #[test]
+    fn a_copy_received_from_another_node_is_bound_to_this_node() {
+        let cid = "egomfd1selfcheckrebind000000000000000000000001";
+        let blocks = manifest_bound_to(cid, "egot1master", &["rebind-a", "rebind-b"]);
+        let n = rebind_manifest(cid, "egot1me", &["egot1someone".into(), "egot1master".into()]);
+        assert_eq!(n, 2);
+        let m = crate::blocks::load_manifest(cid).unwrap();
+        for (entry, (c, b)) in m.blocks.iter().zip(&blocks) {
+            assert_eq!(entry.comm_r, compute_block_comm_r(b, "egot1me", c));
+        }
+        assert_eq!(rebind_manifest(cid, "egot1me", &["egot1master".into()]), 0, "already ours");
+    }
+
+    #[test]
+    fn a_block_that_matches_nobody_it_came_from_stays_unproven() {
+        let cid = "egomfd1selfcheckrebind000000000000000000000002";
+        manifest_bound_to(cid, "egot1stranger", &["stranger-a"]);
+        assert_eq!(rebind_manifest(cid, "egot1me", &["egot1master".into()]), 0);
+        let (c, _) = block("stranger-a");
+        crate::blocks::save_block(&c, b"replaced bytes").unwrap();
+        assert_eq!(rebind_manifest(cid, "egot1me", &["egot1stranger".into()]), 0, "changed bytes never get rebound");
+    }
+
+    #[test]
+    fn where_a_copy_came_from_is_remembered_from_the_record() {
+        let mut f = StoredFile { owner: "egot1owner".into(), local_path: "sender:egot1master".into(), ..Default::default() };
+        f.replica_grace.insert("egot1old".into(), 1);
+        f.replica_peers.push("egot1owner".into());
+        let b = earlier_binders(&f);
+        assert_eq!(b, vec!["egot1owner".to_string(), "egot1master".into(), "egot1old".into()]);
+    }
+
+    #[test]
+    fn a_failed_file_waits_the_full_interval_before_its_next_check() {
+        let now = 1_000_000;
+        let mut f = StoredFile::default();
+        assert!(check_due(&f, now));
+        f.proof_checked_at = now - 60;
+        assert!(!check_due(&f, now), "a restart does not add a strike");
+        f.proof_checked_at = now - POST_CHECK_INTERVAL_SECS;
+        assert!(check_due(&f, now));
+        f.last_proved = Some(now - 10);
+        assert!(!check_due(&f, now));
     }
 }

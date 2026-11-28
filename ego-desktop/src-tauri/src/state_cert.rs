@@ -23,6 +23,7 @@ pub const STATE_CERT_ANCHORS: &[(u64, &str)] = &[
     (16, "118168372afc04a36fbf19148d6a4f1bb313d0f1b397f943ccb43f4ff61dbfc0"),
     (20, "cf99c3e41f70588cb9a9481dac2e3cd602f96c222020e705a8651e8334685cc7"),
     (23, "151431b1ab7c8118d054ab83cefe0b61e9ab24e9ab94ee1a27300b92ac5eb627"),
+    (26, "a51b5848c3209f3ca7d8e5817ece7dcd3889ce23f6336af6db7571e7165f510f"),
 ];
 const KEY_DAY: &[u8] = b"sc:day";
 const KEY_OPEN: &[u8] = b"sc:open";
@@ -569,6 +570,20 @@ mod tests {
         println!("DIAG real chain from 20: {:?}", verify_chain(&from_top, &anchors_with(None)).map(|c| c.map(|c| c.body.index)));
         let old_way = vec![(1u64, STATE_CERT_ANCHORS[0].1.to_string()), (2, STATE_CERT_ANCHORS[1].1.to_string()), (3, STATE_CERT_ANCHORS[2].1.to_string())];
         println!("DIAG real chain with only 1-3: {:?}", verify_chain(&all, &old_way).map(|c| c.map(|c| c.body.index)));
+        let newest_anchor = STATE_CERT_ANCHORS.last().map(|(i, _)| *i).unwrap_or(0);
+        let mut fallbacks = Vec::new();
+        for (i, c) in certs.range(newest_anchor + 1..) {
+            let Some(p) = certs.get(&(i - 1)) else { continue };
+            let by_prev = verify_cert(c, &p.body.next).is_ok();
+            let by_own = verify_cert(c, &c.body.next).is_ok();
+            println!("DIAG cert {i} height {} signers {} prev_next {} own_next {} by_prev {by_prev} by_own {by_own} hash {}", c.body.height, c.signers.len(), p.body.next.len(), c.body.next.len(), c.hash());
+            if !by_prev {
+                fallbacks.push((*i, c.hash()));
+            }
+        }
+        for (i, h) in &fallbacks {
+            println!("DIAG chain if only {i} is published: {:?}", verify_chain(&all, &anchors_with(Some((*i, h.clone())))).map(|c| c.map(|c| c.body.index)));
+        }
     }
 
     #[test]
@@ -683,14 +698,15 @@ mod tests {
             (16u64, "118168372afc04a36fbf19148d6a4f1bb313d0f1b397f943ccb43f4ff61dbfc0".to_string()),
             (20u64, "cf99c3e41f70588cb9a9481dac2e3cd602f96c222020e705a8651e8334685cc7".to_string()),
             (23u64, "151431b1ab7c8118d054ab83cefe0b61e9ab24e9ab94ee1a27300b92ac5eb627".to_string()),
+            (26u64, "a51b5848c3209f3ca7d8e5817ece7dcd3889ce23f6336af6db7571e7165f510f".to_string()),
         ];
-        assert_eq!(anchors_with(None), built_in, "this release names checkpoints 1, 2, 3 and the fallback checkpoints 11, 13, 16, 20 and 23 itself");
+        assert_eq!(anchors_with(None), built_in, "this release names checkpoints 1, 2, 3 and the fallback checkpoints 11, 13, 16, 20, 23 and 26 itself");
         let mut with_four = built_in.clone();
         with_four.push((4, h.clone()));
         with_four.sort();
         assert_eq!(anchors_with(Some((4, h.clone()))), with_four);
-        assert_eq!(start_index(&anchors_with(Some((4, h.clone())))), Some(23), "a new node starts from the newest official checkpoint");
-        assert_eq!(start_index(&anchors_with(Some((25, h.clone())))), Some(25), "the website can name a newer one");
+        assert_eq!(start_index(&anchors_with(Some((4, h.clone())))), Some(26), "a new node starts from the newest official checkpoint");
+        assert_eq!(start_index(&anchors_with(Some((27, h.clone())))), Some(27), "the website can name a newer one");
         assert_eq!(anchors_with(Some((1, "cda691751e0b56e24ef1706b3af4e149c0a51f90c996d47b9fc4b85b7b2c200c".into()))), built_in, "the website naming the same one adds nothing");
         assert_eq!(anchors_with(Some((0, h.clone()))), built_in);
         assert_eq!(anchors_with(Some((4, "AB".repeat(32)))), built_in);
