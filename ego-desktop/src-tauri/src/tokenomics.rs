@@ -45,6 +45,24 @@ pub const CONTRIBUTOR_FEE_PCT: u64 = 40;
 pub fn miner_fee_share(tx_fees: u64)       -> u64 { tx_fees * MINER_FEE_PCT / 100 }
 pub fn contributor_fee_share(tx_fees: u64) -> u64 { tx_fees - miner_fee_share(tx_fees) }
 
+pub const SAFU_PCT: u64 = 3;
+pub const SAFU_FROM_HEIGHT: u64 = u64::MAX;
+
+pub fn safu_share_from(from_height: u64, height: u64, amount: u64) -> u64 {
+    if height < from_height {
+        return 0;
+    }
+    (amount as u128 * SAFU_PCT as u128 / 100) as u64
+}
+
+pub fn safu_share(height: u64, amount: u64) -> u64 {
+    safu_share_from(SAFU_FROM_HEIGHT, height, amount)
+}
+
+pub fn fees_for_nodes(height: u64, tx_fees: u64) -> u64 {
+    tx_fees - safu_share(height, tx_fees)
+}
+
 pub fn compute_block_reward(height: u64, tx_fees_uegoc: u64, prev_hash: &str) -> u64 {
     let base = block_reward_at(height);
     let seed = format!("ego/block-bonus/v1:{prev_hash}:{height}");

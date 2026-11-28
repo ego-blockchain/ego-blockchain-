@@ -52,9 +52,7 @@ pub fn check_hosting_access() -> Result<HostingAccess, EgoDesktopError> {
     let owner  = &ledger.address;
     let now    = chrono::Utc::now().timestamp();
 
-    let plan = if owner.is_empty() { None } else {
-        crate::chain_db::get_hosting_plan(owner).filter(|p| p.expires_at > now)
-    };
+    let plan = if owner.is_empty() { None } else { current_plan(owner, now) };
 
     if let Some(ref p) = plan {
         return Ok(HostingAccess {
@@ -119,14 +117,33 @@ pub struct HostingPlanOption {
 /// The storage each tier includes costs about $0.002 a gigabyte-month to serve, so even the
 /// largest keeps over eighty percent. There was room to halve these and there still is.
 fn plan_options() -> Vec<(String, String, f64, u32, f64)> {
-    vec![
-        ("starter".into(),  "Starter".into(),   1.49,  20,  50.0),
-        ("pro".into(),      "Pro".into(),       2.99,  60, 120.0),
-        ("business".into(), "Business".into(),  5.99,   0, 500.0),
-    ]
+    crate::storage_pay::HOSTING_TIERS.iter().map(|(tier, cents, gb)| {
+        let (label, max_sites) = match *tier {
+            "starter" => ("Starter", 20),
+            "pro" => ("Pro", 60),
+            _ => ("Business", 0),
+        };
+        (tier.to_string(), label.to_string(), *cents as f64 / 100.0, max_sites, *gb as f64)
+    }).collect()
+}
+
+fn plan_rules_on() -> bool {
+    crate::chain_db::local_chain_height().saturating_add(1) >= crate::storage_pay::HOSTING_PLAN_FROM_HEIGHT
+}
+
+fn current_plan(owner: &str, now: i64) -> Option<crate::chain_db::ActiveHostingPlan> {
+    if plan_rules_on() {
+        return crate::chain_db::hosting_plan_on_chain(owner, now);
+    }
+    crate::chain_db::get_hosting_plan(owner).filter(|p| p.expires_at > now)
 }
 
 fn usd_to_uegoc(usd: f64) -> u64 {
+    if plan_rules_on() {
+        if let Some(micro) = crate::chain_db::consensus_price_micro_usd().filter(|m| *m > 0) {
+            return ((usd * 1_000_000.0 * 1_000_000.0) / micro as f64).ceil() as u64;
+        }
+    }
     let price = crate::p2p::get_egoc_price_usd().max(0.000001);
     ((usd / price) * 1_000_000.0).ceil() as u64
 }
@@ -198,7 +215,7 @@ pub fn site_dir(owner: &str, name: &str) -> std::path::PathBuf {
     dir
 }
 
-fn cid_of(data: &[u8]) -> String {
+pub(crate) fn cid_of(data: &[u8]) -> String {
     use blake2::{Blake2s256, Digest};
     let mut h = Blake2s256::new();
     h.update(data);
@@ -228,6 +245,19 @@ pub(crate) fn hosting_keypair() -> Option<ego_core::KeyPair> {
 }
 
 pub fn hosting_signing_bytes(r: &crate::chain_db::HostingNodeRecord) -> Vec<u8> {
+    if !r.mirrors.is_empty() || !r.mirrored.is_empty() {
+        return format!(
+            "ego/hosting/v3\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            r.node_id,
+            r.endpoint,
+            r.last_seen,
+            r.sites.join(","),
+            r.domains.join(","),
+            r.mirrors.join(","),
+            r.mirrored.join(",")
+        )
+        .into_bytes();
+    }
     format!(
         "ego/hosting/v2\n{}\n{}\n{}\n{}\n{}",
         r.node_id,
@@ -278,6 +308,12 @@ pub fn verify_hosting_record(r: &crate::chain_db::HostingNodeRecord, now: i64) -
     }
     if r.domains.len() > HOSTING_MAX_DOMAINS || !r.domains.iter().all(|d| valid_hosting_domain(d)) {
         return Err("domain");
+    }
+    if r.mirrored.len() > HOSTING_MAX_DOMAINS || !r.mirrored.iter().all(|d| valid_hosting_domain(d)) {
+        return Err("domain");
+    }
+    if r.mirrors.len() > 8 || r.mirrors.iter().any(|a| a.len() > 80 || a.contains(',') || a.contains('\n')) {
+        return Err("mirrors");
     }
     let pk: [u8; 32] = hex::decode(&r.pubkey).ok().and_then(|v| v.try_into().ok()).ok_or("pubkey")?;
     let sig: [u8; 64] = hex::decode(&r.signature_v2).ok().and_then(|v| v.try_into().ok()).ok_or("sig")?;
@@ -582,7 +618,7 @@ pub fn undeploy_site(name: String) -> Result<(), EgoDesktopError> {
     Ok(())
 }
 
-async fn announce_hosting_record() {
+pub(crate) async fn announce_hosting_record() {
     let Ok((owner, names, stored)) = tokio::task::spawn_blocking(|| {
         let owner = Ledger::load().address;
         if owner.is_empty() {
@@ -597,7 +633,21 @@ async fn announce_hosting_record() {
         return;
     };
     let (sites, domains) = names;
-    if sites.is_empty() && domains.is_empty() {
+    let plan_on = plan_rules_on();
+    let me = owner.clone();
+    let (mirrors, mirrored) = if plan_on {
+        tokio::task::spawn_blocking(move || {
+            let mut hosts: Vec<String> = crate::chain_db::hosting_plan_hosts(&me).into_iter().filter(|h| *h != me).collect();
+            hosts.truncate(8);
+            (hosts, crate::site_mirror::serving_domains())
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mirrors = if domains.is_empty() { Vec::new() } else { mirrors };
+    if sites.is_empty() && domains.is_empty() && mirrored.is_empty() {
         return;
     }
     let endpoint = match discover_public_ip().await {
@@ -623,6 +673,8 @@ async fn announce_hosting_record() {
         signature: String::new(),
         pubkey: String::new(),
         signature_v2: String::new(),
+        mirrors,
+        mirrored,
     };
     sign_hosting_record(&mut record, &kp);
     let saved = record.clone();
@@ -759,9 +811,7 @@ pub fn get_hosting_plans() -> Vec<HostingPlanOption> {
 pub fn get_my_hosting_plan() -> Option<crate::chain_db::ActiveHostingPlan> {
     let owner = Ledger::load().address;
     if owner.is_empty() { return None; }
-    let plan = crate::chain_db::get_hosting_plan(&owner)?;
-    let now   = chrono::Utc::now().timestamp();
-    if plan.expires_at > now { Some(plan) } else { None }
+    current_plan(&owner, chrono::Utc::now().timestamp())
 }
 
 #[tauri::command]
@@ -780,6 +830,9 @@ pub async fn purchase_hosting_plan(
         .ok_or_else(|| EgoDesktopError::InvalidInput(format!("Unknown tier: {}", tier)))?;
 
     let pay_egusd       = pay_with_egusd.unwrap_or(false);
+    if plan_rules_on() && !pay_egusd && crate::chain_db::consensus_price_micro_usd().filter(|m| *m > 0).is_none() {
+        return Err(EgoDesktopError::InvalidInput("The network has no EGOC price yet, so pay with EGUSD.".into()));
+    }
     let uegoc_per_month = usd_to_uegoc(usd_per_month);
     let total_uegoc     = uegoc_per_month.saturating_mul(months as u64);
     // The plan has a dollar price, so in credits it is simply that price. No trip through
@@ -852,8 +905,20 @@ pub async fn purchase_hosting_plan(
     let _ = ledger.save();
 
     let new_tier = tier.trim().to_string();
-    let existing = crate::chain_db::get_hosting_plan(&owner)
-        .filter(|p| p.expires_at > now);
+    let existing = current_plan(&owner, now);
+
+    if plan_rules_on() {
+        let start = existing.as_ref().map(|p| p.expires_at).unwrap_or(now).max(now);
+        return Ok(crate::chain_db::ActiveHostingPlan {
+            owner,
+            tier: new_tier,
+            months,
+            started_at: start,
+            expires_at: start + months as i64 * crate::storage_pay::HOSTING_MONTH_SECS,
+            paid_uegoc: if pay_egusd { 0 } else { total_uegoc },
+            tx_hash,
+        });
+    }
 
     let expires_at = if let Some(ref p) = existing {
         if p.tier == new_tier {
@@ -885,6 +950,9 @@ pub fn cancel_hosting_plan() -> Result<(), EgoDesktopError> {
     let owner = Ledger::load().address;
     if owner.is_empty() {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
+    }
+    if plan_rules_on() {
+        return Err(EgoDesktopError::InvalidInput("A paid hosting plan is recorded on the chain and runs until it ends.".into()));
     }
     let db = crate::chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf = db.cf_handle("hosting_plans")
@@ -1014,6 +1082,8 @@ mod tests {
             signature: String::new(),
             pubkey: String::new(),
             signature_v2: String::new(),
+            mirrors: Vec::new(),
+            mirrored: Vec::new(),
         };
         sign_hosting_record(&mut r, kp);
         r
@@ -1021,7 +1091,7 @@ mod tests {
 
     #[test]
     fn the_signed_text_matches_what_the_oracle_checks() {
-        let r = HostingNodeRecord {
+        let mut r = HostingNodeRecord {
             node_id: "egot1abc".into(),
             endpoint: "http://1.2.3.4:5".into(),
             sites: vec!["a".into(), "b".into()],
@@ -1030,8 +1100,16 @@ mod tests {
             signature: String::new(),
             pubkey: String::new(),
             signature_v2: String::new(),
+            mirrors: Vec::new(),
+            mirrored: Vec::new(),
         };
         assert_eq!(hosting_signing_bytes(&r), b"ego/hosting/v2\negot1abc\nhttp://1.2.3.4:5\n7\na,b\nx.com,y.org".to_vec());
+        r.mirrors = vec!["egot1m1".into(), "egot1m2".into()];
+        r.mirrored = vec!["z.net".into()];
+        assert_eq!(
+            hosting_signing_bytes(&r),
+            b"ego/hosting/v3\negot1abc\nhttp://1.2.3.4:5\n7\na,b\nx.com,y.org\negot1m1,egot1m2\nz.net".to_vec()
+        );
     }
 
     #[test]

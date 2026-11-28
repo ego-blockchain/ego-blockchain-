@@ -1760,6 +1760,7 @@ pub fn is_reserved_system_source(addr: &str) -> bool {
         || addr.starts_with("egot1rewards")
         || addr.starts_with("egot1shielded")
         || addr.starts_with("egot1marketescrow")
+        || addr.starts_with("egot1safupool")
 }
 
 pub fn pays_fee_from_amount(tx: &LedgerTx) -> bool {
@@ -1789,7 +1790,7 @@ fn tx_hash_must_match_standard_signing(tx: &LedgerTx) -> bool {
 }
 
 pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
-    if is_protocol_system_tx(tx) || crate::drs::is_batch_tx(tx) || crate::chain_db::is_contributor_fee_tx(tx) {
+    if is_protocol_system_tx(tx) || crate::drs::is_batch_tx(tx) || crate::chain_db::is_contributor_fee_tx(tx) || crate::chain_db::is_safu_fee_tx(tx) || crate::dao_chain::is_safu_payout_tx(tx) {
         return Ok(());
     }
     if crate::shielded_chain::unshield_is_well_formed(tx)

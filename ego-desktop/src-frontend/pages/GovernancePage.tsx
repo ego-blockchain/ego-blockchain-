@@ -15,7 +15,7 @@ interface DaoProposal {
   stake_vote_count: number; knowledge_vote_count: number;
   questions: TestQuestion[] | null;
   my_stake_vote: number | null; my_knowledge_vote: number | null; my_test_score: number | null;
-  on_chain?: boolean; answers_revealed?: boolean; target?: string;
+  on_chain?: boolean; answers_revealed?: boolean; target?: string; safu_uegoc?: number; safu_credits?: number;
 }
 
 interface OptionResult { option: string; stake_power: number; knowledge_power: number; combined_power: number; }
@@ -43,8 +43,10 @@ const TYPE_LABELS: Record<string, { label: string; color: string }> = {
   tender:    { label: 'Tender',    color: 'bg-orange-500/20 text-orange-300 border-orange-500/30' },
   arbiter_add:    { label: 'Add P2P arbiter',    color: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' },
   arbiter_remove: { label: 'Remove P2P arbiter', color: 'bg-red-500/20 text-red-300 border-red-500/30' },
+  safu_payout:    { label: 'SAFU payout',        color: 'bg-amber-500/20 text-amber-300 border-amber-500/30' },
 };
 const ARBITER_TYPES = ['arbiter_add', 'arbiter_remove'];
+const STAKE_TYPES = [...ARBITER_TYPES, 'safu_payout'];
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
   active:  { label: 'Active',  color: 'bg-green-500/20 text-green-300 border-green-500/30' },
@@ -102,10 +104,17 @@ function CreateProposalModal({ onClose, onCreated }: { onClose: () => void; onCr
   const [target, setTarget] = useState('');
   const [arbiters, setArbiters] = useState<string[]>([]);
   const [minStake, setMinStake] = useState(0);
-  const arbiterVote = ARBITER_TYPES.includes(type);
+  const arbiterVote = STAKE_TYPES.includes(type);
+  const safuVote = type === 'safu_payout';
+  const [safuEgoc, setSafuEgoc] = useState('');
+  const [safuOn, setSafuOn] = useState(false);
+  useEffect(() => {
+    invoke<{ from_height: number | null }>('get_safu_fund').then(f => setSafuOn(f.from_height !== null)).catch(() => {});
+  }, []);
+  const [safuUsd, setSafuUsd] = useState('');
 
   useEffect(() => {
-    if (!arbiterVote) return;
+    if (!arbiterVote || safuVote) return;
     invoke<{ arbiters?: string[]; arbiter_min_stake_uegoc?: number }>('market_params')
       .then(p => { setArbiters(p.arbiters ?? []); setMinStake((p.arbiter_min_stake_uegoc ?? 0) / 1_000_000); })
       .catch(() => {});
@@ -136,12 +145,16 @@ function CreateProposalModal({ onClose, onCreated }: { onClose: () => void; onCr
       })) : null;
       const who = target.trim();
       await invoke('create_dao_proposal', {
-        title: arbiterVote && !title.trim() ? `${type === 'arbiter_add' ? 'Add' : 'Remove'} ${who} as a P2P arbiter` : title,
+        title: arbiterVote && !title.trim()
+          ? (safuVote ? `SAFU payout to ${who}` : `${type === 'arbiter_add' ? 'Add' : 'Remove'} ${who} as a P2P arbiter`)
+          : title,
         description: desc, proposalType: type,
         options: arbiterVote ? ['Yes', 'No'] : options.filter(o => o.trim()),
-        durationDays: days,
+        durationDays: safuVote ? Math.max(days, 7) : days,
         questions: arbiterVote ? null : qs,
         target: arbiterVote ? who : null,
+        safuUegoc: safuVote ? Math.round((Number(safuEgoc) || 0) * 1_000_000) : null,
+        safuCredits: safuVote ? Math.round((Number(safuUsd) || 0) * 100) : null,
       });
       onCreated();
       onClose();
@@ -182,7 +195,7 @@ function CreateProposalModal({ onClose, onCreated }: { onClose: () => void; onCr
               <label className="block text-xs text-gray-400 mb-1">Type</label>
               <select value={type} onChange={e => setType(e.target.value)}
                 className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-purple-500">
-                {Object.entries(TYPE_LABELS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                {Object.entries(TYPE_LABELS).filter(([k]) => k !== 'safu_payout' || safuOn).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
               </select>
             </div>
             <div>
@@ -192,7 +205,30 @@ function CreateProposalModal({ onClose, onCreated }: { onClose: () => void; onCr
             </div>
           </div>
 
-          {arbiterVote && (
+          {safuVote && (
+            <div className="space-y-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+              <label className="block text-xs text-gray-400">Ego address that receives the payout</label>
+              <input value={target} onChange={e => setTarget(e.target.value.trim())} placeholder="egot1…"
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-amber-500" />
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">EGOC</label>
+                  <input type="number" min={0} value={safuEgoc} onChange={e => setSafuEgoc(e.target.value)} placeholder="0"
+                    className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-amber-500" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">EGUSD ($)</label>
+                  <input type="number" min={0} step="0.01" value={safuUsd} onChange={e => setSafuUsd(e.target.value)} placeholder="0.00"
+                    className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-amber-500" />
+                </div>
+              </div>
+              <div className="text-xs text-gray-400 leading-relaxed">
+                Voted Yes or No by stake for at least 7 days. It passes with at least 3 voters, 10% of all staked EGOC voting, and two thirds Yes. The next block then pays it from the SAFU fund, up to what the fund holds. Explain the hack and who was hurt in the description.
+              </div>
+            </div>
+          )}
+
+          {arbiterVote && !safuVote && (
             <div className="space-y-2 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3">
               <label className="block text-xs text-gray-400">Ego address of the arbiter</label>
               <input value={target} onChange={e => setTarget(e.target.value.trim())} placeholder="egot1…"
@@ -473,10 +509,12 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
           {error && <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm">{error}</div>}
           {notice && <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-xl text-green-400 text-sm">{notice}</div>}
 
-          {proposal.target && ARBITER_TYPES.includes(proposal.proposal_type) && (
+          {proposal.target && STAKE_TYPES.includes(proposal.proposal_type) && (
             <div className="p-3 bg-gray-900 border border-gray-700/60 rounded-xl">
               <div className="text-xs text-gray-400 mb-1">
-                {proposal.proposal_type === 'arbiter_add' ? 'Address that would become a P2P arbiter' : 'Arbiter address that would be removed'}
+                {proposal.proposal_type === 'safu_payout'
+                  ? `Would receive ${((proposal.safu_uegoc ?? 0) / 1_000_000).toLocaleString()} EGOC and $${((proposal.safu_credits ?? 0) / 100).toFixed(2)} EGUSD from the SAFU fund`
+                  : proposal.proposal_type === 'arbiter_add' ? 'Address that would become a P2P arbiter' : 'Arbiter address that would be removed'}
               </div>
               <div className="font-mono text-xs text-white break-all">{proposal.target}</div>
             </div>
@@ -706,7 +744,7 @@ function ProposalCard({ proposal, onClick }: { proposal: DaoProposal; onClick: (
       <h3 className="text-sm font-semibold text-white mb-1 group-hover:text-purple-300 transition-colors leading-snug">
         {proposal.title}
       </h3>
-      {proposal.target && ARBITER_TYPES.includes(proposal.proposal_type) && (
+      {proposal.target && STAKE_TYPES.includes(proposal.proposal_type) && (
         <p className="text-xs font-mono text-gray-300 mb-1 truncate" title={proposal.target}>{proposal.target}</p>
       )}
       <p className="text-xs text-gray-400 line-clamp-2 mb-3">{proposal.description}</p>
@@ -747,6 +785,14 @@ function fmtCountdown(secs: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
+interface SafuFund {
+  address: string;
+  egoc_uegoc: number;
+  egusd_credits: number;
+  percent: number;
+  from_height: number | null;
+}
+
 export default function GovernancePage() {
   const { wallet } = useWallet();
   const [proposals, setProposals]   = useState<DaoProposal[]>([]);
@@ -755,6 +801,7 @@ export default function GovernancePage() {
   const [selected, setSelected]     = useState<DaoProposal | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [loading, setLoading]       = useState(true);
+  const [safu, setSafu]             = useState<SafuFund | null>(null);
 
   const loadProposals = useCallback(async (statusFilter?: string) => {
     setLoading(true);
@@ -776,6 +823,9 @@ export default function GovernancePage() {
 
   useEffect(() => { loadProposals(tab); }, [tab]);
   useEffect(() => { refreshRateLimit(); }, [refreshRateLimit]);
+  useEffect(() => {
+    withTimeout<SafuFund | null>(invoke<SafuFund>('get_safu_fund'), null).then(setSafu).catch(() => {});
+  }, []);
 
   async function refreshSelected() {
     if (!selected) return;
@@ -839,6 +889,20 @@ export default function GovernancePage() {
           <span className="text-gray-400">My votes:</span>
           <span className="text-white font-medium">{myVoteCount}</span>
         </div>
+        {safu && (
+          <div className="flex items-center gap-2"
+            title={`${safu.percent}% of every network fee and every EGUSD payment to the network goes to this fund. Nobody holds its key; only a passed DAO vote can pay from it.`}>
+            <span className="text-gray-400">SAFU fund:</span>
+            {safu.from_height === null ? (
+              <span className="text-gray-500">starts with an update</span>
+            ) : (
+              <span className="text-white font-medium">
+                {(safu.egoc_uegoc / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 2 })} EGOC
+                {' · '}${(safu.egusd_credits / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} EGUSD
+              </span>
+            )}
+          </div>
+        )}
         <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">
           <span>Two-type voting:</span>
           <span className="text-purple-400">Stake</span>

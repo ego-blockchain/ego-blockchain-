@@ -22,6 +22,23 @@ pub const KINDS: [&str; 5] = ["protocol", "resource", "feature", "parameter", "t
 pub const KIND_ARBITER_ADD: &str = "arbiter_add";
 pub const KIND_ARBITER_REMOVE: &str = "arbiter_remove";
 pub const ARBITER_KINDS: [&str; 2] = [KIND_ARBITER_ADD, KIND_ARBITER_REMOVE];
+pub const KIND_SAFU_PAYOUT: &str = "safu_payout";
+pub const SAFU_MIN_TURNOUT_PERCENT: u128 = 10;
+pub const SAFU_MIN_DAYS: u32 = 7;
+pub const TX_SAFU_PAYOUT: &str = "safu_payout";
+const SAFU_DUE_PREFIX: &[u8] = b"dao:sp:";
+
+pub fn safu_rules_active(height: u64) -> bool {
+    height >= crate::tokenomics::SAFU_FROM_HEIGHT
+}
+
+fn stake_decided(kind: &str, height: u64, safu_from: u64) -> bool {
+    (is_arbiter_kind(kind) && arbiter_rules_active(height)) || (kind == KIND_SAFU_PAYOUT && height >= safu_from)
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
 pub const ARBITER_OPTIONS: [&str; 2] = ["Yes", "No"];
 pub const ARBITER_MIN_STAKE_UEGOC: u64 = 10_000 * 1_000_000;
 pub const MAX_ARBITERS: usize = 100;
@@ -86,6 +103,10 @@ pub struct ProposeBody {
     pub answers_commit: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub safu_uegoc: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub safu_credits: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -148,6 +169,18 @@ pub struct Proposal {
     pub revealed_at: Option<i64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub safu_uegoc: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub safu_credits: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SafuDue {
+    pub id: String,
+    pub target: String,
+    pub uegoc: u64,
+    pub credits: u64,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -243,7 +276,31 @@ fn arbiter_address_ok(a: &str) -> bool {
 }
 
 pub fn check_propose_at(b: &ProposeBody, height: u64) -> Result<(), String> {
-    if is_arbiter_kind(&b.kind) && arbiter_rules_active(height) {
+    check_propose_rules(b, height, crate::tokenomics::SAFU_FROM_HEIGHT)
+}
+
+fn check_propose_rules(b: &ProposeBody, height: u64, safu_from: u64) -> Result<(), String> {
+    let safu = b.kind == KIND_SAFU_PAYOUT && height >= safu_from;
+    if height >= safu_from && !safu && (b.safu_uegoc > 0 || b.safu_credits > 0) {
+        return Err("only a SAFU payout proposal names an amount".into());
+    }
+    if safu {
+        if !arbiter_address_ok(&b.target) || b.target == crate::chain_db::SAFU_ADDR {
+            return Err("a SAFU payout names the Ego address that receives it".into());
+        }
+        if b.safu_uegoc == 0 && b.safu_credits == 0 {
+            return Err("a SAFU payout names an amount of EGOC or EGUSD".into());
+        }
+        if b.options.iter().map(String::as_str).ne(ARBITER_OPTIONS.iter().copied()) {
+            return Err("a SAFU payout is voted Yes or No".into());
+        }
+        if !b.questions.is_empty() {
+            return Err("a SAFU payout is decided by stake alone, with no knowledge test".into());
+        }
+        if b.duration_days < SAFU_MIN_DAYS {
+            return Err(format!("a SAFU payout is open for at least {SAFU_MIN_DAYS} days"));
+        }
+    } else if is_arbiter_kind(&b.kind) && arbiter_rules_active(height) {
         if !arbiter_address_ok(&b.target) {
             return Err("an arbiter proposal names the Ego address it adds or removes".into());
         }
@@ -380,7 +437,74 @@ pub fn arbiter_outcome(ov: &Ov, id: &str) -> Option<u8> {
     ov.get(&arbiter_outcome_key(id)).and_then(|v| v.first().copied())
 }
 
+fn safu_due_key(id: &str) -> Vec<u8> {
+    let mut k = SAFU_DUE_PREFIX.to_vec();
+    k.extend_from_slice(id.as_bytes());
+    k
+}
+
+pub fn safu_passed(yes: u64, no: u64, voters: u64, network_stake: u64) -> bool {
+    voters >= MIN_STAKE_VOTERS
+        && (yes as u128 + no as u128) * 100 >= network_stake as u128 * SAFU_MIN_TURNOUT_PERCENT
+        && yes as u128 * 3 >= (yes as u128 + no as u128) * 2
+        && yes > 0
+}
+
+fn decide_safu(ov: &mut Ov, p: &Proposal, network_stake: u64) -> u8 {
+    if p.withdrawn || p.target.is_empty() || (p.safu_uegoc == 0 && p.safu_credits == 0) {
+        return OUTCOME_REJECTED;
+    }
+    let tallies: Vec<u64> = load(ov, &tally_key(&p.id)).unwrap_or_default();
+    let yes = tallies.first().copied().unwrap_or(0);
+    let no = tallies.get(1).copied().unwrap_or(0);
+    if !safu_passed(yes, no, u64_at(ov, &stake_count_key(&p.id)), network_stake) {
+        return OUTCOME_REJECTED;
+    }
+    save(ov, safu_due_key(&p.id), &SafuDue { id: p.id.clone(), target: p.target.clone(), uegoc: p.safu_uegoc, credits: p.safu_credits });
+    OUTCOME_APPLIED
+}
+
+pub fn next_safu_payout(ov: &Ov) -> Option<SafuDue> {
+    let key = ov.committed_keys(SAFU_DUE_PREFIX, 1, |_| false).into_iter().next()?;
+    load(ov, &key)
+}
+
+pub fn safu_payout_memo(id: &str, credits: u64) -> String {
+    format!("{TX_SAFU_PAYOUT}:{id}:{credits}")
+}
+
+pub fn safu_payout_credits(tx: &LedgerTx) -> Option<(String, u64)> {
+    let rest = tx.memo.as_deref()?.strip_prefix(TX_SAFU_PAYOUT)?.strip_prefix(':')?;
+    let (id, credits) = rest.rsplit_once(':')?;
+    Some((id.to_string(), credits.parse().ok()?))
+}
+
+pub fn safu_payout_tx(due: &SafuDue, height: u64, timestamp: i64, egoc_in_fund: u64, credits_in_fund: u64) -> LedgerTx {
+    let amount = due.uegoc.min(egoc_in_fund);
+    let credits = due.credits.min(credits_in_fund);
+    LedgerTx {
+        hash: format!("0x{}", blake3::hash(format!("safupayout:{}:{height}:{amount}:{credits}", due.id).as_bytes()).to_hex()),
+        from: crate::chain_db::SAFU_ADDR.to_string(),
+        to: due.target.clone(),
+        amount,
+        memo: Some(safu_payout_memo(&due.id, credits)),
+        timestamp,
+        status: "Confirmed".to_string(),
+        block_height: Some(height),
+        tx_type: TX_SAFU_PAYOUT.to_string(),
+        signature: "dao".to_string(),
+        ..LedgerTx::default()
+    }
+}
+
+pub fn is_safu_payout_tx(tx: &LedgerTx) -> bool {
+    tx.tx_type == TX_SAFU_PAYOUT && tx.from == crate::chain_db::SAFU_ADDR && tx.signature == "dao" && tx.fee_uegoc == 0
+}
+
 fn decide_arbiter(ov: &mut Ov, p: &Proposal, network_stake: u64, height: u64) -> u8 {
+    if p.kind == KIND_SAFU_PAYOUT {
+        return decide_safu(ov, p, network_stake);
+    }
     if p.withdrawn || p.target.is_empty() || !is_arbiter_kind(&p.kind) {
         return OUTCOME_REJECTED;
     }
@@ -592,8 +716,9 @@ fn propose(ov: &mut Ov, block: &LedgerBlock, tx: &LedgerTx, network_stake: u64) 
     }
     times.push(block.timestamp);
     save(ov, created_key(&tx.from), &times);
-    let arbiter_vote = is_arbiter_kind(&b.kind) && arbiter_rules_active(block.height);
+    let arbiter_vote = stake_decided(&b.kind, block.height, crate::tokenomics::SAFU_FROM_HEIGHT);
     let target = if arbiter_vote { b.target.clone() } else { String::new() };
+    let (safu_uegoc, safu_credits) = if arbiter_vote && b.kind == KIND_SAFU_PAYOUT { (b.safu_uegoc, b.safu_credits) } else { (0, 0) };
     let p = Proposal {
         id: id.clone(),
         title: b.title,
@@ -610,6 +735,8 @@ fn propose(ov: &mut Ov, block: &LedgerBlock, tx: &LedgerTx, network_stake: u64) 
         withdrawn: false,
         revealed_at: None,
         target,
+        safu_uegoc,
+        safu_credits,
     };
     if arbiter_vote {
         ov.put(arbiter_end_key(p.ends_at, &id), Vec::new());
@@ -761,6 +888,11 @@ pub fn apply_block(ov: &mut Ov, block: &LedgerBlock, txs: &[&LedgerTx], network_
             tracing::debug!("[DAO] {} {} had no effect: {e}", tx.tx_type, tx.hash);
         }
     }
+    for tx in txs.iter().filter(|t| is_safu_payout_tx(t)) {
+        if let Some((id, _)) = safu_payout_credits(tx) {
+            ov.del(safu_due_key(&id));
+        }
+    }
     if arbiter_rules_active(block.height) {
         settle_arbiter_votes(ov, block, network_stake);
     }
@@ -892,6 +1024,8 @@ pub fn to_public(ov: &Ov, p: &Proposal, voter: Option<&str>, now: i64) -> DaoPro
         on_chain: true,
         answers_revealed: p.answers.is_some(),
         target: p.target.clone(),
+        safu_uegoc: p.safu_uegoc,
+        safu_credits: p.safu_credits,
     }
 }
 
@@ -1011,6 +1145,7 @@ mod tests {
             questions,
             answers_commit: commit,
             target: String::new(),
+            ..ProposeBody::default()
         }
     }
 
@@ -1321,6 +1456,7 @@ mod arbiter_vote_tests {
             questions: Vec::new(),
             answers_commit: String::new(),
             target: "egot1candidate000000000".into(),
+            ..ProposeBody::default()
         };
         assert!(check_propose_at(&b, h - 1).is_err(), "old nodes do not know this type, so it waits for the switch");
         assert!(check_propose_at(&b, h).is_ok());
@@ -1329,5 +1465,111 @@ mod arbiter_vote_tests {
         b.options = vec!["Yes".into(), "No".into()];
         b.target = "0xabc".into();
         assert!(check_propose_at(&b, h).is_err());
+    }
+}
+
+#[cfg(test)]
+mod safu_payout_tests {
+    use super::*;
+
+    fn body(kind: &str) -> ProposeBody {
+        ProposeBody {
+            title: "Pay back the victims of the bridge hack".into(),
+            kind: kind.into(),
+            options: vec!["Yes".into(), "No".into()],
+            duration_days: 7,
+            target: "egot1victim0000000000000".into(),
+            safu_uegoc: 5_000_000,
+            ..ProposeBody::default()
+        }
+    }
+
+    #[test]
+    fn a_payout_proposal_waits_for_the_switch_and_must_be_well_formed() {
+        let at = 1_000;
+        assert!(check_propose_rules(&body(KIND_SAFU_PAYOUT), at - 1, at).is_err(), "unknown before the switch");
+        assert!(check_propose_rules(&body(KIND_SAFU_PAYOUT), at, at).is_ok());
+        let mut b = body(KIND_SAFU_PAYOUT);
+        b.safu_uegoc = 0;
+        assert!(check_propose_rules(&b, at, at).is_err(), "no amount");
+        let mut b = body(KIND_SAFU_PAYOUT);
+        b.duration_days = 3;
+        assert!(check_propose_rules(&b, at, at).is_err(), "too short to react");
+        let mut b = body(KIND_SAFU_PAYOUT);
+        b.target = crate::chain_db::SAFU_ADDR.into();
+        assert!(check_propose_rules(&b, at, at).is_err(), "the fund cannot pay itself");
+        let mut b = body(KIND_SAFU_PAYOUT);
+        b.options = vec!["Pay".into(), "No".into()];
+        assert!(check_propose_rules(&b, at, at).is_err());
+        let mut b = body("protocol");
+        b.target.clear();
+        assert!(check_propose_rules(&b, at, at).is_err(), "other kinds cannot name an amount");
+        assert!(check_propose_rules(&b, at - 1, at).is_ok(), "before the switch old and new nodes agree the amount is ignored");
+    }
+
+    #[test]
+    fn a_payout_needs_three_voters_a_tenth_of_stake_and_two_thirds_yes() {
+        assert!(safu_passed(700, 300, 3, 10_000));
+        assert!(!safu_passed(700, 300, 2, 10_000), "too few voters");
+        assert!(!safu_passed(60, 30, 5, 10_000), "under 10% of stake voted");
+        assert!(!safu_passed(600, 400, 5, 10_000), "under two thirds");
+        assert!(safu_passed(2_000, 1_000, 5, 10_000));
+    }
+
+    #[test]
+    fn a_passed_payout_is_paid_once_and_capped_by_the_fund() {
+        let h = crate::drs::NODE_PAY_V2_FROM_HEIGHT;
+        let mut ov = Ov::memory();
+        let id = "b".repeat(64);
+        let p = Proposal {
+            id: id.clone(),
+            kind: KIND_SAFU_PAYOUT.into(),
+            options: vec!["Yes".into(), "No".into()],
+            ends_at: 50,
+            target: "egot1victim0000000000000".into(),
+            safu_uegoc: 5_000_000,
+            safu_credits: 900,
+            ..Proposal::default()
+        };
+        save(&mut ov, p_key(&id), &p);
+        ov.put(arbiter_end_key(p.ends_at, &id), Vec::new());
+        save(&mut ov, tally_key(&id), &vec![9_000u64, 1_000]);
+        put_u64(&mut ov, stake_count_key(&id), 4);
+        ov.commit_memory();
+        assert!(next_safu_payout(&ov).is_none());
+        apply_block(&mut ov, &LedgerBlock { height: h, timestamp: 50, ..LedgerBlock::default() }, &[], 20_000);
+        ov.commit_memory();
+        assert_eq!(arbiter_outcome(&ov, &id), Some(OUTCOME_APPLIED));
+        let due = next_safu_payout(&ov).expect("due after the vote");
+        assert_eq!((due.target.as_str(), due.uegoc, due.credits), ("egot1victim0000000000000", 5_000_000, 900));
+
+        let tx = safu_payout_tx(&due, h + 1, 60, 2_000_000, 10_000);
+        assert_eq!(tx.amount, 2_000_000, "never more than the fund holds");
+        assert_eq!(safu_payout_credits(&tx), Some((id.clone(), 900)));
+        assert!(is_safu_payout_tx(&tx));
+        let mut forged = tx.clone();
+        forged.from = "egot1someone".into();
+        assert!(!is_safu_payout_tx(&forged));
+
+        apply_block(&mut ov, &LedgerBlock { height: h + 1, timestamp: 60, ..LedgerBlock::default() }, &[&tx], 20_000);
+        ov.commit_memory();
+        assert!(next_safu_payout(&ov).is_none(), "paid once");
+    }
+
+    #[test]
+    fn a_failed_payout_vote_pays_nothing() {
+        let h = crate::drs::NODE_PAY_V2_FROM_HEIGHT;
+        let mut ov = Ov::memory();
+        let id = "c".repeat(64);
+        let p = Proposal { id: id.clone(), kind: KIND_SAFU_PAYOUT.into(), ends_at: 50, target: "egot1victim0000000000000".into(), safu_uegoc: 1, ..Proposal::default() };
+        save(&mut ov, p_key(&id), &p);
+        ov.put(arbiter_end_key(p.ends_at, &id), Vec::new());
+        save(&mut ov, tally_key(&id), &vec![500u64, 500]);
+        put_u64(&mut ov, stake_count_key(&id), 4);
+        ov.commit_memory();
+        apply_block(&mut ov, &LedgerBlock { height: h, timestamp: 50, ..LedgerBlock::default() }, &[], 2_000);
+        ov.commit_memory();
+        assert_eq!(arbiter_outcome(&ov, &id), Some(OUTCOME_REJECTED));
+        assert!(next_safu_payout(&ov).is_none());
     }
 }

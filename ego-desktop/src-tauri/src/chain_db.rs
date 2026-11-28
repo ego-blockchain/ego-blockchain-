@@ -417,6 +417,78 @@ pub const STAKING_ADDR:     &str = "egot1staking00000000000000000000000000000000
 pub const STAKING_POOL_ADDR:&str = "egot1stakingpool0000000000000000000000000000000";
 pub const SLASH_POOL_ADDR:  &str = "egot1slashpool0000000000000000000000000000000";
 pub const FAUCET_ADDR_FULL: &str = "egot1faucet000000000000000000000000000000000000";
+pub const SAFU_ADDR:        &str = "egot1safupool00000000000000000000000000000000";
+pub const SAFU_FEE_TX: &str = "safu_fee";
+
+pub fn is_safu_fee_tx(tx: &LedgerTx) -> bool {
+    tx.tx_type == SAFU_FEE_TX && tx.from.is_empty() && tx.to == SAFU_ADDR && tx.signature == "coinbase"
+}
+
+pub fn safu_fee_tx(height: u64, amount: u64, timestamp: i64) -> LedgerTx {
+    LedgerTx {
+        hash:         format!("0x{}", blake3::hash(format!("safufee:{height}:{amount}:{timestamp}").as_bytes()).to_hex()),
+        from:         String::new(),
+        to:           SAFU_ADDR.to_string(),
+        amount,
+        memo:         Some(format!("Block #{height} SAFU fund share")),
+        timestamp,
+        status:       "Confirmed".to_string(),
+        block_height: Some(height),
+        tx_type:      SAFU_FEE_TX.to_string(),
+        signature:    "coinbase".to_string(),
+        ..LedgerTx::default()
+    }
+}
+
+fn safu_fund_in(db: &DB) -> (u64, u64) {
+    let egoc = db.cf_handle(CF_BALANCES)
+        .and_then(|cf| db.get_cf(cf, SAFU_ADDR.as_bytes()).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0);
+    let credits = db.cf_handle(CF_META)
+        .and_then(|cf| db.get_cf(cf, credits_key(SAFU_ADDR)).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0);
+    (egoc, credits)
+}
+
+pub fn expected_safu_payout(db: &DB, height: u64, timestamp: i64) -> Option<LedgerTx> {
+    if !crate::dao_chain::safu_rules_active(height) {
+        return None;
+    }
+    let due = crate::dao_chain::next_safu_payout(&crate::drs::Ov::new(db))?;
+    let (egoc, credits) = safu_fund_in(db);
+    Some(crate::dao_chain::safu_payout_tx(&due, height, timestamp, egoc, credits))
+}
+
+pub fn check_safu_payout(db: &DB, txs: &[&LedgerTx], height: u64, timestamp: i64) -> Result<(), String> {
+    let found: Vec<&&LedgerTx> = txs.iter().filter(|t| t.tx_type == crate::dao_chain::TX_SAFU_PAYOUT).collect();
+    match (expected_safu_payout(db, height, timestamp), found.as_slice()) {
+        (None, []) => Ok(()),
+        (None, _) => Err("a SAFU payout no passed DAO vote asked for".into()),
+        (Some(want), [t]) if crate::dao_chain::is_safu_payout_tx(t)
+            && t.hash == want.hash && t.to == want.to && t.amount == want.amount && t.memo == want.memo => Ok(()),
+        (Some(want), _) => Err(format!("the block must make the passed SAFU payout to {} exactly once", want.to)),
+    }
+}
+
+pub fn check_safu_fee(txs: &[&LedgerTx], height: u64, timestamp: i64, tx_fees: u64) -> Result<(), String> {
+    check_safu_fee_from(crate::tokenomics::SAFU_FROM_HEIGHT, txs, height, timestamp, tx_fees)
+}
+
+fn check_safu_fee_from(from_height: u64, txs: &[&LedgerTx], height: u64, timestamp: i64, tx_fees: u64) -> Result<(), String> {
+    let expected = crate::tokenomics::safu_share_from(from_height, height, tx_fees);
+    let found: Vec<&&LedgerTx> = txs.iter().filter(|t| t.tx_type == SAFU_FEE_TX).collect();
+    if expected == 0 {
+        return if found.is_empty() { Ok(()) } else { Err("unexpected SAFU fund tx".into()) };
+    }
+    let want = safu_fee_tx(height, expected, timestamp);
+    match found.as_slice() {
+        [t] if is_safu_fee_tx(t) && t.amount == want.amount && t.hash == want.hash => Ok(()),
+        [_] => Err(format!("invalid SAFU fund tx (expected {expected} uEGOC)")),
+        _ => Err(format!("expected exactly one SAFU fund tx, got {}", found.len())),
+    }
+}
 
 pub const SLASH_BPS: u64 = 1_000; // 10%
 
@@ -2810,7 +2882,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             let cur = drs_ov.get(&key).map(|v| read_u64_le(&v)).unwrap_or(0);
             drs_ov.put(key, u64_le(cur.saturating_add(amount)).to_vec());
         }
-        let (deltas, released) = credit_updates(&fresh_txs);
+        let (deltas, released) = credit_updates(&fresh_txs, block.height);
         for (addr, delta) in deltas {
             let key = credits_key(&addr);
             let cur = drs_ov.get(&key).map(|v| read_u64_le(&v)).unwrap_or(0);
@@ -2934,7 +3006,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     }
     if block.height < CHECKIN_FROM_HEIGHT {
         record_escrow_releases(db, &confirmed_txs);
-        apply_credit_txs(db, &confirmed_txs);
+        apply_credit_txs(db, &confirmed_txs, block.height);
     }
 
     // BFT finality is immediate: a block persisted with a quorum of votes is
@@ -4230,8 +4302,10 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let new_base_fee = compute_next_base_fee(prev_base_fee, user_tx_count);
 
     let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
+    let safu_fee = crate::tokenomics::safu_share(height, tx_fees_sum);
+    let node_fees = tx_fees_sum - safu_fee;
     let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(&db));
-    let reward = expected_block_reward_inner(&db, height, timestamp, tx_fees_sum, &prev_hash).min(remaining);
+    let reward = expected_block_reward_inner(&db, height, timestamp, node_fees, &prev_hash).min(remaining);
     if reward == 0 {
         tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
     }
@@ -4265,7 +4339,13 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     }
 
 
-    let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
+    if safu_fee > 0 {
+        stamped.push(safu_fee_tx(height, safu_fee, timestamp));
+    }
+    if let Some(payout) = expected_safu_payout(&db, height, timestamp) {
+        stamped.push(payout);
+    }
+    let contributor_fee = crate::tokenomics::contributor_fee_share(node_fees);
     if contributor_fee > 0 {
         let sf_hash = format!("0x{}", blake3::hash(
             format!("contributorfee:{height}:{contributor_fee}:{timestamp}").as_bytes()
@@ -4689,8 +4769,10 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     let new_base_fee = compute_next_base_fee(prev_base_fee, user_tx_count);
 
     let tx_fees_sum: u64 = valid_txs.iter().map(|t| t.fee_uegoc).sum();
+    let safu_fee = crate::tokenomics::safu_share(height, tx_fees_sum);
+    let node_fees = tx_fees_sum - safu_fee;
     let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(&db));
-    let reward = expected_block_reward_inner(&db, height, timestamp, tx_fees_sum, &prev_hash).min(remaining);
+    let reward = expected_block_reward_inner(&db, height, timestamp, node_fees, &prev_hash).min(remaining);
     if reward == 0 {
         tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
     }
@@ -4724,7 +4806,13 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     }
 
 
-    let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
+    if safu_fee > 0 {
+        stamped.push(safu_fee_tx(height, safu_fee, timestamp));
+    }
+    if let Some(payout) = expected_safu_payout(&db, height, timestamp) {
+        stamped.push(payout);
+    }
+    let contributor_fee = crate::tokenomics::contributor_fee_share(node_fees);
     if contributor_fee > 0 {
         let sf_hash = format!("0x{}", blake3::hash(
             format!("contributorfee:{height}:{contributor_fee}:{timestamp}").as_bytes()
@@ -5088,14 +5176,17 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
         .sum();
     let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(db));
     let v2 = emission_v2_active(block.height);
+    let node_fees = crate::tokenomics::fees_for_nodes(block.height, tx_fees_sum);
+    check_safu_fee(&sorted_txs.iter().collect::<Vec<_>>(), block.height, block.timestamp, tx_fees_sum)?;
+    check_safu_payout(db, &sorted_txs.iter().collect::<Vec<_>>(), block.height, block.timestamp)?;
     let expected_reward = expected_block_reward_inner(
         db,
         block.height,
         block.timestamp,
-        tx_fees_sum,
+        node_fees,
         &block.prev_hash,
     ).min(remaining);
-    let expected_contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
+    let expected_contributor_fee = crate::tokenomics::contributor_fee_share(node_fees);
 
     // Tolerate reward=0 from nodes that missed the genesis pool seeding.
     // v2: the reward is an upper bound (registry growth must not invalidate
@@ -5206,7 +5297,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                     && tx.from == crate::shielded_chain::SHIELDED_POOL_ADDR;
                 let is_settle = tx.tx_type == crate::market_chain::TX_SETTLE
                     && tx.from == crate::market_chain::MARKET_ESCROW_ADDR;
-                let is_contributor_fee = is_contributor_fee_tx(tx);
+                let is_contributor_fee = is_contributor_fee_tx(tx) || is_safu_fee_tx(tx) || crate::dao_chain::is_safu_payout_tx(tx);
                 let is_drs_batch = crate::drs::is_batch_tx(tx);
                 // A system pool pays out only through a kind of payment whose amount and
                 // recipient the rules check. Accepting any "emission type" bounded only by
@@ -6491,11 +6582,16 @@ pub struct HoldersSummary {
     pub shielded_uegoc: u64,
     pub groups: Vec<HolderGroup>,
     pub top: Vec<HolderRow>,
+    pub safu_address: String,
+    pub safu_uegoc: u64,
+    pub safu_credits: u64,
+    pub safu_from_height: Option<u64>,
 }
 
 pub fn holder_label(addr: &str) -> Option<&'static str> {
     let named = match addr {
         NODE_POOL_ADDR => Some("Node rewards pool"),
+        SAFU_ADDR => Some("SAFU fund"),
         ECOSYSTEM_ADDR => Some("Ecosystem fund"),
         FOUNDATION_ADDR => Some("Foundation"),
         STAKING_POOL_ADDR => Some("Staking rewards pool"),
@@ -6526,6 +6622,7 @@ pub fn summarize_holders<I: IntoIterator<Item = (String, u64)>>(height: u64, bal
     let mut wallets = 0u64;
     let mut wallet_total: u128 = 0;
     let mut shielded = 0u64;
+    let mut safu = 0u64;
     let mut groups = vec![(0u64, 0u128); HOLDER_GROUPS_EGOC.len()];
     for (addr, bal) in balances {
         if bal == 0 {
@@ -6534,6 +6631,7 @@ pub fn summarize_holders<I: IntoIterator<Item = (String, u64)>>(height: u64, bal
         total += bal as u128;
         match holder_label(&addr) {
             Some("Shielded pool") => shielded = bal,
+            Some("SAFU fund") => safu = bal,
             Some(_) => {}
             None => {
                 wallets += 1;
@@ -6571,6 +6669,10 @@ pub fn summarize_holders<I: IntoIterator<Item = (String, u64)>>(height: u64, bal
             .into_iter()
             .map(|(b, a)| HolderRow { label: holder_label(&a), address: a, balance_uegoc: b })
             .collect(),
+        safu_address: SAFU_ADDR.to_string(),
+        safu_uegoc: safu,
+        safu_credits: 0,
+        safu_from_height: (crate::tokenomics::SAFU_FROM_HEIGHT != u64::MAX).then_some(crate::tokenomics::SAFU_FROM_HEIGHT),
     }
 }
 
@@ -6587,7 +6689,9 @@ pub fn holders_summary() -> HoldersSummary {
         let addr = std::str::from_utf8(&k).ok()?;
         (addr.starts_with("egot1") || addr.starts_with("ego1")).then(|| (addr.to_string(), read_u64_le(&v)))
     });
-    summarize_holders(height, rows)
+    let mut summary = summarize_holders(height, rows);
+    summary.safu_credits = safu_fund_in(&db).1;
+    summary
 }
 
 pub fn get_state_stats() -> StateStats {
@@ -7003,6 +7107,10 @@ pub struct DaoProposalPublic {
     pub answers_revealed:     bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target:               String,
+    #[serde(default)]
+    pub safu_uegoc:           u64,
+    #[serde(default)]
+    pub safu_credits:         u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -7067,6 +7175,8 @@ fn proposal_to_public(p: &DaoProposal, voter: Option<&str>) -> DaoProposalPublic
         on_chain:         false,
         answers_revealed: false,
         target: String::new(),
+        safu_uegoc: 0,
+        safu_credits: 0,
     }
 }
 
@@ -7600,6 +7710,10 @@ pub struct HostingNodeRecord {
     pub pubkey: String,
     #[serde(default)]
     pub signature_v2: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrored: Vec<String>,
 }
 
 pub fn upsert_hosting_node(record: &HostingNodeRecord) {
@@ -7947,7 +8061,11 @@ type CreditUpdates = (
     std::collections::BTreeMap<(String, String), u64>,
 );
 
-fn credit_updates(txs: &[&crate::ledger::LedgerTx]) -> CreditUpdates {
+fn credit_updates(txs: &[&crate::ledger::LedgerTx], height: u64) -> CreditUpdates {
+    credit_updates_from(crate::tokenomics::SAFU_FROM_HEIGHT, txs, height)
+}
+
+fn credit_updates_from(safu_from: u64, txs: &[&crate::ledger::LedgerTx], height: u64) -> CreditUpdates {
     let mut deltas: std::collections::BTreeMap<String, i128> = Default::default();
     let mut rel_index: std::collections::BTreeMap<(String, String), u64> = Default::default();
     for tx in txs {
@@ -7967,6 +8085,20 @@ fn credit_updates(txs: &[&crate::ledger::LedgerTx]) -> CreditUpdates {
                 let Some(credits) = parse_credits_pay_memo(&tx.memo) else { continue };
                 if credits == 0 { continue; }
                 *deltas.entry(tx.from.clone()).or_default() -= credits as i128;
+                let safu = if tx.to == crate::commands::storage::STORAGE_FEE_SINK {
+                    crate::tokenomics::safu_share_from(safu_from, height, credits)
+                } else {
+                    0
+                };
+                *deltas.entry(tx.to.clone()).or_default() += (credits - safu) as i128;
+                if safu > 0 {
+                    *deltas.entry(SAFU_ADDR.to_string()).or_default() += safu as i128;
+                }
+            }
+            crate::dao_chain::TX_SAFU_PAYOUT if crate::dao_chain::is_safu_payout_tx(tx) => {
+                let Some((_, credits)) = crate::dao_chain::safu_payout_credits(tx) else { continue };
+                if credits == 0 { continue; }
+                *deltas.entry(SAFU_ADDR.to_string()).or_default() -= credits as i128;
                 *deltas.entry(tx.to.clone()).or_default() += credits as i128;
             }
             "credits_escrow" => {
@@ -7983,9 +8115,9 @@ fn credit_updates(txs: &[&crate::ledger::LedgerTx]) -> CreditUpdates {
     (deltas, rel_index)
 }
 
-fn apply_credit_txs(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
+fn apply_credit_txs(db: &DB, txs: &[&crate::ledger::LedgerTx], height: u64) {
     let Some(cf) = db.cf_handle(CF_META) else { return };
-    let (deltas, rel_index) = credit_updates(txs);
+    let (deltas, rel_index) = credit_updates(txs, height);
     if deltas.is_empty() && rel_index.is_empty() { return; }
     let mut batch = rocksdb::WriteBatch::default();
     for (addr, delta) in deltas {
@@ -10393,6 +10525,13 @@ fn storage_pay_in(db: &DB, ov: &mut crate::drs::Ov, block: &LedgerBlock, txs: &[
                 crate::storage_pay::want_hosts(ov, &tx.from, at);
             }
         }
+        if let Some((bytes, price_micro, period)) = crate::storage_pay::hosting_plan_payment(tx, block.height, price) {
+            let plan_owner = crate::storage_pay::hosting_plan_owner(&tx.from);
+            crate::storage_pay::add_plan(ov, &plan_owner, at, bytes, price_micro, period);
+            if plan_mode {
+                crate::storage_pay::want_hosts(ov, &plan_owner, at);
+            }
+        }
         if plan_mode && counted_claim(tx) {
             let offer = crate::storage_pay::claim_offer(tx).unwrap_or(0);
             let pay = crate::storage_pay::apply_claim(ov, &tx.from, offer, at, price);
@@ -10431,6 +10570,28 @@ fn storage_pay_in(db: &DB, ov: &mut crate::drs::Ov, block: &LedgerBlock, txs: &[
 pub fn storage_plan_active(owner: &str, at: i64) -> bool {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     crate::storage_pay::active_plan(&crate::drs::Ov::new(db), owner, at).is_some()
+}
+
+pub fn hosting_plan_on_chain(owner: &str, at: i64) -> Option<ActiveHostingPlan> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let spans = crate::storage_pay::hosting_spans(&crate::drs::Ov::new(db), owner);
+    let now = spans.iter().find(|s| s.start <= at && at < s.expires)?;
+    let tier = crate::storage_pay::hosting_tier_of_bytes(now.bytes)?;
+    let expires_at = spans.iter().filter(|s| s.expires > at).map(|s| s.expires).max().unwrap_or(now.expires);
+    Some(ActiveHostingPlan {
+        owner: owner.to_string(),
+        tier: tier.to_string(),
+        months: (now.period / crate::storage_pay::HOSTING_MONTH_SECS).max(1) as u32,
+        started_at: now.start,
+        expires_at,
+        paid_uegoc: 0,
+        tx_hash: String::new(),
+    })
+}
+
+pub fn hosting_plan_hosts(owner: &str) -> Vec<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    crate::storage_pay::hosting_hosts(&crate::drs::Ov::new(db), owner)
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -13528,5 +13689,82 @@ mod holders_tests {
         assert_eq!(h.top[0].balance_uegoc, (HOLDERS_TOP as u64 + 50) * 1_000_000);
         assert_eq!(h.top[HOLDERS_TOP - 1].balance_uegoc, 51_000_000);
         assert_eq!(h.wallets, HOLDERS_TOP as u64 + 50);
+    }
+}
+
+#[cfg(test)]
+mod safu_fund_tests {
+    use super::*;
+
+    fn fee_tx(amount: u64) -> LedgerTx {
+        LedgerTx { from: "egot1payer".into(), to: "egot1shop".into(), fee_uegoc: amount, ..LedgerTx::default() }
+    }
+
+    #[test]
+    fn three_percent_of_fees_go_to_the_fund_and_nodes_split_the_rest() {
+        let at = 1_000;
+        assert_eq!(crate::tokenomics::safu_share_from(at, at - 1, 100_000), 0);
+        let safu = crate::tokenomics::safu_share_from(at, at, 100_000);
+        assert_eq!(safu, 3_000);
+        let nodes = 100_000 - safu;
+        let maker = crate::tokenomics::miner_fee_share(nodes);
+        let pool = crate::tokenomics::contributor_fee_share(nodes);
+        assert_eq!((maker, pool), (58_200, 38_800));
+        assert_eq!(safu + maker + pool, 100_000, "no fee is lost or created");
+    }
+
+    #[test]
+    fn a_block_must_carry_exactly_the_fund_share() {
+        let (at, h, ts) = (500, 600, 1_700_000_000);
+        let paid = fee_tx(10_000);
+        let good = safu_fee_tx(h, 300, ts);
+        assert!(check_safu_fee_from(at, &[&paid, &good], h, ts, 10_000).is_ok());
+        assert!(check_safu_fee_from(at, &[&paid], h, ts, 10_000).is_err(), "missing share");
+        let more = safu_fee_tx(h, 301, ts);
+        assert!(check_safu_fee_from(at, &[&paid, &more], h, ts, 10_000).is_err(), "too much");
+        let mut elsewhere = good.clone();
+        elsewhere.to = "egot1thief".into();
+        assert!(check_safu_fee_from(at, &[&paid, &elsewhere], h, ts, 10_000).is_err(), "wrong recipient");
+        assert!(check_safu_fee_from(at, &[&paid, &good, &good], h, ts, 10_000).is_err(), "twice");
+        assert!(check_safu_fee_from(at, &[&paid, &good], at - 1, ts, 10_000).is_err(), "before the switch it would be a mint");
+        assert!(check_safu_fee_from(at, &[&paid], at - 1, ts, 10_000).is_ok());
+    }
+
+    #[test]
+    fn until_the_switch_no_block_may_pay_the_fund() {
+        let ts = 1_700_000_000;
+        let sneaky = safu_fee_tx(10, 3, ts);
+        assert!(check_safu_fee(&[&sneaky], 10, ts, 100).is_err());
+        assert_eq!(crate::tokenomics::safu_share(u64::MAX - 1, 1_000_000), 0);
+    }
+
+    #[test]
+    fn nobody_can_send_from_the_fund() {
+        assert!(crate::ledger::is_reserved_system_source(SAFU_ADDR));
+        assert!(is_safu_fee_tx(&safu_fee_tx(1, 1, 1)));
+        let mut signed = safu_fee_tx(1, 1, 1);
+        signed.from = "egot1someone".into();
+        assert!(!is_safu_fee_tx(&signed));
+    }
+
+    #[test]
+    fn three_percent_of_egusd_paid_to_the_network_goes_to_the_fund() {
+        let at = 100;
+        let pay = |to: &str, credits: u64| LedgerTx {
+            from: "egot1buyer".into(),
+            to: to.into(),
+            tx_type: "credits_pay".into(),
+            memo: Some(format!("credits_pay:{credits}:plan:Pro:monthly")),
+            ..LedgerTx::default()
+        };
+        let plan = pay(crate::commands::storage::STORAGE_FEE_SINK, 1_000);
+        let friend = pay("egot1friend", 1_000);
+        let (d, _) = credit_updates_from(at, &[&plan, &friend], at);
+        assert_eq!(d.get(SAFU_ADDR).copied(), Some(30));
+        assert_eq!(d.get(crate::commands::storage::STORAGE_FEE_SINK).copied(), Some(970));
+        assert_eq!(d.get("egot1friend").copied(), Some(1_000), "payments between people are not touched");
+        assert_eq!(d.get("egot1buyer").copied(), Some(-2_000));
+        let (before, _) = credit_updates_from(at, &[&plan], at - 1);
+        assert_eq!(before.get(SAFU_ADDR), None);
     }
 }

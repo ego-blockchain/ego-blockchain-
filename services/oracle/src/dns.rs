@@ -71,19 +71,22 @@ async fn handle_dns_query(
         return Some(build_empty_response(&query, RCODE_OK));
     }
 
-    let Some(owner) = crate::hosting::owner_of(&*owners.read().await, &domain).map(str::to_string) else {
+    let bindings = owners.read().await.clone();
+    let Some(owner) = crate::hosting::owner_of(&bindings, &domain).map(str::to_string) else {
         return Some(build_empty_response(&query, RCODE_REFUSED));
     };
     if qtype == QTYPE_A {
         let now = chrono::Utc::now().timestamp();
-        let ip = hosting_nodes.read().await.get(&owner).and_then(|n| {
-            (n.last_seen >= now - crate::hosting::ONLINE_SECS && crate::hosting::serves(&n.domains, &domain))
-                .then(|| extract_ip(&n.endpoint))
-                .flatten()
-        });
-        if let Some(ip) = ip {
-            tracing::info!("[DNS] {} → {}", domain, owner);
-            return Some(build_a_response(&query, ip));
+        let nodes = hosting_nodes.read().await;
+        let mut ips: Vec<[u8; 4]> = Vec::new();
+        for n in crate::hosting::serving_nodes(&nodes, &bindings, &domain, now) {
+            if let Some(ip) = extract_ip(&n.endpoint).filter(|ip| !ips.contains(ip)) {
+                ips.push(ip);
+            }
+        }
+        if !ips.is_empty() {
+            tracing::info!("[DNS] {} → {} ({} computer(s))", domain, owner, ips.len());
+            return Some(if ips.len() == 1 { build_a_response(&query, ips[0]) } else { build_multi_a_response(&query, &ips) });
         }
     }
     Some(build_empty_response(&query, RCODE_OK))
@@ -213,6 +216,8 @@ mod tests {
             pubkey: String::new(),
             signature_v2: String::new(),
             signature: String::new(),
+            mirrors: Vec::new(),
+            mirrored: Vec::new(),
         })
     }
 

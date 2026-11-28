@@ -13,7 +13,23 @@ const MAX_ENDPOINT_LEN: usize = 200;
 pub const MAX_BINDINGS: usize = 100_000;
 pub const NEW_BINDINGS_PER_IP_PER_DAY: u32 = 20;
 
+pub const MAX_MIRRORS: usize = 8;
+pub const MAX_ANSWERS: usize = 4;
+
 pub fn signing_bytes(r: &HostingNodeRecord) -> Vec<u8> {
+    if !r.mirrors.is_empty() || !r.mirrored.is_empty() {
+        return format!(
+            "ego/hosting/v3\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            r.node_id,
+            r.endpoint,
+            r.last_seen,
+            r.sites.join(","),
+            r.domains.join(","),
+            r.mirrors.join(","),
+            r.mirrored.join(",")
+        )
+        .into_bytes();
+    }
     format!(
         "ego/hosting/v2\n{}\n{}\n{}\n{}\n{}",
         r.node_id,
@@ -57,6 +73,12 @@ pub fn verify(r: &HostingNodeRecord, now: i64) -> Result<(), &'static str> {
     if r.domains.len() > MAX_DOMAINS || !r.domains.iter().all(|d| valid_domain(d)) {
         return Err("A domain is not a valid lowercase domain name.");
     }
+    if r.mirrored.len() > MAX_DOMAINS || !r.mirrored.iter().all(|d| valid_domain(d)) {
+        return Err("A copied domain is not a valid lowercase domain name.");
+    }
+    if r.mirrors.len() > MAX_MIRRORS || !r.mirrors.iter().all(|a| valid_address(a)) {
+        return Err("The list of computers keeping copies is not valid.");
+    }
     let pk: [u8; 32] = hex::decode(&r.pubkey)
         .ok()
         .and_then(|v| v.try_into().ok())
@@ -86,11 +108,95 @@ pub fn serves(record_domains: &[String], name: &str) -> bool {
     record_domains.iter().any(|d| d == name || name.strip_prefix("www.") == Some(d.as_str()))
 }
 
+fn valid_address(a: &str) -> bool {
+    a.starts_with("ego") && (20..=80).contains(&a.len()) && a.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+type MirrorMap = HashMap<String, Vec<String>>;
+
+fn mirror_map() -> &'static std::sync::RwLock<MirrorMap> {
+    static MAP: std::sync::OnceLock<std::sync::RwLock<MirrorMap>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+pub fn mirrors_of(owner: &str) -> Vec<String> {
+    mirror_map().read().unwrap_or_else(|e| e.into_inner()).get(owner).cloned().unwrap_or_default()
+}
+
+pub fn set_mirrors(owner: &str, list: &[String]) -> bool {
+    let mut map = mirror_map().write().unwrap_or_else(|e| e.into_inner());
+    let mut list: Vec<String> = list.iter().filter(|a| a.as_str() != owner).cloned().collect();
+    list.sort();
+    list.dedup();
+    list.truncate(MAX_MIRRORS);
+    if map.get(owner).map(Vec::as_slice).unwrap_or_default() == list.as_slice() {
+        return false;
+    }
+    if list.is_empty() {
+        map.remove(owner);
+    } else if map.contains_key(owner) || map.len() < MAX_RECORDS {
+        map.insert(owner.to_string(), list);
+    } else {
+        return false;
+    }
+    true
+}
+
+pub fn mirrors_path(chain_path: &Path) -> PathBuf {
+    std::env::var("ORACLE_HOSTING_MIRRORS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| chain_path.with_file_name("hosting-mirrors.json"))
+}
+
+pub fn load_mirrors(path: &Path) -> usize {
+    let loaded: MirrorMap = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let n = loaded.len();
+    *mirror_map().write().unwrap_or_else(|e| e.into_inner()) = loaded;
+    n
+}
+
+pub fn save_mirrors(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(&*mirror_map().read().unwrap_or_else(|e| e.into_inner()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+pub fn may_serve(bindings: &HashMap<String, String>, domain: &str, node: &str) -> bool {
+    match owner_of(bindings, domain) {
+        Some(owner) => owner == node || mirrors_of(owner).iter().any(|m| m == node),
+        None => false,
+    }
+}
+
+pub fn serving_nodes<'a>(
+    nodes: &'a HashMap<String, HostingNodeRecord>,
+    bindings: &HashMap<String, String>,
+    domain: &str,
+    now: i64,
+) -> Vec<&'a HostingNodeRecord> {
+    let Some(owner) = owner_of(bindings, domain) else { return Vec::new() };
+    let online = |n: &&HostingNodeRecord| n.last_seen >= now - ONLINE_SECS;
+    let mut out: Vec<&HostingNodeRecord> = nodes.get(owner).filter(online).filter(|n| serves(&n.domains, domain)).into_iter().collect();
+    for m in mirrors_of(owner) {
+        if out.len() >= MAX_ANSWERS {
+            break;
+        }
+        if let Some(n) = nodes.get(&m).filter(online).filter(|n| serves(&n.mirrored, domain)) {
+            out.push(n);
+        }
+    }
+    out
+}
+
 pub fn cert_names(bindings: &HashMap<String, String>, domain: &str, signer: &str) -> Result<Vec<String>, &'static str> {
     if !valid_domain(domain) || domain.starts_with("www.") {
         return Err("Ask for the plain domain, like example.com; www is added for you.");
     }
-    if owner_of(bindings, domain) != Some(signer) {
+    if !may_serve(bindings, domain, signer) {
         return Err("This domain belongs to another Ego address, or nobody has claimed it yet.");
     }
     let www = format!("www.{domain}");
@@ -185,6 +291,8 @@ mod tests {
             pubkey: hex::encode(pk),
             signature_v2: String::new(),
             signature: String::new(),
+            mirrors: Vec::new(),
+            mirrored: Vec::new(),
         };
         r.signature_v2 = hex::encode(key.sign(&signing_bytes(&r)).to_bytes());
         r
@@ -201,6 +309,8 @@ mod tests {
             pubkey: String::new(),
             signature_v2: String::new(),
             signature: String::new(),
+            mirrors: Vec::new(),
+            mirrored: Vec::new(),
         };
         assert_eq!(signing_bytes(&r), b"ego/hosting/v2\negot1abc\nhttp://1.2.3.4:5\n7\na,b\nx.com,y.org".to_vec());
     }
@@ -308,5 +418,94 @@ mod tests {
         save_bindings(&path, &b).unwrap();
         assert_eq!(load_bindings(&path), b);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn record(key: &SigningKey, ts: i64, domains: &[&str], mirrors: &[&str], mirrored: &[&str]) -> HostingNodeRecord {
+        let pk = key.verifying_key().to_bytes();
+        let mut r = HostingNodeRecord {
+            node_id: crate::gateways::address_of(&pk),
+            endpoint: "http://57.1.2.3:47395".into(),
+            sites: Vec::new(),
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+            last_seen: ts,
+            pubkey: hex::encode(pk),
+            signature_v2: String::new(),
+            signature: String::new(),
+            mirrors: mirrors.iter().map(|d| d.to_string()).collect(),
+            mirrored: mirrored.iter().map(|d| d.to_string()).collect(),
+        };
+        r.signature_v2 = hex::encode(key.sign(&signing_bytes(&r)).to_bytes());
+        r
+    }
+
+    #[test]
+    fn the_copy_text_matches_what_ego_desktop_signs() {
+        let r = HostingNodeRecord {
+            node_id: "egot1abc".into(),
+            endpoint: "http://1.2.3.4:5".into(),
+            sites: vec!["a".into(), "b".into()],
+            domains: vec!["x.com".into(), "y.org".into()],
+            last_seen: 7,
+            pubkey: String::new(),
+            signature_v2: String::new(),
+            signature: String::new(),
+            mirrors: vec!["egot1m1".into(), "egot1m2".into()],
+            mirrored: vec!["z.net".into()],
+        };
+        assert_eq!(signing_bytes(&r), b"ego/hosting/v3
+egot1abc
+http://1.2.3.4:5
+7
+a,b
+x.com,y.org
+egot1m1,egot1m2
+z.net".to_vec());
+    }
+
+    #[test]
+    fn copy_lists_are_signed_and_old_records_keep_their_text() {
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let mirror = crate::gateways::address_of(&SigningKey::from_bytes(&[12; 32]).verifying_key().to_bytes());
+        let r = record(&key, now, &["shop-mirror-test.com"], &[mirror.as_str()], &[]);
+        assert!(signing_bytes(&r).starts_with(b"ego/hosting/v3\n"));
+        assert!(verify(&r, now).is_ok());
+        let mut tampered = r.clone();
+        tampered.mirrors.push(crate::gateways::address_of(&[13; 32]));
+        assert!(verify(&tampered, now).is_err(), "nobody can add a copy holder to an owner's record");
+        let plain = record(&key, now, &["shop-mirror-test.com"], &[], &[]);
+        assert!(signing_bytes(&plain).starts_with(b"ego/hosting/v2\n"));
+    }
+
+    #[test]
+    fn only_copy_holders_the_owner_named_are_answered_and_get_certificates() {
+        let now = chrono::Utc::now().timestamp();
+        let owner = SigningKey::from_bytes(&[21; 32]);
+        let named = SigningKey::from_bytes(&[22; 32]);
+        let stranger = SigningKey::from_bytes(&[23; 32]);
+        let named_addr = crate::gateways::address_of(&named.verifying_key().to_bytes());
+        let o = record(&owner, now, &["copies-test.org"], &[named_addr.as_str()], &[]);
+        let n = record(&named, now, &[], &[], &["copies-test.org"]);
+        let s = record(&stranger, now, &[], &[], &["copies-test.org"]);
+        let bindings = HashMap::from([("copies-test.org".to_string(), o.node_id.clone())]);
+        assert!(set_mirrors(&o.node_id, &o.mirrors));
+        assert!(!set_mirrors(&o.node_id, &o.mirrors), "unchanged");
+        let nodes: HashMap<String, HostingNodeRecord> = [o.clone(), n.clone(), s.clone()].into_iter().map(|r| (r.node_id.clone(), r)).collect();
+        let answered: Vec<&str> = serving_nodes(&nodes, &bindings, "copies-test.org", now).iter().map(|r| r.node_id.as_str()).collect();
+        assert_eq!(answered, vec![o.node_id.as_str(), n.node_id.as_str()]);
+        assert!(cert_names(&bindings, "copies-test.org", &n.node_id).is_ok());
+        assert!(cert_names(&bindings, "copies-test.org", &s.node_id).is_err());
+        let mut offline = nodes.clone();
+        offline.get_mut(&o.node_id).unwrap().last_seen = now - 10 * ONLINE_SECS;
+        let answered: Vec<&str> = serving_nodes(&offline, &bindings, "copies-test.org", now).iter().map(|r| r.node_id.as_str()).collect();
+        assert_eq!(answered, vec![n.node_id.as_str()], "the site stays up while the owner's computer is off");
+        assert!(set_mirrors(&o.node_id, &[]));
+        assert!(serving_nodes(&offline, &bindings, "copies-test.org", now).is_empty());
     }
 }

@@ -198,6 +198,9 @@ async fn serve(method: Method, headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().to_string();
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(str::to_string);
     let served = tokio::task::spawn_blocking(move || {
+        if site.starts_with("mirror:") {
+            return crate::site_mirror::read(&site, &path).map(Ok);
+        }
         let base = crate::rpc::resolve_site_base(&site)?;
         if crate::python_host::is_python_site(&base) {
             return Some(Err(()));
@@ -526,17 +529,39 @@ fn published_domains() -> HashMap<String, String> {
     if owner.is_empty() {
         return HashMap::new();
     }
-    crate::chain_db::list_hosted_sites_raw(&owner)
-        .into_iter()
-        .filter_map(|raw| {
-            let domain = raw["custom_domain"].as_str()?.to_string();
-            let name = raw["name"].as_str()?.to_string();
-            crate::commands::hosting::valid_hosting_domain(&domain).then_some((domain, name))
-        })
-        .collect()
+    let mut map = crate::site_mirror::serving_map();
+    map.extend(crate::chain_db::list_hosted_sites_raw(&owner).into_iter().filter_map(|raw| {
+        let domain = raw["custom_domain"].as_str()?.to_string();
+        let name = raw["name"].as_str()?.to_string();
+        crate::commands::hosting::valid_hosting_domain(&domain).then_some((domain, name))
+    }));
+    map
+}
+
+static LAST_MIRROR_ANNOUNCE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+const MIRROR_ANNOUNCE_EVERY_SECS: i64 = 300;
+
+async fn mirror_duties() {
+    crate::site_mirror::tick().await;
+    let me = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address).await.unwrap_or_default();
+    if !me.is_empty() {
+        crate::site_mirror::push_own_sites(me).await;
+    }
+    let now = now();
+    let last = LAST_MIRROR_ANNOUNCE.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last >= MIRROR_ANNOUNCE_EVERY_SECS {
+        LAST_MIRROR_ANNOUNCE.store(now, std::sync::atomic::Ordering::Relaxed);
+        let mirrors = tokio::task::spawn_blocking(crate::site_mirror::serving_domains).await.unwrap_or_default();
+        if !mirrors.is_empty() {
+            crate::commands::hosting::announce_hosting_record().await;
+        }
+    }
 }
 
 async fn tick() {
+    if crate::chain_db::local_chain_height().saturating_add(1) >= crate::storage_pay::HOSTING_PLAN_FROM_HEIGHT {
+        mirror_duties().await;
+    }
     let map = tokio::task::spawn_blocking(published_domains).await.unwrap_or_default();
     *sites().write().unwrap_or_else(|e| e.into_inner()) = map.clone();
     update(|s| {

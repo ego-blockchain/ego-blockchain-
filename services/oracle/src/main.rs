@@ -115,6 +115,10 @@ pub struct HostingNodeRecord {
     pub signature_v2: String,
     #[serde(default, skip_serializing)]
     pub signature: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors:   Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrored:  Vec<String>,
 }
 
 type HostingNodes = HashMap<String, HostingNodeRecord>;
@@ -979,6 +983,12 @@ async fn handle_hosting_announce(
     };
     let refused: Vec<&String> = record.domains.iter().filter(|d| !claimed.domains.contains(d)).collect();
     let refused = json!(refused);
+    if hosting::set_mirrors(&record.node_id, &record.mirrors) {
+        let path = hosting::mirrors_path(&chain_data_path());
+        if let Err(e) = tokio::task::block_in_place(|| hosting::save_mirrors(&path)) {
+            error!("[Hosting] Saving copy holders to {} FAILED: {}", path.display(), e);
+        }
+    }
     {
         let mut nodes = state.hosting_nodes.write().await;
         if nodes.get(&record.node_id).is_some_and(|old| old.last_seen > record.last_seen) {
@@ -1001,15 +1011,16 @@ async fn handle_hosting_nodes(
 ) -> impl IntoResponse {
     let now = Utc::now().timestamp();
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    let owner = hosting::owner_of(&*state.hosting_domains.read().await, &domain).map(str::to_string);
+    let bindings = state.hosting_domains.read().await.clone();
     let nodes = state.hosting_nodes.read().await;
-    let matching: Vec<&HostingNodeRecord> = nodes.values()
-        .filter(|n| n.last_seen >= now - hosting::ONLINE_SECS)
-        .filter(|n| {
-            (owner.as_deref() == Some(n.node_id.as_str()) && hosting::serves(&n.domains, &domain))
-                || (!domain.contains('.') && n.sites.iter().any(|s| s == &domain))
-        })
-        .collect();
+    let matching: Vec<&HostingNodeRecord> = if domain.contains('.') {
+        hosting::serving_nodes(&nodes, &bindings, &domain, now)
+    } else {
+        nodes.values()
+            .filter(|n| n.last_seen >= now - hosting::ONLINE_SECS)
+            .filter(|n| n.sites.iter().any(|s| s == &domain))
+            .collect()
+    };
     Json(json!({ "domain": domain, "nodes": matching }))
 }
 
@@ -1623,6 +1634,8 @@ async fn main() {
             let path = hosting::bindings_path(&chain_data_path());
             let loaded = hosting::load_bindings(&path);
             info!("[Hosting] {} domain owner(s) loaded from {}", loaded.len(), path.display());
+            let mirrors_file = hosting::mirrors_path(&chain_data_path());
+            info!("[Hosting] {} owner(s) with copy holders loaded from {}", hosting::load_mirrors(&mirrors_file), mirrors_file.display());
             loaded
         })),
         hosting_claims:  Arc::new(RwLock::new(HashMap::new())),

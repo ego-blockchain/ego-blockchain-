@@ -191,6 +191,10 @@ interface Holders {
   shielded_uegoc: number;
   groups: HolderGroup[];
   top: HolderRow[];
+  safu_address?: string;
+  safu_uegoc?: number;
+  safu_credits?: number;
+  safu_from_height?: number | null;
 }
 
 const egoc = (u: number) => (u / 1_000_000).toLocaleString('en-US', { maximumFractionDigits: 2 });
@@ -216,7 +220,7 @@ function HoldersView({ data }: { data: Holders | null }) {
   const rows = showAll ? data.top : data.top.slice(0, 25);
   return (
     <div className="p-5 space-y-5">
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         {[
           { label: 'Wallets holding EGOC', val: data.wallets.toLocaleString('en-US'), sub: 'not counting the pools' },
           { label: 'Held by those wallets', val: `${egoc(data.wallet_total_uegoc)} EGOC`, sub: 'all of them together' },
@@ -228,6 +232,22 @@ function HoldersView({ data }: { data: Holders | null }) {
             <div className="text-xs text-gray-500 mt-0.5">{c.sub}</div>
           </div>
         ))}
+        {data.safu_address && (
+          <div className="bg-gray-900 rounded-xl p-4 border border-amber-500/40"
+            title={`SAFU fund address: ${data.safu_address}. Nobody holds its key; only a passed DAO vote can pay from it.`}>
+            <div className="text-xs text-amber-300 mb-1">SAFU fund</div>
+            <div className="text-lg font-bold text-white">{egoc(data.safu_uegoc ?? 0)} EGOC</div>
+            <div className="text-xs text-gray-300">${((data.safu_credits ?? 0) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} EGUSD</div>
+            <button onClick={openOnWeb(addressUrl(data.safu_address))} className="font-mono text-[11px] text-blue-400 hover:text-blue-300 hover:underline mt-1">
+              {data.safu_address.slice(0, 14)}…{data.safu_address.slice(-6)}
+            </button>
+            <div className="text-xs text-gray-500 mt-0.5">
+              {data.safu_from_height == null
+                ? 'starts with an update'
+                : '3% of network fees, paid out only by a DAO vote'}
+            </div>
+          </div>
+        )}
       </div>
 
       {groups.length > 0 && (

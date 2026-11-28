@@ -717,3 +717,127 @@ mod plan_pay_tests {
         assert!(!is_storage_claim(&to_other));
     }
 }
+
+pub const HOSTING_PLAN_FROM_HEIGHT: u64 = u64::MAX;
+pub const HOSTING_TIERS: [(&str, u64, u64); 3] = [("starter", 149, 50), ("pro", 299, 120), ("business", 599, 500)];
+pub const HOSTING_MAX_MONTHS: u32 = 24;
+pub const HOSTING_MONTH_SECS: i64 = 30 * 86_400;
+
+pub fn hosting_plan_owner(owner: &str) -> String {
+    format!("hosting.{owner}")
+}
+
+pub fn hosting_tier(name: &str) -> Option<(u64, u64)> {
+    HOSTING_TIERS.iter().find(|(t, ..)| *t == name).map(|(_, cents, gb)| (*cents, *gb))
+}
+
+pub fn hosting_tier_of_bytes(bytes: u64) -> Option<&'static str> {
+    HOSTING_TIERS.iter().find(|(_, _, gb)| gb * 1_000_000_000 == bytes).map(|(t, ..)| *t)
+}
+
+fn tier_and_months<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<(&'a str, u32)> {
+    let tier = parts.next()?;
+    let months: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || months == 0 || months > HOSTING_MAX_MONTHS {
+        return None;
+    }
+    hosting_tier(tier)?;
+    Some((tier, months))
+}
+
+pub fn hosting_payment_terms(tx: &LedgerTx, price_micro_per_egoc: Option<u64>) -> Option<(u64, u64, i64)> {
+    let memo = tx.memo.as_deref()?;
+    let (tier, months) = if tx.tx_type == "credits_pay" && tx.to == crate::commands::storage::STORAGE_FEE_SINK {
+        let mut parts = memo.strip_prefix("credits_pay:")?.split(':');
+        let credits: u64 = parts.next()?.parse().ok()?;
+        if parts.next()? != "hosting" {
+            return None;
+        }
+        let (tier, months) = tier_and_months(parts)?;
+        let (cents, _) = hosting_tier(tier)?;
+        if credits < cents * months as u64 {
+            return None;
+        }
+        (tier, months)
+    } else if tx.tx_type == "hosting_plan" && !tx.from.is_empty() {
+        let (tier, months) = tier_and_months(memo.strip_prefix("hosting_plan:")?.split(':'))?;
+        let (cents, _) = hosting_tier(tier)?;
+        let paid_micro = tx.fee_uegoc as u128 * price_micro_per_egoc? as u128 / 1_000_000;
+        let due_micro = cents as u128 * months as u128 * 10_000;
+        if paid_micro * 10 < due_micro * 9 {
+            return None;
+        }
+        (tier, months)
+    } else {
+        return None;
+    };
+    let (cents, gb) = hosting_tier(tier)?;
+    Some((gb * 1_000_000_000, cents * months as u64 * 10_000, months as i64 * HOSTING_MONTH_SECS))
+}
+
+pub fn hosting_plan_payment(tx: &LedgerTx, height: u64, price_micro_per_egoc: Option<u64>) -> Option<(u64, u64, i64)> {
+    if height < HOSTING_PLAN_FROM_HEIGHT {
+        return None;
+    }
+    hosting_payment_terms(tx, price_micro_per_egoc)
+}
+
+pub fn hosting_spans(ov: &Ov, owner: &str) -> Vec<PlanSpan> {
+    spans(ov, &hosting_plan_owner(owner))
+}
+
+pub fn hosting_hosts(ov: &Ov, owner: &str) -> Vec<String> {
+    plan_hosts(ov, &hosting_plan_owner(owner))
+}
+
+#[cfg(test)]
+mod hosting_plan_tests {
+    use super::*;
+
+    fn egusd(memo: &str) -> LedgerTx {
+        LedgerTx {
+            from: "egot1owner".into(),
+            to: crate::commands::storage::STORAGE_FEE_SINK.into(),
+            tx_type: "credits_pay".into(),
+            memo: Some(memo.into()),
+            ..LedgerTx::default()
+        }
+    }
+
+    fn egoc(memo: &str, fee: u64) -> LedgerTx {
+        LedgerTx { from: "egot1owner".into(), tx_type: "hosting_plan".into(), memo: Some(memo.into()), fee_uegoc: fee, ..LedgerTx::default() }
+    }
+
+    #[test]
+    fn a_hosting_plan_counts_only_when_its_price_was_paid() {
+        let pro3 = Some((120 * 1_000_000_000, 299 * 3 * 10_000, 3 * HOSTING_MONTH_SECS));
+        assert_eq!(hosting_payment_terms(&egusd("credits_pay:897:hosting:pro:3"), None), pro3);
+        assert_eq!(hosting_payment_terms(&egusd("credits_pay:896:hosting:pro:3"), None), None, "a cent short");
+        assert_eq!(hosting_payment_terms(&egusd("credits_pay:99999:hosting:gold:1"), None), None);
+        assert_eq!(hosting_payment_terms(&egusd("credits_pay:99999:hosting:pro:25"), None), None);
+        assert_eq!(hosting_payment_terms(&egusd("credits_pay:99999:hosting:pro:0"), None), None);
+        assert_eq!(hosting_payment_terms(&egusd("credits_pay:897:plan:Pro:monthly"), None), None, "storage plans are not hosting");
+        let mut elsewhere = egusd("credits_pay:897:hosting:pro:3");
+        elsewhere.to = "egot1friend".into();
+        assert_eq!(hosting_payment_terms(&elsewhere, None), None);
+
+        let price = Some(100_000);
+        let fair = 299 * 3 * 10_000 * 1_000_000 / 100_000;
+        assert_eq!(hosting_payment_terms(&egoc("hosting_plan:pro:3", fair), price), pro3);
+        assert_eq!(hosting_payment_terms(&egoc("hosting_plan:pro:3", fair * 9 / 10), price), pro3, "a 10% price move is fine");
+        assert_eq!(hosting_payment_terms(&egoc("hosting_plan:pro:3", fair * 8 / 10), price), None);
+        assert_eq!(hosting_payment_terms(&egoc("hosting_plan:pro:3", fair), None), None, "no price on chain, no plan");
+    }
+
+    #[test]
+    fn hosting_plans_wait_for_the_switch_and_keep_apart_from_storage() {
+        assert_eq!(hosting_plan_payment(&egusd("credits_pay:149:hosting:starter:1"), u64::MAX - 1, None), None);
+        assert_eq!(hosting_plan_owner("egot1abc"), "hosting.egot1abc");
+        assert!(!hosting_plan_owner("egot1abc").contains(':'));
+        assert_eq!(hosting_tier_of_bytes(500 * 1_000_000_000), Some("business"));
+        let mut ov = Ov::memory();
+        add_plan(&mut ov, &hosting_plan_owner("egot1abc"), 100, 50 * 1_000_000_000, 1_490_000, HOSTING_MONTH_SECS);
+        assert!(active_plan(&ov, "egot1abc", 200).is_none(), "a hosting plan gives no storage quota");
+        assert_eq!(hosting_spans(&ov, "egot1abc").len(), 1);
+    }
+}

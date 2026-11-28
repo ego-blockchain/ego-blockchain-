@@ -117,10 +117,12 @@ pub async fn create_dao_proposal(
     duration_days: Option<u32>,
     questions:     Option<Vec<NewTestQuestion>>,
     target:        Option<String>,
+    safu_uegoc:    Option<u64>,
+    safu_credits:  Option<u64>,
     state:         State<'_, AppState>,
 ) -> Result<String, EgoDesktopError> {
     if crate::dao_chain::rule_active_at_tip() {
-        return chain_propose(&state, title, description, proposal_type, options, duration_days, questions.unwrap_or_default(), target.unwrap_or_default()).await;
+        return chain_propose(&state, title, description, proposal_type, options, duration_days, questions.unwrap_or_default(), target.unwrap_or_default(), safu_uegoc.unwrap_or(0), safu_credits.unwrap_or(0)).await;
     }
     let ledger = Ledger::load();
     let creator = ledger.address.clone();
@@ -544,6 +546,8 @@ async fn chain_propose(
     duration_days: Option<u32>,
     questions:     Vec<NewTestQuestion>,
     target:        String,
+    safu_uegoc:    u64,
+    safu_credits:  u64,
 ) -> Result<String, EgoDesktopError> {
     for (i, q) in questions.iter().enumerate() {
         if q.correct_index >= q.options.len() {
@@ -564,6 +568,8 @@ async fn chain_propose(
             .collect(),
         answers_commit: if questions.is_empty() { String::new() } else { crate::dao_chain::answers_commit(&salt, &answers) },
         target: target.trim().to_string(),
+        safu_uegoc,
+        safu_credits,
     };
     crate::dao_chain::check_propose(&body).map_err(EgoDesktopError::InvalidInput)?;
 
@@ -743,4 +749,32 @@ pub async fn dao_reveal_tick() {
     use tauri::Manager;
     let state = app.state::<AppState>();
     send_due_reveals(&state).await;
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SafuFund {
+    pub address: String,
+    pub egoc_uegoc: u64,
+    pub egusd_credits: u64,
+    pub percent: u64,
+    pub from_height: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn get_safu_fund() -> SafuFund {
+    tokio::task::spawn_blocking(|| SafuFund {
+        address: crate::chain_db::SAFU_ADDR.to_string(),
+        egoc_uegoc: crate::chain_db::balance_of(crate::chain_db::SAFU_ADDR),
+        egusd_credits: crate::chain_db::credits_balance(crate::chain_db::SAFU_ADDR),
+        percent: crate::tokenomics::SAFU_PCT,
+        from_height: (crate::tokenomics::SAFU_FROM_HEIGHT != u64::MAX).then_some(crate::tokenomics::SAFU_FROM_HEIGHT),
+    })
+    .await
+    .unwrap_or(SafuFund {
+        address: crate::chain_db::SAFU_ADDR.to_string(),
+        egoc_uegoc: 0,
+        egusd_credits: 0,
+        percent: crate::tokenomics::SAFU_PCT,
+        from_height: None,
+    })
 }

@@ -4245,6 +4245,19 @@ pub enum P2PMessage {
         multiaddrs: Vec<String>,
         known_count: u32,
     },
+    SiteManifestPush {
+        manifest: crate::site_mirror::SiteManifest,
+    },
+    SiteFileRequest {
+        cid: String,
+        owner: String,
+        requester_addr: String,
+        requester_endpoint: String,
+    },
+    SiteFileData {
+        cid: String,
+        data_b64: String,
+    },
     FileRequest {
         cid: String,
         requester_addr: String,
@@ -11100,7 +11113,7 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
                                 if let Err(e) = send_message_any(&eps, &response).await {
                                     eprintln!("[P2P] ManifestData direct failed: {} — relay inbox", e);
                                     crate::commands::messenger::deposit_in_relay_inbox(
-                                        &addr, &my_addr, &response,
+                                        &my_addr, &addr, &response,
                                     ).await;
                                 } else {
                                     eprintln!("[P2P] ManifestData sent for {} ({} blocks)", &cid[..16], manifest.blocks.len());
@@ -11144,7 +11157,7 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
                     if let Err(e) = send_message_any(&eps, &response).await {
                         eprintln!("[P2P] FileData direct failed: {} — relay inbox", e);
                         crate::commands::messenger::deposit_in_relay_inbox(
-                            &addr, &my_addr, &response,
+                            &my_addr, &addr, &response,
                         ).await;
                     } else {
                         eprintln!("[P2P] FileData sent OK for {}", cid2);
@@ -11163,6 +11176,40 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
 
         P2PMessage::MasterPromotion { shard_id, new_master, new_endpoint, former_master, timestamp, pubkey, signature } => {
             tokio::spawn(on_master_promotion(shard_id, new_master, new_endpoint, former_master, timestamp, pubkey, signature, false));
+        }
+
+        P2PMessage::SiteManifestPush { manifest } => {
+            tokio::task::spawn_blocking(move || crate::site_mirror::accept(manifest)).await.ok();
+        }
+
+        P2PMessage::SiteFileRequest { cid, owner, requester_addr, requester_endpoint } => {
+            if requester_addr.is_empty() || !crate::site_mirror::may_answer(&requester_addr, Utc::now().timestamp()) {
+                return;
+            }
+            let c = cid.clone();
+            let found = tokio::task::spawn_blocking(move || {
+                let me = crate::ledger::Ledger::load().address;
+                let data = if owner == me { crate::site_mirror::own_file(&me, &c) } else { None }
+                    .or_else(|| crate::site_mirror::held_file(&c));
+                (me, data)
+            }).await;
+            if let Ok((me, Some(data))) = found {
+                use base64::Engine as _;
+                let msg = P2PMessage::SiteFileData { cid, data_b64: base64::engine::general_purpose::STANDARD.encode(&data) };
+                if requester_endpoint.is_empty() || send_message_any(&[requester_endpoint], &msg).await.is_err() {
+                    crate::commands::messenger::deposit_in_relay_inbox(&me, &requester_addr, &msg).await;
+                }
+            }
+        }
+
+        P2PMessage::SiteFileData { cid, data_b64 } => {
+            use base64::Engine as _;
+            if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                let stored = tokio::task::spawn_blocking(move || crate::site_mirror::store_file(&cid, &data)).await.unwrap_or(false);
+                if stored {
+                    crate::public_sites::wake_now();
+                }
+            }
         }
 
 P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
@@ -15172,7 +15219,7 @@ async fn handle_block_proposal(
     for tx in &transactions {
         // Skip coinbase (system reward tx) — its amount is validated below.
         if Some(&tx.hash) == block.coinbase_tx.as_ref() { continue; }
-        if crate::ledger::is_protocol_system_tx(tx) || crate::drs::is_batch_tx(tx) || crate::chain_db::is_contributor_fee_tx(tx) || crate::hold_chain::settle_is_well_formed(tx) { continue; }
+        if crate::ledger::is_protocol_system_tx(tx) || crate::drs::is_batch_tx(tx) || crate::chain_db::is_contributor_fee_tx(tx) || crate::chain_db::is_safu_fee_tx(tx) || crate::dao_chain::is_safu_payout_tx(tx) || crate::hold_chain::settle_is_well_formed(tx) { continue; }
         if let Err(reason) = crate::ledger::verify_incoming_tx_with_miner(tx, &proposer) {
             eprintln!("[TX] {:.12} Rejected — {} (in proposal #{} from {:.16})",
                 tx.hash, reason, block.height, proposer);
@@ -15188,10 +15235,20 @@ async fn handle_block_proposal(
         .map(|t| t.fee_uegoc)
         .sum();
     let emission_v2 = crate::chain_db::emission_v2_active(block.height);
+    let node_fees = crate::tokenomics::fees_for_nodes(block.height, tx_fees_sum);
+    if let Err(reason) = crate::chain_db::check_safu_fee(&transactions.iter().collect::<Vec<_>>(), block.height, block.timestamp, tx_fees_sum)
+        .and_then(|_| {
+            let db = crate::chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+            crate::chain_db::check_safu_payout(&db, &transactions.iter().collect::<Vec<_>>(), block.height, block.timestamp)
+        })
+    {
+        eprintln!("[BFT] Committee: rejected proposal #{} — {}", block.height, reason);
+        return;
+    }
     let expected_reward = crate::chain_db::expected_block_reward(
-        block.height, block.timestamp, tx_fees_sum, &block.prev_hash,
+        block.height, block.timestamp, node_fees, &block.prev_hash,
     );
-    let expected_contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
+    let expected_contributor_fee = crate::tokenomics::contributor_fee_share(node_fees);
 
     if let Some(ref cb_hash) = block.coinbase_tx {
         match transactions.iter().find(|t| &t.hash == cb_hash) {

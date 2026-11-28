@@ -64,6 +64,7 @@ mod p2p;
 mod poc;
 mod proof;
 mod public_sites;
+mod site_mirror;
 mod python_host;
 mod rpc;
 mod sandbox;
@@ -1696,6 +1697,7 @@ fn main() {
             commands::dao_chat::dao_chat_sync,
             commands::gateway::gateway_status,
             commands::governance::get_proposal_rate_limit,
+            commands::governance::get_safu_fund,
             commands::hosting::deploy_site,
             commands::hosting::deploy_site_begin,
             commands::hosting::deploy_site_file,
