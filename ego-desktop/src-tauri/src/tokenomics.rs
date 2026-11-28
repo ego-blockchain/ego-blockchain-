@@ -46,7 +46,7 @@ pub fn miner_fee_share(tx_fees: u64)       -> u64 { tx_fees * MINER_FEE_PCT / 10
 pub fn contributor_fee_share(tx_fees: u64) -> u64 { tx_fees - miner_fee_share(tx_fees) }
 
 pub const SAFU_PCT: u64 = 3;
-pub const SAFU_FROM_HEIGHT: u64 = u64::MAX;
+pub const SAFU_FROM_HEIGHT: u64 = 224_041;
 
 pub fn safu_share_from(from_height: u64, height: u64, amount: u64) -> u64 {
     if height < from_height {

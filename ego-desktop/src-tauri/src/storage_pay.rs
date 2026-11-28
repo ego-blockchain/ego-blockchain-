@@ -718,7 +718,7 @@ mod plan_pay_tests {
     }
 }
 
-pub const HOSTING_PLAN_FROM_HEIGHT: u64 = u64::MAX;
+pub const HOSTING_PLAN_FROM_HEIGHT: u64 = crate::tokenomics::SAFU_FROM_HEIGHT;
 pub const HOSTING_TIERS: [(&str, u64, u64); 3] = [("starter", 149, 50), ("pro", 299, 120), ("business", 599, 500)];
 pub const HOSTING_MAX_MONTHS: u32 = 24;
 pub const HOSTING_MONTH_SECS: i64 = 30 * 86_400;
@@ -831,7 +831,8 @@ mod hosting_plan_tests {
 
     #[test]
     fn hosting_plans_wait_for_the_switch_and_keep_apart_from_storage() {
-        assert_eq!(hosting_plan_payment(&egusd("credits_pay:149:hosting:starter:1"), u64::MAX - 1, None), None);
+        assert_eq!(hosting_plan_payment(&egusd("credits_pay:149:hosting:starter:1"), HOSTING_PLAN_FROM_HEIGHT - 1, None), None);
+        assert!(hosting_plan_payment(&egusd("credits_pay:149:hosting:starter:1"), HOSTING_PLAN_FROM_HEIGHT, None).is_some());
         assert_eq!(hosting_plan_owner("egot1abc"), "hosting.egot1abc");
         assert!(!hosting_plan_owner("egot1abc").contains(':'));
         assert_eq!(hosting_tier_of_bytes(500 * 1_000_000_000), Some("business"));

@@ -132,10 +132,11 @@ fn plan_rules_on() -> bool {
 }
 
 fn current_plan(owner: &str, now: i64) -> Option<crate::chain_db::ActiveHostingPlan> {
+    let earlier = || crate::chain_db::get_hosting_plan(owner).filter(|p| p.expires_at > now);
     if plan_rules_on() {
-        return crate::chain_db::hosting_plan_on_chain(owner, now);
+        return crate::chain_db::hosting_plan_on_chain(owner, now).or_else(earlier);
     }
-    crate::chain_db::get_hosting_plan(owner).filter(|p| p.expires_at > now)
+    earlier()
 }
 
 fn usd_to_uegoc(usd: f64) -> u64 {

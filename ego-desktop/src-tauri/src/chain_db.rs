@@ -13735,7 +13735,8 @@ mod safu_fund_tests {
         let ts = 1_700_000_000;
         let sneaky = safu_fee_tx(10, 3, ts);
         assert!(check_safu_fee(&[&sneaky], 10, ts, 100).is_err());
-        assert_eq!(crate::tokenomics::safu_share(u64::MAX - 1, 1_000_000), 0);
+        assert_eq!(crate::tokenomics::safu_share(crate::tokenomics::SAFU_FROM_HEIGHT - 1, 1_000_000), 0);
+        assert_eq!(crate::tokenomics::safu_share(crate::tokenomics::SAFU_FROM_HEIGHT, 1_000_000), 30_000);
     }
 
     #[test]
